@@ -30,4 +30,7 @@ archive_name="workspace-mgr-${version}-${expected_target}"
 mkdir -p "dist/${archive_name}"
 cp target/release/workspace-mgr LICENSE README.md "dist/${archive_name}/"
 tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
-shasum -a 256 "dist/${archive_name}.tar.gz" > "dist/${archive_name}.tar.gz.sha256"
+(
+    cd dist
+    shasum -a 256 "${archive_name}.tar.gz" > "${archive_name}.tar.gz.sha256"
+)
