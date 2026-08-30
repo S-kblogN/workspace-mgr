@@ -5,6 +5,8 @@ fn user_documentation_covers_the_complete_public_model() {
     let normalized_model = model.split_whitespace().collect::<Vec<_>>().join(" ");
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
+    let e2e_readme = include_str!("e2e/README.md");
+    let e2e_coverage = include_str!("e2e/COVERAGE.md");
 
     assert!(readme.contains("docs/management-model.md"));
     assert!(guide.contains("management-model.md"));
@@ -69,6 +71,20 @@ fn user_documentation_covers_the_complete_public_model() {
     }
     assert!(guide.contains("S3 first, then Git"));
     assert!(guide.contains("Nested placement boundaries"));
+    assert!(e2e_readme.contains("COVERAGE.md"));
+    for boundary in [
+        "Transaction concurrency",
+        "Version-aware S3",
+        "Publish failure ordering",
+        "Shared-checkout refresh",
+        "Refresh ancestry",
+        "Pull-request ownership",
+    ] {
+        assert!(
+            e2e_coverage.contains(boundary),
+            "E2E coverage contract is missing {boundary}"
+        );
+    }
     assert!(!model.to_ascii_lowercase().contains("dvc"));
     assert!(!guide.to_ascii_lowercase().contains("dvc"));
     assert!(!commands.to_ascii_lowercase().contains("dvc"));

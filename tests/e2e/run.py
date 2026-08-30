@@ -7,6 +7,7 @@ git-daemon. It intentionally uses the compiled CLI as an opaque executable.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -253,6 +254,24 @@ class Harness:
             bodies.append(response["Body"].read())
         return bodies
 
+    def s3_version_for_body(self, expected: bytes) -> dict[str, Any]:
+        matches = []
+        for version in self.list_s3_versions():
+            response = self.s3.get_object(
+                Bucket=self.bucket,
+                Key=version["key"],
+                VersionId=version["version_id"],
+            )
+            if response["Body"].read() == expected:
+                matches.append(version)
+        self.check(
+            len(matches) == 1,
+            "exactly one S3 object version contains the expected payload",
+            matches=matches,
+            size=len(expected),
+        )
+        return matches[0]
+
     @staticmethod
     def free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -403,6 +422,27 @@ class Harness:
             "--s3-endpoint-url",
             self.endpoint,
         )
+        unmanaged = self.root / "unmanaged-init"
+        self.run(["git", "clone", self.remote_url, unmanaged], cwd=self.root)
+        unmanaged_agents = "# Existing repository policy\n\nKeep this unmanaged rule.\n"
+        (unmanaged / "AGENTS.md").write_text(unmanaged_agents, encoding="utf-8")
+        rejected_unmanaged = self.wm(unmanaged, *common, expected=2)
+        self.check(
+            "will not be overwritten" in rejected_unmanaged["stderr"],
+            "init refuses to replace an unmanaged AGENTS bootstrap",
+        )
+        self.check(
+            (unmanaged / "AGENTS.md").read_text(encoding="utf-8")
+            == unmanaged_agents,
+            "failed init preserves the unmanaged policy exactly",
+        )
+        self.check(
+            not (unmanaged / ".workspace-mgr.toml").exists()
+            and not (unmanaged / ".workspace-mgr").exists()
+            and not (unmanaged / ".dvc").exists(),
+            "unmanaged bootstrap refusal leaves no partial scaffolding",
+        )
+
         dry = self.wm(self.shared, *common, "--dry-run")
         self.check(dry["status"] == "dry_run", "init dry-run reports planned scaffolding")
         self.check(not (self.shared / ".workspace-mgr.toml").exists(), "init dry-run writes nothing")
@@ -562,6 +602,25 @@ class Harness:
         self.check(created["branch"] == branch, "task branch follows configured prefix")
         self.check(task.joinpath("README.md").is_file(), "task README created")
         self.check(task.joinpath(".workspace-mgr-task.toml").is_file(), "task manifest created")
+        readme_before_collision = task.joinpath("README.md").read_bytes()
+        collision = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-flow",
+            "--title",
+            "Replacement title",
+            "--purpose",
+            "This duplicate must not replace the existing task.",
+            "--timestamp",
+            "20260829-180000",
+            expected=2,
+        )
+        self.check(collision["stderr"], "duplicate task creation is rejected")
+        self.check(
+            task.joinpath("README.md").read_bytes() == readme_before_collision,
+            "duplicate task creation preserves existing scaffolding",
+        )
         self.assert_shared_head()
         base_oid = self.remote_ref("main")
         local_task_oid = self.git(self.shared, "rev-parse", branch).stdout.strip()
@@ -579,7 +638,30 @@ class Harness:
         )
         self.check(explicit["branch"] == branch, "explicit manifest resolution matches discovery")
 
+        self.git(self.shared, "switch", "-c", "e2e-alternate-checkout")
+        wrong_checkout = self.wm(task, "plan", expected=2)
+        self.check(
+            "--allow-non-shared-head" in wrong_checkout["stderr"],
+            "deliverable plan rejects an unexpected shared-checkout branch",
+        )
+        authorized_checkout = self.wm(
+            task,
+            "plan",
+            "--allow-non-shared-head",
+            "--scope-note",
+            "The E2E scenario explicitly exercises the exceptional checkout override.",
+        )
+        self.check(
+            authorized_checkout["status"] == "dry_run",
+            "explicitly authorized alternate checkout can plan",
+        )
+        self.git(self.shared, "switch", "main")
+
         (task / "notes.txt").write_text("task-only content\n", encoding="utf-8")
+        git_move_source = task / "move me - α.txt"
+        git_move_source.write_text("ordinary Git move payload\n", encoding="utf-8")
+        unicode_path = task / "notes with spaces - 结果.txt"
+        unicode_path.write_text("Unicode repository path\n", encoding="utf-8")
         (self.shared / "authorized.txt").write_text("authorized root content\n", encoding="utf-8")
         (self.shared / "unrelated.txt").write_text("another active task\n", encoding="utf-8")
         plan = self.wm(task, "plan")
@@ -587,6 +669,17 @@ class Harness:
         self.check(all(path.startswith(task_id + "/") for path in plan["changed_paths"]), "plan stays in task scope")
         self.check(self.remote_ref(branch) is None, "plan does not push target branch")
         self.check(self.list_s3_versions() == [], "plan does not write S3")
+
+        publish_preview = self.wm(
+            task,
+            "publish",
+            "-m",
+            "Preview the first publication",
+            "--dry-run",
+        )
+        self.check(publish_preview["status"] == "dry_run", "publish dry-run previews the transaction")
+        self.check(self.remote_ref(branch) is None, "publish dry-run creates no remote branch")
+        self.check(self.list_s3_versions() == [], "publish dry-run writes no S3 objects")
 
         rejected = self.wm(
             task,
@@ -615,6 +708,10 @@ class Harness:
         self.check(published["remote_oid"] == commit, "publish verifies remote object ID")
         self.check(self.remote_ref(branch) == commit, "network Git server has published branch")
         self.check(self.remote_path_exists(commit, f"{task_id}/notes.txt"), "task file exists in remote tree")
+        self.check(
+            self.remote_path_exists(commit, f"{task_id}/notes with spaces - 结果.txt"),
+            "Unicode and spaces survive network Git publication",
+        )
         self.check(self.remote_path_exists(commit, "authorized.txt"), "authorized extra scope exists in remote tree")
         self.check(not self.remote_path_exists(commit, "unrelated.txt"), "unrelated overlay is absent from remote tree")
         message = self.run(
@@ -622,15 +719,55 @@ class Harness:
             cwd=self.root,
         ).stdout
         self.check("Scope-Authorization: authorized.txt" in message, "commit records scope authorization")
+        self.check(published["review"]["pull_request"] == "required", "deliverable review handoff requires one PR")
+        self.check(published["review"]["managed_by"] == "agent", "deliverable review handoff assigns the agent")
+        self.check(published["review"]["merge_authority"] == "user", "deliverable review handoff reserves merge for user")
         self.assert_shared_head(base_oid)
+
+        remote_before_move = self.remote_ref(branch)
+        versions_before_move = self.list_s3_versions()
+        moved_git = self.wm(
+            task,
+            "move",
+            f"{task_id}/move me - α.txt",
+            f"{task_id}/renamed/结果.txt",
+        )
+        self.check(moved_git["placements"][0]["target"] == "git", "ordinary Git move preserves placement")
+        self.check(self.remote_ref(branch) == remote_before_move, "ordinary Git move is local-only")
+        self.check(self.list_s3_versions() == versions_before_move, "ordinary Git move writes no S3 object")
+        moved_git_publish = self.wm(task, "publish", "-m", "Publish ordinary Git move")
+        moved_git_oid = moved_git_publish["commit_oid"]
+        self.check(
+            not self.remote_path_exists(moved_git_oid, f"{task_id}/move me - α.txt")
+            and self.remote_path_exists(moved_git_oid, f"{task_id}/renamed/结果.txt"),
+            "ordinary Git move is represented exactly in the remote tree",
+        )
+
         no_changes = self.wm(task, "plan")
         self.check(no_changes["status"] == "no_changes", "post-publish plan is clean")
+        common_dir_text = self.git(self.shared, "rev-parse", "--git-common-dir").stdout.strip()
+        common_dir = Path(common_dir_text)
+        if not common_dir.is_absolute():
+            common_dir = self.shared / common_dir
+        repository_lock = common_dir / "workspace-mgr" / "repository.lock"
+        repository_lock.parent.mkdir(parents=True, exist_ok=True)
+        with repository_lock.open("a+", encoding="utf-8") as locked:
+            fcntl.flock(locked.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.wm(task, "plan", expected=2)
+            self.check(
+                "repository operation is running" in blocked["stderr"],
+                "a second process cannot enter a repository transaction",
+            )
+            fcntl.flock(locked.fileno(), fcntl.LOCK_UN)
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "transaction resumes after lock release")
         return task_id, task, branch
 
     def create_and_publish_infrastructure_task(self) -> None:
         assert self.shared is not None
         self.section("isolated infrastructure task and review handoff")
         branch = "codex/infra-e2e-policy"
+        private_config = self.shared / ".dvc" / "config.local"
+        private_config.write_text("# Virtual private storage state.\n", encoding="utf-8")
         dry = self.wm(
             self.shared,
             "task",
@@ -644,6 +781,8 @@ class Harness:
             "Exercise isolated repository-wide publication.",
             "--scope",
             "e2e-shared-policy.md",
+            "--scope",
+            "e2e-infra-assets",
             "--scope-note",
             "The E2E scenario authorizes this repository-wide policy file.",
             "--dry-run",
@@ -664,6 +803,8 @@ class Harness:
             "Exercise isolated repository-wide publication.",
             "--scope",
             "e2e-shared-policy.md",
+            "--scope",
+            "e2e-infra-assets",
             "--scope-note",
             "The E2E scenario authorizes this repository-wide policy file.",
         )
@@ -679,10 +820,27 @@ class Harness:
             self.git(worktree, "branch", "--show-current").stdout.strip() == branch,
             "infrastructure branch is mounted only in its worktree",
         )
+        self.check(
+            worktree.joinpath(".dvc", "cache").is_symlink(),
+            "infrastructure worktree reuses the repository-private storage cache",
+        )
+        self.check(
+            worktree.joinpath(".dvc", "config.local").is_symlink()
+            and worktree.joinpath(".dvc", "config.local").resolve()
+            == private_config.resolve(),
+            "infrastructure worktree reuses private storage configuration",
+        )
         status = self.wm(worktree, "task", "status")
-        self.check(status["scopes"] == ["e2e-shared-policy.md"], "infrastructure scope is exact")
+        self.check(
+            status["scopes"] == ["e2e-infra-assets", "e2e-shared-policy.md"],
+            "infrastructure scopes are exact",
+        )
 
         (worktree / "e2e-shared-policy.md").write_text("isolated policy\n", encoding="utf-8")
+        infra_assets = worktree / "e2e-infra-assets"
+        infra_assets.mkdir()
+        infra_payload = b"infrastructure managed payload\n"
+        (infra_assets / "data.bin").write_bytes(infra_payload)
         (worktree / "outside-scope.txt").write_text("must not publish\n", encoding="utf-8")
         rejected = self.wm(worktree, "plan", expected=2)
         self.check(
@@ -690,10 +848,29 @@ class Harness:
             "infrastructure worktree rejects undeclared changes",
         )
         (worktree / "outside-scope.txt").unlink()
+        infra_placement = self.wm(
+            worktree,
+            "storage",
+            "set",
+            "e2e-infra-assets/data.bin",
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise private managed storage from an infrastructure worktree.",
+        )
+        self.check(infra_placement["status"] == "updated", "infrastructure content can select S3")
+        self.check(infra_placement["remote_writes"] is False, "infrastructure placement is local-only")
         plan = self.wm(worktree, "plan")
         self.check(
-            plan["changed_paths"] == ["e2e-shared-policy.md"],
-            "infrastructure plan contains only its declared shared path",
+            all(
+                path == "e2e-shared-policy.md" or path.startswith("e2e-infra-assets/")
+                for path in plan["changed_paths"]
+            ),
+            "infrastructure plan contains only declared shared paths",
+        )
+        self.check(
+            "e2e-infra-assets/data.bin.dvc" in plan["changed_paths"],
+            "infrastructure plan includes managed-storage metadata",
         )
         published = self.wm(worktree, "publish", "-m", "Publish E2E shared policy")
         oid = published["commit_oid"]
@@ -702,6 +879,12 @@ class Harness:
             self.remote_path_exists(oid, "e2e-shared-policy.md"),
             "infrastructure path exists in the published tree",
         )
+        self.check(
+            self.remote_path_exists(oid, "e2e-infra-assets/data.bin.dvc")
+            and not self.remote_path_exists(oid, "e2e-infra-assets/data.bin"),
+            "infrastructure publication stores metadata in Git and payload in S3",
+        )
+        self.check(infra_payload in self.s3_bodies(), "infrastructure payload reaches versioned S3")
         self.check(published["review"]["pull_request"] == "required", "review handoff requires one PR")
         self.check(published["review"]["initial_state"] == "draft", "review handoff starts draft")
         self.check(published["review"]["managed_by"] == "agent", "review handoff assigns the agent")
@@ -824,12 +1007,43 @@ class Harness:
         for payload in (v1, bundle_v1_a, bundle_v1_b):
             self.check(payload in bodies_v1, "S3 contains exact version-one payload", payload=payload.decode().strip())
         self.check(self.wm(task, "plan")["status"] == "no_changes", "published S3 state is clean")
+        inherited = self.wm(task, "storage", "status", f"{task_id}/bundle/alpha.txt")
+        self.check(
+            inherited["placements"][0]["target"] == "s3"
+            and inherited["placements"][0]["selected_by"] == "explicit-ancestor",
+            "a descendant inherits its directory S3 boundary",
+        )
+        remote_before_overlap = self.remote_ref(branch)
+        versions_before_overlap = self.list_s3_versions()
+        overlap = self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/bundle/alpha.txt",
+            "--to",
+            "git",
+            "--reason",
+            "This nested override must be rejected.",
+            expected=2,
+        )
+        self.check("existing placement boundary" in overlap["stderr"], "nested placement is rejected")
+        nested_reset = self.wm(
+            task,
+            "storage",
+            "reset",
+            f"{task_id}/bundle/alpha.txt",
+            expected=2,
+        )
+        self.check("existing placement boundary" in nested_reset["stderr"], "nested reset is rejected")
+        self.check(self.remote_ref(branch) == remote_before_overlap, "nested-boundary guards leave Git unchanged")
+        self.check(self.list_s3_versions() == versions_before_overlap, "nested-boundary guards leave S3 unchanged")
 
         v2 = b"single-file version two\n"
         bundle_v2_a = b"bundle alpha version two\n"
         bundle_v2_c = b"bundle gamma version two\n"
         data.write_bytes(v2)
         (bundle / "alpha.txt").write_bytes(bundle_v2_a)
+        (bundle / "beta.txt").unlink()
         (bundle / "gamma.txt").write_bytes(bundle_v2_c)
         pointer_before_plan = data_pointer.read_bytes()
         s3_before_plan = self.list_s3_versions()
@@ -854,6 +1068,11 @@ class Harness:
             env=bad_credentials,
         )
         self.check(failed_s3["stderr"], "S3 authentication failure is reported")
+        self.check(
+            "invalid-e2e-key" not in failed_s3["stderr"]
+            and "invalid-e2e-secret" not in failed_s3["stderr"],
+            "S3 authentication failure does not echo credentials",
+        )
         self.check(self.remote_ref(branch) == remote_before_plan, "S3 failure leaves remote Git ref unchanged")
         self.check(self.git(self.shared, "rev-parse", branch).stdout.strip() == remote_before_plan, "S3 failure leaves local target ref unchanged")
         self.check(self.list_s3_versions() == s3_before_plan, "S3 authentication failure uploads no object")
@@ -896,6 +1115,26 @@ class Harness:
         self.check(retried["status"] == "pushed", "Git publication retry succeeds")
         self.check(self.remote_ref(branch) == retried["commit_oid"], "retry reconciles local and remote refs")
 
+        cache = self.shared / ".dvc" / "cache"
+        if cache.exists():
+            shutil.rmtree(cache)
+        unpublished_edit = b"unpublished local edit that hydrate must preserve\n"
+        data.write_bytes(unpublished_edit)
+        remote_before_conflict = self.remote_ref(branch)
+        versions_before_conflict = self.list_s3_versions()
+        conflict = self.wm(
+            task,
+            "storage",
+            "hydrate",
+            f"{task_id}/data.bin",
+            expected=2,
+        )
+        self.check("locally changed outputs" in conflict["stderr"], "hydrate rejects a locally modified output")
+        self.check(data.read_bytes() == unpublished_edit, "failed hydrate preserves the local modification")
+        self.check(self.remote_ref(branch) == remote_before_conflict, "hydrate conflict leaves Git unchanged")
+        self.check(self.list_s3_versions() == versions_before_conflict, "hydrate conflict leaves S3 unchanged")
+        data.write_bytes(v3)
+
         remote_before_missing = self.remote_ref(branch)
         data.unlink()
         missing = self.wm(task, "publish", "-m", "Do not interpret missing data as deletion", expected=2)
@@ -903,7 +1142,6 @@ class Harness:
         self.check(self.remote_ref(branch) == remote_before_missing, "missing output leaves Git remote unchanged")
         self.check(not data.exists(), "failed missing-output publication does not synthesize data")
 
-        cache = self.shared / ".dvc" / "cache"
         if cache.exists():
             shutil.rmtree(cache)
         if bundle.exists():
@@ -919,6 +1157,7 @@ class Harness:
         self.check(hydrated_all["status"] == "hydrated", "scope-wide hydrate succeeds")
         self.check((bundle / "alpha.txt").read_bytes() == bundle_v3_a, "directory hydrate restores latest alpha")
         self.check((bundle / "gamma.txt").read_bytes() == bundle_v2_c, "directory hydrate preserves unchanged file")
+        self.check(not (bundle / "beta.txt").exists(), "directory hydrate preserves a published deletion")
 
         old_path = f"{task_id}/data.bin"
         new_path = f"{task_id}/moved.bin"
@@ -1009,6 +1248,49 @@ class Harness:
         self.check(dry["status"] == "dry_run", "refresh dry-run sees incoming main")
         self.check(self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main, "refresh dry-run does not move local main")
         self.check(not bundle.exists(), "refresh dry-run does not hydrate DVC output")
+
+        self.git(self.shared, "add", "README.md")
+        staged_guard = self.wm(self.shared, "refresh", expected=2)
+        self.check("staged changes" in staged_guard["stderr"], "refresh refuses a staged shared index")
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "staged-index refusal leaves the local main ref unchanged",
+        )
+        self.git(self.shared, "restore", "--staged", "--", "README.md")
+
+        bad_credentials = {
+            "AWS_ACCESS_KEY_ID": "invalid-refresh-key",
+            "AWS_SECRET_ACCESS_KEY": "invalid-refresh-secret",
+        }
+        failed_prefetch = self.wm(
+            self.shared,
+            "refresh",
+            expected=2,
+            env=bad_credentials,
+        )
+        self.check(failed_prefetch["stderr"], "refresh reports provider authorization failure")
+        self.check(
+            "invalid-refresh-key" not in failed_prefetch["stderr"]
+            and "invalid-refresh-secret" not in failed_prefetch["stderr"],
+            "refresh provider failure does not echo credentials",
+        )
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "provider failure before refresh leaves the local main ref unchanged",
+        )
+        self.check(
+            (self.shared / "refresh-update.txt").read_text(encoding="utf-8")
+            == "old refresh value\n"
+            and (self.shared / "refresh-delete.txt").is_file()
+            and not (self.shared / "refresh-added.txt").exists(),
+            "provider failure before refresh leaves ordinary Git files unchanged",
+        )
+        self.check(not bundle.exists(), "provider failure before refresh materializes no stored output")
+        self.check((self.shared / "README.md").read_bytes() == overlay, "provider failure preserves tracked overlay")
+        self.check(
+            self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
+            "provider failure preserves a clean shared index",
+        )
         runtime_dvc = (
             self.home
             / ".local"
@@ -1171,6 +1453,62 @@ class Harness:
         self.check(len(self.list_s3_versions()) > len(versions_before), "automatic placement uploads a versioned S3 object")
         self.check(self.wm(task, "plan")["status"] == "no_changes", "mixed placement ends cleanly")
 
+        stored_version = self.s3_version_for_body(automatic_s3.read_bytes())
+        remote_before_loss = self.remote_ref(branch)
+        self.s3.delete_object(
+            Bucket=self.bucket,
+            Key=stored_version["key"],
+            VersionId=stored_version["version_id"],
+        )
+        self.record("s3-fault", {"operation": "delete-version", **stored_version})
+        automatic_s3.unlink()
+        cache = self.shared / ".dvc" / "cache"
+        if cache.exists():
+            shutil.rmtree(cache)
+        missing_remote = self.wm(
+            task,
+            "storage",
+            "hydrate",
+            f"{task_id}/automatic-s3.bin",
+            expected=2,
+        )
+        self.check(missing_remote["stderr"], "hydrate reports a missing exact S3 version")
+        self.check(not automatic_s3.exists(), "failed exact-version hydrate leaves output absent")
+        self.check(self.remote_ref(branch) == remote_before_loss, "missing S3 version leaves Git unchanged")
+
+    def exercise_non_fast_forward_refresh_guard(self) -> None:
+        assert self.shared is not None
+        self.section("network non-fast-forward refresh guard")
+        local_main = self.git(self.shared, "rev-parse", "main").stdout.strip()
+        tree = self.git(self.shared, "show", "-s", "--format=%T", local_main).stdout.strip()
+        divergent = self.git(
+            self.shared,
+            "commit-tree",
+            tree,
+            "-m",
+            "Intentional divergent E2E root",
+        ).stdout.strip()
+        self.git(
+            self.shared,
+            "push",
+            "--force",
+            "origin",
+            f"{divergent}:refs/heads/main",
+        )
+        self.check(self.remote_ref("main") == divergent, "network Git server exposes divergent main")
+        overlay = (self.shared / "README.md").read_bytes()
+        rejected = self.wm(self.shared, "refresh", expected=2)
+        self.check("cannot fast-forward" in rejected["stderr"], "refresh rejects a non-fast-forward remote")
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == local_main,
+            "non-fast-forward refusal preserves local main",
+        )
+        self.check((self.shared / "README.md").read_bytes() == overlay, "non-fast-forward refusal preserves overlays")
+        self.check(
+            self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
+            "non-fast-forward refusal preserves a clean shared index",
+        )
+
     def close(self) -> None:
         if self.git_daemon is not None:
             self.git_daemon.terminate()
@@ -1188,11 +1526,12 @@ class Harness:
         self.provision_runtime()
         self.setup_repository()
         self.initialize_workspace()
-        self.create_and_publish_infrastructure_task()
         task_id, task, branch = self.create_and_publish_task()
         self.exercise_dvc(task_id, task, branch)
+        self.create_and_publish_infrastructure_task()
         self.refresh_and_cross_clone(task_id, task, branch)
         self.exercise_automatic_and_explicit_git()
+        self.exercise_non_fast_forward_refresh_guard()
         summary = {
             "status": "passed",
             "assertions": self.assertions,
