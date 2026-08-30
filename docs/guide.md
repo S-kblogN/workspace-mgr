@@ -67,9 +67,10 @@ optional repository-specific module. Run `workspace-mgr doctor` before work if
 the installation or repository state may be inconsistent.
 
 The `[agent].modules` list controls which policy sections appear. The operating
-core is always present; task scope, publication, artifact hygiene, storage,
-shared-checkout, and infrastructure rules are independent modules. Requesting
-a disabled topic is an error instead of silently returning incomplete policy.
+core is always included in the default `all` document and is not configurable;
+task scope, publication, artifact hygiene, storage, shared-checkout, and
+infrastructure rules are independent modules. Requesting a disabled topic is an
+error instead of silently returning incomplete policy.
 
 ### 3. Create one task
 

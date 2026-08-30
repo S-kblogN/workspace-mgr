@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use workspace_mgr::cli::{
-    Cli, Command, ConfigCommand, PublishArgs, PublishCommandArgs, ScopedArgs, StorageCommand,
+    Cli, Command, ConfigCommand, PlanArgs, PublishCommandArgs, ScopedArgs, StorageCommand,
     TaskCommand,
 };
 use workspace_mgr::config::Config;
@@ -95,7 +95,7 @@ fn run(cli: Cli) -> Result<()> {
                 cli.format,
             ),
         },
-        Command::Plan(args) => run_transaction(args, Operation::Plan, cli.format),
+        Command::Plan(args) => run_plan(args, cli.format),
         Command::Publish(args) => run_publish(args, cli.format),
         Command::Storage(args) => match args.command {
             StorageCommand::Status(args) => {
@@ -115,7 +115,7 @@ fn run(cli: Cli) -> Result<()> {
                         &args.paths,
                         args.to,
                         &args.reason,
-                        args.scoped.dry_run,
+                        args.dry_run,
                     )?,
                     cli.format,
                 )
@@ -123,14 +123,14 @@ fn run(cli: Cli) -> Result<()> {
             StorageCommand::Reset(args) => {
                 let (repo, config, scopes) = scoped_context(&args.scoped)?;
                 emit(
-                    &storage::reset(&repo, &config, &scopes, &args.paths, args.scoped.dry_run)?,
+                    &storage::reset(&repo, &config, &scopes, &args.paths, args.dry_run)?,
                     cli.format,
                 )
             }
             StorageCommand::Hydrate(args) => {
                 let (repo, config, scopes) = scoped_context(&args.scoped)?;
                 emit(
-                    &storage::hydrate(&repo, &config, &scopes, &args.paths, args.scoped.dry_run)?,
+                    &storage::hydrate(&repo, &config, &scopes, &args.paths, args.dry_run)?,
                     cli.format,
                 )
             }
@@ -144,7 +144,7 @@ fn run(cli: Cli) -> Result<()> {
                     &scopes,
                     &args.old_path,
                     &args.new_path,
-                    args.scoped.dry_run,
+                    args.dry_run,
                 )?,
                 cli.format,
             )
@@ -161,33 +161,33 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn run_plan(args: PlanArgs, format: Format) -> Result<()> {
+    emit(
+        &transact(&TransactionOptions {
+            start: args.repo,
+            manifest: args.manifest,
+            message: None,
+            include: args.include,
+            scope_note: args.scope_note,
+            allow_non_shared_head: args.allow_non_shared_head,
+            dry_run: false,
+            operation: Operation::Plan,
+        })?,
+        format,
+    )
+}
+
 fn run_publish(args: PublishCommandArgs, format: Format) -> Result<()> {
-    run_transaction(
-        PublishArgs {
+    emit(
+        &transact(&TransactionOptions {
+            start: args.repo,
             manifest: args.manifest,
             message: Some(args.message),
             include: args.include,
             scope_note: args.scope_note,
             allow_non_shared_head: args.allow_non_shared_head,
             dry_run: args.dry_run,
-            repo: args.repo,
-        },
-        Operation::Publish,
-        format,
-    )
-}
-
-fn run_transaction(args: PublishArgs, operation: Operation, format: Format) -> Result<()> {
-    emit(
-        &transact(&TransactionOptions {
-            start: args.repo,
-            manifest: args.manifest,
-            message: args.message,
-            include: args.include,
-            scope_note: args.scope_note,
-            allow_non_shared_head: args.allow_non_shared_head,
-            dry_run: args.dry_run,
-            operation,
+            operation: Operation::Publish,
         })?,
         format,
     )

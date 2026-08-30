@@ -79,7 +79,7 @@ pub fn set(
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
-    validate_non_overlapping_boundaries(repo, scopes, &paths)?;
+    validate_boundary_targets(repo, scopes, &paths)?;
     let reason = one_line(reason, "storage placement reason")?;
     if target == StorageTarget::S3 && !config.storage.s3_enabled() {
         return Err(Error::message(
@@ -124,6 +124,7 @@ pub fn reset(
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
+    validate_boundary_targets(repo, scopes, &paths)?;
     let desired = paths
         .iter()
         .map(|path| Ok((path.clone(), automatic_target(repo, config, path)?)))
@@ -590,11 +591,7 @@ fn inherited_boundary(repo: &GitRepo, path: &str) -> Result<Option<Boundary>> {
     Ok(None)
 }
 
-fn validate_non_overlapping_boundaries(
-    repo: &GitRepo,
-    scopes: &[String],
-    paths: &[String],
-) -> Result<()> {
+fn validate_boundary_targets(repo: &GitRepo, scopes: &[String], paths: &[String]) -> Result<()> {
     for (index, path) in paths.iter().enumerate() {
         if paths
             .iter()
@@ -602,7 +599,7 @@ fn validate_non_overlapping_boundaries(
             .any(|other| is_descendant(path, other) || is_descendant(other, path))
         {
             return Err(Error::message(
-                "one storage set command may not create nested placement boundaries",
+                "one storage operation may not target nested placement boundaries",
             ));
         }
         if let Some(boundary) = inherited_boundary(repo, path)? {

@@ -87,8 +87,9 @@ outside the core transaction engine.
 ## Agent instruction modules
 
 `[agent].modules` controls the generated policy returned by
-`workspace-mgr instructions`. The operating core is always rendered. Supported
-optional modules are:
+`workspace-mgr instructions`. The operating core is always included in the
+default `all` document and is not module-controlled. Supported optional modules
+are:
 
 | Module | Instruction topic | Policy added |
 | --- | --- | --- |

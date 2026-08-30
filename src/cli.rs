@@ -45,7 +45,7 @@ pub enum Command {
     Task(TaskArgs),
 
     /// Preview a scoped repository transaction without publishing.
-    Plan(PublishArgs),
+    Plan(PlanArgs),
 
     /// Publish a scoped repository transaction.
     Publish(PublishCommandArgs),
@@ -157,12 +157,9 @@ pub struct TaskStatusArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct PublishArgs {
+pub struct PlanArgs {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
-
-    #[arg(short = 'm', long)]
-    pub message: Option<String>,
 
     #[arg(long = "include")]
     pub include: Vec<String>,
@@ -172,9 +169,6 @@ pub struct PublishArgs {
 
     #[arg(long)]
     pub allow_non_shared_head: bool,
-
-    #[arg(long)]
-    pub dry_run: bool,
 
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
@@ -235,9 +229,6 @@ pub struct ScopedArgs {
 
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-
-    #[arg(long)]
-    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -261,6 +252,9 @@ pub struct StorageSetArgs {
 
     #[arg(long)]
     pub reason: String,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -270,6 +264,9 @@ pub struct StorageResetArgs {
 
     #[arg(required = true)]
     pub paths: Vec<String>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +275,9 @@ pub struct StorageHydrateArgs {
     pub scoped: ScopedArgs,
 
     pub paths: Vec<String>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -287,6 +287,9 @@ pub struct MoveArgs {
 
     pub old_path: String,
     pub new_path: String,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

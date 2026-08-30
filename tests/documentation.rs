@@ -152,3 +152,10 @@ fn documented_command_shapes_are_accepted_by_clap() {
         });
     }
 }
+
+#[test]
+fn read_only_commands_do_not_expose_meaningless_mutation_flags() {
+    assert!(Cli::try_parse_from(["workspace-mgr", "plan", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["workspace-mgr", "plan", "-m", "unused"]).is_err());
+    assert!(Cli::try_parse_from(["workspace-mgr", "storage", "status", "--dry-run"]).is_err());
+}

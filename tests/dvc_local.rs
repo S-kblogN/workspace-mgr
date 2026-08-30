@@ -154,6 +154,12 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     );
     assert_eq!(overlap.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&overlap.stderr).contains("existing placement boundary"));
+    let nested_reset = workspace_unchecked(
+        &task,
+        ["storage", "reset", &format!("{task_name}/bundle/alpha.txt")],
+    );
+    assert_eq!(nested_reset.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&nested_reset.stderr).contains("existing placement boundary"));
 
     std::fs::write(&data, b"version two\n").unwrap();
     let published = workspace(&task, ["publish", "-m", "Update DVC data"]);
