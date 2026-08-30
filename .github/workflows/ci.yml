@@ -2,9 +2,13 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact Git revision to check
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -20,6 +24,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Set up minimum supported Rust
         run: |
           rustup toolchain install 1.85.0 --profile minimal
@@ -33,6 +39,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
         with:
@@ -49,6 +57,8 @@ jobs:
           dvc version
       - name: Check formatting
         run: cargo fmt --check
+      - name: Test release state machine
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Audit dependencies and licenses
         uses: EmbarkStudios/cargo-deny-action@v2
       - name: Lint
@@ -76,7 +86,7 @@ jobs:
       - name: Upload native archive
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: workspace-mgr-x86_64-unknown-linux-gnu
+          name: native-workspace-mgr-x86_64-unknown-linux-gnu
           path: |
             dist/*.tar.gz
             dist/*.sha256
@@ -97,6 +107,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
         with:
@@ -118,7 +130,7 @@ jobs:
       - name: Upload native archive
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: workspace-mgr-${{ matrix.target }}
+          name: native-workspace-mgr-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

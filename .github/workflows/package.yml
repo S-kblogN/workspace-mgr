@@ -1,10 +1,28 @@
 name: Package native binaries
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact Git revision to package
+        required: true
+        type: string
+      version:
+        description: Expected Cargo package version
+        required: true
+        type: string
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+    inputs:
+      ref:
+        description: Git revision to package
+        required: false
+        default: main
+        type: string
+      version:
+        description: Expected Cargo package version; empty accepts the checked-out version
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -26,16 +44,26 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - name: Set up Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Build and assemble native archive
-        run: sh scripts/package-native.sh ${{ matrix.target }}
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          actual_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -n "${EXPECTED_VERSION}" ] && [ "${actual_version}" != "${EXPECTED_VERSION}" ]; then
+            echo "checked-out package version ${actual_version} does not match ${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
+          sh scripts/package-native.sh ${{ matrix.target }}
       - name: Upload immutable workflow artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: workspace-mgr-${{ matrix.target }}
+          name: release-native-workspace-mgr-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

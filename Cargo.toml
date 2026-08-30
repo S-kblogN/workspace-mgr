@@ -8,6 +8,7 @@ license = "MIT"
 repository = "https://github.com/S-kblogN/workspace-mgr"
 homepage = "https://github.com/S-kblogN/workspace-mgr"
 readme = "README.md"
+publish = ["crates-io"]
 keywords = ["agents", "storage", "workspace", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/", "scripts/", "tests/e2e/"]
