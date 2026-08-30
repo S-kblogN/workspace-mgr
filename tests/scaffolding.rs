@@ -103,6 +103,32 @@ fn adopt_preserves_existing_agents_as_a_module() {
     assert!(agents.contains("workspace-mgr instructions"));
 }
 
+#[test]
+fn agent_modules_control_the_generated_policy() {
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    workspace(&fixture.shared, ["init"]);
+
+    let path = fixture.shared.join(".workspace-mgr.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mut config: toml::Value = toml::from_str(&raw).unwrap();
+    config["agent"]["modules"] = toml::Value::Array(vec![toml::Value::String("scope".to_owned())]);
+    std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    let all = workspace(&fixture.shared, ["--format", "human", "instructions"]);
+    let text = String::from_utf8(all.stdout).unwrap();
+    assert!(text.contains("Operating model"));
+    assert!(text.contains("Task lifecycle"));
+    assert!(!text.contains("Publication"));
+    assert!(!text.contains("Artifact hygiene"));
+    assert!(!text.contains("Storage placement"));
+    assert!(!text.contains("Shared checkout"));
+
+    let disabled = workspace_unchecked(&fixture.shared, ["instructions", "publish"]);
+    assert_eq!(disabled.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&disabled.stderr).contains("disabled"));
+}
+
 #[cfg(unix)]
 #[test]
 fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {

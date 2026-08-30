@@ -453,10 +453,20 @@ class Harness:
         self.check(config["storage"]["default"] == "auto", "config defaults to automatic placement")
         self.check("dvc" not in config, "public config JSON hides the internal storage engine")
 
-        for topic in ("all", "core", "task", "publish", "storage", "infrastructure"):
+        for topic in (
+            "all",
+            "core",
+            "task",
+            "publish",
+            "artifacts",
+            "storage",
+            "shared-checkout",
+        ):
             document = self.wm(self.shared, "instructions", topic)
             self.check(document["topic"] == topic, "instruction topic renders", topic=topic)
             self.check(len(document["policy_hash"]) == 64, "instruction policy hash is complete", topic=topic)
+        disabled = self.wm(self.shared, "instructions", "infrastructure", expected=2)
+        self.check("disabled" in disabled["stderr"], "disabled instruction module is rejected")
         all_instructions = self.wm(self.shared, "instructions")
         self.check(
             "Preserve this repository-specific rule" in all_instructions["markdown"],
@@ -624,13 +634,17 @@ class Harness:
         self.check(self.remote_ref(branch) == remote_before, "placement leaves Git remote unchanged")
         self.check(self.list_s3_versions() == [], "placement leaves S3 remote unchanged")
         statuses = self.wm(task, "storage", "status")
+        status_paths = {item["path"] for item in statuses["placements"]}
         self.check(
-            {item["path"] for item in statuses["placements"]}
-            == {f"{task_id}/data.bin", f"{task_id}/bundle"},
-            "storage status finds both explicit boundaries",
+            {f"{task_id}/data.bin", f"{task_id}/bundle"}.issubset(status_paths),
+            "storage status finds both explicit boundaries alongside Git content",
         )
         self.check(
-            all(item["target"] == "s3" and item["selected_by"] == "explicit" for item in statuses["placements"]),
+            all(
+                item["target"] == "s3" and item["selected_by"] == "explicit"
+                for item in statuses["placements"]
+                if item["path"] in {f"{task_id}/data.bin", f"{task_id}/bundle"}
+            ),
             "storage status explains explicit S3 placement",
         )
         tracked = self.wm(task, "publish", "-m", "Publish S3 file and directory")

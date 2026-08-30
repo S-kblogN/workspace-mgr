@@ -14,6 +14,10 @@ The public model has two storage locations:
 Users and agents choose between those concepts; the lower-level engines remain
 implementation details.
 
+Start with the [user guide](docs/guide.md) for the complete mental model and
+lifecycle. The [command reference](docs/commands.md) documents every public
+command, option, side effect, and example.
+
 ## Core workflow
 
 ```sh
@@ -73,7 +77,8 @@ installer. The exact compatibility contract is in
 
 Configuration is documented in
 [docs/configuration.md](docs/configuration.md), transaction guarantees in
-[docs/architecture.md](docs/architecture.md), and releases in
+[docs/architecture.md](docs/architecture.md), platform requirements in
+[docs/platform-support.md](docs/platform-support.md), and releases in
 [docs/releasing.md](docs/releasing.md).
 
 ## Development

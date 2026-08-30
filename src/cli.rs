@@ -91,7 +91,7 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct InstructionsArgs {
-    /// Optional topic: core, task, publish, storage, or infrastructure.
+    /// Optional topic: core, task, publish, artifacts, storage, shared-checkout, or infrastructure.
     pub topic: Option<String>,
 
     #[arg(long, default_value = ".")]

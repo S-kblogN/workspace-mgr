@@ -12,6 +12,12 @@ metadata. This makes the choice reviewable and keeps independently active task
 scopes from contending on one central placement file. Users must not edit these
 sidecars or the generated S3 metadata directly.
 
+A directory choice is one recursive placement boundary. Descendants inherit
+the explicit or published directory placement, and nested boundaries are
+rejected so one path never has competing owners. Status enumeration reports a
+directory boundary once while still listing ordinary Git files elsewhere in the
+scope.
+
 ## Placement lifecycle
 
 Content has one public placement: Git or S3.

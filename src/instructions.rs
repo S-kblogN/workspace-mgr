@@ -26,7 +26,9 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
         "core",
         "task",
         "publish",
+        "artifacts",
         "storage",
+        "shared-checkout",
         "infrastructure",
     ];
     if !valid_topics.contains(&topic) {
@@ -44,30 +46,24 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     ));
 
     if topic == "all" || topic == "core" {
-        sections.push(core_section(config));
+        sections.push(core_section());
     }
-    if topic == "all" || topic == "task" {
+    if include_module(config, topic, "task", "scope")? {
         sections.push(task_section(config));
     }
-    if topic == "all" || topic == "publish" {
+    if include_module(config, topic, "publish", "publication")? {
         sections.push(publication_section(config));
     }
-    if (topic == "all" || topic == "storage")
-        && config
-            .agent
-            .modules
-            .iter()
-            .any(|module| module == "storage")
-    {
+    if include_module(config, topic, "artifacts", "artifact-hygiene")? {
+        sections.push(artifact_hygiene_section());
+    }
+    if include_module(config, topic, "storage", "storage")? {
         sections.push(storage_section(config));
     }
-    if (topic == "all" || topic == "infrastructure")
-        && config
-            .agent
-            .modules
-            .iter()
-            .any(|module| module == "infrastructure")
-    {
+    if include_module(config, topic, "shared-checkout", "shared-checkout")? {
+        sections.push(shared_checkout_section(config));
+    }
+    if include_module(config, topic, "infrastructure", "infrastructure")? {
         sections.push(infrastructure_section());
     }
     if topic == "all" {
@@ -113,17 +109,20 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     })
 }
 
-fn core_section(config: &Config) -> String {
-    let checkout = match config.profile {
-        Profile::Standard => "This repository uses the standard checkout profile. Work on an appropriate branch and preserve unrelated working-tree changes.".to_owned(),
-        Profile::SharedCheckout => format!(
-            "This repository uses a shared checkout. Keep the checkout on `{}` and publish task branches without switching it. Do not stash, clean, reset, or delete unrelated overlays.",
-            config.publication.shared_checkout_branch
-        ),
-    };
-    format!(
-        "## Operating model\n\n- Read-only requests do not require a task directory.\n- Requests that create or modify retained files use one declared task scope unless the user explicitly authorizes another workflow.\n- User authorization overrides repository defaults only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level tools.\n- {checkout}\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
-    )
+fn include_module(config: &Config, topic: &str, topic_name: &str, module: &str) -> Result<bool> {
+    let enabled = config.agent.modules.iter().any(|item| item == module);
+    if topic == topic_name && !enabled {
+        return Err(Error::message(format!(
+            "instruction topic {topic_name:?} is disabled; enable agent module {module:?} in {}",
+            crate::config::CONFIG_NAME
+        )));
+    }
+    Ok(enabled && (topic == "all" || topic == topic_name))
+}
+
+fn core_section() -> String {
+    "## Operating model\n\n- Read-only requests do not require a task directory.\n- User authorization overrides repository defaults only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level tools.\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
+        .to_owned()
 }
 
 fn task_section(config: &Config) -> String {
@@ -134,20 +133,20 @@ fn task_section(config: &Config) -> String {
 }
 
 fn publication_section(config: &Config) -> String {
-    let profile_note = if config.profile == Profile::SharedCheckout {
-        "After a merged task, use `workspace-mgr refresh`; ordinary pull may conflict with active overlays in the shared checkout.".to_owned()
-    } else {
-        "Use the repository's normal merge and update workflow after publication.".to_owned()
-    };
     let review_note = if config.tasks.draft_pull_request {
         "Maintain one draft pull request per task branch using the repository hosting workflow. Keep its title and living description current. `workspace-mgr` publishes the branch transaction but does not call a hosting provider API."
     } else {
         "Follow the repository hosting workflow when a review request is needed."
     };
     format!(
-        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Keep every eligible task-owned file in scope. Ignore reproducible build output and external nested repositories using the narrowest applicable rule.\n- Never flatten a nested repository into the parent repository unless explicitly requested.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming publication is current.\n- {review_note}\n- `{}` is the configured base branch on remote `{}`.\n- {profile_note}",
+        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming publication is current.\n- {review_note}\n- `{}` is the configured base branch on remote `{}`.",
         config.publication.base_branch, config.publication.remote
     )
+}
+
+fn artifact_hygiene_section() -> String {
+    "## Artifact hygiene\n\n- Keep every eligible task-owned input, deliverable, and reproducibility artifact in the declared scope.\n- Before publication, identify external Git checkouts, generated build output, and retained large content.\n- Ignore safely reproducible output and external nested repositories using the narrowest applicable rule.\n- Never flatten a nested repository into the parent repository or create a gitlink unless explicitly requested.\n- Choose retained-content placement through `workspace-mgr storage`; do not introduce another large-file mechanism.\n- Keep credentials and private runtime configuration out of tracked files and command output."
+        .to_owned()
 }
 
 fn storage_section(config: &Config) -> String {
@@ -162,6 +161,17 @@ fn storage_section(config: &Config) -> String {
         "## Storage placement\n\n- Every retained path is stored either directly in Git or as versioned content in S3. `workspace-mgr` owns the underlying mechanics; do not invoke lower-level storage tools.\n- Use `workspace-mgr storage status [<path> ...]` to inspect effective placement and whether it came from an explicit choice, existing history, or automatic policy.\n- Use `workspace-mgr storage set <path> --to git|s3 --reason <reason>` when placement must be explicit. This is valid in either direction regardless of file size.\n- Use `workspace-mgr storage reset <path>` to remove an explicit choice and reapply automatic policy. In automatic mode, previously published placement stays stable; new retained files above {} bytes go to S3 and smaller files go to Git.\n- Placement changes, resets, and `workspace-mgr move <old> <new>` update local desired state only. `workspace-mgr publish` is the only command that writes to Git or S3 remotes.\n- Use `workspace-mgr storage hydrate [<path> ...]` to materialize S3 content locally without publishing. Never hand-edit or directly delete workspace-mgr storage metadata.\n- Storage credentials stay outside tracked repository configuration. Never print, copy, or commit credentials.\n- {s3_note}\n- Never request permanent remote or cache garbage collection without explicit authorization for shared-data deletion.",
         config.storage.auto_s3_above_bytes
     )
+}
+
+fn shared_checkout_section(config: &Config) -> String {
+    match config.profile {
+        Profile::SharedCheckout => format!(
+            "## Shared checkout\n\n- Keep the shared checkout on `{}` and publish task branches without switching it.\n- Preserve unrelated working-tree overlays. Do not use broad stash, clean, reset, or deletion operations.\n- After a task is merged, use `workspace-mgr refresh`; an ordinary pull may conflict with active overlays.",
+            config.publication.shared_checkout_branch
+        ),
+        Profile::Standard => "## Shared checkout\n\n- This repository uses the standard checkout profile, so shared-checkout publication and refresh rules are not active. Preserve unrelated working-tree changes and use the repository's normal branch-update workflow."
+            .to_owned(),
+    }
 }
 
 fn infrastructure_section() -> String {

@@ -104,6 +104,9 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let task = fixture.shared.join(task_name);
     let data = task.join("data.bin");
     std::fs::write(&data, b"version one\n").unwrap();
+    let bundle = task.join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::write(bundle.join("alpha.txt"), b"alpha\n").unwrap();
 
     let placed = workspace(
         &task,
@@ -111,6 +114,7 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
             "storage",
             "set",
             &format!("{task_name}/data.bin"),
+            &format!("{task_name}/bundle"),
             "--to",
             "s3",
             "--reason",
@@ -122,6 +126,34 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let tracked = workspace(&task, ["publish", "-m", "Publish S3 data"]);
     assert_eq!(json(&tracked)["status"], "pushed");
     assert!(task.join("data.bin.dvc").is_file());
+
+    let inherited = workspace(
+        &task,
+        [
+            "storage",
+            "status",
+            &format!("{task_name}/bundle/alpha.txt"),
+        ],
+    );
+    assert_eq!(json(&inherited)["placements"][0]["target"], "s3");
+    assert_eq!(
+        json(&inherited)["placements"][0]["selected_by"],
+        "explicit-ancestor"
+    );
+    let overlap = workspace_unchecked(
+        &task,
+        [
+            "storage",
+            "set",
+            &format!("{task_name}/bundle/alpha.txt"),
+            "--to",
+            "git",
+            "--reason",
+            "This nested choice must be rejected.",
+        ],
+    );
+    assert_eq!(overlap.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&overlap.stderr).contains("existing placement boundary"));
 
     std::fs::write(&data, b"version two\n").unwrap();
     let published = workspace(&task, ["publish", "-m", "Update DVC data"]);

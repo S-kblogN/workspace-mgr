@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -78,6 +79,7 @@ pub fn set(
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
+    validate_non_overlapping_boundaries(repo, scopes, &paths)?;
     let reason = one_line(reason, "storage placement reason")?;
     if target == StorageTarget::S3 && !config.storage.s3_enabled() {
         return Err(Error::message(
@@ -185,6 +187,15 @@ pub fn move_path(
             "move destination already exists: {new_path}"
         )));
     }
+    let old_container = inherited_boundary(repo, &old_path)?;
+    let new_container = inherited_boundary(repo, &new_path)?;
+    if old_container.as_ref().map(|boundary| &boundary.path)
+        != new_container.as_ref().map(|boundary| &boundary.path)
+    {
+        return Err(Error::message(
+            "move may not cross an existing directory placement boundary; move the boundary itself or reset it first",
+        ));
+    }
     let before = placement_status(repo, config, &old_path)?;
     if !dry_run {
         if pointer_path(repo, &old_path).is_file() {
@@ -237,11 +248,18 @@ pub fn hydrate(
         let mut selected = BTreeSet::new();
         for path in paths {
             for (pointer, values) in &outputs {
-                if values.iter().any(|output| output == &path) {
+                if values
+                    .iter()
+                    .any(|output| path == *output || is_descendant(&path, output))
+                {
                     selected.insert(pointer.clone());
                 }
             }
-            if !outputs.values().any(|values| values.contains(&path)) {
+            if !outputs.values().any(|values| {
+                values
+                    .iter()
+                    .any(|output| path == *output || is_descendant(&path, output))
+            }) {
                 return Err(Error::message(format!("path is not stored in S3: {path}")));
             }
         }
@@ -290,9 +308,7 @@ pub fn apply_automatic(
                     "git check-ignore failed for {path}"
                 )));
             }
-            if read_placement(repo, &path)?
-                .is_some_and(|placement| placement.target == StorageTarget::Git)
-            {
+            if explicit_target(repo, &path)? == Some(StorageTarget::Git) {
                 continue;
             }
             let object = format!("{base_oid}:{path}");
@@ -337,7 +353,10 @@ pub fn apply_automatic(
 }
 
 pub fn explicit_target(repo: &GitRepo, path: &str) -> Result<Option<StorageTarget>> {
-    Ok(read_placement(repo, path)?.map(|placement| placement.target))
+    if let Some(placement) = read_placement(repo, path)? {
+        return Ok(Some(placement.target));
+    }
+    Ok(inherited_boundary(repo, path)?.and_then(|boundary| boundary.explicit_target))
 }
 
 fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarget) -> Result<()> {
@@ -398,6 +417,14 @@ fn placement_status(repo: &GitRepo, config: &Config, path: &str) -> Result<Place
             reason: None,
         });
     }
+    if let Some(boundary) = inherited_boundary(repo, path)? {
+        return Ok(PlacementStatus {
+            path: path.to_owned(),
+            target: boundary.target,
+            selected_by: boundary.selected_by,
+            reason: boundary.reason,
+        });
+    }
     let history = repo.run_unchecked(["log", "--all", "--format=%H", "-n", "1", "--", path])?;
     if history.success() && !history.stdout.trim().is_empty() {
         return Ok(PlacementStatus {
@@ -448,15 +475,16 @@ fn resolve_status_paths(
     paths: &[String],
 ) -> Result<Vec<String>> {
     if !paths.is_empty() {
-        return validate_targets(repo, scopes, paths, true);
+        return validate_targets(repo, scopes, paths, false);
     }
     let mut found = BTreeSet::new();
+    let mut boundaries = BTreeSet::new();
     for pointer in dvc::discover(repo, scopes)? {
         for output in dvc::output_paths(repo, std::slice::from_ref(&pointer))?
             .remove(&pointer)
             .unwrap_or_default()
         {
-            found.insert(output);
+            boundaries.insert(output);
         }
     }
     for scope in scopes {
@@ -470,11 +498,164 @@ fn resolve_status_paths(
                 && entry.path().to_string_lossy().ends_with(PLACEMENT_SUFFIX)
             {
                 let sidecar = relative_to(entry.path(), &repo.root, "placement metadata")?;
-                found.insert(sidecar.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
+                boundaries.insert(sidecar.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
+            }
+        }
+    }
+    found.extend(boundaries.iter().cloned());
+    for scope in scopes {
+        let root = resolved_under(&repo.root, scope);
+        if !root.exists() || root.is_symlink() {
+            continue;
+        }
+        let walker = if root.is_file() {
+            WalkDir::new(&root).max_depth(0)
+        } else {
+            WalkDir::new(&root)
+        };
+        for entry in walker
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| entry.file_name() != ".git")
+        {
+            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
+            if !entry.file_type().is_file() || entry.path().is_symlink() {
+                continue;
+            }
+            let path = relative_to(entry.path(), &repo.root, "storage status path")?;
+            if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
+                continue;
+            }
+            if boundaries
+                .iter()
+                .any(|boundary| path == *boundary || is_descendant(&path, boundary))
+            {
+                continue;
+            }
+            let ignored = repo.run_unchecked(["check-ignore", "--quiet", "--", &path])?;
+            match ignored.code {
+                0 => continue,
+                1 => {
+                    found.insert(path);
+                }
+                _ => {
+                    return Err(Error::message(
+                        "git check-ignore failed while listing storage status",
+                    ));
+                }
             }
         }
     }
     Ok(found.into_iter().collect())
+}
+
+#[derive(Debug)]
+struct Boundary {
+    path: String,
+    target: StorageTarget,
+    selected_by: String,
+    reason: Option<String>,
+    explicit_target: Option<StorageTarget>,
+}
+
+fn inherited_boundary(repo: &GitRepo, path: &str) -> Result<Option<Boundary>> {
+    let mut parent = Path::new(path)
+        .parent()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .map(crate::path::to_slash);
+    while let Some(candidate) = parent {
+        if let Some(placement) = read_placement(repo, &candidate)? {
+            return Ok(Some(Boundary {
+                path: candidate,
+                target: placement.target,
+                selected_by: "explicit-ancestor".to_owned(),
+                reason: Some(placement.reason),
+                explicit_target: Some(placement.target),
+            }));
+        }
+        if pointer_path(repo, &candidate).is_file() {
+            return Ok(Some(Boundary {
+                path: candidate,
+                target: StorageTarget::S3,
+                selected_by: "published-ancestor".to_owned(),
+                reason: None,
+                explicit_target: None,
+            }));
+        }
+        parent = Path::new(&candidate)
+            .parent()
+            .filter(|candidate| !candidate.as_os_str().is_empty())
+            .map(crate::path::to_slash);
+    }
+    Ok(None)
+}
+
+fn validate_non_overlapping_boundaries(
+    repo: &GitRepo,
+    scopes: &[String],
+    paths: &[String],
+) -> Result<()> {
+    for (index, path) in paths.iter().enumerate() {
+        if paths
+            .iter()
+            .skip(index + 1)
+            .any(|other| is_descendant(path, other) || is_descendant(other, path))
+        {
+            return Err(Error::message(
+                "one storage set command may not create nested placement boundaries",
+            ));
+        }
+        if let Some(boundary) = inherited_boundary(repo, path)? {
+            return Err(Error::message(format!(
+                "storage path {path:?} is inside the existing placement boundary {:?}; set or reset that boundary instead",
+                boundary.path
+            )));
+        }
+    }
+    let known = known_boundaries(repo, scopes)?;
+    for path in paths {
+        if let Some(descendant) = known
+            .iter()
+            .find(|candidate| *candidate != path && is_descendant(candidate, path))
+        {
+            return Err(Error::message(format!(
+                "storage path {path:?} contains the existing placement boundary {descendant:?}; reset the nested boundary first"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn known_boundaries(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String>> {
+    let mut boundaries = BTreeSet::new();
+    for pointer in dvc::discover(repo, scopes)? {
+        boundaries.extend(
+            dvc::output_paths(repo, std::slice::from_ref(&pointer))?
+                .remove(&pointer)
+                .unwrap_or_default(),
+        );
+    }
+    for scope in scopes {
+        let root = resolved_under(&repo.root, scope);
+        if !root.exists() || root.is_symlink() {
+            continue;
+        }
+        for entry in WalkDir::new(&root).follow_links(false) {
+            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
+            if entry.file_type().is_file()
+                && entry.path().to_string_lossy().ends_with(PLACEMENT_SUFFIX)
+            {
+                let sidecar = relative_to(entry.path(), &repo.root, "placement metadata")?;
+                boundaries.insert(sidecar.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
+            }
+        }
+    }
+    Ok(boundaries)
+}
+
+fn is_descendant(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn pointer_path(repo: &GitRepo, path: &str) -> std::path::PathBuf {

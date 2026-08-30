@@ -83,3 +83,24 @@ reason = "The user explicitly requested this shared documentation change"
 `require_readme` is checked before publication. `draft_pull_request` affects the
 generated review instructions; provider-specific pull-request API calls remain
 outside the core transaction engine.
+
+## Agent instruction modules
+
+`[agent].modules` controls the generated policy returned by
+`workspace-mgr instructions`. The operating core is always rendered. Supported
+optional modules are:
+
+| Module | Instruction topic | Policy added |
+| --- | --- | --- |
+| `scope` | `task` | Task creation, manifest scope, and README rules |
+| `publication` | `publish` | Planning, branch publication, and review handoff |
+| `artifact-hygiene` | `artifacts` | Nested repositories, generated output, credentials, and retained artifacts |
+| `storage` | `storage` | Git/S3 placement and hydration rules |
+| `shared-checkout` | `shared-checkout` | Overlay preservation and post-merge refresh |
+| `infrastructure` | `infrastructure` | Isolation and test rules for shared repository mechanisms |
+
+The default module set includes scope, publication, artifact hygiene, and
+storage. `shared-checkout` is added by `init --profile shared-checkout`.
+Infrastructure policy is opt-in. Unknown and duplicate module names are
+rejected. Requesting a topic whose module is disabled is also rejected, so an
+agent cannot mistake an empty document for effective policy.

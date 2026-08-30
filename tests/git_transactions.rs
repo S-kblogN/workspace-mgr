@@ -109,6 +109,70 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
 }
 
 #[test]
+fn explicit_git_directory_applies_recursively_and_status_lists_git_content() {
+    let fixture = managed_fixture();
+    let config_path = fixture.shared.join(".workspace-mgr.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "auto_s3_above_bytes = 10485760",
+        "auto_s3_above_bytes = 1024",
+    );
+    std::fs::write(config_path, config).unwrap();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "git-directory",
+            "--title",
+            "Git directory",
+            "--purpose",
+            "Verify recursive explicit placement.",
+            "--timestamp",
+            "20260829-170155",
+        ],
+    );
+    let task_id = "20260829-170155-git-directory";
+    let task = fixture.shared.join(task_id);
+    let directory = task.join("reviewable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("large.bin"), vec![3_u8; 2048]).unwrap();
+    workspace(
+        &task,
+        [
+            "storage",
+            "set",
+            &format!("{task_id}/reviewable"),
+            "--to",
+            "git",
+            "--reason",
+            "The complete directory must remain reviewable in Git.",
+        ],
+    );
+
+    let status = workspace(&task, ["storage", "status"]);
+    let placements = json(&status)["placements"].as_array().unwrap().clone();
+    assert!(placements.iter().any(|entry| {
+        entry["path"] == format!("{task_id}/reviewable") && entry["target"] == "git"
+    }));
+    assert!(placements.iter().any(|entry| {
+        entry["path"] == format!("{task_id}/README.md") && entry["target"] == "git"
+    }));
+    assert!(
+        !placements
+            .iter()
+            .any(|entry| { entry["path"] == format!("{task_id}/reviewable/large.bin") })
+    );
+    let plan = workspace(&task, ["plan"]);
+    assert_eq!(json(&plan)["status"], "dry_run");
+    assert!(
+        json(&plan)["storage"]["placement"]["would_place_in_s3"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn additional_scope_requires_and_records_a_reason() {
     let fixture = managed_fixture();
     workspace(
