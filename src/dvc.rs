@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
+use crate::hex::encode_lower;
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
 use crate::process::{CommandOutput, run as run_process, run_unchecked as run_process_unchecked};
 
@@ -689,7 +690,7 @@ fn md5_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(encode_lower(hasher.finalize()))
 }
 
 pub fn management(

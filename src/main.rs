@@ -7,6 +7,7 @@ mod doctor;
 mod dvc;
 mod error;
 mod git;
+mod hex;
 mod instructions;
 mod lock;
 mod manifest;
