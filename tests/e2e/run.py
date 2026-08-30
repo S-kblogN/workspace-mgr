@@ -560,6 +560,11 @@ class Harness:
             "Preserve this repository-specific rule" in all_instructions["markdown"],
             "repository-specific instructions are composed into output",
         )
+        self.check(
+            "They do not change the fixed task, storage, publication, or review policy"
+            in all_instructions["markdown"],
+            "repository-specific content cannot redefine workspace strategy",
+        )
         human = self.run([self.binary, "instructions"], cwd=self.shared)
         self.check("Effective repository instructions" in human.stdout, "human instructions render")
 

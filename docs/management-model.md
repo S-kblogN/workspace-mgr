@@ -102,7 +102,7 @@ Every retained path has one storage placement:
 - **S3** is appropriate when content is bulky, binary, or naturally retrieved
   as versioned data.
 
-Both are first-class choices. File size provides an automatic default for new
+Both are first-class choices. File size drives the fixed automatic rule for new
 content, not a prohibition. The user or agent may explicitly put a large
 reviewable artifact in Git or a small data artifact in S3 when intent matters
 more than size.
@@ -117,7 +117,7 @@ Placement operations describe or change local intent:
 
 - `storage status` explains where a path is placed and why.
 - `storage set` records an explicit Git or S3 choice.
-- `storage reset` removes that choice and returns the path to repository policy.
+- `storage reset` removes that choice and returns the path to fixed policy.
 - `move` changes a path while preserving its placement.
 - `storage hydrate` retrieves exact S3 content into the local workspace.
 
@@ -141,19 +141,18 @@ state: a published branch must never refer to missing S3 content.
 
 Publishing makes the target branch ready for review; it does not merge it. The
 agent maintains the corresponding pull request through the repository's hosting
-workflow. `workspace-mgr` does not
-create, edit, approve, or merge that pull request through a hosting-provider
-API. Merging remains an explicit authorized action.
+workflow. `workspace-mgr` does not create, edit, approve, or merge that pull
+request through a hosting-provider API. Merging remains an explicit authorized
+action.
 
-The agent must query by head branch after the first successful publish, reuse an existing open
-pull request or create exactly one, and never create a duplicate. It owns the
-title and living description and updates them whenever the goal, scope,
-deliverables, validation, or known limitations materially change. It then
-verifies the base branch, head branch, review state, and that the pull-request
-head revision equals the revision reported by `publish`. Provider failures are
-blockers to full synchronization. When merge authority belongs to the user, the
-agent must not merge, enable auto-merge, approve, close, or mark the request
-ready.
+The agent must query by head branch after the first successful publish, reuse
+an existing open pull request or create exactly one, and never create a
+duplicate. It owns the title and living description and updates them whenever
+the goal, scope, deliverables, validation, or known limitations materially
+change. It then verifies the base branch, head branch, review state, and that
+the pull-request head revision equals the revision reported by `publish`.
+Provider failures are blockers to full synchronization. The agent must not
+merge, enable auto-merge, approve, close, or mark the request ready.
 
 A task is fully synchronized when its local and remote branch revisions match,
 its pull-request description reflects the same intention, and a final plan
@@ -166,8 +165,8 @@ history is outside normal workspace management.
 
 ## How multiple chats share the workspace
 
-The checkout remains on its shared branch while
-multiple chats may have independent task directories and working-tree overlays.
+The checkout remains on its shared branch while multiple chats may have
+independent task directories and working-tree overlays.
 A task publishes to its own branch without checking that branch out and without
 staging paths owned by other tasks in the shared Git index.
 
@@ -184,7 +183,7 @@ Refresh is inbound synchronization; it does not publish a task.
 The complete story is:
 
 1. A repository owner uses `setup` and `init` to establish the managed
-   workspace and its tracked policy.
+   workspace, tracked repository facts, and thin agent bootstrap.
 2. The user starts a chat and describes the outcome they want.
 3. The agent loads `instructions` and decides whether the conversation is
    read-only or needs a writable task.
