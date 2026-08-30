@@ -1,4 +1,3 @@
-use std::env;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -19,27 +18,11 @@ use workspace_mgr::scaffold::{InitOptions, TaskCreateOptions, create_task, init}
 use workspace_mgr::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
-    let args = normalize_legacy_args(env::args_os().collect());
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse();
     if let Err(error) = run(cli) {
         eprintln!("workspace-mgr: {error}");
         std::process::exit(2);
     }
-}
-
-fn normalize_legacy_args(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    if args.len() <= 1 {
-        return args;
-    }
-    let first = args[1].to_string_lossy();
-    if first == "commit" {
-        args[1] = "publish".into();
-    } else if first == "refresh-main" {
-        args[1] = "refresh".into();
-    } else if first == "--manifest" || first == "-m" {
-        args.insert(1, "publish".into());
-    }
-    args
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -129,15 +112,14 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Hydrate(args) => {
             let repo = GitRepo::discover(&args.repo)?;
-            let config = Config::load(&repo).ok();
+            let config = Config::load(&repo)?;
             let manifest_path = match args.manifest {
                 Some(path) => path,
-                None => ResolvedTask::discover(&repo, config.as_ref(), &args.repo)?,
+                None => ResolvedTask::discover(&repo, &config, &args.repo)?,
             };
-            let task = ResolvedTask::load(&repo, config.as_ref(), &manifest_path)?;
+            let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
             let (scopes, _) = hydrate_scopes(&task, &args.include, args.scope_note.as_deref())?;
-            let report =
-                dvc::hydrate(&repo, config.as_ref(), &scopes, &args.targets, args.dry_run)?;
+            let report = dvc::hydrate(&repo, &config, &scopes, &args.targets, args.dry_run)?;
             emit(&report, cli.format)
         }
         Command::Refresh(args) => emit(

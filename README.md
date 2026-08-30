@@ -5,9 +5,8 @@ combines deterministic task scaffolding, repository-specific agent
 instructions, scoped Git publication, and optional DVC-backed large-file
 transactions in one standalone Rust CLI.
 
-The project is under active development. Phase 1 builds the complete software
-project and compatibility surface; crates.io publication is deliberately
-reserved for a later migration phase.
+The project is currently pre-release. Its configuration and task schemas are
+strict: unknown fields and unsupported schema versions are rejected.
 
 ## Core model
 
@@ -23,7 +22,7 @@ reserved for a later migration phase.
 - `refresh` safely advances a shared checkout while preserving working-tree
   overlays.
 
-## Installation during development
+## Installation from source
 
 ```sh
 cargo build --release
@@ -48,12 +47,9 @@ workspace-mgr task create example-task \
 
 Run `workspace-mgr COMMAND --help` for command-specific options. The
 configuration schema is documented in [docs/configuration.md](docs/configuration.md),
-the transaction guarantees in [docs/architecture.md](docs/architecture.md), and
-the complete adoption sequence in [docs/migration-plan.md](docs/migration-plan.md).
-Release-candidate packaging and the later public release boundary are described
-in [docs/releasing.md](docs/releasing.md). Supported hosts, dependencies, and
-the legacy command matrix are recorded in
-[docs/compatibility.md](docs/compatibility.md).
+the transaction guarantees in [docs/architecture.md](docs/architecture.md), the
+release process in [docs/releasing.md](docs/releasing.md), and supported hosts
+and dependencies in [docs/platform-support.md](docs/platform-support.md).
 
 ## Development
 

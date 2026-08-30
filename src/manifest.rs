@@ -8,8 +8,6 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::{relative_to, repo_path};
 
-pub const LEGACY_MANIFEST_NAME: &str = ".chat-sync.json";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskManifest {
@@ -28,38 +26,6 @@ pub struct AdditionalScope {
     pub reason: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyManifest {
-    version: u32,
-    task_path: String,
-    branch: String,
-    #[serde(default = "default_remote")]
-    remote: String,
-    #[serde(default = "default_main")]
-    base_branch: String,
-    #[serde(default = "default_main")]
-    shared_head: String,
-    #[serde(default)]
-    additional_paths: Vec<LegacyAdditionalPath>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pr: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyAdditionalPath {
-    path: String,
-    reason: String,
-}
-
-fn default_remote() -> String {
-    "origin".to_owned()
-}
-
-fn default_main() -> String {
-    "main".to_owned()
-}
-
 #[derive(Debug, Clone)]
 pub struct ResolvedTask {
     pub manifest_path: PathBuf,
@@ -70,7 +36,6 @@ pub struct ResolvedTask {
     pub base_branch: String,
     pub shared_head: String,
     pub additional_scopes: Vec<AdditionalScope>,
-    pub legacy: bool,
 }
 
 impl TaskManifest {
@@ -81,7 +46,7 @@ impl TaskManifest {
 }
 
 impl ResolvedTask {
-    pub fn load(repo: &GitRepo, config: Option<&Config>, path: &Path) -> Result<Self> {
+    pub fn load(repo: &GitRepo, config: &Config, path: &Path) -> Result<Self> {
         let absolute = path.canonicalize().map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
@@ -90,16 +55,6 @@ impl ResolvedTask {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| Error::message("manifest file name is not valid UTF-8"))?;
-        if file_name == LEGACY_MANIFEST_NAME {
-            return Self::load_legacy(repo, &absolute);
-        }
-        let config = config.ok_or_else(|| {
-            Error::message(format!(
-                "{} requires repository config {}",
-                absolute.display(),
-                crate::config::CONFIG_NAME
-            ))
-        })?;
         if file_name != config.tasks.manifest_name {
             return Err(Error::message(format!(
                 "task manifest must be named {:?}",
@@ -142,53 +97,10 @@ impl ResolvedTask {
             base_branch: config.git.base_branch.clone(),
             shared_head: config.git.shared_checkout_branch.clone(),
             additional_scopes,
-            legacy: false,
         })
     }
 
-    fn load_legacy(repo: &GitRepo, path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path).at(path)?;
-        let manifest: LegacyManifest =
-            serde_json::from_str(&raw).map_err(|source| Error::Json {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if manifest.version != 1 {
-            return Err(Error::message("legacy manifest version must be 1"));
-        }
-        let task_path = repo_path(&manifest.task_path, "task_path")?;
-        let expected = repo.root.join(&task_path).join(LEGACY_MANIFEST_NAME);
-        if path != expected {
-            return Err(Error::message(format!(
-                "legacy manifest must be located at {}; got {}",
-                expected.display(),
-                path.display()
-            )));
-        }
-        let additional_scopes = validate_scopes(
-            manifest
-                .additional_paths
-                .into_iter()
-                .map(|entry| AdditionalScope {
-                    path: entry.path,
-                    reason: entry.reason,
-                })
-                .collect(),
-        )?;
-        Ok(Self {
-            manifest_path: path.to_path_buf(),
-            task_id: task_path.clone(),
-            task_path,
-            branch: one_line(&manifest.branch, "branch")?,
-            remote: one_line(&manifest.remote, "remote")?,
-            base_branch: one_line(&manifest.base_branch, "base_branch")?,
-            shared_head: one_line(&manifest.shared_head, "shared_head")?,
-            additional_scopes,
-            legacy: true,
-        })
-    }
-
-    pub fn discover(repo: &GitRepo, config: Option<&Config>, start: &Path) -> Result<PathBuf> {
+    pub fn discover(repo: &GitRepo, config: &Config, start: &Path) -> Result<PathBuf> {
         let mut current = if start.is_dir() {
             start.canonicalize().map_err(|source| Error::Io {
                 path: start.to_path_buf(),
@@ -205,15 +117,9 @@ impl ResolvedTask {
                 })?
         };
         loop {
-            if let Some(config) = config {
-                let candidate = current.join(&config.tasks.manifest_name);
-                if candidate.is_file() {
-                    return Ok(candidate);
-                }
-            }
-            let legacy = current.join(LEGACY_MANIFEST_NAME);
-            if legacy.is_file() {
-                return Ok(legacy);
+            let candidate = current.join(&config.tasks.manifest_name);
+            if candidate.is_file() {
+                return Ok(candidate);
             }
             if current == repo.root {
                 break;

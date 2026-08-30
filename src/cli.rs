@@ -48,7 +48,6 @@ pub enum Command {
     Plan(PublishArgs),
 
     /// Publish a scoped Git+DVC transaction.
-    #[command(visible_alias = "commit")]
     Publish(PublishCommandArgs),
 
     /// Declare one or more new DVC-managed boundaries and publish them.
@@ -64,7 +63,6 @@ pub enum Command {
     Hydrate(HydrateArgs),
 
     /// Safely fast-forward a shared checkout and hydrate incoming DVC data.
-    #[command(visible_alias = "refresh-main")]
     Refresh(RefreshArgs),
 }
 
@@ -182,7 +180,7 @@ pub struct PublishArgs {
     #[arg(long)]
     pub scope_note: Option<String>,
 
-    #[arg(long, visible_alias = "allow-non-main-head")]
+    #[arg(long)]
     pub allow_non_shared_head: bool,
 
     #[arg(long)]
@@ -209,7 +207,7 @@ pub struct PublishCommandArgs {
     #[arg(long)]
     pub scope_note: Option<String>,
 
-    #[arg(long, visible_alias = "allow-non-main-head")]
+    #[arg(long)]
     pub allow_non_shared_head: bool,
 
     #[arg(long)]
@@ -263,7 +261,7 @@ pub struct RequiredPublishArgs {
     #[arg(long)]
     pub scope_note: Option<String>,
 
-    #[arg(long, visible_alias = "allow-non-main-head")]
+    #[arg(long)]
     pub allow_non_shared_head: bool,
 
     #[arg(long)]

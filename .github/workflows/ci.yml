@@ -43,9 +43,9 @@ jobs:
         run: cargo test --locked --all-features --no-fail-fast
       - name: Assemble crate package
         run: cargo package --locked
-      - name: Package native release candidate
+      - name: Package native archive
         run: sh scripts/package-native.sh x86_64-unknown-linux-gnu
-      - name: Upload native release candidate
+      - name: Upload native archive
         uses: actions/upload-artifact@v7.0.1
         with:
           name: workspace-mgr-x86_64-unknown-linux-gnu
@@ -88,9 +88,9 @@ jobs:
           dvc version
       - name: Test
         run: cargo test --locked --all-features --no-fail-fast
-      - name: Package native release candidate
+      - name: Package native archive
         run: sh scripts/package-native.sh ${{ matrix.target }}
-      - name: Upload native release candidate
+      - name: Upload native archive
         uses: actions/upload-artifact@v7.0.1
         with:
           name: workspace-mgr-${{ matrix.target }}

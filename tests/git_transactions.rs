@@ -103,33 +103,6 @@ fn additional_scope_requires_and_records_a_reason() {
 }
 
 #[test]
-fn legacy_manifest_and_command_line_remain_compatible() {
-    let fixture = managed_fixture();
-    let name = "20260829-170300-legacy";
-    let task = fixture.shared.join(name);
-    std::fs::create_dir(&task).unwrap();
-    std::fs::write(task.join("README.md"), "legacy task\n").unwrap();
-    std::fs::write(
-        task.join(".chat-sync.json"),
-        format!(
-            "{{\n  \"version\": 1,\n  \"task_path\": \"{name}\",\n  \"branch\": \"codex/legacy\",\n  \"remote\": \"origin\",\n  \"base_branch\": \"main\",\n  \"shared_head\": \"main\",\n  \"additional_paths\": []\n}}\n"
-        ),
-    )
-    .unwrap();
-    let output = workspace(
-        &task,
-        [
-            "--manifest",
-            task.join(".chat-sync.json").to_str().unwrap(),
-            "-m",
-            "Publish legacy task",
-        ],
-    );
-    assert_eq!(json(&output)["legacy_manifest"], true);
-    assert_eq!(json(&output)["status"], "pushed");
-}
-
-#[test]
 fn refresh_preserves_working_tree_overlays() {
     let fixture = managed_fixture();
     workspace(

@@ -56,21 +56,15 @@ pub struct RefreshDvcReport {
 
 pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let repo = GitRepo::discover(&options.repo)?;
-    let config = Config::load(&repo).ok();
+    let config = Config::load(&repo)?;
     let remote = options
         .remote
         .clone()
-        .or_else(|| config.as_ref().map(|value| value.git.remote.clone()))
-        .unwrap_or_else(|| "origin".to_owned());
+        .unwrap_or_else(|| config.git.remote.clone());
     let branch = options
         .branch
         .clone()
-        .or_else(|| {
-            config
-                .as_ref()
-                .map(|value| value.git.shared_checkout_branch.clone())
-        })
-        .unwrap_or_else(|| "main".to_owned());
+        .unwrap_or_else(|| config.git.shared_checkout_branch.clone());
     if options.git_only && options.scope_note.is_none() {
         return Err(Error::message("refresh --git-only requires --scope-note"));
     }
@@ -221,7 +215,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
                     .chain(new_dvc.iter().cloned())
                     .collect::<Vec<_>>();
                 run("dvc", args, &repo.root)?;
-                dvc::verify(&repo, config.as_ref(), &new_dvc)?;
+                dvc::verify(&repo, &config, &new_dvc)?;
             }
         }
         if repo.optional_oid(&local_ref)?.as_deref() != Some(&new_oid) {

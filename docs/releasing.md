@@ -1,19 +1,19 @@
 # Release process
 
-Phase 1 produces release candidates but does not publish a public package.
-
-1. Run the local quality gate documented in the README.
-2. Push a review branch and let CI produce the four native candidate artifacts.
-3. After the workflow exists on the default branch, the standalone **Package
-   release candidate** workflow can reproduce them from a reviewed commit.
-4. Download each immutable workflow artifact, verify its SHA-256 checksum, and
-   exercise the binary on its named architecture.
+1. Update the package version and changelog in a review branch.
+2. Run the quality gate documented in the README.
+3. Review and merge the release change.
+4. Create a signed `v<version>` tag from the reviewed default-branch commit.
+5. Run the package workflow for that tag and verify every SHA-256 checksum on
+   its named architecture.
+6. Publish the crate from the tagged source with `cargo publish --locked`.
+7. Create a GitHub Release for the same tag and attach the four verified native
+   archives and checksum files.
 
 The packaging workflow builds native archives for Linux x86-64 and arm64 and
 macOS arm64 and Intel. Each archive contains the executable, MIT License, and
-README. Artifacts expire after 14 days and are not a GitHub Release.
+README.
 
-Phase 4 adds the irreversible publication steps: a reviewed version/tag,
-crates.io publication, durable GitHub Release assets, and release notes. A
-crates.io token or GitHub release permission must never be exposed to pull
-request workflows.
+Publishing crates.io packages, tags, or durable GitHub Release assets is an
+explicit maintainer action. Credentials and release permissions must never be
+available to pull-request workflows.

@@ -73,7 +73,6 @@ pub struct TransactionReport {
     pub lfs_entries: usize,
     pub large_lfs_files: Vec<String>,
     pub tree_oid: String,
-    pub legacy_manifest: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_oid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,15 +91,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     } else {
         GitRepo::discover(&options.start)?
     };
-    let config = Config::load(&repo).ok();
+    let config = Config::load(&repo)?;
     let manifest_path = match &options.manifest {
         Some(path) => path.clone(),
-        None => ResolvedTask::discover(&repo, config.as_ref(), &options.start)?,
+        None => ResolvedTask::discover(&repo, &config, &options.start)?,
     };
-    let task = ResolvedTask::load(&repo, config.as_ref(), &manifest_path)?;
-    if config
-        .as_ref()
-        .is_some_and(|value| value.tasks.require_readme)
+    let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
+    if config.tasks.require_readme
         && !resolved_under(&repo.root, &format!("{}/README.md", task.task_path)).is_file()
     {
         return Err(Error::message(format!(
@@ -184,7 +181,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let dvc_report = if options.git_only {
         serde_json::json!({"mode": "git-only", "files": pointers})
     } else {
-        serde_json::to_value(dvc::reconcile(&repo, config.as_ref(), &pointers, dry_run)?)
+        serde_json::to_value(dvc::reconcile(&repo, &config, &pointers, dry_run)?)
             .map_err(|error| Error::message(format!("failed to encode DVC report: {error}")))?
     };
 
@@ -223,10 +220,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         )));
     }
     check_gitlinks(&repo, &index, &paths)?;
-    let threshold = config
-        .as_ref()
-        .map(|value| value.large_files.threshold_bytes)
-        .unwrap_or(10_485_760);
+    let threshold = config.large_files.threshold_bytes;
     let large_lfs_files = check_large_files(&repo, &index, &scopes, threshold)?;
     repo.run_with_index(
         &index,
@@ -266,7 +260,6 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         lfs_entries,
         large_lfs_files,
         tree_oid: tree_oid.clone(),
-        legacy_manifest: task.legacy,
         commit_oid: None,
         remote_oid: None,
         push: None,
@@ -625,12 +618,12 @@ fn build_commit_message(
 
 pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> {
     let repo = GitRepo::discover(start)?;
-    let config = Config::load(&repo).ok();
+    let config = Config::load(&repo)?;
     let path = match manifest {
         Some(path) => path.to_path_buf(),
-        None => ResolvedTask::discover(&repo, config.as_ref(), start)?,
+        None => ResolvedTask::discover(&repo, &config, start)?,
     };
-    let task = ResolvedTask::load(&repo, config.as_ref(), &path)?;
+    let task = ResolvedTask::load(&repo, &config, &path)?;
     let scopes = task.scopes();
     let mut args = vec!["status".to_owned(), "--short".to_owned(), "--".to_owned()];
     args.extend(scopes.iter().cloned());
@@ -648,7 +641,6 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
         base_branch: task.base_branch,
         scopes,
         working_changes,
-        legacy: task.legacy,
     })
 }
 
@@ -661,5 +653,4 @@ pub struct TaskStatus {
     pub base_branch: String,
     pub scopes: Vec<String>,
     pub working_changes: Vec<String>,
-    pub legacy: bool,
 }

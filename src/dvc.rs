@@ -118,7 +118,7 @@ pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
 
 pub fn reconcile(
     repo: &GitRepo,
-    config: Option<&Config>,
+    config: &Config,
     pointers: &[String],
     dry_run: bool,
 ) -> Result<DvcReport> {
@@ -174,11 +174,7 @@ pub fn reconcile(
     Ok(report)
 }
 
-pub fn verify(
-    repo: &GitRepo,
-    config: Option<&Config>,
-    pointers: &[String],
-) -> Result<serde_json::Value> {
+pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<serde_json::Value> {
     if pointers.is_empty() {
         return Ok(serde_json::json!({"mode": "no-files"}));
     }
@@ -194,13 +190,9 @@ pub fn verify(
         )));
     }
 
-    let exact = config
-        .map(|value| value.dvc.require_version_aware)
-        .unwrap_or_else(|| detect_version_aware(repo).unwrap_or(false));
+    let exact = config.dvc.require_version_aware;
     if exact {
-        let python = config
-            .map(|value| value.dvc.python.as_str())
-            .unwrap_or("python3");
+        let python = config.dvc.python.as_str();
         let serialized = serde_json::to_string(pointers)
             .map_err(|error| Error::message(format!("failed to encode DVC files: {error}")))?;
         let output = run_unchecked(
@@ -244,19 +236,9 @@ pub fn verify(
     Ok(serde_json::json!({"mode": "dvc-cloud-status"}))
 }
 
-fn detect_version_aware(repo: &GitRepo) -> Result<bool> {
-    let remote = run_unchecked("dvc", ["config", "core.remote"], &repo.root)?;
-    if !remote.success() || remote.stdout.trim().is_empty() {
-        return Ok(false);
-    }
-    let key = format!("remote.{}.version_aware", remote.stdout.trim());
-    let value = run_unchecked("dvc", ["config", &key], &repo.root)?;
-    Ok(value.success() && value.stdout.trim().eq_ignore_ascii_case("true"))
-}
-
 pub fn hydrate(
     repo: &GitRepo,
-    config: Option<&Config>,
+    config: &Config,
     scopes: &[String],
     targets: &[String],
     dry_run: bool,

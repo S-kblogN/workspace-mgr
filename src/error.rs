@@ -12,13 +12,6 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("invalid JSON in {path}: {source}")]
-    Json {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-
     #[error("invalid TOML in {path}: {source}")]
     Toml {
         path: PathBuf,

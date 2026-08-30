@@ -63,10 +63,6 @@ path = "docs/shared.md"
 reason = "The user explicitly requested this shared documentation change"
 ```
 
-Legacy `.chat-sync.json` version 1 manifests remain readable during the
-documented migration window. Their `remote`, `base_branch`, and `shared_head`
-fields override repository defaults for compatibility.
-
 `require_readme` is enforced before publication. `draft_pull_request` controls
 the generated review instructions; pull-request API calls are intentionally
 outside the provider-neutral transaction engine.
