@@ -160,6 +160,30 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
         .status
         .success()
     );
+
+    std::fs::remove_file(worktree.join("shared-policy.md")).unwrap();
+    let removed = workspace(&worktree, ["publish", "-m", "Remove shared policy"]);
+    let removed = json(&removed);
+    assert_eq!(removed["status"], "pushed");
+    assert_eq!(
+        removed["changed_paths"],
+        serde_json::json!(["shared-policy.md"])
+    );
+    let removed_commit = removed["commit_oid"].as_str().unwrap();
+    assert!(
+        !git_unchecked(
+            &fixture.shared,
+            [
+                "cat-file",
+                "-e",
+                &format!("{removed_commit}:shared-policy.md")
+            ],
+        )
+        .status
+        .success()
+    );
+    let clean = workspace(&worktree, ["plan"]);
+    assert_eq!(json(&clean)["status"], "no_changes");
 }
 
 #[test]

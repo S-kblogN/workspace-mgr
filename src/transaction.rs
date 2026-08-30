@@ -181,9 +181,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         fs::remove_file(&preview_index).at(&preview_index)?;
     }
     repo.run_with_index(&preview_index, ["read-tree", &base_oid], None, true)?;
-    let mut preview_add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
-    preview_add.extend(scopes.iter().cloned());
-    repo.run_with_index(&preview_index, preview_add, None, true)?;
+    stage_scopes(&repo, &preview_index, &scopes)?;
     remove_stored_outputs_from_index(&repo, &preview_index, &initial_outputs)?;
     remove_output_paths_from_index(&repo, &preview_index, preview_automatic_s3.iter())?;
     let preview_paths = changed_paths(&repo, &preview_index, &base_oid)?;
@@ -228,9 +226,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             fs::remove_file(&preflight_index).at(&preflight_index)?;
         }
         repo.run_with_index(&preflight_index, ["read-tree", &base_oid], None, true)?;
-        let mut preflight_add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
-        preflight_add.extend(scopes.iter().cloned());
-        repo.run_with_index(&preflight_index, preflight_add, None, true)?;
+        stage_scopes(&repo, &preflight_index, &scopes)?;
         remove_stored_outputs_from_index(&repo, &preflight_index, &preflight_outputs)?;
         let preflight_paths = changed_paths(&repo, &preflight_index, &base_oid)?;
         validate_private_index(
@@ -251,9 +247,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         fs::remove_file(&index).at(&index)?;
     }
     repo.run_with_index(&index, ["read-tree", &base_oid], None, true)?;
-    let mut add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
-    add.extend(scopes.iter().cloned());
-    repo.run_with_index(&index, add, None, true)?;
+    stage_scopes(&repo, &index, &scopes)?;
     remove_stored_outputs_from_index(&repo, &index, &s3.outputs)?;
     remove_output_paths_from_index(&repo, &index, automatic_s3.iter())?;
     let paths = changed_paths(&repo, &index, &base_oid)?;
@@ -399,6 +393,43 @@ fn validate_private_index(
         None,
         true,
     )?;
+    Ok(())
+}
+
+fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
+    let mut present = Vec::new();
+    for scope in scopes {
+        let exists = match fs::symlink_metadata(resolved_under(&repo.root, scope)) {
+            Ok(_) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(source) => {
+                return Err(Error::Io {
+                    path: resolved_under(&repo.root, scope),
+                    source,
+                });
+            }
+        };
+        let tracked = !repo
+            .run_with_index(index, ["ls-files", "-z", "--", scope], None, true)?
+            .stdout
+            .is_empty();
+        if exists || tracked {
+            present.push(scope.clone());
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
+    add.extend(present);
+    repo.run_with_index(index, add, None, true)?;
     Ok(())
 }
 

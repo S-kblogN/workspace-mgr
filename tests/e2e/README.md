@@ -16,7 +16,8 @@ instructions, diagnostics, task creation, storage status, explicit Git and S3
 placement, aggregate boundary sizing, tiny-S3 warnings, the semantic review
 band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
-isolated infrastructure task scaffolding and scoped publication,
+isolated infrastructure task scaffolding, scoped publication, and stable
+publication of a deleted infrastructure file scope,
 deliverable and infrastructure task discard with branch/worktree cleanup while
 retaining versioned S3 objects,
 fixed policy with a minimal Git/S3-only public configuration,

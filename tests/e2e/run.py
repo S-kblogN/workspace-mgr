@@ -946,6 +946,25 @@ class Harness:
             "published infrastructure worktree is clean",
         )
         self.check(self.wm(worktree, "plan")["status"] == "no_changes", "infrastructure plan ends clean")
+        (worktree / "e2e-shared-policy.md").unlink()
+        removed = self.wm(worktree, "publish", "-m", "Remove E2E shared policy")
+        removed_oid = removed["commit_oid"]
+        self.check(
+            removed["changed_paths"] == ["e2e-shared-policy.md"],
+            "infrastructure deletion publishes only its missing file scope",
+        )
+        self.check(
+            not self.remote_path_exists(removed_oid, "e2e-shared-policy.md"),
+            "published infrastructure deletion removes the remote path",
+        )
+        self.check(
+            self.git(worktree, "status", "--short").stdout == "",
+            "deleted infrastructure scope leaves a clean worktree",
+        )
+        self.check(
+            self.wm(worktree, "plan")["status"] == "no_changes",
+            "missing published infrastructure scope remains a clean plan",
+        )
         versions_before_discard = self.list_s3_versions()
         discard_preview = self.wm(worktree, "task", "discard", "--dry-run")
         self.check(discard_preview["status"] == "dry_run", "infrastructure discard previews cleanup")
