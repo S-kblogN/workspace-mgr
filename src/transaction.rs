@@ -7,13 +7,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::config::{Config, MergeAuthority, PullRequestPolicy, PullRequestState, ReviewManager};
+use crate::config::Config;
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::manifest::{AdditionalScope, ResolvedTask, TaskKind, one_line};
 use crate::path::{allowed, relative_to, repo_path, resolved_under};
+use crate::policy::{
+    AUTO_S3_ABOVE_BYTES, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
+    REVIEW_PULL_REQUEST,
+};
 use crate::storage;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -74,10 +78,10 @@ pub struct TransactionReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewHandoff {
-    pub pull_request: PullRequestPolicy,
-    pub initial_state: PullRequestState,
-    pub managed_by: ReviewManager,
-    pub merge_authority: MergeAuthority,
+    pub pull_request: &'static str,
+    pub initial_state: &'static str,
+    pub managed_by: &'static str,
+    pub merge_authority: &'static str,
     pub remote: String,
     pub base_branch: String,
     pub head_branch: String,
@@ -93,10 +97,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let config = Config::load_compatible(&repo)?;
     let manifest_path = match &options.manifest {
         Some(path) => path.clone(),
-        None => ResolvedTask::discover(&repo, &config, &options.start)?,
+        None => ResolvedTask::discover(&repo, &options.start)?,
     };
     let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
-    if config.tasks.require_readme && task.kind == TaskKind::Deliverable {
+    if task.kind == TaskKind::Deliverable {
         let task_path = task
             .task_path
             .as_deref()
@@ -190,7 +194,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &base_oid,
         &scopes,
         &preview_paths,
-        config.storage.auto_s3_above_bytes,
+        AUTO_S3_ABOVE_BYTES,
         &placement_preview.would_place_in_s3,
     )?;
     let mut lock_names = initial_dvc
@@ -206,7 +210,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     lock_names.sort();
     lock_names.dedup();
     let _dvc_locks = acquire_dvc_locks(&common_dir, &lock_names)?;
-    if config.storage.requires_object_versioning()
+    if config.requires_object_versioning()
         && (!initial_dvc.is_empty() || !placement_preview.would_place_in_s3.is_empty())
     {
         dvc::verify_object_versioning(&repo, &config)?;
@@ -236,7 +240,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             &base_oid,
             &scopes,
             &preflight_paths,
-            config.storage.auto_s3_above_bytes,
+            AUTO_S3_ABOVE_BYTES,
             &placement.would_place_in_s3,
         )?;
     }
@@ -260,7 +264,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &base_oid,
         &scopes,
         &paths,
-        config.storage.auto_s3_above_bytes,
+        AUTO_S3_ABOVE_BYTES,
         &placement.would_place_in_s3,
     )?;
     let ignored_entries = count_ignored(&repo, &index, &scopes)?;
@@ -285,10 +289,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         remote_base_oid,
         scopes: scopes.clone(),
         review: ReviewHandoff {
-            pull_request: config.review.pull_request,
-            initial_state: config.review.initial_state,
-            managed_by: config.review.managed_by,
-            merge_authority: config.review.merge_authority,
+            pull_request: REVIEW_PULL_REQUEST,
+            initial_state: REVIEW_INITIAL_STATE,
+            managed_by: REVIEW_MANAGED_BY,
+            merge_authority: REVIEW_MERGE_AUTHORITY,
             remote: task.remote.clone(),
             base_branch: task.base_branch.clone(),
             head_branch: task.branch.clone(),
@@ -738,7 +742,7 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
     let config = Config::load_compatible(&repo)?;
     let path = match manifest {
         Some(path) => path.to_path_buf(),
-        None => ResolvedTask::discover(&repo, &config, start)?,
+        None => ResolvedTask::discover(&repo, start)?,
     };
     let task = ResolvedTask::load(&repo, &config, &path)?;
     let scopes = task.scopes();

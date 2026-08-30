@@ -11,6 +11,7 @@ mod lock;
 mod manifest;
 mod output;
 mod path;
+mod policy;
 mod process;
 mod refresh;
 mod runtime;
@@ -54,7 +55,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Init(args) => {
             let report = init(&InitOptions {
                 repo: args.repo,
-                profile: args.profile,
                 s3_url: args.s3_url,
                 s3_endpoint_url: args.s3_endpoint_url,
                 dry_run: args.dry_run,
@@ -109,7 +109,6 @@ fn run(cli: Cli) -> Result<()> {
                     kind: args.kind,
                     scopes: args.scopes,
                     scope_note: args.scope_note,
-                    branch: args.branch,
                     timestamp: args.timestamp,
                     dry_run: args.dry_run,
                 })?,
@@ -261,7 +260,7 @@ fn scoped_context(
     let config = Config::load_compatible(&repo)?;
     let manifest_path = match &args.manifest {
         Some(path) => path.clone(),
-        None => ResolvedTask::discover(&repo, &config, &args.repo)?,
+        None => ResolvedTask::discover(&repo, &args.repo)?,
     };
     let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
     let (scopes, _) = hydrate_scopes(&task, &args.include, args.scope_note.as_deref())?;

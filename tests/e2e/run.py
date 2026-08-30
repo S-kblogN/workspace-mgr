@@ -415,8 +415,6 @@ class Harness:
         self.section("init, configuration, instructions, and doctor")
         common = (
             "init",
-            "--profile",
-            "shared-checkout",
             "--s3-url",
             f"s3://{self.bucket}/dvc",
             "--s3-endpoint-url",
@@ -463,7 +461,25 @@ class Harness:
         )
         self.check("workspace-mgr instructions" in bootstrap, "thin AGENTS bootstrap installed")
         self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
-        self.check("[storage.s3]" in config_text, "S3 placement is configured")
+        self.check("[git]" in config_text, "Git topology is configured")
+        self.check("[s3]" in config_text, "S3 location is configured")
+        for forbidden in (
+            "schema_version",
+            "required_cli",
+            "profile",
+            "[publication]",
+            "[tasks]",
+            "[review]",
+            "[storage]",
+            "[agent]",
+            "branch_prefix",
+            "auto_s3_above_bytes",
+        ):
+            self.check(
+                forbidden not in config_text,
+                "public config contains no strategy switch",
+                forbidden=forbidden,
+            )
         self.check("version_aware = true" in dvc_config, "internal storage engine is version-aware")
         self.check("Managed by workspace-mgr" in dvc_config, "internal storage configuration records ownership")
         self.check(f"s3://{self.bucket}/dvc" in dvc_config, "internal storage URL selects test bucket")
@@ -500,12 +516,10 @@ class Harness:
         self.check(main_oid is not None, "initialized main exists on Git server")
 
         config = self.wm(self.shared, "config", "show")
-        self.check(config["publication"]["remote"] == "origin", "config resolves publication remote")
-        self.check(config["storage"]["s3"]["url"] == f"s3://{self.bucket}/dvc", "config resolves S3 storage")
-        self.check(config["storage"]["default"] == "auto", "config defaults to automatic placement")
-        self.check(config["review"]["pull_request"] == "required", "config requires review")
-        self.check(config["review"]["managed_by"] == "agent", "config assigns PR metadata to agent")
-        self.check(config["review"]["merge_authority"] == "user", "config reserves merge authority")
+        self.check(set(config) == {"git", "s3"}, "config exposes only Git and S3 facts")
+        self.check(config["git"]["remote"] == "origin", "config resolves Git remote")
+        self.check(config["git"]["branch"] == "main", "config resolves shared branch")
+        self.check(config["s3"]["url"] == f"s3://{self.bucket}/dvc", "config resolves S3 location")
         self.check("dvc" not in config, "public config JSON hides the internal storage engine")
 
         for topic in (
@@ -517,12 +531,11 @@ class Harness:
             "artifacts",
             "storage",
             "shared-checkout",
+            "infrastructure",
         ):
             document = self.wm(self.shared, "instructions", topic)
             self.check(document["topic"] == topic, "instruction topic renders", topic=topic)
             self.check(len(document["policy_hash"]) == 64, "instruction policy hash is complete", topic=topic)
-        disabled = self.wm(self.shared, "instructions", "infrastructure", expected=2)
-        self.check("disabled" in disabled["stderr"], "disabled instruction module is rejected")
         all_instructions = self.wm(self.shared, "instructions")
         model_heading = all_instructions["markdown"].find("# How this workspace works")
         rules_heading = all_instructions["markdown"].find("# Effective repository instructions")
@@ -537,6 +550,11 @@ class Harness:
         self.check(
             "general-purpose collaborator" in all_instructions["markdown"],
             "instructions explain the workspace purpose before its mechanics",
+        )
+        self.check(
+            "The agent owns pull-request operations" in all_instructions["markdown"]
+            and "must not merge" in all_instructions["markdown"],
+            "instructions fix agent PR ownership and user merge authority",
         )
         self.check(
             "Preserve this repository-specific rule" in all_instructions["markdown"],
@@ -599,7 +617,7 @@ class Harness:
         )
         task = self.shared / task_id
         self.check(created["status"] == "created", "task scaffold created")
-        self.check(created["branch"] == branch, "task branch follows configured prefix")
+        self.check(created["branch"] == branch, "task branch follows fixed codex prefix")
         self.check(task.joinpath("README.md").is_file(), "task README created")
         self.check(task.joinpath(".workspace-mgr-task.toml").is_file(), "task manifest created")
         readme_before_collision = task.joinpath("README.md").read_bytes()

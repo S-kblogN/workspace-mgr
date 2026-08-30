@@ -26,7 +26,7 @@ side effect, and example.
 
 ```sh
 workspace-mgr setup
-workspace-mgr init --profile shared-checkout \
+workspace-mgr init \
   --s3-url s3://example-bucket/workspace \
   --s3-endpoint-url https://s3.example.invalid
 workspace-mgr doctor
@@ -56,7 +56,7 @@ Git revision.
 
 ## Placement policy
 
-The default `auto` policy sends new retained files above 10 MiB to S3 and smaller
+The fixed automatic policy sends new retained files above 10 MiB to S3 and smaller
 files to Git. Existing published placement stays stable. Size is a default, not
 a prohibition: `storage set --to git|s3` records an explicit choice in either
 direction, and `storage reset` returns a path to automatic policy.
@@ -69,10 +69,10 @@ path's placement. `storage hydrate` materializes S3 content without publishing.
 `workspace-mgr init` installs a deliberately small `AGENTS.md` that tells the
 agent to run `workspace-mgr instructions --repo .`. The generated document
 begins with the same [workspace model](docs/management-model.md) read by users,
-then combines product-owned policy modules, repository
-configuration, and an optional repository-specific module. This keeps the
-bootstrap stable while allowing both the model and effective policy to evolve
-with the CLI.
+then renders the complete product-owned policy using the repository's Git and
+S3 facts and appends an optional repository-specific content module. Every
+initialized repository gets the same management strategy; policy evolves with
+the CLI rather than through per-repository switches.
 
 ## Installation
 

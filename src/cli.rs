@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::{Profile, StorageTarget};
+use crate::config::StorageTarget;
 use crate::manifest::TaskKind;
 use crate::output::Format;
 
@@ -33,7 +33,7 @@ pub enum Command {
     /// Provision the private execution runtime used by managed storage.
     Setup(SetupArgs),
 
-    /// Initialize or reconcile repository policy and managed scaffolding.
+    /// Initialize or reconcile repository facts and managed scaffolding.
     Init(InitArgs),
 
     /// Print the shared workspace model and effective repository instructions.
@@ -84,9 +84,6 @@ pub struct RepoArgs {
 pub struct InitArgs {
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-
-    #[arg(long, value_enum, default_value = "standard")]
-    pub profile: Profile,
 
     /// Configure an S3 bucket at this non-secret URL.
     #[arg(long)]
@@ -155,9 +152,6 @@ pub struct TaskCreateArgs {
     /// Explain why the declared infrastructure paths are authorized.
     #[arg(long, requires = "scopes")]
     pub scope_note: Option<String>,
-
-    #[arg(long)]
-    pub branch: Option<String>,
 
     #[arg(long, hide = true)]
     pub timestamp: Option<String>,
@@ -345,11 +339,9 @@ mod tests {
                 "/tmp/workspace-mgr-runtime",
                 "--dry-run",
             ],
-            &["init", "--profile", "standard"],
+            &["init"],
             &[
                 "init",
-                "--profile",
-                "shared-checkout",
                 "--s3-url",
                 "s3://example-bucket/workspace",
                 "--s3-endpoint-url",
@@ -370,8 +362,6 @@ mod tests {
                 "Training report",
                 "--purpose",
                 "Produce the final training report",
-                "--branch",
-                "review/training-report",
                 "--dry-run",
             ],
             &[

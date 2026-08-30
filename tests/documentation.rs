@@ -5,6 +5,7 @@ fn user_documentation_covers_the_complete_public_model() {
     let normalized_model = model.split_whitespace().collect::<Vec<_>>().join(" ");
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
+    let configuration = include_str!("../docs/configuration.md");
     let e2e_readme = include_str!("e2e/README.md");
     let e2e_coverage = include_str!("e2e/COVERAGE.md");
 
@@ -30,6 +31,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "one writable conversation (chat) = one task = one target branch = one draft pull request"
     ));
     assert!(normalized_model.contains("Infrastructure is a kind of task"));
+    assert!(normalized_model.contains("same management strategy"));
     assert!(normalized_model.contains("the user asks for outcomes"));
     assert!(normalized_model.contains("None of these operations publishes a task"));
     for command in [
@@ -71,6 +73,28 @@ fn user_documentation_covers_the_complete_public_model() {
     }
     assert!(guide.contains("S3 first, then Git"));
     assert!(guide.contains("Nested placement boundaries"));
+    for fact in ["[git]", "remote", "branch", "[s3]", "endpoint_url"] {
+        assert!(
+            configuration.contains(fact),
+            "configuration reference is missing external fact {fact:?}"
+        );
+    }
+    for policy_knob in [
+        "[review]",
+        "[publication]",
+        "[tasks]",
+        "[storage]",
+        "[agent]",
+        "required_cli",
+        "branch_prefix",
+        "auto_s3_above_bytes",
+    ] {
+        assert!(
+            !configuration.contains(policy_knob),
+            "configuration reference exposes policy knob {policy_knob:?}"
+        );
+    }
+    assert!(configuration.contains("deliberately not configurable"));
     assert!(e2e_readme.contains("COVERAGE.md"));
     for boundary in [
         "Transaction concurrency",

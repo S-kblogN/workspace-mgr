@@ -11,8 +11,6 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
         &fixture.shared,
         [
             "init",
-            "--profile",
-            "shared-checkout",
             "--dry-run",
             "--repo",
             fixture.shared.to_str().unwrap(),
@@ -29,13 +27,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 
     let initialized = workspace(
         &fixture.shared,
-        [
-            "init",
-            "--profile",
-            "shared-checkout",
-            "--repo",
-            fixture.shared.to_str().unwrap(),
-        ],
+        ["init", "--repo", fixture.shared.to_str().unwrap()],
     );
     assert_eq!(json(&initialized)["status"], "initialized");
     assert!(fixture.shared.join(".workspace-mgr.toml").is_file());
@@ -101,7 +93,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 #[test]
 fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init", "--profile", "shared-checkout"]);
+    workspace(&fixture.seed, ["init"]);
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();
 
@@ -330,29 +322,84 @@ fn init_refuses_to_overwrite_unmanaged_agents() {
 }
 
 #[test]
-fn agent_modules_control_the_generated_policy() {
+fn repository_configuration_cannot_change_the_workspace_policy() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
     workspace(&fixture.shared, ["init"]);
 
     let path = fixture.shared.join(".workspace-mgr.toml");
     let raw = std::fs::read_to_string(&path).unwrap();
-    let mut config: toml::Value = toml::from_str(&raw).unwrap();
-    config["agent"]["modules"] = toml::Value::Array(vec![toml::Value::String("scope".to_owned())]);
-    std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+    for forbidden in [
+        "schema_version",
+        "required_cli",
+        "profile",
+        "[publication]",
+        "[tasks]",
+        "[review]",
+        "[storage]",
+        "[agent]",
+        "branch_prefix",
+        "auto_s3_above_bytes",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "unexpected policy key {forbidden}"
+        );
+    }
 
     let all = workspace(&fixture.shared, ["--format", "human", "instructions"]);
     let text = String::from_utf8(all.stdout).unwrap();
     assert!(text.contains("Operating model"));
     assert!(text.contains("Task lifecycle"));
-    assert!(!text.contains("\n## Publication\n"));
-    assert!(!text.contains("\n## Artifact hygiene\n"));
-    assert!(!text.contains("\n## Storage placement\n"));
-    assert!(!text.contains("\n## Shared checkout\n"));
+    assert!(text.contains("\n## Publication\n"));
+    assert!(text.contains("\n## Pull request responsibility\n"));
+    assert!(text.contains("\n## Artifact hygiene\n"));
+    assert!(text.contains("\n## Storage placement\n"));
+    assert!(text.contains("\n## Shared checkout\n"));
+    assert!(text.contains("\n## Repository infrastructure\n"));
 
-    let disabled = workspace_unchecked(&fixture.shared, ["instructions", "publish"]);
-    assert_eq!(disabled.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&disabled.stderr).contains("disabled"));
+    for topic in [
+        "task",
+        "publish",
+        "artifacts",
+        "storage",
+        "shared-checkout",
+        "infrastructure",
+    ] {
+        let rendered = workspace(&fixture.shared, ["instructions", topic]);
+        assert!(
+            !rendered.stdout.is_empty(),
+            "topic {topic} was not rendered"
+        );
+    }
+
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "fixed-branch",
+            "--title",
+            "Fixed branch",
+            "--purpose",
+            "Verify the product-owned branch strategy.",
+            "--timestamp",
+            "20260829-170010",
+        ],
+    );
+    let manifest = fixture
+        .shared
+        .join("20260829-170010-fixed-branch/.workspace-mgr-task.toml");
+    let altered = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("codex/fixed-branch", "review/fixed-branch");
+    std::fs::write(&manifest, altered).unwrap();
+    let rejected = workspace_unchecked(
+        &fixture.shared.join("20260829-170010-fixed-branch"),
+        ["task", "status"],
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("fixed \"codex/\" prefix"));
 }
 
 #[cfg(unix)]
@@ -421,7 +468,7 @@ fn partially_failing_storage_initialization_rolls_back_all_scaffolding() {
 }
 
 #[test]
-fn tracked_configuration_rejects_credential_urls_and_incompatible_cli_versions() {
+fn tracked_configuration_rejects_credentials_and_policy_keys() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
     let credentials = workspace_unchecked(
@@ -439,16 +486,12 @@ fn tracked_configuration_rejects_credential_urls_and_incompatible_cli_versions()
 
     workspace(&fixture.shared, ["init"]);
     let config_path = fixture.shared.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path)
-        .unwrap()
-        .replace(">=0.1.0-alpha.1,<0.2.0", ">=9.0.0");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[review]\nmanaged_by = \"agent\"\n");
     std::fs::write(&config_path, config).unwrap();
     let instructions = workspace_unchecked(&fixture.shared, ["instructions"]);
     assert_eq!(instructions.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&instructions.stderr).contains("does not satisfy"));
-    let doctor = workspace_unchecked(&fixture.shared, ["doctor"]);
-    assert_eq!(doctor.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("cli-version"));
+    assert!(String::from_utf8_lossy(&instructions.stderr).contains("unknown field"));
 }
 
 #[test]
@@ -488,7 +531,7 @@ fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
     let config_path = fixture.shared.join(".workspace-mgr.toml");
     let mut config: toml::Value =
         toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config["storage"].as_table_mut().unwrap().remove("s3");
+    config.as_table_mut().unwrap().remove("s3");
     std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
     let disabled = workspace(&fixture.shared, ["init"]);
     assert_eq!(json(&disabled)["status"], "initialized");

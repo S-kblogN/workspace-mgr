@@ -37,14 +37,14 @@ and actions without changing the host.
 Run `init` once from the Git repository:
 
 ```sh
-workspace-mgr init --profile shared-checkout \
+workspace-mgr init \
   --s3-url s3://example-bucket/workspace \
   --s3-endpoint-url https://s3.example.invalid
 ```
 
 Initialization creates:
 
-- `.workspace-mgr.toml`, the public repository policy;
+- `.workspace-mgr.toml`, the public Git and optional S3 facts;
 - a thin `AGENTS.md` bootstrap;
 - internal storage scaffolding when S3 is configured.
 
@@ -54,9 +54,9 @@ storage configuration. Repository-specific additions may be maintained in
 files into that module. `--dry-run` reports every planned action without writing
 files.
 
-Use the `standard` profile for an ordinary checkout. Use `shared-checkout` when
-multiple tasks may leave independent working-tree overlays in one checkout
-that remains on a shared branch such as `main`.
+Every initialized repository uses the same shared-checkout, task, storage, and
+review strategy. There are no policy profiles. The configuration records only
+the external facts that genuinely differ between repositories.
 
 ### 3. Load the policy for an agent session
 
@@ -69,17 +69,15 @@ workspace-mgr instructions --repo .
 `instructions` is intentionally different from `help`: help explains command
 syntax, while instructions first establishes the shared workspace model and
 then renders the repository's actual operating policy. The output combines the
-canonical model document, built-in policy modules, `.workspace-mgr.toml`, and
-the optional repository-specific module. Run `workspace-mgr doctor` before work
+canonical model document, the complete built-in policy, `.workspace-mgr.toml`
+facts, and the optional repository-specific content module. Run
+`workspace-mgr doctor` before work
 if the installation or repository state may be inconsistent.
 
-The default `all` document contains the model followed by all enabled rules.
-`instructions model` returns only the conceptual model. The `[agent].modules`
-list controls which operational sections appear; the operating core is always
-included in `all`, while task scope, publication, artifact hygiene, storage,
-shared-checkout, and infrastructure rules are independent modules. Requesting a
-disabled operational topic is an error instead of silently returning incomplete
-policy.
+The default `all` document contains the model followed by the complete fixed
+policy. `instructions model` returns only the conceptual model. Every
+operational topic is always available; a repository cannot disable selected
+rules and thereby give an agent an incomplete management contract.
 
 ### 4. Create one task
 
@@ -106,8 +104,8 @@ manifest automatically and creates no timestamped task directory.
 
 ### 5. Choose where retained content lives
 
-Most files need no manual choice. With the default automatic policy, a new file
-above the configured threshold goes to S3 and a smaller file goes to Git.
+Most files need no manual choice. With the fixed automatic policy, a new file
+above the fixed 10 MiB threshold goes to S3 and a smaller file goes to Git.
 Previously published placement is sticky: changing a file's size does not
 silently move it between storage locations.
 
@@ -152,7 +150,7 @@ shown once rather than once per descendant. For a selected path,
 | `explicit-ancestor` | An explicit directory boundary contains the path |
 | `published-history` | Existing published history fixes this path in Git or S3 |
 | `published-ancestor` | A published S3 directory boundary contains the path |
-| `automatic` | Repository defaults and, for a new file, its current size decide |
+| `automatic` | Fixed product policy and, for a new file, its current size decide |
 
 `storage hydrate` reads exact S3 content into the working tree. With no paths it
 hydrates every S3 boundary in scope. It refuses to overwrite locally modified
@@ -181,14 +179,13 @@ Git index.
 Creating and maintaining the task's one draft pull request remains a
 repository-hosting action.
 `workspace-mgr` is provider-neutral: it publishes the branch transaction but
-does not call a GitHub or other hosting API. If repository policy asks for one
-draft pull request per task and assigns management to the agent, the agent finds
-the request by head branch, reuses it or creates exactly one, and never creates
-a duplicate. It keeps the title and living description aligned with the goal,
+does not call a GitHub or other hosting API. The agent finds the request by head
+branch, reuses it or creates exactly one draft pull request, and never creates a
+duplicate. It keeps the title and living description aligned with the goal,
 scope, deliverables, validation, and known limitations, then verifies the base,
 head, draft/open state, and head revision after every material publication.
-Hosting failures are reported immediately. With the default user merge
-authority, the agent must not merge, enable auto-merge, approve, close, or mark
+Hosting failures are reported immediately. The agent must not merge, enable
+auto-merge, approve, close, or mark
 the pull request ready.
 
 Repository-wide policy, root entrypoints, CI, and shared storage mechanisms use
@@ -223,7 +220,7 @@ absolute size prohibition.
 | Ordinary clone and checkout behavior is desirable | Exact object-version recovery matters |
 | The file is intentionally reviewable despite being large | A directory should be retained as one logical boundary |
 
-The automatic threshold is a useful default for new content. Explicit
+The fixed automatic threshold is a useful starting point for new content. Explicit
 `--to git` and `--to s3` choices always take precedence until reset.
 
 For an `s3://` location, bucket object versioning is mandatory. Publication

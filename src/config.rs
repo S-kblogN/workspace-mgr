@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, IoContext, Result};
@@ -9,114 +8,28 @@ use crate::git::GitRepo;
 use crate::path::reject_symlink_traversal;
 
 pub const CONFIG_NAME: &str = ".workspace-mgr.toml";
-pub const SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum Profile {
-    Standard,
-    SharedCheckout,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub schema_version: u32,
-    pub required_cli: String,
-    pub profile: Profile,
-    pub publication: PublicationConfig,
-    #[serde(default)]
-    pub tasks: TaskConfig,
-    #[serde(default)]
-    pub review: ReviewConfig,
-    #[serde(default)]
-    pub storage: StorageConfig,
-    #[serde(default)]
-    pub agent: AgentConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublicationConfig {
-    pub remote: String,
-    pub base_branch: String,
-    pub shared_checkout_branch: String,
-    pub branch_prefix: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TaskConfig {
-    pub enabled: bool,
-    pub directory_pattern: String,
-    pub manifest_name: String,
-    pub require_readme: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReviewConfig {
-    pub pull_request: PullRequestPolicy,
-    pub initial_state: PullRequestState,
-    pub managed_by: ReviewManager,
-    pub merge_authority: MergeAuthority,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PullRequestPolicy {
-    #[default]
-    Required,
-    Optional,
-    Disabled,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PullRequestState {
-    #[default]
-    Draft,
-    Ready,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReviewManager {
-    #[default]
-    Agent,
-    User,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MergeAuthority {
-    #[default]
-    User,
-    Agent,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct StorageConfig {
-    pub default: StorageDefault,
-    pub auto_s3_above_bytes: u64,
+    pub git: GitConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3: Option<S3Config>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitConfig {
+    pub remote: String,
+    pub branch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3Config {
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum StorageDefault {
-    #[default]
-    Auto,
-    Git,
-    S3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -126,93 +39,16 @@ pub enum StorageTarget {
     S3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AgentConfig {
-    pub modules: Vec<String>,
-}
-
-impl Default for TaskConfig {
+impl Default for GitConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            directory_pattern: "%Y%m%d-%H%M%S-{slug}".to_owned(),
-            manifest_name: ".workspace-mgr-task.toml".to_owned(),
-            require_readme: true,
+            remote: "origin".to_owned(),
+            branch: "main".to_owned(),
         }
-    }
-}
-
-impl Default for ReviewConfig {
-    fn default() -> Self {
-        Self {
-            pull_request: PullRequestPolicy::Required,
-            initial_state: PullRequestState::Draft,
-            managed_by: ReviewManager::Agent,
-            merge_authority: MergeAuthority::User,
-        }
-    }
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            modules: vec![
-                "scope".to_owned(),
-                "publication".to_owned(),
-                "artifact-hygiene".to_owned(),
-                "storage".to_owned(),
-            ],
-        }
-    }
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            default: StorageDefault::Auto,
-            auto_s3_above_bytes: 10_485_760,
-            s3: None,
-        }
-    }
-}
-
-impl StorageConfig {
-    pub fn s3_enabled(&self) -> bool {
-        self.s3.is_some()
-    }
-
-    pub fn requires_object_versioning(&self) -> bool {
-        self.s3
-            .as_ref()
-            .is_some_and(|s3| s3.url.starts_with("s3://"))
     }
 }
 
 impl Config {
-    pub fn defaults(profile: Profile) -> Self {
-        let shared = profile == Profile::SharedCheckout;
-        let mut modules = AgentConfig::default().modules;
-        if shared {
-            modules.push("shared-checkout".to_owned());
-        }
-        Self {
-            schema_version: SCHEMA_VERSION,
-            required_cli: ">=0.1.0-alpha.1,<0.2.0".to_owned(),
-            profile,
-            publication: PublicationConfig {
-                remote: "origin".to_owned(),
-                base_branch: "main".to_owned(),
-                shared_checkout_branch: "main".to_owned(),
-                branch_prefix: "codex/".to_owned(),
-            },
-            tasks: TaskConfig::default(),
-            review: ReviewConfig::default(),
-            storage: StorageConfig::default(),
-            agent: AgentConfig { modules },
-        }
-    }
-
     pub fn path(repo: &GitRepo) -> PathBuf {
         repo.root.join(CONFIG_NAME)
     }
@@ -224,13 +60,11 @@ impl Config {
 
     pub fn load_compatible(repo: &GitRepo) -> Result<Self> {
         let config = Self::load(repo)?;
-        config.require_compatible_cli()?;
-        repo.validate_remote_name(&config.publication.remote)?;
-        repo.validate_branch(&config.publication.base_branch)?;
-        repo.validate_branch(&config.publication.shared_checkout_branch)?;
+        repo.validate_remote_name(&config.git.remote)?;
+        repo.validate_branch(&config.git.branch)?;
         repo.validate_branch(&format!(
             "{}workspace-mgr-probe",
-            config.publication.branch_prefix
+            crate::policy::TASK_BRANCH_PREFIX
         ))?;
         Ok(config)
     }
@@ -251,25 +85,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
-            return Err(Error::message(format!(
-                "unsupported config schema {}, expected {}",
-                self.schema_version, SCHEMA_VERSION
-            )));
-        }
-        VersionReq::parse(&self.required_cli).map_err(|error| {
-            Error::message(format!("invalid required_cli requirement: {error}"))
-        })?;
         for (field, value) in [
-            ("publication.remote", &self.publication.remote),
-            ("publication.base_branch", &self.publication.base_branch),
-            (
-                "publication.shared_checkout_branch",
-                &self.publication.shared_checkout_branch,
-            ),
-            ("publication.branch_prefix", &self.publication.branch_prefix),
-            ("tasks.directory_pattern", &self.tasks.directory_pattern),
-            ("tasks.manifest_name", &self.tasks.manifest_name),
+            ("git.remote", &self.git.remote),
+            ("git.branch", &self.git.branch),
         ] {
             if value.trim().is_empty() || value.contains('\n') {
                 return Err(Error::message(format!(
@@ -277,92 +95,24 @@ impl Config {
                 )));
             }
         }
-        validate_remote_name(&self.publication.remote)?;
-        if !self.tasks.directory_pattern.contains("{slug}") {
-            return Err(Error::message(
-                "tasks.directory_pattern must contain {slug}",
-            ));
-        }
-        let sample_task_path = self
-            .tasks
-            .directory_pattern
-            .replace("%Y%m%d-%H%M%S", "20260101-000000")
-            .replace("{slug}", "workspace-mgr-probe");
-        if sample_task_path.contains('%')
-            || sample_task_path.contains('/')
-            || sample_task_path == ".git"
-            || sample_task_path.starts_with('.')
-        {
-            return Err(Error::message(
-                "tasks.directory_pattern must produce one safe top-level directory using only %Y%m%d-%H%M%S and {slug}",
-            ));
-        }
-        if self.tasks.manifest_name.contains(['/', '\\'])
-            || matches!(self.tasks.manifest_name.as_str(), "." | "..")
-            || self.tasks.manifest_name.eq_ignore_ascii_case(".git")
-            || self.tasks.manifest_name.eq_ignore_ascii_case("README.md")
-        {
-            return Err(Error::message(
-                "tasks.manifest_name must be a safe file name distinct from README.md",
-            ));
-        }
-        if self.storage.auto_s3_above_bytes == 0 {
-            return Err(Error::message(
-                "storage.auto_s3_above_bytes must be positive",
-            ));
-        }
-        if self.storage.default == StorageDefault::S3 && self.storage.s3.is_none() {
-            return Err(Error::message(
-                "storage.default = \"s3\" requires [storage.s3]",
-            ));
-        }
-        if let Some(s3) = &self.storage.s3 {
-            validate_s3_url("storage.s3.url", &s3.url)?;
+        validate_remote_name(&self.git.remote)?;
+        if let Some(s3) = &self.s3 {
+            validate_s3_url("s3.url", &s3.url)?;
             if let Some(endpoint) = &s3.endpoint_url {
-                validate_endpoint_url("storage.s3.endpoint_url", endpoint)?;
-            }
-        }
-        let supported = [
-            "scope",
-            "shared-checkout",
-            "publication",
-            "artifact-hygiene",
-            "storage",
-            "infrastructure",
-        ];
-        let mut seen = std::collections::BTreeSet::new();
-        for module in &self.agent.modules {
-            if !supported.contains(&module.as_str()) {
-                return Err(Error::message(format!(
-                    "unsupported agent module {module:?}"
-                )));
-            }
-            if !seen.insert(module) {
-                return Err(Error::message(format!("duplicate agent module {module:?}")));
+                validate_endpoint_url("s3.endpoint_url", endpoint)?;
             }
         }
         Ok(())
     }
 
-    pub fn version_matches(&self) -> Result<bool> {
-        let requirement = VersionReq::parse(&self.required_cli).map_err(|error| {
-            Error::message(format!("invalid required_cli requirement: {error}"))
-        })?;
-        let version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|error| {
-            Error::message(format!("invalid compiled package version: {error}"))
-        })?;
-        Ok(requirement.matches(&version))
+    pub fn s3_enabled(&self) -> bool {
+        self.s3.is_some()
     }
 
-    pub fn require_compatible_cli(&self) -> Result<()> {
-        if self.version_matches()? {
-            return Ok(());
-        }
-        Err(Error::message(format!(
-            "workspace-mgr {} does not satisfy repository requirement {}; install a compatible CLI before operating on this repository",
-            env!("CARGO_PKG_VERSION"),
-            self.required_cli
-        )))
+    pub fn requires_object_versioning(&self) -> bool {
+        self.s3
+            .as_ref()
+            .is_some_and(|s3| s3.url.starts_with("s3://"))
     }
 }
 
@@ -372,7 +122,7 @@ fn validate_remote_name(value: &str) -> Result<()> {
         || value.chars().any(char::is_control)
     {
         return Err(Error::message(
-            "publication.remote must be a safe Git remote name, not an option or URL",
+            "git.remote must be a safe Git remote name, not an option or URL",
         ));
     }
     Ok(())
@@ -455,36 +205,29 @@ mod tests {
 
     #[test]
     fn rejects_option_like_remotes_and_credential_bearing_locations() {
-        let mut config = Config::defaults(Profile::Standard);
-        config.publication.remote = "--upload-pack=printf injected".to_owned();
+        let mut config = Config::default();
+        config.git.remote = "--upload-pack=printf injected".to_owned();
         assert!(config.validate().is_err());
 
-        config.publication.remote = "origin".to_owned();
-        config.storage.s3 = Some(S3Config {
+        config.git.remote = "origin".to_owned();
+        config.s3 = Some(S3Config {
             url: "s3://bucket/prefix?X-Amz-Signature=secret".to_owned(),
             endpoint_url: None,
         });
         assert!(config.validate().is_err());
 
-        config.storage.s3 = Some(S3Config {
+        config.s3 = Some(S3Config {
             url: "s3://bucket/prefix".to_owned(),
             endpoint_url: Some("https://user:secret@example.invalid".to_owned()),
         });
-        assert!(config.validate().is_err());
-
-        config.storage.s3 = None;
-        config.tasks.manifest_name = "..".to_owned();
-        assert!(config.validate().is_err());
-
-        config.tasks.manifest_name = "README.md".to_owned();
         assert!(config.validate().is_err());
     }
 
     #[cfg(not(feature = "test-storage"))]
     #[test]
     fn production_build_rejects_filesystem_storage() {
-        let mut config = Config::defaults(Profile::Standard);
-        config.storage.s3 = Some(S3Config {
+        let mut config = Config::default();
+        config.s3 = Some(S3Config {
             url: "/tmp/test-storage".to_owned(),
             endpoint_url: None,
         });

@@ -12,20 +12,8 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        [
-            "init",
-            "--profile",
-            "shared-checkout",
-            "--s3-url",
-            storage_remote.to_str().unwrap(),
-        ],
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
     );
-    let config_path = fixture.seed.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path).unwrap().replace(
-        "auto_s3_above_bytes = 10485760",
-        "auto_s3_above_bytes = 1024",
-    );
-    std::fs::write(config_path, config).unwrap();
     fixture.commit_seed("Initialize automatic storage policy");
     fixture.clone_shared();
     workspace(
@@ -44,7 +32,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     );
     let task_id = "20260829-170450-automatic-placement";
     let task = fixture.shared.join(task_id);
-    std::fs::write(task.join("large.bin"), vec![7_u8; 2048]).unwrap();
+    std::fs::write(task.join("large.bin"), vec![7_u8; 10_485_761]).unwrap();
 
     let plan = workspace(&task, ["plan"]);
     assert_eq!(json(&plan)["status"], "dry_run");
@@ -60,7 +48,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     assert!(task.join("large.bin.dvc").is_file());
     assert!(storage_remote.exists());
 
-    std::fs::write(task.join("second-large.bin"), vec![8_u8; 2048]).unwrap();
+    std::fs::write(task.join("second-large.bin"), vec![8_u8; 10_485_761]).unwrap();
     let second_plan = workspace(&task, ["plan"]);
     assert_eq!(json(&second_plan)["status"], "dry_run");
     assert!(
@@ -90,16 +78,10 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
         &fixture.seed,
-        [
-            "init",
-            "--profile",
-            "shared-checkout",
-            "--s3-url",
-            dvc_remote.to_str().unwrap(),
-        ],
+        ["init", "--s3-url", dvc_remote.to_str().unwrap()],
     );
     let config = std::fs::read_to_string(fixture.seed.join(".workspace-mgr.toml")).unwrap();
-    assert!(config.contains("[storage]"));
+    assert!(config.contains("[s3]"));
     assert!(config.contains(&format!("url = {:?}", dvc_remote.to_str().unwrap())));
     let internal = std::fs::read_to_string(fixture.seed.join(".dvc/config")).unwrap();
     assert!(internal.contains("remote = workspace-mgr"));
@@ -260,13 +242,7 @@ fn a_published_git_file_can_move_to_s3_without_remaining_in_git() {
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
         &fixture.seed,
-        [
-            "init",
-            "--profile",
-            "shared-checkout",
-            "--s3-url",
-            dvc_remote.to_str().unwrap(),
-        ],
+        ["init", "--s3-url", dvc_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize managed storage");
     fixture.clone_shared();
@@ -340,13 +316,7 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        [
-            "init",
-            "--profile",
-            "shared-checkout",
-            "--s3-url",
-            storage_remote.to_str().unwrap(),
-        ],
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize managed storage");
     fixture.clone_shared();
@@ -421,13 +391,7 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
         &fixture.seed,
-        [
-            "init",
-            "--profile",
-            "shared-checkout",
-            "--s3-url",
-            dvc_remote.to_str().unwrap(),
-        ],
+        ["init", "--s3-url", dvc_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize managed DVC repository");
     fixture.clone_shared();
@@ -490,8 +454,6 @@ fn object_version_adapter_and_engine_config_are_internal() {
     let output = std::process::Command::new(binary())
         .args([
             "init",
-            "--profile",
-            "shared-checkout",
             "--s3-url",
             "s3://example.invalid/workspace",
             "--s3-endpoint-url",
@@ -504,7 +466,7 @@ fn object_version_adapter_and_engine_config_are_internal() {
         .unwrap();
     assert!(output.status.success());
     let public = std::fs::read_to_string(fixture.seed.join(".workspace-mgr.toml")).unwrap();
-    assert!(public.contains("[storage.s3]"));
+    assert!(public.contains("[s3]"));
     assert!(public.contains("url = \"s3://example.invalid/workspace\""));
     assert!(!public.contains("[dvc]"));
     assert!(!public.contains("require_version_aware"));

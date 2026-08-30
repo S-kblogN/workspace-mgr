@@ -2,15 +2,20 @@
 
 ## State boundaries
 
-`workspace-mgr` separates package defaults, tracked repository policy, scoped
-task state, and private runtime state. `.workspace-mgr.toml` contains public
-policy and non-secret locations. Task manifests contain identity, purpose,
+`workspace-mgr` separates fixed product policy, tracked repository facts,
+scoped task state, and private runtime state. `.workspace-mgr.toml` contains
+only non-secret Git and optional S3 locations. Task manifests contain identity, purpose,
 scope, and branch state. Deliverable manifests are tracked inside their task
 directories; infrastructure manifests and isolated worktrees live below the
 Git common directory. Private indexes and locks also live there. All
 mutating repository, placement, publication, hydration, and refresh operations
 share a repository lock; task and storage-boundary locks add narrower
 diagnostics.
+
+The task layout, branch prefix, shared-checkout behavior, storage threshold,
+instruction set, pull-request ownership, and merge authority are compiled
+product policy. They are intentionally absent from repository configuration so
+different repositories cannot drift into different management strategies.
 
 An explicit storage choice is recorded beside its path as workspace-mgr-owned
 metadata. This makes the choice reviewable and keeps independently active task

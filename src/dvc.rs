@@ -66,7 +66,7 @@ pub fn require_version_adapter(repo: &GitRepo) -> Result<String> {
 }
 
 pub fn render_internal_config(config: &Config) -> Result<Option<String>> {
-    let Some(s3) = &config.storage.s3 else {
+    let Some(s3) = &config.s3 else {
         return Ok(None);
     };
     let url = &s3.url;
@@ -76,7 +76,7 @@ pub fn render_internal_config(config: &Config) -> Result<Option<String>> {
     if let Some(endpoint) = &s3.endpoint_url {
         rendered.push_str(&format!("    endpointurl = {endpoint}\n"));
     }
-    if config.storage.requires_object_versioning() {
+    if config.requires_object_versioning() {
         rendered.push_str("    version_aware = true\n");
     }
     Ok(Some(rendered))
@@ -184,14 +184,14 @@ fn internal_config_path(repo: &GitRepo) -> Result<std::path::PathBuf> {
 }
 
 pub fn ensure_ready(repo: &GitRepo, config: &Config) -> Result<()> {
-    if !config.storage.s3_enabled() {
+    if !config.s3_enabled() {
         return Err(Error::message(
             "managed storage is not enabled in .workspace-mgr.toml",
         ));
     }
     require_runtime(repo)?;
     validate_internal_config(repo, config)?;
-    if config.storage.requires_object_versioning() {
+    if config.requires_object_versioning() {
         require_version_adapter(repo)?;
     }
     Ok(())
@@ -199,7 +199,7 @@ pub fn ensure_ready(repo: &GitRepo, config: &Config) -> Result<()> {
 
 pub fn verify_object_versioning(repo: &GitRepo, config: &Config) -> Result<serde_json::Value> {
     ensure_ready(repo, config)?;
-    if !config.storage.requires_object_versioning() {
+    if !config.requires_object_versioning() {
         return Ok(serde_json::json!({"mode": "not-required"}));
     }
     let python = storage_python();
@@ -387,10 +387,10 @@ pub fn reconcile(
     pointers: &[String],
     dry_run: bool,
 ) -> Result<DvcReport> {
-    if config.storage.s3_enabled() || !pointers.is_empty() {
+    if config.s3_enabled() || !pointers.is_empty() {
         ensure_ready(repo, config)?;
     }
-    if !pointers.is_empty() && config.storage.requires_object_versioning() {
+    if !pointers.is_empty() && config.requires_object_versioning() {
         verify_object_versioning(repo, config)?;
     }
     let outputs = output_paths(repo, pointers)?;
@@ -466,7 +466,7 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
     }
 
     ensure_ready(repo, config)?;
-    let exact = config.storage.requires_object_versioning();
+    let exact = config.requires_object_versioning();
     if exact {
         let python = storage_python();
         let serialized = serde_json::to_string(pointers).map_err(|error| {
@@ -521,7 +521,7 @@ pub fn hydrate(
     dry_run: bool,
 ) -> Result<HydrateReport> {
     ensure_ready(repo, config)?;
-    if config.storage.requires_object_versioning() {
+    if config.requires_object_versioning() {
         verify_object_versioning(repo, config)?;
     }
     let discovered = discover(repo, scopes)?;
@@ -839,7 +839,7 @@ pub fn prepare_revision(
     pointers: &[String],
 ) -> Result<PreparedRevision> {
     ensure_ready(repo, config)?;
-    if config.storage.requires_object_versioning() {
+    if config.requires_object_versioning() {
         verify_object_versioning(repo, config)?;
     }
     if pointers.is_empty() {

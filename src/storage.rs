@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::config::{Config, StorageDefault, StorageTarget};
+use crate::config::{Config, StorageTarget};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::manifest::{ResolvedTask, one_line};
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
+use crate::policy::{AUTO_S3_ABOVE_BYTES, TASK_MANIFEST_NAME};
 
 pub const PLACEMENT_SUFFIX: &str = ".workspace-mgr-storage.toml";
 const PLACEMENT_SCHEMA: u32 = 1;
@@ -82,9 +83,9 @@ pub fn set(
     let paths = validate_targets(repo, scopes, paths, true)?;
     validate_boundary_targets(repo, scopes, &paths)?;
     let reason = one_line(reason, "storage placement reason")?;
-    if target == StorageTarget::S3 && !config.storage.s3_enabled() {
+    if target == StorageTarget::S3 && !config.s3_enabled() {
         return Err(Error::message(
-            "cannot place content in S3 because [storage.s3] is not configured",
+            "cannot place content in S3 because [s3] is not configured",
         ));
     }
     if target == StorageTarget::S3 {
@@ -355,21 +356,15 @@ pub fn apply_automatic(
                 .metadata()
                 .map_err(|error| Error::message(error.to_string()))?
                 .len();
-            let target = match config.storage.default {
-                StorageDefault::Git => StorageTarget::Git,
-                StorageDefault::S3 => StorageTarget::S3,
-                StorageDefault::Auto => {
-                    if size > config.storage.auto_s3_above_bytes {
-                        StorageTarget::S3
-                    } else {
-                        StorageTarget::Git
-                    }
-                }
+            let target = if size > AUTO_S3_ABOVE_BYTES {
+                StorageTarget::S3
+            } else {
+                StorageTarget::Git
             };
             if target == StorageTarget::S3 {
-                if !config.storage.s3_enabled() {
+                if !config.s3_enabled() {
                     return Err(Error::message(format!(
-                        "automatic policy selected S3 for {path:?}, but [storage.s3] is not configured; configure S3 or run `workspace-mgr storage set {path} --to git --reason <reason>`"
+                        "automatic policy selected S3 for {path:?}, but [s3] is not configured; configure S3 or run `workspace-mgr storage set {path} --to git --reason <reason>`"
                     )));
                 }
                 candidates.push(path);
@@ -416,21 +411,15 @@ fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarg
 }
 
 fn automatic_target(repo: &GitRepo, config: &Config, path: &str) -> Result<StorageTarget> {
-    let target = match config.storage.default {
-        StorageDefault::Git => StorageTarget::Git,
-        StorageDefault::S3 => StorageTarget::S3,
-        StorageDefault::Auto => {
-            let metadata = fs::metadata(resolved_under(&repo.root, path)).at(path)?;
-            if metadata.is_file() && metadata.len() > config.storage.auto_s3_above_bytes {
-                StorageTarget::S3
-            } else {
-                StorageTarget::Git
-            }
-        }
+    let metadata = fs::metadata(resolved_under(&repo.root, path)).at(path)?;
+    let target = if metadata.is_file() && metadata.len() > AUTO_S3_ABOVE_BYTES {
+        StorageTarget::S3
+    } else {
+        StorageTarget::Git
     };
-    if target == StorageTarget::S3 && !config.storage.s3_enabled() {
+    if target == StorageTarget::S3 && !config.s3_enabled() {
         return Err(Error::message(format!(
-            "automatic policy selected S3 for {path:?}, but [storage.s3] is not configured"
+            "automatic policy selected S3 for {path:?}, but [s3] is not configured"
         )));
     }
     Ok(target)
@@ -528,19 +517,12 @@ fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Resul
     let task_path = scopes
         .iter()
         .find(|scope| {
-            resolved_under(
-                &repo.root,
-                &format!("{scope}/{}", config.tasks.manifest_name),
-            )
-            .is_file()
+            resolved_under(&repo.root, &format!("{scope}/{TASK_MANIFEST_NAME}")).is_file()
         })
         .or_else(|| scopes.first());
     let manifest = match task_path {
-        Some(task_path) => resolved_under(
-            &repo.root,
-            &format!("{task_path}/{}", config.tasks.manifest_name),
-        ),
-        None => match ResolvedTask::discover(repo, config, &repo.root) {
+        Some(task_path) => resolved_under(&repo.root, &format!("{task_path}/{TASK_MANIFEST_NAME}")),
+        None => match ResolvedTask::discover(repo, &repo.root) {
             Ok(path) => path,
             Err(_) => return Ok(None),
         },

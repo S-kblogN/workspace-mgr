@@ -5,7 +5,7 @@ use fs2::FileExt;
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init", "--profile", "shared-checkout"]);
+    workspace(&fixture.seed, ["init"]);
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();
     fixture
@@ -63,12 +63,6 @@ fn publishes_only_the_task_scope_without_switching_main() {
 #[test]
 fn published_git_placement_stays_stable_when_a_file_grows() {
     let fixture = managed_fixture();
-    let config_path = fixture.shared.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path).unwrap().replace(
-        "auto_s3_above_bytes = 10485760",
-        "auto_s3_above_bytes = 1024",
-    );
-    std::fs::write(config_path, config).unwrap();
     workspace(
         &fixture.shared,
         [
@@ -89,7 +83,7 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
     std::fs::write(&retained, vec![1_u8; 512]).unwrap();
     workspace(&task, ["publish", "-m", "Publish small Git file"]);
 
-    std::fs::write(&retained, vec![2_u8; 2048]).unwrap();
+    std::fs::write(&retained, vec![2_u8; 10_485_761]).unwrap();
     let status = workspace(
         &task,
         ["storage", "status", &format!("{task_id}/retained.bin")],
@@ -216,12 +210,6 @@ fn storage_status_uses_the_task_history_not_unrelated_branches() {
 #[test]
 fn explicit_git_directory_applies_recursively_and_status_lists_git_content() {
     let fixture = managed_fixture();
-    let config_path = fixture.shared.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path).unwrap().replace(
-        "auto_s3_above_bytes = 10485760",
-        "auto_s3_above_bytes = 1024",
-    );
-    std::fs::write(config_path, config).unwrap();
     workspace(
         &fixture.shared,
         [
@@ -240,7 +228,7 @@ fn explicit_git_directory_applies_recursively_and_status_lists_git_content() {
     let task = fixture.shared.join(task_id);
     let directory = task.join("reviewable");
     std::fs::create_dir(&directory).unwrap();
-    std::fs::write(directory.join("large.bin"), vec![3_u8; 2048]).unwrap();
+    std::fs::write(directory.join("large.bin"), vec![3_u8; 10_485_761]).unwrap();
     workspace(
         &task,
         [
@@ -447,13 +435,6 @@ fn refresh_preserves_working_tree_overlays() {
 #[test]
 fn rejects_unmanaged_large_files_and_nested_gitlinks() {
     let fixture = managed_fixture();
-    let config_path = fixture.shared.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path).unwrap().replace(
-        "auto_s3_above_bytes = 10485760",
-        "auto_s3_above_bytes = 1024",
-    );
-    std::fs::write(&config_path, config).unwrap();
-
     workspace(
         &fixture.shared,
         [
@@ -469,10 +450,10 @@ fn rejects_unmanaged_large_files_and_nested_gitlinks() {
         ],
     );
     let task = fixture.shared.join("20260829-170700-unsafe-artifacts");
-    std::fs::write(task.join("large.bin"), vec![0_u8; 2048]).unwrap();
+    std::fs::write(task.join("large.bin"), vec![0_u8; 10_485_761]).unwrap();
     let large = workspace_unchecked(&task, ["plan"]);
     assert_eq!(large.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&large.stderr).contains("[storage.s3] is not configured"));
+    assert!(String::from_utf8_lossy(&large.stderr).contains("[s3] is not configured"));
 
     let explicitly_git = workspace(
         &task,

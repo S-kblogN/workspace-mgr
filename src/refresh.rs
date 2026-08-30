@@ -58,11 +58,11 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let remote = options
         .remote
         .clone()
-        .unwrap_or_else(|| config.publication.remote.clone());
+        .unwrap_or_else(|| config.git.remote.clone());
     let branch = options
         .branch
         .clone()
-        .unwrap_or_else(|| config.publication.shared_checkout_branch.clone());
+        .unwrap_or_else(|| config.git.branch.clone());
     repo.validate_remote_name(&remote)?;
     repo.validate_branch(&branch)?;
     let head = repo.current_branch()?;

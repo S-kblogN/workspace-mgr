@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, SCHEMA_VERSION};
+use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::repo_path;
+use crate::policy::{TASK_BRANCH_PREFIX, TASK_MANIFEST_NAME};
 
 pub const INFRASTRUCTURE_MANIFEST_NAME: &str = "workspace-mgr/task.toml";
+pub const TASK_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -76,10 +78,10 @@ impl ResolvedTask {
             path: absolute.clone(),
             source,
         })?;
-        if manifest.schema_version != SCHEMA_VERSION {
+        if manifest.schema_version != TASK_SCHEMA_VERSION {
             return Err(Error::message(format!(
                 "unsupported task schema {}, expected {}",
-                manifest.schema_version, SCHEMA_VERSION
+                manifest.schema_version, TASK_SCHEMA_VERSION
             )));
         }
         let task_id = one_line(&manifest.id, "task id")?;
@@ -101,7 +103,7 @@ impl ResolvedTask {
                         "task id must match task path {task_path:?}; got {task_id:?}"
                     )));
                 }
-                let expected = repo.root.join(&task_path).join(&config.tasks.manifest_name);
+                let expected = repo.root.join(&task_path).join(TASK_MANIFEST_NAME);
                 if absolute != expected {
                     return Err(Error::message(format!(
                         "deliverable task manifest must be located at {}; got {}",
@@ -133,12 +135,18 @@ impl ResolvedTask {
                 None
             }
         };
+        let branch = one_line(&manifest.branch, "task branch")?;
+        if !branch.starts_with(TASK_BRANCH_PREFIX) {
+            return Err(Error::message(format!(
+                "task branch must use the fixed {TASK_BRANCH_PREFIX:?} prefix"
+            )));
+        }
         Ok(Self {
             manifest_path: absolute,
             kind: manifest.kind,
             task_id,
             task_path,
-            branch: one_line(&manifest.branch, "task branch")?,
+            branch,
             title: manifest
                 .title
                 .map(|value| one_line(&value, "task title"))
@@ -147,14 +155,14 @@ impl ResolvedTask {
                 .purpose
                 .map(|value| one_line(&value, "task purpose"))
                 .transpose()?,
-            remote: config.publication.remote.clone(),
-            base_branch: config.publication.base_branch.clone(),
-            shared_head: config.publication.shared_checkout_branch.clone(),
+            remote: config.git.remote.clone(),
+            base_branch: config.git.branch.clone(),
+            shared_head: config.git.branch.clone(),
             additional_scopes,
         })
     }
 
-    pub fn discover(repo: &GitRepo, config: &Config, start: &Path) -> Result<PathBuf> {
+    pub fn discover(repo: &GitRepo, start: &Path) -> Result<PathBuf> {
         let mut current = if start.is_dir() {
             start.canonicalize().map_err(|source| Error::Io {
                 path: start.to_path_buf(),
@@ -171,7 +179,7 @@ impl ResolvedTask {
                 })?
         };
         loop {
-            let candidate = current.join(&config.tasks.manifest_name);
+            let candidate = current.join(TASK_MANIFEST_NAME);
             if candidate.is_file() {
                 return Ok(candidate);
             }

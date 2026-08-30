@@ -28,6 +28,12 @@ content, publish a reviewable result, and coexist with other chats. It is not
 the subject of the user's work; it is the mechanism that keeps the workspace
 safe and understandable while the agent carries out that work.
 
+The product applies the same management strategy to every initialized
+repository. Repositories provide different Git and optional S3 locations, but
+they do not select different task layouts, storage thresholds, review models,
+or agent responsibilities. This makes behavior portable: a user and agent can
+move between managed repositories without relearning their operating contract.
+
 A chat that remains purely conversational or read-only does not need to create
 repository state. As soon as a chat needs to create, change, download,
 generate, or retain files, it becomes a writable conversation and owns exactly
@@ -79,10 +85,8 @@ timestamped repository task directory, and an explicitly declared scope of
 shared policy, root entrypoints, CI, or other repository-wide mechanisms.
 Infrastructure is a kind of task, not a bypass around task ownership.
 
-The draft-pull-request relationship is the default review model. A repository
-may explicitly disable that hosting requirement; the conversation, task, and
-target branch remain one-to-one, and the effective repository instructions say
-whether a pull request is required.
+The draft-pull-request relationship is the review model for every managed
+repository. It is part of the product strategy, not a per-repository option.
 
 ## Where task content lives
 
@@ -136,13 +140,12 @@ remote revision. The Git revision is the publication point for the combined
 state: a published branch must never refer to missing S3 content.
 
 Publishing makes the target branch ready for review; it does not merge it. The
-actor selected by repository review policy maintains the corresponding pull
-request through the repository's hosting workflow. `workspace-mgr` does not
+agent maintains the corresponding pull request through the repository's hosting
+workflow. `workspace-mgr` does not
 create, edit, approve, or merge that pull request through a hosting-provider
 API. Merging remains an explicit authorized action.
 
-When repository policy assigns review management to the agent, the agent must
-query by head branch after the first successful publish, reuse an existing open
+The agent must query by head branch after the first successful publish, reuse an existing open
 pull request or create exactly one, and never create a duplicate. It owns the
 title and living description and updates them whenever the goal, scope,
 deliverables, validation, or known limitations materially change. It then
@@ -163,7 +166,7 @@ history is outside normal workspace management.
 
 ## How multiple chats share the workspace
 
-In the shared-checkout profile, the checkout remains on its shared branch while
+The checkout remains on its shared branch while
 multiple chats may have independent task directories and working-tree overlays.
 A task publishes to its own branch without checking that branch out and without
 staging paths owned by other tasks in the shared Git index.
@@ -198,7 +201,7 @@ The complete story is:
 10. `refresh` brings the merged result into the shared workspace without
     disturbing other active chats.
 
-`config show` reports the effective repository policy, and `doctor` diagnoses
+`config show` reports the repository's Git and S3 facts, and `doctor` diagnoses
 the CLI, repository, Git, and storage environment without changing repository
 state.
 

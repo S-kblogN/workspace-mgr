@@ -1,84 +1,80 @@
 # Configuration reference
 
-Repository policy lives in `.workspace-mgr.toml` at the Git root. Unknown fields
-and unsupported schema versions are rejected.
+`.workspace-mgr.toml` describes the external facts that differ between
+repositories. It does not select a workspace-management strategy.
+`workspace-mgr` applies one product-owned strategy to every initialized
+repository, so policy changes ship as tested CLI releases rather than per-repo
+configuration switches.
+
+The complete public schema is:
 
 ```toml
-schema_version = 1
-required_cli = ">=0.1.0-alpha.1,<0.2.0"
-profile = "shared-checkout"
-
-[publication]
+[git]
 remote = "origin"
-base_branch = "main"
-shared_checkout_branch = "main"
-branch_prefix = "codex/"
+branch = "main"
 
-[tasks]
-enabled = true
-directory_pattern = "%Y%m%d-%H%M%S-{slug}"
-manifest_name = ".workspace-mgr-task.toml"
-require_readme = true
-
-[review]
-pull_request = "required"
-initial_state = "draft"
-managed_by = "agent"
-merge_authority = "user"
-
-[storage]
-default = "auto"
-auto_s3_above_bytes = 10485760
-
-[storage.s3]
+[s3]
 url = "s3://example-bucket/workspace"
 endpoint_url = "https://s3.example.invalid"
-
-[agent]
-modules = [
-  "scope",
-  "shared-checkout",
-  "publication",
-  "artifact-hygiene",
-  "storage",
-]
 ```
 
-## Publication
+`[git]` is always present. `[s3]` is optional. Unknown fields are rejected so a
+repository cannot silently invent or retain policy knobs that the product does
+not support.
 
-`publication` identifies where task branches are published and which branch a
-shared checkout must keep mounted. Repository URLs are discovered through the
-named Git remote; they are never compiled into the binary. `remote` must be a
-safe Git remote name, not a URL or command-line option.
+## Git facts
 
-## Storage
+`git.remote` names the Git remote used for publication and refresh.
+`git.branch` names the shared and base branch. Repository URLs are discovered
+through the named remote; they are never compiled into the binary or copied
+into this file. The remote must be a safe Git remote name rather than a URL or
+command-line option.
 
-`storage.default` is `auto`, `git`, or `s3`. In `auto`, an unplaced new file
-larger than `auto_s3_above_bytes` is placed in S3 and a smaller file is placed in
-Git. Published placement is sticky. An explicit per-path choice made with
-`storage set` overrides the default until `storage reset`.
+## S3 facts
 
-`[storage.s3]` enables S3 and `url` must use `s3://`. It has one fixed product contract:
-bucket object versioning is required and exact version IDs are verified before
-Git publication. There is no configuration switch that weakens this guarantee.
-`endpoint_url` supports S3-compatible services.
+Adding `[s3]` enables S3 placement. `url` must use `s3://` in release builds.
+`endpoint_url` is optional and supports S3-compatible services.
 
-URL userinfo, queries, and fragments are rejected so tracked locations cannot
-carry credentials or signed URLs. Authentication belongs in ignored local
-configuration or platform-standard identity and environment mechanisms.
+S3 has one fixed product contract: bucket object versioning is required and
+exact object version IDs are verified before Git publication. There is no
+configuration switch that weakens this guarantee. URL userinfo, queries, and
+fragments are rejected so tracked locations cannot carry credentials or signed
+URLs. Authentication belongs in ignored local configuration or
+platform-standard identity and environment mechanisms.
 
-`workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes this public
-configuration and deterministically generates the private engine configuration.
-Every S3 operation rejects drift in that derived file. Users and agents should
-edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
+`workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes these
+public facts and deterministically generates the private storage-engine
+configuration. Every S3 operation rejects drift in that derived file. Users and
+agents should edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
 
-`required_cli` is enforced by every repository operation. `doctor` remains able
-to load an incompatible configuration so it can report the required and
-installed versions without mutating the repository.
+## Fixed workspace policy
 
-## Tasks
+The following behavior is deliberately not configurable:
 
-Task manifests contain task-specific state only:
+- one writable conversation maps to one task, one `codex/` branch, and one
+  draft pull request;
+- deliverable tasks use timestamped top-level directories, a README, and
+  `.workspace-mgr-task.toml`;
+- shared repository changes use an infrastructure task in an isolated
+  worktree;
+- the shared checkout remains on `git.branch` and preserves unrelated overlays;
+- new retained content above 10 MiB goes to S3 automatically and smaller
+  content goes to Git, while published or explicitly selected placement stays
+  sticky;
+- the agent creates and maintains the pull request title and living
+  description;
+- the user or maintainer controls merge, ready, approval, close, and auto-merge
+  transitions;
+- all instruction topics are always available, and Git/S3 are the only public
+  storage concepts.
+
+Users may still explicitly select Git or S3 for a path, authorize an additional
+scope, or request a narrow exceptional action. Those are task-level decisions,
+not alternate repository strategies.
+
+## Task manifests
+
+Task manifests contain task-specific state rather than repository policy:
 
 ```toml
 schema_version = 1
@@ -96,40 +92,5 @@ reason = "The user explicitly requested this shared documentation change"
 
 An infrastructure manifest uses `kind = "infrastructure"`, omits `path`, and
 requires at least one `additional_scopes` entry. It is stored in private
-worktree Git state rather than committed to the repository.
-
-`require_readme` is checked for deliverable tasks before publication.
-Infrastructure task metadata is private Git worktree state and has no README or
-timestamped repository directory.
-
-## Review
-
-`review.pull_request` is `required`, `optional`, or `disabled`.
-`initial_state` is `draft` or `ready`; `managed_by` is `agent` or `user`; and
-`merge_authority` is `user` or `agent`. The defaults require the agent to create
-and maintain exactly one draft pull request while reserving merge-state actions
-for the user. These values generate an explicit agent responsibility contract
-and a structured publication handoff. They never make `workspace-mgr` call a
-GitHub or other hosting-provider API.
-
-## Agent instruction modules
-
-`[agent].modules` controls the generated policy returned by
-`workspace-mgr instructions`. The canonical workspace model and operating core
-are always included in the default `all` document and are not module-controlled;
-`instructions model` returns the model by itself. Supported optional modules are:
-
-| Module | Instruction topic | Policy added |
-| --- | --- | --- |
-| `scope` | `task` | Task creation, manifest scope, and README rules |
-| `publication` | `publish` | Planning, branch publication, and review handoff |
-| `artifact-hygiene` | `artifacts` | Nested repositories, generated output, credentials, and retained artifacts |
-| `storage` | `storage` | Git/S3 placement and hydration rules |
-| `shared-checkout` | `shared-checkout` | Overlay preservation and post-merge refresh |
-| `infrastructure` | `infrastructure` | Isolation and test rules for shared repository mechanisms |
-
-The default module set includes scope, publication, artifact hygiene, and
-storage. `shared-checkout` is added by `init --profile shared-checkout`.
-Infrastructure policy is opt-in. Unknown and duplicate module names are
-rejected. Requesting a topic whose module is disabled is also rejected, so an
-agent cannot mistake an empty document for effective policy.
+worktree Git state rather than committed to the repository. The manifest schema
+version describes serialized task state; it is not a strategy selector.

@@ -40,13 +40,11 @@ Initialize a repository or reconcile its managed scaffolding.
 
 ```text
 workspace-mgr init [--repo <path>]
-  [--profile standard|shared-checkout]
   [--s3-url <url> [--s3-endpoint-url <url>]]
   [--dry-run]
 ```
 
-`--profile` selects defaults only when creating a new configuration. `--s3-url`
-must use `s3://` and is a tracked, non-secret storage location; userinfo,
+`--s3-url` must use `s3://` and is a tracked, non-secret storage location; userinfo,
 queries, fragments, and other credential-bearing URL forms are rejected.
 Re-running `init` validates public configuration and deterministically repairs
 managed internal storage scaffolding. It never overwrites an existing unmanaged
@@ -54,8 +52,8 @@ managed internal storage scaffolding. It never overwrites an existing unmanaged
 writes a remote.
 
 ```sh
-workspace-mgr init --profile standard
-workspace-mgr init --profile shared-checkout \
+workspace-mgr init
+workspace-mgr init \
   --s3-url s3://example-bucket/workspace
 workspace-mgr init --dry-run
 ```
@@ -71,10 +69,9 @@ workspace-mgr instructions [all|model|core|task|publish|artifacts|storage|shared
 
 With no topic, `all` is used. It renders the canonical workspace model first,
 then the effective operational rules. `model` returns only that
-shared conceptual document. The output includes a CLI version, schema version,
-topic, and policy hash. `core` and `model` are always available. Other topics
-require their corresponding `[agent].modules` entry; requesting a disabled
-topic is an error. Repository-specific additions are appended only to `all`.
+shared conceptual document. The output includes a CLI version, product policy
+version, topic, and policy hash. Every topic is always available.
+Repository-specific additions are appended only to `all`.
 
 ```sh
 workspace-mgr instructions
@@ -85,7 +82,7 @@ workspace-mgr --format json instructions publish
 
 ## `workspace-mgr doctor`
 
-Diagnose the CLI version constraint, repository configuration, Git state, and
+Diagnose the repository configuration, Git state, and
 required private execution engines.
 
 ```text
@@ -115,7 +112,7 @@ Create one deliverable workspace or repository-infrastructure workspace.
 workspace-mgr task create <slug> --title <title> --purpose <purpose>
   [--kind deliverable|infrastructure]
   [--scope <path>... --scope-note <reason>]
-  [--branch <branch>] [--repo <path>] [--dry-run]
+  [--repo <path>] [--dry-run]
 ```
 
 The slug is lowercase kebab case. The default `deliverable` kind creates a
@@ -132,7 +129,7 @@ workspace-mgr task create training-report \
   --title "Training report" \
   --purpose "Produce the final training report"
 workspace-mgr task create urgent-fix --title "Urgent fix" \
-  --purpose "Repair the release input" --branch review/urgent-fix --dry-run
+  --purpose "Repair the release input" --dry-run
 workspace-mgr task create shared-policy --kind infrastructure \
   --title "Shared policy" --purpose "Update repository-wide policy" \
   --scope AGENTS.md --scope .github/workflows/ci.yml \
@@ -317,7 +314,7 @@ workspace-mgr refresh [--repo <path>]
   [--remote <remote>] [--branch <branch>] [--dry-run]
 ```
 
-Defaults come from `[publication]`. The checkout must be on the selected branch,
+Defaults come from `[git]`. The checkout must be on the selected branch,
 the shared index must have no staged or unresolved entries, and the remote
 revision must be a fast-forward. Refresh preserves unrelated working-tree
 overlays, materializes safe ordinary Git additions, modifications, and

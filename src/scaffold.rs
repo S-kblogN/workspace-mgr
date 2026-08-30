@@ -4,22 +4,23 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::Serialize;
 
-use crate::config::{CONFIG_NAME, Config, Profile, S3Config, SCHEMA_VERSION};
+use crate::config::{CONFIG_NAME, Config, S3Config};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::instructions::BOOTSTRAP;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    AdditionalScope, INFRASTRUCTURE_MANIFEST_NAME, TaskKind, TaskManifest, one_line,
+    AdditionalScope, INFRASTRUCTURE_MANIFEST_NAME, TASK_SCHEMA_VERSION, TaskKind, TaskManifest,
+    one_line,
 };
 use crate::path::{reject_symlink_traversal, repo_path};
+use crate::policy::{TASK_BRANCH_PREFIX, TASK_DIRECTORY_PATTERN, TASK_MANIFEST_NAME};
 use crate::process::run;
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
     pub repo: PathBuf,
-    pub profile: Profile,
     pub s3_url: Option<String>,
     pub s3_endpoint_url: Option<String>,
     pub dry_run: bool,
@@ -64,18 +65,18 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     let mut config = if existing_config {
         Config::load_compatible(&repo)?
     } else {
-        let mut config = Config::defaults(options.profile);
+        let mut config = Config::default();
         detect_git_defaults(&repo, &mut config)?;
         config
     };
     if let Some(url) = &options.s3_url {
-        config.storage.s3 = Some(S3Config {
+        config.s3 = Some(S3Config {
             url: url.clone(),
             endpoint_url: options.s3_endpoint_url.clone(),
         });
     }
     config.validate()?;
-    repo.validate_remote_name(&config.publication.remote)?;
+    repo.validate_remote_name(&config.git.remote)?;
 
     let rendered = config.render()?;
     let config_changed = fs::read_to_string(&config_path).ok().as_deref() != Some(&rendered);
@@ -83,7 +84,7 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         actions.push(InitAction {
             action: if existing_config { "update" } else { "create" }.to_owned(),
             path: CONFIG_NAME.to_owned(),
-            detail: "repository policy configuration".to_owned(),
+            detail: "repository Git and S3 facts".to_owned(),
         });
     }
 
@@ -107,9 +108,9 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     let mut initialize_storage_engine = false;
     let mut attributes_changed = false;
     let mut remove_storage_config = false;
-    if config.storage.s3_enabled() {
+    if config.s3_enabled() {
         dvc::require_runtime(&repo)?;
-        if config.storage.requires_object_versioning() {
+        if config.requires_object_versioning() {
             dvc::require_version_adapter(&repo)?;
         }
         dvc::validate_internal_config_ownership(&repo)?;
@@ -124,7 +125,7 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         if let Some(rendered) = dvc::render_internal_config(&config)? {
             let internal_path = repo.root.join(".dvc/config");
             if fs::read_to_string(&internal_path).ok().as_deref() != Some(&rendered) {
-                let versioning = if config.storage.requires_object_versioning() {
+                let versioning = if config.requires_object_versioning() {
                     " with exact object-version verification"
                 } else {
                     ""
@@ -173,7 +174,7 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
             if install_bootstrap {
                 atomic_write(&agents_path, BOOTSTRAP)?;
             }
-            if config.storage.s3_enabled() {
+            if config.s3_enabled() {
                 if initialize_storage_engine {
                     run(&dvc::dvc_program(), ["init"], &repo.root)?;
                 }
@@ -224,11 +225,11 @@ fn detect_git_defaults(repo: &GitRepo, config: &mut Config) -> Result<()> {
         .filter(|line| !line.trim().is_empty())
         .collect();
     if remote_names.contains(&"origin") {
-        config.publication.remote = "origin".to_owned();
+        config.git.remote = "origin".to_owned();
     } else if let Some(remote) = remote_names.first() {
-        config.publication.remote = (*remote).to_owned();
+        config.git.remote = (*remote).to_owned();
     }
-    let remote_head = format!("refs/remotes/{}/HEAD", config.publication.remote);
+    let remote_head = format!("refs/remotes/{}/HEAD", config.git.remote);
     let symbolic = repo.run_unchecked(["symbolic-ref", "--quiet", "--short", &remote_head])?;
     let branch = if symbolic.success() {
         symbolic
@@ -240,8 +241,7 @@ fn detect_git_defaults(repo: &GitRepo, config: &mut Config) -> Result<()> {
         repo.current_branch()?
     };
     if let Some(branch) = branch {
-        config.publication.base_branch.clone_from(&branch);
-        config.publication.shared_checkout_branch = branch;
+        config.git.branch = branch;
     }
     Ok(())
 }
@@ -255,7 +255,6 @@ pub struct TaskCreateOptions {
     pub kind: TaskKind,
     pub scopes: Vec<String>,
     pub scope_note: Option<String>,
-    pub branch: Option<String>,
     pub timestamp: Option<String>,
     pub dry_run: bool,
 }
@@ -279,12 +278,7 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
     let repo = GitRepo::discover(&options.repo)?;
     let _repository_lock = RepositoryLock::acquire(&repo)?;
     let config = Config::load_compatible(&repo)?;
-    repo.validate_remote_name(&config.publication.remote)?;
-    if !config.tasks.enabled {
-        return Err(Error::message(
-            "task scaffolding is disabled by repository config",
-        ));
-    }
+    repo.validate_remote_name(&config.git.remote)?;
     let additional_scopes = create_scopes(options)?;
     let (task_id, task_dir) = match options.kind {
         TaskKind::Deliverable => {
@@ -292,14 +286,12 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
                 Some(value) => validate_timestamp(value)?,
                 None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
             };
-            let pattern = config
-                .tasks
-                .directory_pattern
+            let pattern = TASK_DIRECTORY_PATTERN
                 .replace("%Y%m%d-%H%M%S", &timestamp)
                 .replace("{slug}", &options.slug);
             if pattern.contains('%') {
                 return Err(Error::message(
-                    "tasks.directory_pattern contains unsupported chrono directives; use %Y%m%d-%H%M%S and {slug}",
+                    "the fixed task directory pattern contains unsupported chrono directives",
                 ));
             }
             let task_id = repo_path(&pattern, "generated task directory")?;
@@ -340,23 +332,16 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             (task_id, checkout)
         }
     };
-    let branch = options
-        .branch
-        .clone()
-        .unwrap_or_else(|| match options.kind {
-            TaskKind::Deliverable => {
-                format!("{}{}", config.publication.branch_prefix, options.slug)
-            }
-            TaskKind::Infrastructure => {
-                format!("{}infra-{}", config.publication.branch_prefix, options.slug)
-            }
-        });
+    let branch = match options.kind {
+        TaskKind::Deliverable => format!("{}{}", TASK_BRANCH_PREFIX, options.slug),
+        TaskKind::Infrastructure => format!("{}infra-{}", TASK_BRANCH_PREFIX, options.slug),
+    };
     repo.validate_branch(&branch)?;
     if repo
         .optional_oid(&format!("refs/heads/{branch}"))?
         .is_some()
         || repo
-            .remote_branch_oid(&config.publication.remote, &branch)?
+            .remote_branch_oid(&config.git.remote, &branch)?
             .is_some()
     {
         return Err(Error::message(format!(
@@ -364,18 +349,18 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         )));
     }
     let base_oid = if options.dry_run {
-        repo.remote_branch_oid(&config.publication.remote, &config.publication.base_branch)?
+        repo.remote_branch_oid(&config.git.remote, &config.git.branch)?
             .ok_or_else(|| {
                 Error::message(format!(
                     "remote base branch does not exist: {}/{}",
-                    config.publication.remote, config.publication.base_branch
+                    config.git.remote, config.git.branch
                 ))
             })?
     } else {
-        repo.fetch_branch(&config.publication.remote, &config.publication.base_branch)?
+        repo.fetch_branch(&config.git.remote, &config.git.branch)?
     };
     let manifest = TaskManifest {
-        schema_version: SCHEMA_VERSION,
+        schema_version: TASK_SCHEMA_VERSION,
         kind: options.kind,
         id: task_id.clone(),
         path: (options.kind == TaskKind::Deliverable).then(|| task_id.clone()),
@@ -386,16 +371,16 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
     };
     let readme = format!(
         "# {}\n\n{}\n\n## Directory map\n\n- `README.md` describes this task and its retained outputs.\n- `{}` declares the task scope and target branch.\n",
-        title, purpose, config.tasks.manifest_name
+        title, purpose, TASK_MANIFEST_NAME
     );
     let mut manifest_path = match options.kind {
-        TaskKind::Deliverable => task_dir.join(&config.tasks.manifest_name),
+        TaskKind::Deliverable => task_dir.join(TASK_MANIFEST_NAME),
         TaskKind::Infrastructure => task_dir.join("<private-git-state>/task.toml"),
     };
     let files = match options.kind {
         TaskKind::Deliverable => vec![
             format!("{task_id}/README.md"),
-            format!("{task_id}/{}", config.tasks.manifest_name),
+            format!("{task_id}/{TASK_MANIFEST_NAME}"),
         ],
         TaskKind::Infrastructure => Vec::new(),
     };
@@ -410,7 +395,7 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         ])?;
         let created = match options.kind {
             TaskKind::Deliverable => {
-                write_task_files(&task_dir, &config.tasks.manifest_name, &readme, &manifest)
+                write_task_files(&task_dir, TASK_MANIFEST_NAME, &readme, &manifest)
             }
             TaskKind::Infrastructure => {
                 create_infrastructure_worktree(&repo, &task_dir, &branch, &manifest)
