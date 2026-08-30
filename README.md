@@ -67,6 +67,12 @@ Integration tests create isolated temporary Git repositories and local
 filesystem DVC remotes. They do not read user DVC configuration or cloud
 credentials.
 
+GitHub Actions also runs a system-level E2E lifecycle against a versioned local
+S3-compatible service and a bare repository served over the Git network
+protocol. It checks every public command, critical failure ordering, exact
+remote refs and trees, S3 object versions, cache-independent hydration, and
+shared-checkout behavior. See [tests/e2e/README.md](tests/e2e/README.md).
+
 ## License
 
 MIT

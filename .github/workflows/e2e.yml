@@ -1,0 +1,91 @@
+name: End-to-end
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  system:
+    name: MinIO S3 and network Git lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MINIO_ENDPOINT: http://127.0.0.1:9000
+      MINIO_BUCKET: workspace-mgr-e2e
+      MINIO_ROOT_USER: workspace-mgr-e2e
+      MINIO_ROOT_PASSWORD: workspace-mgr-e2e-secret
+      AWS_ACCESS_KEY_ID: workspace-mgr-e2e
+      AWS_SECRET_ACCESS_KEY: workspace-mgr-e2e-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      DVC_NO_ANALYTICS: "true"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install S3-enabled DVC
+        run: python -m pip install --disable-pip-version-check "dvc[s3]==3.67.1"
+      - name: Check external commands
+        run: |
+          git --version
+          git lfs version
+          dvc version
+          docker version
+      - name: Start versioned S3-compatible service
+        run: |
+          docker run --detach --rm \
+            --name workspace-mgr-e2e-minio \
+            --publish 127.0.0.1:9000:9000 \
+            --env MINIO_ROOT_USER \
+            --env MINIO_ROOT_PASSWORD \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z \
+            server /data --address :9000
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            echo "Waiting for MinIO (${attempt}/60)"
+            sleep 1
+          done
+          docker logs workspace-mgr-e2e-minio
+          exit 1
+      - name: Build workspace-mgr
+        run: cargo build --locked
+      - name: Run comprehensive system lifecycle
+        env:
+          WORKSPACE_MGR_BIN: ${{ github.workspace }}/target/debug/workspace-mgr
+          WORKSPACE_MGR_E2E_ROOT: ${{ runner.temp }}/workspace-mgr-e2e
+        run: python tests/e2e/run.py
+      - name: Capture MinIO log
+        if: always()
+        run: |
+          evidence_root="${RUNNER_TEMP}/workspace-mgr-e2e"
+          mkdir -p "${evidence_root}"
+          docker logs workspace-mgr-e2e-minio >"${evidence_root}/minio.log" 2>&1 || true
+      - name: Upload E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: workspace-mgr-e2e-evidence
+          path: ${{ runner.temp }}/workspace-mgr-e2e/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Stop virtual S3 service
+        if: always()
+        run: docker rm --force workspace-mgr-e2e-minio >/dev/null 2>&1 || true
