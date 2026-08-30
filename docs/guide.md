@@ -32,7 +32,7 @@ Setup uses an isolated user data directory and verifies the exact private
 storage runtime. `workspace-mgr setup --dry-run` reports the intended location
 and actions without changing the host.
 
-### 2. Initialize or adopt a repository
+### 2. Initialize a repository
 
 Run `init` once from the Git repository:
 
@@ -48,10 +48,11 @@ Initialization creates:
 - a thin `AGENTS.md` bootstrap;
 - internal storage scaffolding when S3 is configured.
 
-If `AGENTS.md` already contains repository rules, `init` refuses to overwrite
-it. Review the file, then use `init --adopt` to preserve it as
-`.workspace-mgr/instructions/repository.md` and install the thin bootstrap.
-`--dry-run` reports every planned action without writing files.
+`init` refuses to overwrite an existing unmanaged `AGENTS.md` or internal
+storage configuration. Repository-specific additions may be maintained in
+`.workspace-mgr/instructions/repository.md`; `init` does not import existing
+files into that module. `--dry-run` reports every planned action without writing
+files.
 
 Use the `standard` profile for an ordinary checkout. Use `shared-checkout` when
 multiple tasks may leave independent working-tree overlays in one checkout

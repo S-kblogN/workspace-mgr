@@ -42,20 +42,20 @@ Initialize a repository or reconcile its managed scaffolding.
 workspace-mgr init [--repo <path>]
   [--profile standard|shared-checkout]
   [--s3-url <url> [--s3-endpoint-url <url>]]
-  [--adopt] [--dry-run]
+  [--dry-run]
 ```
 
 `--profile` selects defaults only when creating a new configuration. `--s3-url`
 must use `s3://` and is a tracked, non-secret storage location; userinfo,
 queries, fragments, and other credential-bearing URL forms are rejected.
-`--adopt` preserves an existing unmanaged `AGENTS.md` as a repository
-instruction module before replacing it with the bootstrap. Re-running `init`
-validates public configuration and deterministically repairs internal storage
-scaffolding. This command never contacts or writes a remote.
+Re-running `init` validates public configuration and deterministically repairs
+managed internal storage scaffolding. It never overwrites an existing unmanaged
+`AGENTS.md` or internal storage configuration. This command never contacts or
+writes a remote.
 
 ```sh
 workspace-mgr init --profile standard
-workspace-mgr init --profile shared-checkout --adopt \
+workspace-mgr init --profile shared-checkout \
   --s3-url s3://example-bucket/workspace
 workspace-mgr init --dry-run
 ```

@@ -244,7 +244,7 @@ fn concurrent_runtime_install_is_rejected_before_provisioning() {
 }
 
 #[test]
-fn adopt_preserves_existing_agents_as_a_module() {
+fn init_refuses_to_overwrite_unmanaged_agents() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
     std::fs::write(
@@ -255,18 +255,11 @@ fn adopt_preserves_existing_agents_as_a_module() {
 
     let rejected = workspace_unchecked(&fixture.shared, ["init"]);
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--adopt"));
-
-    workspace(&fixture.shared, ["init", "--adopt"]);
-    let module = std::fs::read_to_string(
-        fixture
-            .shared
-            .join(".workspace-mgr/instructions/repository.md"),
-    )
-    .unwrap();
-    assert!(module.contains("Keep this rule"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("will not be overwritten"));
     let agents = std::fs::read_to_string(fixture.shared.join("AGENTS.md")).unwrap();
-    assert!(agents.contains("workspace-mgr instructions"));
+    assert_eq!(agents, "# Existing policy\n\n- Keep this rule.\n");
+    assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+    assert!(!fixture.shared.join(".workspace-mgr").exists());
 }
 
 #[test]

@@ -83,7 +83,6 @@ fn documented_command_shapes_are_accepted_by_clap() {
             "s3://example-bucket/workspace",
             "--s3-endpoint-url",
             "https://s3.example.invalid",
-            "--adopt",
             "--dry-run",
         ],
         &["instructions"],

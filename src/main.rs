@@ -41,7 +41,6 @@ fn run(cli: Cli) -> Result<()> {
                 profile: args.profile,
                 s3_url: args.s3_url,
                 s3_endpoint_url: args.s3_endpoint_url,
-                adopt: args.adopt,
                 dry_run: args.dry_run,
             })?;
             emit(&report, cli.format)

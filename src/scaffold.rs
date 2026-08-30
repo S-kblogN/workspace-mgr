@@ -20,7 +20,6 @@ pub struct InitOptions {
     pub profile: Profile,
     pub s3_url: Option<String>,
     pub s3_endpoint_url: Option<String>,
-    pub adopt: bool,
     pub dry_run: bool,
 }
 
@@ -48,7 +47,6 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     for path in [
         CONFIG_NAME,
         "AGENTS.md",
-        ".workspace-mgr/instructions/repository.md",
         ".dvc",
         ".dvc/config",
         ".dvc/.gitignore",
@@ -87,48 +85,13 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         });
     }
 
-    let mut adopted_module = None;
     let mut install_bootstrap = false;
     if agents_path.is_file() {
         let existing = fs::read_to_string(&agents_path).at(&agents_path)?;
         if existing != BOOTSTRAP {
-            if !options.adopt {
-                return Err(Error::message(
-                    "AGENTS.md already contains unmanaged instructions; rerun with --adopt to preserve them as a repository instruction module",
-                ));
-            }
-            let module = repo.root.join(".workspace-mgr/instructions/repository.md");
-            if module.exists() {
-                if !module.is_file() {
-                    return Err(Error::message(format!(
-                        "repository instruction module is not a regular file: {}",
-                        module.display()
-                    )));
-                }
-                let preserved = fs::read_to_string(&module).at(&module)?;
-                if preserved != existing {
-                    return Err(Error::message(
-                        "AGENTS.md and the existing repository instruction module differ; merge them explicitly before rerunning init --adopt",
-                    ));
-                }
-            }
-            actions.push(InitAction {
-                action: if module.exists() {
-                    "preserve"
-                } else {
-                    "create"
-                }
-                .to_owned(),
-                path: ".workspace-mgr/instructions/repository.md".to_owned(),
-                detail: "preserve the previous AGENTS.md as a tracked repository module".to_owned(),
-            });
-            actions.push(InitAction {
-                action: "replace".to_owned(),
-                path: "AGENTS.md".to_owned(),
-                detail: "install the workspace-mgr bootstrap".to_owned(),
-            });
-            adopted_module = Some((module, existing));
-            install_bootstrap = true;
+            return Err(Error::message(
+                "existing AGENTS.md is not managed by workspace-mgr and will not be overwritten; resolve it explicitly before rerunning init",
+            ));
         }
     } else {
         actions.push(InitAction {
@@ -204,11 +167,6 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         let applied: Result<()> = (|| {
             if config_changed {
                 atomic_write(&config_path, &rendered)?;
-            }
-            if let Some((module, existing)) = &adopted_module {
-                if !module.exists() {
-                    atomic_write(module, existing)?;
-                }
             }
             if install_bootstrap {
                 atomic_write(&agents_path, BOOTSTRAP)?;
@@ -527,7 +485,6 @@ impl ScaffoldSnapshot {
         let relative_paths = [
             CONFIG_NAME,
             "AGENTS.md",
-            ".workspace-mgr/instructions/repository.md",
             ".dvc/config",
             ".dvc/.gitignore",
             ".dvcignore",

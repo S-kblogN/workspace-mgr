@@ -115,7 +115,7 @@ pub fn validate_internal_config_ownership(repo: &GitRepo) -> Result<()> {
         return Ok(());
     }
     Err(Error::message(
-        "existing .dvc/config is not owned by workspace-mgr and will not be overwritten; migrate or preserve it explicitly before init",
+        "existing .dvc/config is not managed by workspace-mgr and will not be overwritten; resolve it explicitly before rerunning init",
     ))
 }
 

@@ -313,11 +313,7 @@ class Harness:
         self.run(["git", "init", "-b", "main", self.seed], cwd=self.root)
         self.configure_git(self.seed)
         (self.seed / "README.md").write_text("# Virtual workspace\n", encoding="utf-8")
-        (self.seed / "AGENTS.md").write_text(
-            "# Existing repository policy\n\nPreserve this repository-specific rule.\n",
-            encoding="utf-8",
-        )
-        self.git(self.seed, "add", "README.md", "AGENTS.md")
+        self.git(self.seed, "add", "README.md")
         self.git(self.seed, "commit", "-m", "Create virtual workspace")
         self.git(self.seed, "remote", "add", "origin", self.remote_url)
         self.git(self.seed, "push", "-u", "origin", "main")
@@ -397,18 +393,7 @@ class Harness:
 
     def initialize_workspace(self) -> None:
         assert self.shared is not None
-        self.section("init, adoption, configuration, instructions, and doctor")
-        original_agents = (self.shared / "AGENTS.md").read_text(encoding="utf-8")
-        rejected = self.wm(
-            self.shared,
-            "init",
-            "--s3-url",
-            f"s3://{self.bucket}/dvc",
-            expected=2,
-        )
-        self.check("--adopt" in rejected["stderr"], "init refuses unmanaged AGENTS.md")
-        self.check(not (self.shared / ".dvc").exists(), "failed init is mutation-free")
-
+        self.section("init, configuration, instructions, and doctor")
         common = (
             "init",
             "--profile",
@@ -417,15 +402,11 @@ class Harness:
             f"s3://{self.bucket}/dvc",
             "--s3-endpoint-url",
             self.endpoint,
-            "--adopt",
         )
         dry = self.wm(self.shared, *common, "--dry-run")
         self.check(dry["status"] == "dry_run", "init dry-run reports planned scaffolding")
         self.check(not (self.shared / ".workspace-mgr.toml").exists(), "init dry-run writes nothing")
-        self.check(
-            (self.shared / "AGENTS.md").read_text(encoding="utf-8") == original_agents,
-            "init dry-run preserves AGENTS.md",
-        )
+        self.check(not (self.shared / "AGENTS.md").exists(), "init dry-run writes no bootstrap")
 
         initialized = self.wm(self.shared, *common)
         self.check(initialized["status"] == "initialized", "repository initialized")
@@ -434,9 +415,13 @@ class Harness:
         bootstrap = (self.shared / "AGENTS.md").read_text(encoding="utf-8")
         module = (
             self.shared / ".workspace-mgr" / "instructions" / "repository.md"
-        ).read_text(encoding="utf-8")
+        )
+        module.parent.mkdir(parents=True)
+        module.write_text(
+            "# Repository policy\n\nPreserve this repository-specific rule.\n",
+            encoding="utf-8",
+        )
         self.check("workspace-mgr instructions" in bootstrap, "thin AGENTS bootstrap installed")
-        self.check(module == original_agents, "existing AGENTS content preserved as a module")
         self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
         self.check("[storage.s3]" in config_text, "S3 placement is configured")
         self.check("version_aware = true" in dvc_config, "internal storage engine is version-aware")
@@ -451,13 +436,13 @@ class Harness:
             in (self.shared / ".gitattributes").read_text(encoding="utf-8"),
             "init installs the narrow generated-metadata whitespace rule",
         )
-        repeated = self.wm(self.shared, "init", "--adopt")
+        repeated = self.wm(self.shared, "init")
         self.check(repeated["status"] == "no_changes", "init is idempotent")
 
         (self.shared / ".dvc" / "config").write_text(dvc_config + "# drift\n", encoding="utf-8")
         drifted = self.wm(self.shared, "doctor", expected=2)
         self.check("configuration drifted" in drifted["stdout"], "doctor rejects internal storage drift")
-        repaired = self.wm(self.shared, "init", "--adopt")
+        repaired = self.wm(self.shared, "init")
         self.check(repaired["status"] == "initialized", "init repairs internal storage drift")
         self.check(
             (self.shared / ".dvc" / "config").read_text(encoding="utf-8") == dvc_config,
@@ -512,7 +497,7 @@ class Harness:
         )
         self.check(
             "Preserve this repository-specific rule" in all_instructions["markdown"],
-            "adopted repository instructions are composed into output",
+            "repository-specific instructions are composed into output",
         )
         human = self.run([self.binary, "instructions"], cwd=self.shared)
         self.check("Effective repository instructions" in human.stdout, "human instructions render")

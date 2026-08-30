@@ -7,7 +7,7 @@ lifecycle against two local network services:
 - a bare repository through `git daemon`, including an intentional server-side
   rejection.
 
-The scenario covers private-runtime setup, initialization and adoption,
+The scenario covers private-runtime setup, initialization,
 instructions, diagnostics, task creation, storage status, explicit Git and S3
 placement, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,

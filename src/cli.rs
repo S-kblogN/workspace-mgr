@@ -32,7 +32,7 @@ pub enum Command {
     /// Provision the private execution runtime used by managed storage.
     Setup(SetupArgs),
 
-    /// Initialize or adopt repository policy and scaffolding.
+    /// Initialize or reconcile repository policy and managed scaffolding.
     Init(InitArgs),
 
     /// Print the shared workspace model and effective repository instructions.
@@ -94,9 +94,6 @@ pub struct InitArgs {
     /// Optional S3-compatible API endpoint for managed storage.
     #[arg(long, requires = "s3_url")]
     pub s3_endpoint_url: Option<String>,
-
-    #[arg(long)]
-    pub adopt: bool,
 
     #[arg(long)]
     pub dry_run: bool,
