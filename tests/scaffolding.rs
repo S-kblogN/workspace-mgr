@@ -476,14 +476,10 @@ fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {
     let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_dvc, permissions).unwrap();
-    let inherited_path = std::env::var_os("PATH").unwrap();
-    let mut paths = vec![fake_bin];
-    paths.extend(std::env::split_paths(&inherited_path));
-    let path = std::env::join_paths(paths).unwrap();
     let output = std::process::Command::new(binary())
         .args(["init", "--s3-url", "s3://example.invalid/workspace"])
         .current_dir(&fixture.shared)
-        .env("PATH", path)
+        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));

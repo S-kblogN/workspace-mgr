@@ -24,6 +24,9 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Bidirectional Git/S3 placement transitions, ordinary Git refresh
   materialization, repository-wide operation locking, and tracked-input
   hardening.
+- A fixed collaboration-versus-artifact storage model with aggregate boundary
+  metrics, a 1 MiB recommended S3 minimum, a 1–10 MiB semantic-review band,
+  structured placement warnings, and explainable plan/status decisions.
 - First-class infrastructure tasks with explicit shared scopes, private task
   metadata, isolated worktrees, private storage-state handoff, and scoped
   publication without timestamped repository task directories.

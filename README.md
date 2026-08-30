@@ -56,13 +56,22 @@ Git revision.
 
 ## Placement policy
 
-The fixed automatic policy sends new retained files above 10 MiB to S3 and smaller
-files to Git. Existing published placement stays stable. Size is a default, not
-a prohibition: `storage set --to git|s3` records an explicit choice in either
-direction, and `storage reset` returns a path to automatic policy.
+Git is the collaboration/control plane for clone-ready, directly reviewable
+repository state. S3 is the artifact/data plane for exact objects that change
+atomically or hydrate on demand. The agent records that semantic choice with
+`storage set --to git|s3 --reason <reason>` when intent is clear; the CLI does
+not infer intent from filename extensions.
 
-Directories may be placed in S3 as one logical boundary. `move` preserves a
-path's placement. `storage hydrate` materializes S3 content without publishing.
+Size is only the fallback for unclassified new files. Below 1 MiB, Git is the
+strong default. From 1 through 10 MiB, Git remains the fallback but the plan
+asks the agent to review the semantic choice. Above 10 MiB, S3 is the fallback.
+An explicit S3 boundary below 1 MiB is allowed but receives an efficiency
+warning. Existing published placement stays stable when size changes, and
+`storage reset` returns a path to published history or the fallback.
+
+Directories may be placed in S3 as one logical boundary whose aggregate payload
+size is reported. `move` preserves a path's placement. `storage hydrate`
+materializes S3 content without publishing.
 
 ## Agent instructions
 

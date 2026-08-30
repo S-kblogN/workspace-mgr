@@ -12,10 +12,11 @@ mutating repository, placement, publication, hydration, and refresh operations
 share a repository lock; task and storage-boundary locks add narrower
 diagnostics.
 
-The task layout, branch prefix, shared-checkout behavior, storage threshold,
-instruction set, pull-request ownership, and merge authority are compiled
-product policy. They are intentionally absent from repository configuration so
-different repositories cannot drift into different management strategies.
+The task layout, branch prefix, shared-checkout behavior, semantic storage
+model, 1 MiB S3 recommendation, 10 MiB automatic threshold, instruction set,
+pull-request ownership, and merge authority are compiled product policy. They
+are intentionally absent from repository configuration so different
+repositories cannot drift into different management strategies.
 
 An explicit storage choice is recorded beside its path as workspace-mgr-owned
 metadata. This makes the choice reviewable and keeps independently active task
@@ -32,7 +33,12 @@ scope.
 
 Content has one public placement: Git or S3.
 
-- `storage status` explains the effective placement and its source.
+- Git represents collaboration/control-plane history; S3 represents
+  artifact/data-plane object history. An explicit choice and reason carry the
+  semantic decision, while size is only the fallback for unclassified new
+  files.
+- `storage status` explains the effective target, boundary, basis, payload
+  metrics, semantic reason, and warnings.
 - `storage set` records an explicit local choice.
 - `storage reset` removes that choice and reapplies automatic policy.
 - `move` preserves placement while changing a path.
@@ -40,7 +46,10 @@ Content has one public placement: Git or S3.
 
 These commands do not publish. Automatic policy is evaluated during `plan` and
 `publish`; existing published content is not silently moved because its size
-changed.
+changed. An automatic candidate below 1 MiB uses Git without routine warning;
+1–10 MiB uses Git with semantic-review feedback; above 10 MiB uses S3. Explicit
+S3 below 1 MiB remains valid but reports an efficiency warning based on the
+aggregate materialized boundary size.
 
 ## Scoped publication
 

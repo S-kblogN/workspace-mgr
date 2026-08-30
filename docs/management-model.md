@@ -97,15 +97,29 @@ broaden the task's scope.
 
 Every retained path has one storage placement:
 
-- **Git** is appropriate when content should appear directly in repository
-  history, ordinary clones, and diffs.
-- **S3** is appropriate when content is bulky, binary, or naturally retrieved
-  as versioned data.
+- **Git is the collaboration and control plane.** It is appropriate when
+  content should be present in ordinary clones and its value comes from direct
+  review, diff, merge, or joint evolution with repository source.
+- **S3 is the artifact and data plane.** It is appropriate when content is
+  consumed as an exact object, changes atomically, or should be hydrated on
+  demand.
 
-Both are first-class choices. File size drives the fixed automatic rule for new
-content, not a prohibition. The user or agent may explicitly put a large
-reviewable artifact in Git or a small data artifact in S3 when intent matters
-more than size.
+The agent understands why content exists, so it makes the semantic choice when
+that intent is clear and records the reason with `storage set`. The CLI does not
+guess from filename extensions. A user may explicitly choose either location
+at any size, and that instruction takes priority.
+
+Size is a fallback for new content whose semantics have not been selected. A
+new boundary below 1 MiB strongly defaults to Git. From 1 through 10 MiB, Git
+remains the fallback but the agent is asked to review whether collaboration or
+artifact history is actually intended. Above 10 MiB, S3 is the fallback. A
+standalone S3 boundary below 1 MiB is normally inefficient because its metadata
+and remote operations may outweigh the payload; an explicit selection still
+succeeds with a warning. A meaningful directory may instead be selected as one
+boundary, whose reported size is the aggregate size of its materialized regular
+files. Automatic evaluation treats unclassified files independently; selecting
+a directory boundary is an intentional semantic operation and does not promise
+that the storage backend packs it into one remote object.
 
 Published placement is stable. Content does not silently move between Git and
 S3 merely because its size changes. An explicit placement remains in force
@@ -115,7 +129,8 @@ path never has competing placement owners.
 
 Placement operations describe or change local intent:
 
-- `storage status` explains where a path is placed and why.
+- `storage status` explains the target, boundary, selection basis, semantic
+  reason, payload size/file count, and any structured warning.
 - `storage set` records an explicit Git or S3 choice.
 - `storage reset` removes that choice and returns the path to fixed policy.
 - `move` changes a path while preserving its placement.

@@ -562,6 +562,12 @@ class Harness:
             "instructions fix agent PR ownership and user merge authority",
         )
         self.check(
+            "collaboration and control plane" in all_instructions["markdown"]
+            and "artifact and data plane" in all_instructions["markdown"]
+            and "small-s3-boundary" in all_instructions["markdown"],
+            "instructions teach semantic placement and tiny-boundary economics",
+        )
+        self.check(
             "Preserve this repository-specific rule" in all_instructions["markdown"],
             "repository-specific instructions are composed into output",
         )
@@ -903,7 +909,7 @@ class Harness:
         )
         self.check(
             infra_status["placements"][0]["target"] == "s3"
-            and infra_status["placements"][0]["selected_by"] == "explicit",
+            and infra_status["placements"][0]["basis"] == "explicit",
             "infrastructure storage status resolves its private task identity",
         )
         plan = self.wm(worktree, "plan")
@@ -952,9 +958,11 @@ class Harness:
         v1 = b"single-file version one\n"
         bundle_v1_a = b"bundle alpha version one\n"
         bundle_v1_b = b"bundle beta version one\n"
+        bundle_bulk = b"x" * 1_048_576
         data.write_bytes(v1)
         (bundle / "alpha.txt").write_bytes(bundle_v1_a)
         (bundle / "beta.txt").write_bytes(bundle_v1_b)
+        (bundle / "bulk.bin").write_bytes(bundle_bulk)
         remote_before = self.remote_ref(branch)
         dry = self.wm(
             task,
@@ -971,6 +979,17 @@ class Harness:
         )
         self.check(dry["status"] == "dry_run", "S3 placement dry-run succeeds")
         self.check(dry["remote_writes"] is False, "placement dry-run reports no remote writes")
+        dry_placements = {item["path"]: item for item in dry["placements"]}
+        self.check(
+            dry_placements[f"{task_id}/data.bin"]["warnings"][0]["code"]
+            == "small-s3-boundary",
+            "tiny explicit S3 file receives an efficiency warning",
+        )
+        self.check(
+            "warnings" not in dry_placements[f"{task_id}/bundle"]
+            and dry_placements[f"{task_id}/bundle"]["payload_bytes"] > 1_048_576,
+            "aggregate S3 directory clears the small-boundary warning",
+        )
         self.check(not task.joinpath("data.bin.dvc").exists(), "placement dry-run creates no metadata")
         self.check(not task.joinpath("notes.txt.dvc").exists(), "Git-to-S3 dry-run creates no metadata")
         self.check(self.remote_ref(branch) == remote_before, "placement dry-run leaves Git remote unchanged")
@@ -1000,7 +1019,7 @@ class Harness:
         )
         self.check(
             all(
-                item["target"] == "s3" and item["selected_by"] == "explicit"
+                item["target"] == "s3" and item["basis"] == "explicit"
                 for item in statuses["placements"]
                 if item["path"] in {f"{task_id}/data.bin", f"{task_id}/notes.txt", f"{task_id}/bundle"}
             ),
@@ -1028,6 +1047,17 @@ class Harness:
         self.check(self.list_s3_versions() == [], "disabled versioning uploads no S3 object")
         self.s3.put_bucket_versioning(
             Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        placement_plan = self.wm(task, "plan")
+        small_boundaries = {
+            decision["boundary"]
+            for decision in placement_plan["storage"]["placement"]["decisions"]
+            if any(warning["code"] == "small-s3-boundary" for warning in decision.get("warnings", []))
+        }
+        self.check(
+            {f"{task_id}/data.bin", f"{task_id}/notes.txt"}.issubset(small_boundaries)
+            and f"{task_id}/bundle" not in small_boundaries,
+            "plan surfaces tiny S3 boundaries without warning on an aggregate boundary",
         )
         tracked = self.wm(task, "publish", "-m", "Publish S3 file and directory")
         self.check(tracked["status"] == "pushed", "two S3 boundaries publish atomically")
@@ -1064,13 +1094,13 @@ class Harness:
             "init cannot relocate retained S3 boundaries or rewrite tracked facts",
         )
         bodies_v1 = self.s3_bodies()
-        for payload in (v1, bundle_v1_a, bundle_v1_b):
+        for payload in (v1, bundle_v1_a, bundle_v1_b, bundle_bulk):
             self.check(payload in bodies_v1, "S3 contains exact version-one payload", payload=payload.decode().strip())
         self.check(self.wm(task, "plan")["status"] == "no_changes", "published S3 state is clean")
         inherited = self.wm(task, "storage", "status", f"{task_id}/bundle/alpha.txt")
         self.check(
             inherited["placements"][0]["target"] == "s3"
-            and inherited["placements"][0]["selected_by"] == "explicit-ancestor",
+            and inherited["placements"][0]["basis"] == "explicit-ancestor",
             "a descendant inherits its directory S3 boundary",
         )
         remote_before_overlap = self.remote_ref(branch)
@@ -1460,8 +1490,12 @@ class Harness:
         task = self.shared / task_id
         explicit_git = task / "explicit-git.bin"
         automatic_s3 = task / "automatic-s3.bin"
+        review_band = task / "review-band.bin"
+        small_default = task / "small-default.bin"
         explicit_git.write_bytes(b"g" * 10_485_761)
         automatic_s3.write_bytes(b"s" * 10_485_762)
+        review_band.write_bytes(b"r" * 2_097_152)
+        small_default.write_bytes(b"d" * 1_048_575)
         remote_before = self.remote_ref(branch)
         versions_before = self.list_s3_versions()
         placed = self.wm(
@@ -1500,10 +1534,25 @@ class Harness:
         )
         plan = self.wm(task, "plan")
         self.check(plan["status"] == "dry_run", "automatic S3 placement appears in plan")
+        decisions = {
+            decision["path"]: decision
+            for decision in plan["storage"]["placement"]["decisions"]
+        }
         self.check(
-            f"{task_id}/automatic-s3.bin"
-            in plan["storage"]["placement"]["would_place_in_s3"],
+            decisions[f"{task_id}/automatic-s3.bin"]["target"] == "s3"
+            and decisions[f"{task_id}/automatic-s3.bin"]["basis"]
+            == "automatic-size-fallback",
             "plan routes the unplaced large file to S3",
+        )
+        self.check(
+            decisions[f"{task_id}/review-band.bin"]["target"] == "git"
+            and decisions[f"{task_id}/review-band.bin"]["warnings"][0]["code"]
+            == "semantic-placement-review",
+            "plan asks the agent to review semantic placement in the 1-10 MiB band",
+        )
+        self.check(
+            f"{task_id}/small-default.bin" not in decisions,
+            "sub-1 MiB content uses the strong Git default without plan noise",
         )
         self.check(not task.joinpath("automatic-s3.bin.dvc").exists(), "plan does not create S3 metadata")
         self.check(self.list_s3_versions() == versions_before, "plan performs no S3 upload")
@@ -1512,6 +1561,8 @@ class Harness:
         oid = self.remote_ref(branch)
         assert oid is not None
         self.check(self.remote_path_exists(oid, f"{task_id}/explicit-git.bin"), "explicit large file is stored in Git")
+        self.check(self.remote_path_exists(oid, f"{task_id}/review-band.bin"), "review-band fallback is stored in Git")
+        self.check(self.remote_path_exists(oid, f"{task_id}/small-default.bin"), "sub-1 MiB fallback is stored in Git")
         self.check(not self.remote_path_exists(oid, f"{task_id}/automatic-s3.bin"), "automatic S3 payload is absent from Git")
         self.check(self.remote_path_exists(oid, f"{task_id}/automatic-s3.bin.dvc"), "automatic S3 metadata is stored in Git")
         self.check(len(self.list_s3_versions()) > len(versions_before), "automatic placement uploads a versioned S3 object")

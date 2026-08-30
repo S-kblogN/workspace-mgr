@@ -13,7 +13,8 @@ lifecycle against two local network services:
 
 The scenario covers private-runtime setup, initialization,
 instructions, diagnostics, task creation, storage status, explicit Git and S3
-placement, automatic placement, reset, hydrate, move, scoped plan and publish,
+placement, aggregate boundary sizing, tiny-S3 warnings, the semantic review
+band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
 isolated infrastructure task scaffolding and scoped publication,
 fixed policy with a minimal Git/S3-only public configuration,

@@ -12,7 +12,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::manifest::{ResolvedTask, one_line};
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
-use crate::policy::{AUTO_S3_ABOVE_BYTES, TASK_MANIFEST_NAME};
+use crate::policy::{AUTO_S3_ABOVE_BYTES, RECOMMENDED_S3_MINIMUM_BYTES, TASK_MANIFEST_NAME};
 
 pub const PLACEMENT_SUFFIX: &str = ".workspace-mgr-storage.toml";
 const PLACEMENT_SCHEMA: u32 = 1;
@@ -28,10 +28,33 @@ struct PlacementFile {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlacementStatus {
     pub path: String,
+    pub boundary: String,
     pub target: StorageTarget,
-    pub selected_by: String,
+    pub basis: PlacementBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<PlacementWarning>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlacementWarning {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlacementBasis {
+    Explicit,
+    ExplicitAncestor,
+    PublishedHistory,
+    PublishedAncestor,
+    AutomaticSizeFallback,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,8 +69,18 @@ pub struct StorageOperationReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct AutomaticPlacementReport {
     pub mode: String,
-    pub would_place_in_s3: Vec<String>,
+    pub recommended_s3_minimum_bytes: u64,
+    pub automatic_s3_above_bytes: u64,
+    pub decisions: Vec<PlacementStatus>,
     pub placed_in_s3: Vec<String>,
+    #[serde(skip)]
+    automatic_s3: Vec<String>,
+}
+
+impl AutomaticPlacementReport {
+    pub fn automatic_s3(&self) -> &[String] {
+        &self.automatic_s3
+    }
 }
 
 pub fn status(
@@ -110,12 +143,14 @@ pub fn set(
         .iter()
         .map(|path| {
             if dry_run {
-                Ok(PlacementStatus {
-                    path: path.clone(),
+                placement_report(
+                    repo,
+                    path,
+                    path,
                     target,
-                    selected_by: "explicit".to_owned(),
-                    reason: Some(reason.clone()),
-                })
+                    PlacementBasis::Explicit,
+                    Some(reason.clone()),
+                )
             } else {
                 placement_status(repo, config, path, None)
             }
@@ -143,16 +178,15 @@ pub fn reset(
     let desired = paths
         .iter()
         .map(|path| {
-            Ok((
-                path.clone(),
-                automatic_target_after_reset(repo, config, path, history_oid.as_deref())?,
-            ))
+            let (target, basis) =
+                automatic_target_after_reset(repo, config, path, history_oid.as_deref())?;
+            Ok((path.clone(), target, basis))
         })
         .collect::<Result<Vec<_>>>()?;
     if !dry_run {
         let snapshot = MetadataSnapshot::capture(repo, &paths)?;
         let result = (|| {
-            for (path, target) in &desired {
+            for (path, target, _) in &desired {
                 let sidecar = sidecar_path(repo, path);
                 if sidecar.is_file() {
                     fs::remove_file(&sidecar).at(&sidecar)?;
@@ -167,13 +201,14 @@ pub fn reset(
     }
     let placements = desired
         .into_iter()
-        .map(|(path, target)| PlacementStatus {
-            path,
-            target,
-            selected_by: "automatic".to_owned(),
-            reason: None,
+        .filter_map(|(path, target, basis)| {
+            let is_unbounded_directory = resolved_under(&repo.root, &path).is_dir()
+                && target == StorageTarget::Git
+                && basis == PlacementBasis::AutomaticSizeFallback;
+            (!is_unbounded_directory)
+                .then(|| placement_report(repo, &path, &path, target, basis, None))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(StorageOperationReport {
         status: if dry_run { "dry_run" } else { "updated" }.to_owned(),
         operation: "reset".to_owned(),
@@ -255,16 +290,16 @@ pub fn move_path(
             return Err(rollback_error(error, rollback_move(&old, &new, snapshot)));
         }
     }
+    let mut placement = before;
+    placement.path = new_path.clone();
+    if placement.boundary == old_path {
+        placement.boundary = new_path.clone();
+    }
     Ok(StorageOperationReport {
         status: if dry_run { "dry_run" } else { "updated" }.to_owned(),
         operation: "move".to_owned(),
         paths: vec![old_path, new_path.clone()],
-        placements: vec![PlacementStatus {
-            path: new_path,
-            target: before.target,
-            selected_by: before.selected_by,
-            reason: before.reason,
-        }],
+        placements: vec![placement],
         remote_writes: false,
     })
 }
@@ -313,6 +348,7 @@ pub fn apply_automatic(
     dry_run: bool,
 ) -> Result<AutomaticPlacementReport> {
     let mut candidates = Vec::new();
+    let mut decisions = Vec::new();
     for scope in scopes {
         let root = resolved_under(&repo.root, scope);
         if !root.exists() || root.is_symlink() {
@@ -356,11 +392,17 @@ pub fn apply_automatic(
                 .metadata()
                 .map_err(|error| Error::message(error.to_string()))?
                 .len();
-            let target = if size > AUTO_S3_ABOVE_BYTES {
-                StorageTarget::S3
-            } else {
-                StorageTarget::Git
-            };
+            let target = size_fallback_target(size);
+            if size >= RECOMMENDED_S3_MINIMUM_BYTES {
+                decisions.push(placement_report(
+                    repo,
+                    &path,
+                    &path,
+                    target,
+                    PlacementBasis::AutomaticSizeFallback,
+                    None,
+                )?);
+            }
             if target == StorageTarget::S3 {
                 if !config.s3_enabled() {
                     return Err(Error::message(format!(
@@ -379,10 +421,30 @@ pub fn apply_automatic(
             return Err(rollback_error(error, snapshot.restore()));
         }
     }
+    for decision in warning_relevant_boundaries(repo, config, scopes, base_oid)? {
+        if !decisions
+            .iter()
+            .any(|current| current.path == decision.path && current.basis == decision.basis)
+        {
+            decisions.push(decision);
+        }
+    }
+    decisions.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.basis.cmp(&right.basis))
+    });
     Ok(AutomaticPlacementReport {
         mode: if dry_run { "plan" } else { "apply" }.to_owned(),
-        would_place_in_s3: candidates.clone(),
-        placed_in_s3: if dry_run { Vec::new() } else { candidates },
+        recommended_s3_minimum_bytes: RECOMMENDED_S3_MINIMUM_BYTES,
+        automatic_s3_above_bytes: AUTO_S3_ABOVE_BYTES,
+        decisions,
+        placed_in_s3: if dry_run {
+            Vec::new()
+        } else {
+            candidates.clone()
+        },
+        automatic_s3: candidates,
     })
 }
 
@@ -415,8 +477,8 @@ fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarg
 
 fn automatic_target(repo: &GitRepo, config: &Config, path: &str) -> Result<StorageTarget> {
     let metadata = fs::metadata(resolved_under(&repo.root, path)).at(path)?;
-    let target = if metadata.is_file() && metadata.len() > AUTO_S3_ABOVE_BYTES {
-        StorageTarget::S3
+    let target = if metadata.is_file() {
+        size_fallback_target(metadata.len())
     } else {
         StorageTarget::Git
     };
@@ -428,27 +490,38 @@ fn automatic_target(repo: &GitRepo, config: &Config, path: &str) -> Result<Stora
     Ok(target)
 }
 
+fn size_fallback_target(bytes: u64) -> StorageTarget {
+    if bytes > AUTO_S3_ABOVE_BYTES {
+        StorageTarget::S3
+    } else {
+        StorageTarget::Git
+    }
+}
+
 fn automatic_target_after_reset(
     repo: &GitRepo,
     config: &Config,
     path: &str,
     history_oid: Option<&str>,
-) -> Result<StorageTarget> {
+) -> Result<(StorageTarget, PlacementBasis)> {
     if let Some(oid) = history_oid {
         if repo
             .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}.dvc")])?
             .success()
         {
-            return Ok(StorageTarget::S3);
+            return Ok((StorageTarget::S3, PlacementBasis::PublishedHistory));
         }
         if repo
             .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}")])?
             .success()
         {
-            return Ok(StorageTarget::Git);
+            return Ok((StorageTarget::Git, PlacementBasis::PublishedHistory));
         }
     }
-    automatic_target(repo, config, path)
+    Ok((
+        automatic_target(repo, config, path)?,
+        PlacementBasis::AutomaticSizeFallback,
+    ))
 }
 
 fn placement_status(
@@ -458,41 +531,49 @@ fn placement_status(
     history_oid: Option<&str>,
 ) -> Result<PlacementStatus> {
     if let Some(placement) = read_placement(repo, path)? {
-        return Ok(PlacementStatus {
-            path: path.to_owned(),
-            target: placement.target,
-            selected_by: "explicit".to_owned(),
-            reason: Some(placement.reason),
-        });
+        return placement_report(
+            repo,
+            path,
+            path,
+            placement.target,
+            PlacementBasis::Explicit,
+            Some(placement.reason),
+        );
     }
     if let Some(oid) = history_oid {
         if repo
             .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}.dvc")])?
             .success()
         {
-            return Ok(PlacementStatus {
-                path: path.to_owned(),
-                target: StorageTarget::S3,
-                selected_by: "published-history".to_owned(),
-                reason: None,
-            });
+            return placement_report(
+                repo,
+                path,
+                path,
+                StorageTarget::S3,
+                PlacementBasis::PublishedHistory,
+                None,
+            );
         }
     }
     if pointer_path(repo, path).is_file() {
-        return Ok(PlacementStatus {
-            path: path.to_owned(),
-            target: StorageTarget::S3,
-            selected_by: "automatic".to_owned(),
-            reason: None,
-        });
+        return placement_report(
+            repo,
+            path,
+            path,
+            StorageTarget::S3,
+            PlacementBasis::AutomaticSizeFallback,
+            None,
+        );
     }
     if let Some(boundary) = inherited_boundary(repo, path)? {
-        return Ok(PlacementStatus {
-            path: path.to_owned(),
-            target: boundary.target,
-            selected_by: boundary.selected_by,
-            reason: boundary.reason,
-        });
+        return placement_report(
+            repo,
+            path,
+            &boundary.path,
+            boundary.target,
+            boundary.basis,
+            boundary.reason,
+        );
     }
     let published_in_git = if let Some(oid) = history_oid {
         repo.run_unchecked(["cat-file", "-e", &format!("{oid}:{path}")])?
@@ -501,19 +582,172 @@ fn placement_status(
         false
     };
     if published_in_git {
-        return Ok(PlacementStatus {
-            path: path.to_owned(),
-            target: StorageTarget::Git,
-            selected_by: "published-history".to_owned(),
-            reason: None,
-        });
+        let published_as_directory = history_oid
+            .map(|oid| published_object_is_directory(repo, oid, path))
+            .transpose()?
+            .unwrap_or(false);
+        if resolved_under(&repo.root, path).is_dir() || published_as_directory {
+            return Err(unbounded_directory_status_error(path));
+        }
+        return placement_report(
+            repo,
+            path,
+            path,
+            StorageTarget::Git,
+            PlacementBasis::PublishedHistory,
+            None,
+        );
     }
+    if resolved_under(&repo.root, path).is_dir() {
+        return Err(unbounded_directory_status_error(path));
+    }
+    placement_report(
+        repo,
+        path,
+        path,
+        automatic_target(repo, config, path)?,
+        PlacementBasis::AutomaticSizeFallback,
+        None,
+    )
+}
+
+fn published_object_is_directory(repo: &GitRepo, oid: &str, path: &str) -> Result<bool> {
+    let object = format!("{oid}:{path}");
+    Ok(repo.run(["cat-file", "-t", &object])?.stdout.trim() == "tree")
+}
+
+fn unbounded_directory_status_error(path: &str) -> Error {
+    Error::message(format!(
+        "directory {path:?} is not a single storage boundary; run `workspace-mgr storage status` to inspect its files, or select the directory with `workspace-mgr storage set {path} --to git|s3 --reason <reason>`"
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PayloadMetrics {
+    bytes: u64,
+    files: u64,
+}
+
+fn placement_report(
+    repo: &GitRepo,
+    path: &str,
+    boundary: &str,
+    target: StorageTarget,
+    basis: PlacementBasis,
+    reason: Option<String>,
+) -> Result<PlacementStatus> {
+    let metrics = payload_metrics(repo, boundary)?;
+    let warnings = placement_warnings(target, basis, metrics);
     Ok(PlacementStatus {
         path: path.to_owned(),
-        target: automatic_target(repo, config, path)?,
-        selected_by: "automatic".to_owned(),
-        reason: None,
+        boundary: boundary.to_owned(),
+        target,
+        basis,
+        payload_bytes: metrics.map(|value| value.bytes),
+        payload_files: metrics.map(|value| value.files),
+        reason,
+        warnings,
     })
+}
+
+fn payload_metrics(repo: &GitRepo, boundary: &str) -> Result<Option<PayloadMetrics>> {
+    let root = resolved_under(&repo.root, boundary);
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(source) => return Err(Error::Io { path: root, source }),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(Error::message(format!(
+            "storage boundary may not be a symlink: {boundary}"
+        )));
+    }
+    if metadata.is_file() {
+        return Ok(Some(PayloadMetrics {
+            bytes: metadata.len(),
+            files: 1,
+        }));
+    }
+    if !metadata.is_dir() {
+        return Err(Error::message(format!(
+            "storage boundary is not a regular file or directory: {boundary}"
+        )));
+    }
+    let mut metrics = PayloadMetrics { bytes: 0, files: 0 };
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != ".git")
+    {
+        let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
+        if !entry.file_type().is_file() || entry.path().is_symlink() {
+            continue;
+        }
+        let size = entry
+            .metadata()
+            .map_err(|error| Error::message(error.to_string()))?
+            .len();
+        metrics.bytes = metrics
+            .bytes
+            .checked_add(size)
+            .ok_or_else(|| Error::message(format!("storage boundary is too large: {boundary}")))?;
+        metrics.files = metrics.files.checked_add(1).ok_or_else(|| {
+            Error::message(format!("storage boundary has too many files: {boundary}"))
+        })?;
+    }
+    Ok(Some(metrics))
+}
+
+fn placement_warnings(
+    target: StorageTarget,
+    basis: PlacementBasis,
+    metrics: Option<PayloadMetrics>,
+) -> Vec<PlacementWarning> {
+    let Some(metrics) = metrics else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    if target == StorageTarget::S3 && metrics.bytes < RECOMMENDED_S3_MINIMUM_BYTES {
+        warnings.push(PlacementWarning {
+            code: "small-s3-boundary".to_owned(),
+            message: "S3 boundary is smaller than the recommended 1 MiB minimum; Git or a larger semantic boundary is usually more efficient".to_owned(),
+        });
+    }
+    if basis == PlacementBasis::AutomaticSizeFallback
+        && target == StorageTarget::Git
+        && metrics.bytes >= RECOMMENDED_S3_MINIMUM_BYTES
+        && metrics.bytes <= AUTO_S3_ABOVE_BYTES
+    {
+        warnings.push(PlacementWarning {
+            code: "semantic-placement-review".to_owned(),
+            message: "new boundary is in the 1-10 MiB review band; Git is the size fallback, but choose Git or S3 explicitly when collaboration or artifact semantics are clear".to_owned(),
+        });
+    }
+    warnings
+}
+
+fn warning_relevant_boundaries(
+    repo: &GitRepo,
+    config: &Config,
+    scopes: &[String],
+    base_oid: &str,
+) -> Result<Vec<PlacementStatus>> {
+    known_boundaries(repo, scopes)?
+        .into_iter()
+        .map(|path| placement_status(repo, config, &path, Some(base_oid)))
+        .filter_map(|status| match status {
+            Ok(status) if !status.warnings.is_empty() => Some(Ok(status)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Result<Option<String>> {
@@ -652,7 +886,7 @@ fn resolve_status_paths(
 struct Boundary {
     path: String,
     target: StorageTarget,
-    selected_by: String,
+    basis: PlacementBasis,
     reason: Option<String>,
     explicit_target: Option<StorageTarget>,
 }
@@ -667,7 +901,7 @@ fn inherited_boundary(repo: &GitRepo, path: &str) -> Result<Option<Boundary>> {
             return Ok(Some(Boundary {
                 path: candidate,
                 target: placement.target,
-                selected_by: "explicit-ancestor".to_owned(),
+                basis: PlacementBasis::ExplicitAncestor,
                 reason: Some(placement.reason),
                 explicit_target: Some(placement.target),
             }));
@@ -676,7 +910,7 @@ fn inherited_boundary(repo: &GitRepo, path: &str) -> Result<Option<Boundary>> {
             return Ok(Some(Boundary {
                 path: candidate,
                 target: StorageTarget::S3,
-                selected_by: "published-ancestor".to_owned(),
+                basis: PlacementBasis::PublishedAncestor,
                 reason: None,
                 explicit_target: None,
             }));
@@ -928,4 +1162,73 @@ fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
         source: error.error,
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(bytes: u64) -> Option<PayloadMetrics> {
+        Some(PayloadMetrics { bytes, files: 1 })
+    }
+
+    #[test]
+    fn size_fallback_and_warning_boundaries_are_exact() {
+        assert_eq!(
+            size_fallback_target(RECOMMENDED_S3_MINIMUM_BYTES - 1),
+            StorageTarget::Git
+        );
+        assert_eq!(
+            size_fallback_target(RECOMMENDED_S3_MINIMUM_BYTES),
+            StorageTarget::Git
+        );
+        assert_eq!(
+            size_fallback_target(AUTO_S3_ABOVE_BYTES),
+            StorageTarget::Git
+        );
+        assert_eq!(
+            size_fallback_target(AUTO_S3_ABOVE_BYTES + 1),
+            StorageTarget::S3
+        );
+
+        let small_s3 = placement_warnings(
+            StorageTarget::S3,
+            PlacementBasis::Explicit,
+            metrics(RECOMMENDED_S3_MINIMUM_BYTES - 1),
+        );
+        assert_eq!(small_s3[0].code, "small-s3-boundary");
+        assert!(
+            placement_warnings(
+                StorageTarget::S3,
+                PlacementBasis::Explicit,
+                metrics(RECOMMENDED_S3_MINIMUM_BYTES),
+            )
+            .is_empty()
+        );
+
+        for bytes in [RECOMMENDED_S3_MINIMUM_BYTES, AUTO_S3_ABOVE_BYTES] {
+            let review = placement_warnings(
+                StorageTarget::Git,
+                PlacementBasis::AutomaticSizeFallback,
+                metrics(bytes),
+            );
+            assert_eq!(review[0].code, "semantic-placement-review");
+        }
+        assert!(
+            placement_warnings(
+                StorageTarget::Git,
+                PlacementBasis::AutomaticSizeFallback,
+                metrics(RECOMMENDED_S3_MINIMUM_BYTES - 1),
+            )
+            .is_empty()
+        );
+        assert!(
+            placement_warnings(
+                StorageTarget::S3,
+                PlacementBasis::AutomaticSizeFallback,
+                metrics(AUTO_S3_ABOVE_BYTES + 1),
+            )
+            .is_empty()
+        );
+    }
 }

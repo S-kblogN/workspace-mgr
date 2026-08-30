@@ -33,12 +33,63 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     let task_id = "20260829-170450-automatic-placement";
     let task = fixture.shared.join(task_id);
     std::fs::write(task.join("large.bin"), vec![7_u8; 10_485_761]).unwrap();
+    std::fs::write(task.join("review-band.bin"), vec![6_u8; 2_097_152]).unwrap();
+    std::fs::write(task.join("small.bin"), vec![5_u8; 1_048_575]).unwrap();
+
+    let review_status = workspace(
+        &task,
+        [
+            "storage",
+            "status",
+            &format!("{task_id}/review-band.bin"),
+            &format!("{task_id}/small.bin"),
+        ],
+    );
+    assert_eq!(
+        json(&review_status)["placements"][0]["warnings"][0]["code"],
+        "semantic-placement-review"
+    );
+    assert!(
+        json(&review_status)["placements"][1]
+            .get("warnings")
+            .is_none()
+    );
 
     let plan = workspace(&task, ["plan"]);
     assert_eq!(json(&plan)["status"], "dry_run");
+    let plan_json = json(&plan);
+    let decisions = plan_json["storage"]["placement"]["decisions"]
+        .as_array()
+        .unwrap();
+    let large = decisions
+        .iter()
+        .find(|decision| decision["path"] == format!("{task_id}/large.bin"))
+        .unwrap();
+    assert_eq!(large["target"], "s3");
+    assert_eq!(large["basis"], "automatic-size-fallback");
+    assert_eq!(large["payload_bytes"], 10_485_761);
+    let review_band = decisions
+        .iter()
+        .find(|decision| decision["path"] == format!("{task_id}/review-band.bin"))
+        .unwrap();
+    assert_eq!(review_band["target"], "git");
+    assert_eq!(review_band["basis"], "automatic-size-fallback");
     assert_eq!(
-        json(&plan)["storage"]["placement"]["would_place_in_s3"][0],
-        format!("{task_id}/large.bin")
+        review_band["warnings"][0]["code"],
+        "semantic-placement-review"
+    );
+    assert!(
+        !decisions
+            .iter()
+            .any(|decision| decision["path"] == format!("{task_id}/small.bin"))
+    );
+    assert_eq!(
+        json(&plan)["storage"]["placement"]["recommended_s3_minimum_bytes"],
+        1_048_576
+    );
+    assert_eq!(
+        json(&plan)["storage"]["placement"]["automatic_s3_above_bytes"],
+        10_485_760
     );
     assert!(!task.join("large.bin.dvc").exists());
     assert!(!storage_remote.exists());
@@ -52,11 +103,14 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     let second_plan = workspace(&task, ["plan"]);
     assert_eq!(json(&second_plan)["status"], "dry_run");
     assert!(
-        json(&second_plan)["storage"]["placement"]["would_place_in_s3"]
+        json(&second_plan)["storage"]["placement"]["decisions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|path| path == &format!("{task_id}/second-large.bin"))
+            .any(|decision| {
+                decision["path"] == format!("{task_id}/second-large.bin")
+                    && decision["target"] == "s3"
+            })
     );
     assert!(
         !json(&second_plan)["changed_paths"]
@@ -108,6 +162,7 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let bundle = task.join("bundle");
     std::fs::create_dir(&bundle).unwrap();
     std::fs::write(bundle.join("alpha.txt"), b"alpha\n").unwrap();
+    std::fs::write(bundle.join("bulk.bin"), vec![4_u8; 1_048_576]).unwrap();
 
     let placed = workspace(
         &task,
@@ -124,6 +179,23 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     );
     assert_eq!(json(&placed)["status"], "updated");
     assert_eq!(json(&placed)["remote_writes"], false);
+    let placed_json = json(&placed);
+    let placements = placed_json["placements"].as_array().unwrap();
+    let small_file = placements
+        .iter()
+        .find(|placement| placement["path"] == format!("{task_name}/data.bin"))
+        .unwrap();
+    assert_eq!(small_file["boundary"], format!("{task_name}/data.bin"));
+    assert_eq!(small_file["payload_bytes"], 12);
+    assert_eq!(small_file["payload_files"], 1);
+    assert_eq!(small_file["warnings"][0]["code"], "small-s3-boundary");
+    let aggregate = placements
+        .iter()
+        .find(|placement| placement["path"] == format!("{task_name}/bundle"))
+        .unwrap();
+    assert_eq!(aggregate["payload_bytes"], 1_048_582);
+    assert_eq!(aggregate["payload_files"], 2);
+    assert!(aggregate.get("warnings").is_none());
     let tracked = workspace(&task, ["publish", "-m", "Publish S3 data"]);
     assert_eq!(json(&tracked)["status"], "pushed");
     assert!(task.join("data.bin.dvc").is_file());
@@ -146,9 +218,14 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     );
     assert_eq!(json(&inherited)["placements"][0]["target"], "s3");
     assert_eq!(
-        json(&inherited)["placements"][0]["selected_by"],
+        json(&inherited)["placements"][0]["basis"],
         "explicit-ancestor"
     );
+    assert_eq!(
+        json(&inherited)["placements"][0]["boundary"],
+        format!("{task_name}/bundle")
+    );
+    assert_eq!(json(&inherited)["placements"][0]["payload_files"], 2);
     let overlap = workspace_unchecked(
         &task,
         [

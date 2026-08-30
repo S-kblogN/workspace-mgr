@@ -89,10 +89,7 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
         ["storage", "status", &format!("{task_id}/retained.bin")],
     );
     assert_eq!(json(&status)["placements"][0]["target"], "git");
-    assert_eq!(
-        json(&status)["placements"][0]["selected_by"],
-        "published-history"
-    );
+    assert_eq!(json(&status)["placements"][0]["basis"], "published-history");
     workspace(
         &task,
         [
@@ -114,7 +111,7 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
     let plan = workspace(&task, ["plan"]);
     assert_eq!(json(&plan)["status"], "dry_run");
     assert!(
-        json(&plan)["storage"]["placement"]["would_place_in_s3"]
+        json(&plan)["storage"]["placement"]["decisions"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -204,7 +201,10 @@ fn storage_status_uses_the_task_history_not_unrelated_branches() {
     git(&unrelated, ["commit", "-m", "Add unrelated path history"]);
 
     let status = workspace(&task, ["storage", "status", &format!("{task_id}/data.txt")]);
-    assert_eq!(json(&status)["placements"][0]["selected_by"], "automatic");
+    assert_eq!(
+        json(&status)["placements"][0]["basis"],
+        "automatic-size-fallback"
+    );
 }
 
 #[test]
@@ -255,14 +255,23 @@ fn explicit_git_directory_applies_recursively_and_status_lists_git_content() {
             .iter()
             .any(|entry| { entry["path"] == format!("{task_id}/reviewable/large.bin") })
     );
-    let plan = workspace(&task, ["plan"]);
-    assert_eq!(json(&plan)["status"], "dry_run");
-    assert!(
-        json(&plan)["storage"]["placement"]["would_place_in_s3"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    let reset = workspace(
+        &task,
+        ["storage", "reset", &format!("{task_id}/reviewable")],
     );
+    assert!(json(&reset)["placements"].as_array().unwrap().is_empty());
+    let directory_status = workspace_unchecked(
+        &task,
+        ["storage", "status", &format!("{task_id}/reviewable")],
+    );
+    assert_eq!(directory_status.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&directory_status.stderr)
+            .contains("is not a single storage boundary")
+    );
+    let plan = workspace_unchecked(&task, ["plan"]);
+    assert_eq!(plan.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&plan.stderr).contains("automatic policy selected S3"));
 }
 
 #[test]

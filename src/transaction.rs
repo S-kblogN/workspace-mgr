@@ -176,6 +176,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let initial_dvc = dvc::discover(&repo, &scopes)?;
     let initial_outputs = dvc::output_paths(&repo, &initial_dvc)?;
     let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
+    let preview_automatic_s3 = placement_preview.automatic_s3().to_vec();
     let preview_index = state_dir.join("preview-index");
     if preview_index.exists() {
         fs::remove_file(&preview_index).at(&preview_index)?;
@@ -185,11 +186,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     preview_add.extend(scopes.iter().cloned());
     repo.run_with_index(&preview_index, preview_add, None, true)?;
     remove_stored_outputs_from_index(&repo, &preview_index, &initial_outputs)?;
-    remove_output_paths_from_index(
-        &repo,
-        &preview_index,
-        placement_preview.would_place_in_s3.iter(),
-    )?;
+    remove_output_paths_from_index(&repo, &preview_index, preview_automatic_s3.iter())?;
     let preview_paths = changed_paths(&repo, &preview_index, &base_oid)?;
     validate_private_index(
         &repo,
@@ -198,14 +195,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &scopes,
         &preview_paths,
         AUTO_S3_ABOVE_BYTES,
-        &placement_preview.would_place_in_s3,
+        &preview_automatic_s3,
     )?;
     let mut lock_names = initial_dvc
         .iter()
         .map(|path| format!("pointer:{path}"))
         .chain(
-            placement_preview
-                .would_place_in_s3
+            preview_automatic_s3
                 .iter()
                 .map(|path| format!("output:{path}")),
         )
@@ -214,7 +210,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     lock_names.dedup();
     let _dvc_locks = acquire_dvc_locks(&common_dir, &lock_names)?;
     if config.requires_object_versioning()
-        && (!initial_dvc.is_empty() || !placement_preview.would_place_in_s3.is_empty())
+        && (!initial_dvc.is_empty() || !preview_automatic_s3.is_empty())
     {
         dvc::verify_object_versioning(&repo, &config)?;
     }
@@ -224,6 +220,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     } else {
         storage::apply_automatic(&repo, &config, &scopes, &base_oid, false)?
     };
+    let automatic_s3 = placement.automatic_s3().to_vec();
     let pointers = dvc::discover(&repo, &scopes)?;
     if !dry_run {
         let preflight_outputs = dvc::output_paths(&repo, &pointers)?;
@@ -244,7 +241,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             &scopes,
             &preflight_paths,
             AUTO_S3_ABOVE_BYTES,
-            &placement.would_place_in_s3,
+            &automatic_s3,
         )?;
     }
     let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
@@ -259,7 +256,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     add.extend(scopes.iter().cloned());
     repo.run_with_index(&index, add, None, true)?;
     remove_stored_outputs_from_index(&repo, &index, &s3.outputs)?;
-    remove_output_paths_from_index(&repo, &index, placement.would_place_in_s3.iter())?;
+    remove_output_paths_from_index(&repo, &index, automatic_s3.iter())?;
     let paths = changed_paths(&repo, &index, &base_oid)?;
     validate_private_index(
         &repo,
@@ -268,7 +265,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &scopes,
         &paths,
         AUTO_S3_ABOVE_BYTES,
-        &placement.would_place_in_s3,
+        &automatic_s3,
     )?;
     let ignored_entries = count_ignored(&repo, &index, &scopes)?;
     let tree_oid = repo
@@ -281,7 +278,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .and_then(|value| value.get("dirty_files"))
         .and_then(|value| value.as_array())
         .is_some_and(|files| !files.is_empty());
-    let placement_pending = !placement.would_place_in_s3.is_empty();
+    let placement_pending = !automatic_s3.is_empty();
     let mut report = TransactionReport {
         status: if dry_run { "dry_run" } else { "pending" }.to_owned(),
         operation: options.operation.name().to_owned(),

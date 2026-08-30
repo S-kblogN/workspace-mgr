@@ -34,6 +34,19 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(normalized_model.contains("same management strategy"));
     assert!(normalized_model.contains("the user asks for outcomes"));
     assert!(normalized_model.contains("None of these operations publishes a task"));
+    for storage_concept in [
+        "collaboration and control plane",
+        "artifact and data plane",
+        "below 1 MiB",
+        "1 through 10 MiB",
+        "Above 10 MiB",
+        "aggregate size",
+    ] {
+        assert!(
+            normalized_model.contains(storage_concept),
+            "model is missing storage concept {storage_concept:?}"
+        );
+    }
     for command in [
         "setup",
         "init",
@@ -73,6 +86,9 @@ fn user_documentation_covers_the_complete_public_model() {
     }
     assert!(guide.contains("S3 first, then Git"));
     assert!(guide.contains("Nested placement boundaries"));
+    assert!(guide.contains("small-s3-boundary"));
+    assert!(guide.contains("semantic-placement-review"));
+    assert!(commands.contains("payload_bytes"));
     for fact in ["[git]", "remote", "branch", "[s3]", "endpoint_url"] {
         assert!(
             configuration.contains(fact),

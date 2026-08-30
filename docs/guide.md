@@ -106,10 +106,16 @@ manifest automatically and creates no timestamped task directory.
 
 ### 5. Choose where retained content lives
 
-Most files need no manual choice. With the fixed automatic policy, a new file
-above the fixed 10 MiB threshold goes to S3 and a smaller file goes to Git.
-Previously published placement is sticky: changing a file's size does not
-silently move it between storage locations.
+First decide whether content should be retained at all. Ignore safely
+reproducible caches and intermediate build output that are neither inputs,
+deliverables, nor evidence.
+
+For retained content, choose the history model before considering size. Git is
+the collaboration/control plane for clone-ready content whose value comes from
+review, diff, merge, or joint evolution with source. S3 is the artifact/data
+plane for exact objects that change atomically or hydrate on demand. The agent
+has the task context needed for this choice; `workspace-mgr` deliberately does
+not infer semantics from extensions.
 
 Use an explicit choice when intent matters more than size:
 
@@ -121,11 +127,30 @@ workspace-mgr storage set task/path/dataset \
   --to s3 --reason "Retain the dataset as one versioned directory"
 ```
 
-An explicit choice is valid in either direction at any size. A directory is one
-placement boundary and all descendants inherit it. Nested placement boundaries
-are rejected: set or reset the existing boundary instead. `storage set`,
-`storage reset`, and `move` change only local desired state; none writes to a
-remote.
+An explicit user choice wins at any size. A directory is one logical placement
+boundary and all descendants inherit it. Its reported payload size is the sum
+of its materialized regular files; this does not imply that the backend packs
+the directory into one remote object. Nested placement boundaries are rejected:
+set or reset the existing boundary instead. `storage set`, `storage reset`, and
+`move` change only local desired state; none writes to a remote.
+
+When no semantic choice has been recorded, the fixed size fallback is:
+
+| New boundary size | Fallback |
+| --- | --- |
+| Below 1 MiB | Git, with no routine plan warning |
+| 1 through 10 MiB | Git, with `semantic-placement-review` so the agent checks intent |
+| Above 10 MiB | S3 |
+
+Automatic evaluation treats each unclassified new file as its own candidate.
+Directory aggregation is meaningful only after the agent or user explicitly
+selects that directory as a semantic boundary.
+
+A standalone S3 boundary below 1 MiB is usually less efficient than Git because
+its metadata and remote operations may outweigh the payload. Explicit S3 still
+succeeds but reports `small-s3-boundary`; prefer Git or a larger meaningful
+directory boundary when possible. Previously published placement is sticky, so
+changing size never silently moves content.
 
 `storage reset <path>` removes an explicit choice and returns the path to
 automatic policy. If that directory has not been published, removing its atomic
@@ -144,15 +169,20 @@ workspace-mgr storage hydrate task/path/dataset
 With no paths, `storage status` lists ordinary Git content plus explicit or
 published S3 boundaries in the resolved task scopes. A directory boundary is
 shown once rather than once per descendant. For a selected path,
-`selected_by` explains the result:
+`basis` explains the result:
 
-| `selected_by` | Meaning |
+| `basis` | Meaning |
 | --- | --- |
 | `explicit` | The path itself has an explicit choice |
 | `explicit-ancestor` | An explicit directory boundary contains the path |
 | `published-history` | Existing published history fixes this path in Git or S3 |
 | `published-ancestor` | A published S3 directory boundary contains the path |
-| `automatic` | Fixed product policy and, for a new file, its current size decide |
+| `automatic-size-fallback` | A new unclassified file uses the fixed size fallback |
+
+Each row also reports its effective `boundary`, available `payload_bytes` and
+`payload_files`, an explicit semantic `reason` when present, and structured
+`warnings`. `plan` includes automatic decisions in the 1–10 MiB review band or
+above 10 MiB, plus existing boundaries with actionable warnings.
 
 `storage hydrate` reads exact S3 content into the working tree. With no paths it
 hydrates every S3 boundary in scope. It refuses to overwrite locally modified
@@ -218,11 +248,11 @@ absolute size prohibition.
 
 | Choose Git when | Choose S3 when |
 | --- | --- |
-| The content should appear directly in diffs and repository history | The content is binary, bulky, or naturally retrieved as data |
+| The content's value comes from direct review, diff, merge, or joint evolution with source | The content is consumed as an exact object or changes atomically |
 | Ordinary clone and checkout behavior is desirable | Exact object-version recovery matters |
 | The file is intentionally reviewable despite being large | A directory should be retained as one logical boundary |
 
-The fixed automatic threshold is a useful starting point for new content. Explicit
+The fixed size bands are only a fallback for new, unclassified files. Explicit
 `--to git` and `--to s3` choices always take precedence until reset.
 
 For an `s3://` location, bucket object versioning is mandatory. Publication

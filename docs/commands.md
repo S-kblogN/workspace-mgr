@@ -167,8 +167,12 @@ With paths, status reports those paths, including a descendant inherited from a
 directory boundary. The path need not currently be materialized if published
 metadata can determine its placement. With no paths, status lists ordinary Git
 files and one row per explicit or published S3 boundary in all resolved scopes.
-The report includes `target`, `selected_by`, and an explicit `reason` when one
-exists. It never writes a remote.
+An explicitly queried directory must itself be a selected or published S3
+boundary; otherwise it has no single placement because automatic evaluation
+operates on its files independently. Query without paths to inspect those files.
+Each row includes `target`, `basis`, effective `boundary`, available
+`payload_bytes` and `payload_files`, an explicit semantic `reason` when one
+exists, and structured `warnings`. It never writes a remote.
 
 ```sh
 workspace-mgr storage status
@@ -190,7 +194,9 @@ Every target must exist and remain in the resolved scopes. The reason must be a
 non-empty single line. S3 must be configured before selecting it. Setting a
 directory creates one recursive boundary; nested or overlapping existing
 boundaries are rejected. The command updates local desired state and reports
-`remote_writes: false`.
+`remote_writes: false`. Explicit S3 below the recommended 1 MiB aggregate
+boundary size remains valid but reports `small-s3-boundary`; select Git or a
+larger meaningful boundary when practical.
 
 ```sh
 workspace-mgr storage set 20260829-180000-report/report.pdf \
@@ -214,7 +220,8 @@ workspace-mgr storage reset <path>...
 
 This may locally convert a prior S3 boundary back to ordinary content. Resetting
 a directory removes the directory boundary, so its files can be evaluated
-individually by the next `plan` or `publish`. No remote is changed.
+individually by the next `plan` or `publish`; the reset report therefore has no
+single placement row for an unpublished directory boundary. No remote is changed.
 
 ## `workspace-mgr storage hydrate`
 
@@ -264,8 +271,11 @@ workspace-mgr plan [--manifest <path>]
 Plan fetches the configured base and target Git refs, evaluates automatic
 placement, validates S3 metadata and local outputs, constructs a private
 preview tree that excludes payloads destined for S3, and reports changed paths,
-object IDs, and pending placement. Exact generated S3 metadata is established by
-`publish`, because `plan` does not rewrite it. Plan may create ignored local
+object IDs, and pending placement. Its placement report gives the fixed 1 MiB
+recommended S3 minimum and 10 MiB automatic threshold, automatic decisions in
+the 1–10 MiB semantic-review band or above the S3 threshold, and existing
+boundaries with actionable warnings. Exact generated S3 metadata is established
+by `publish`, because `plan` does not rewrite it. Plan may create ignored local
 locks or preview state. It never creates a commit, uploads S3 content, or pushes
 a Git branch.
 

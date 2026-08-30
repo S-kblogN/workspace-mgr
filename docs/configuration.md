@@ -62,9 +62,10 @@ The following behavior is deliberately not configurable:
 - shared repository changes use an infrastructure task in an isolated
   worktree;
 - the shared checkout remains on `git.branch` and preserves unrelated overlays;
-- new retained content above 10 MiB goes to S3 automatically and smaller
-  content goes to Git, while published or explicitly selected placement stays
-  sticky;
+- Git is the collaboration/control plane and S3 is the artifact/data plane;
+  agents record clear semantic choices, while unclassified new files use the
+  fixed below-1 MiB Git preference, 1–10 MiB review band, and above-10 MiB S3
+  fallback; published or explicitly selected placement stays sticky;
 - the agent creates and maintains the pull request title and living
   description;
 - the user or maintainer controls merge, ready, approval, close, and auto-merge
