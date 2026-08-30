@@ -1,0 +1,1934 @@
+#!/usr/bin/env python3
+"""System-level workspace-mgr E2E test.
+
+The test talks to MinIO through the S3 API and to a bare Git repository through
+git-daemon. It intentionally uses the compiled CLI as an opaque executable.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterable
+
+import botocore.session
+from botocore.config import Config as BotocoreConfig
+
+
+class E2EFailure(RuntimeError):
+    pass
+
+
+class Harness:
+    def __init__(self) -> None:
+        binary = os.environ.get("WORKSPACE_MGR_BIN")
+        root = os.environ.get("WORKSPACE_MGR_E2E_ROOT")
+        if not binary or not root:
+            raise E2EFailure(
+                "WORKSPACE_MGR_BIN and WORKSPACE_MGR_E2E_ROOT are required"
+            )
+        self.binary = Path(binary).resolve()
+        self.root = Path(root).resolve()
+        if not self.binary.is_file():
+            raise E2EFailure(f"workspace-mgr binary does not exist: {self.binary}")
+        if self.root.exists():
+            raise E2EFailure(f"E2E root must not already exist: {self.root}")
+        self.root.mkdir(parents=True)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.evidence_path = self.root / "evidence.jsonl"
+        self.sequence = 0
+        self.assertions = 0
+        self.git_daemon: subprocess.Popen[str] | None = None
+        self.git_daemon_log = None
+        self.endpoint = os.environ.get("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+        self.bucket = os.environ.get("MINIO_BUCKET", "workspace-mgr-e2e")
+        self.access_key = os.environ.get("AWS_ACCESS_KEY_ID", "workspace-mgr-e2e")
+        self.secret_key = os.environ.get(
+            "AWS_SECRET_ACCESS_KEY", "workspace-mgr-e2e-secret"
+        )
+        self.region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        self.env = os.environ.copy()
+        self.env.update(
+            {
+                "HOME": str(self.home),
+                "XDG_CONFIG_HOME": str(self.root / "xdg"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "DVC_NO_ANALYTICS": "true",
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "AWS_MAX_ATTEMPTS": "1",
+                "AWS_ACCESS_KEY_ID": self.access_key,
+                "AWS_SECRET_ACCESS_KEY": self.secret_key,
+                "AWS_DEFAULT_REGION": self.region,
+            }
+        )
+        session = botocore.session.get_session()
+        self.s3 = session.create_client(
+            "s3",
+            endpoint_url=self.endpoint,
+            region_name=self.region,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key,
+            config=BotocoreConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                retries={"max_attempts": 1, "mode": "standard"},
+            ),
+        )
+        self.remote: Path | None = None
+        self.remote_url = ""
+        self.seed: Path | None = None
+        self.shared: Path | None = None
+
+    def record(self, kind: str, detail: dict[str, Any]) -> None:
+        self.sequence += 1
+        entry = {
+            "sequence": self.sequence,
+            "time": time.time(),
+            "kind": kind,
+            **detail,
+        }
+        with self.evidence_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, sort_keys=True) + "\n")
+
+    def check(self, condition: bool, message: str, **state: Any) -> None:
+        if not condition:
+            self.record("assertion", {"status": "failed", "message": message, **state})
+            raise E2EFailure(f"assertion failed: {message}; state={state!r}")
+        self.assertions += 1
+        self.record("assertion", {"status": "passed", "message": message, **state})
+
+    def section(self, name: str) -> None:
+        print(f"\n=== {name} ===", flush=True)
+        self.record("section", {"name": name})
+
+    def run(
+        self,
+        command: Iterable[str | Path],
+        *,
+        cwd: Path | None = None,
+        expected: int | Iterable[int] = 0,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        argv = [str(part) for part in command]
+        expected_codes = {expected} if isinstance(expected, int) else set(expected)
+        process_env = self.env.copy()
+        if env:
+            process_env.update(env)
+        print(f"+ ({cwd or self.root}) {' '.join(argv)}", flush=True)
+        result = subprocess.run(
+            argv,
+            cwd=cwd or self.root,
+            env=process_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.record(
+            "command",
+            {
+                "argv": argv,
+                "cwd": str(cwd or self.root),
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
+        )
+        if result.stdout.strip():
+            print(result.stdout.rstrip(), flush=True)
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr, flush=True)
+        if result.returncode not in expected_codes:
+            raise E2EFailure(
+                f"command exited {result.returncode}, expected {sorted(expected_codes)}: {argv}"
+            )
+        return result
+
+    def wm(
+        self,
+        cwd: Path,
+        *args: str,
+        expected: int = 0,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        result = self.run(
+            [self.binary, "--format", "json", *args],
+            cwd=cwd,
+            expected=expected,
+            env=env,
+        )
+        if expected != 0:
+            return {"stdout": result.stdout, "stderr": result.stderr}
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise E2EFailure(f"workspace-mgr returned invalid JSON: {error}") from error
+        self.record("workspace-mgr-report", {"args": list(args), "payload": payload})
+        return payload
+
+    def git(self, repo: Path, *args: str, expected: int | Iterable[int] = 0):
+        return self.run(["git", "-C", repo, *args], cwd=repo, expected=expected)
+
+    def configure_git(self, repo: Path) -> None:
+        self.git(repo, "config", "user.name", "workspace-mgr E2E")
+        self.git(repo, "config", "user.email", "e2e@example.invalid")
+
+    def wait_for_minio(self) -> None:
+        deadline = time.monotonic() + 60
+        url = f"{self.endpoint}/minio/health/ready"
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    if response.status == 200:
+                        self.record("service", {"name": "minio", "status": "ready"})
+                        return
+            except OSError:
+                time.sleep(0.5)
+        raise E2EFailure(f"MinIO did not become ready at {url}")
+
+    def setup_s3(self) -> None:
+        self.wait_for_minio()
+        self.s3.create_bucket(Bucket=self.bucket)
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        status = self.s3.get_bucket_versioning(Bucket=self.bucket)
+        self.check(status.get("Status") == "Enabled", "S3 bucket versioning enabled")
+        self.check(self.list_s3_versions() == [], "S3 bucket starts empty")
+
+    def provision_runtime(self) -> None:
+        self.section("private runtime provisioning")
+        runtime = (
+            self.home
+            / ".local"
+            / "share"
+            / "workspace-mgr"
+            / "storage-3.67.1"
+        )
+        dry = self.wm(self.root, "setup", "--dry-run")
+        self.check(dry["status"] == "dry_run", "setup dry-run reports provisioning")
+        self.check(not runtime.exists(), "setup dry-run creates no runtime")
+        installed = self.wm(self.root, "setup")
+        self.check(installed["status"] == "installed", "setup provisions private runtime")
+        self.check((runtime / "bin" / "dvc").is_file(), "private storage executable exists")
+        self.check((runtime / "bin" / "python").is_file(), "private Python adapter exists")
+        self.check(
+            runtime.joinpath(".workspace-mgr-runtime").read_text(encoding="utf-8")
+            == "workspace-mgr private runtime v1\n",
+            "private runtime records explicit workspace-mgr ownership",
+        )
+        repeated = self.wm(self.root, "setup")
+        self.check(repeated["status"] == "no_changes", "setup is idempotent")
+
+    def list_s3_versions(self) -> list[dict[str, Any]]:
+        versions: list[dict[str, Any]] = []
+        paginator = self.s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix="dvc/"):
+            for item in page.get("Versions", []):
+                versions.append(
+                    {
+                        "key": item["Key"],
+                        "version_id": item["VersionId"],
+                        "size": item["Size"],
+                        "etag": item["ETag"].strip('"'),
+                        "is_latest": item["IsLatest"],
+                    }
+                )
+        versions.sort(key=lambda value: (value["key"], value["version_id"]))
+        self.record("s3-state", {"versions": versions})
+        return versions
+
+    def s3_bodies(self) -> list[bytes]:
+        bodies = []
+        for version in self.list_s3_versions():
+            response = self.s3.get_object(
+                Bucket=self.bucket,
+                Key=version["key"],
+                VersionId=version["version_id"],
+            )
+            bodies.append(response["Body"].read())
+        return bodies
+
+    def s3_version_for_body(self, expected: bytes) -> dict[str, Any]:
+        matches = []
+        for version in self.list_s3_versions():
+            response = self.s3.get_object(
+                Bucket=self.bucket,
+                Key=version["key"],
+                VersionId=version["version_id"],
+            )
+            if response["Body"].read() == expected:
+                matches.append(version)
+        self.check(
+            len(matches) == 1,
+            "exactly one S3 object version contains the expected payload",
+            matches=matches,
+            size=len(expected),
+        )
+        return matches[0]
+
+    @staticmethod
+    def free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+
+    def start_git_server(self) -> None:
+        git_root = self.root / "git-server"
+        git_root.mkdir()
+        self.remote = git_root / "remote.git"
+        self.run(["git", "init", "--bare", self.remote], cwd=git_root)
+        self.run(
+            ["git", "--git-dir", self.remote, "symbolic-ref", "HEAD", "refs/heads/main"],
+            cwd=git_root,
+        )
+        (self.remote / "git-daemon-export-ok").write_text("", encoding="utf-8")
+        port = self.free_port()
+        self.remote_url = f"git://127.0.0.1:{port}/remote.git"
+        log_path = self.root / "git-daemon.log"
+        self.git_daemon_log = log_path.open("w", encoding="utf-8")
+        self.git_daemon = subprocess.Popen(
+            [
+                "git",
+                "daemon",
+                "--verbose",
+                "--reuseaddr",
+                "--export-all",
+                "--enable=receive-pack",
+                f"--base-path={git_root}",
+                "--listen=127.0.0.1",
+                f"--port={port}",
+                str(git_root),
+            ],
+            cwd=git_root,
+            env=self.env,
+            text=True,
+            stdout=self.git_daemon_log,
+            stderr=subprocess.STDOUT,
+        )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if self.git_daemon.poll() is not None:
+                raise E2EFailure("git daemon exited during startup")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    self.record(
+                        "service",
+                        {"name": "git-daemon", "status": "ready", "url": self.remote_url},
+                    )
+                    return
+            except OSError:
+                time.sleep(0.2)
+        raise E2EFailure("git daemon did not become ready")
+
+    def setup_repository(self) -> None:
+        self.start_git_server()
+        self.seed = self.root / "seed"
+        self.run(["git", "init", "-b", "main", self.seed], cwd=self.root)
+        self.configure_git(self.seed)
+        (self.seed / "README.md").write_text("# Virtual workspace\n", encoding="utf-8")
+        self.git(self.seed, "add", "README.md")
+        self.git(self.seed, "commit", "-m", "Create virtual workspace")
+        self.git(self.seed, "remote", "add", "origin", self.remote_url)
+        self.git(self.seed, "push", "-u", "origin", "main")
+        self.shared = self.root / "shared"
+        self.run(["git", "clone", self.remote_url, self.shared], cwd=self.root)
+        self.configure_git(self.shared)
+        self.check(
+            self.git(self.shared, "remote", "get-url", "origin").stdout.strip().startswith(
+                "git://"
+            ),
+            "workspace clone uses the network Git server",
+        )
+
+    def remote_ref(self, branch: str) -> str | None:
+        result = self.run(
+            ["git", "ls-remote", self.remote_url, f"refs/heads/{branch}"],
+            cwd=self.root,
+        )
+        line = result.stdout.strip()
+        network_oid = line.split()[0] if line else None
+        assert self.remote is not None
+        direct = self.run(
+            ["git", "--git-dir", self.remote, "rev-parse", "--verify", f"refs/heads/{branch}"],
+            cwd=self.root,
+            expected=(0, 128),
+        )
+        direct_oid = direct.stdout.strip() if direct.returncode == 0 else None
+        self.check(network_oid == direct_oid, "network and bare Git refs agree", branch=branch)
+        self.record("git-ref", {"branch": branch, "oid": network_oid})
+        return network_oid
+
+    def remote_path_exists(self, oid: str, path: str) -> bool:
+        assert self.remote is not None
+        result = self.run(
+            ["git", "--git-dir", self.remote, "cat-file", "-e", f"{oid}:{path}"],
+            cwd=self.root,
+            expected=(0, 128),
+        )
+        return result.returncode == 0
+
+    def remote_file(self, oid: str, path: str) -> str:
+        assert self.remote is not None
+        return self.run(
+            ["git", "--git-dir", self.remote, "show", f"{oid}:{path}"], cwd=self.root
+        ).stdout
+
+    def install_rejecting_hook(self) -> Path:
+        assert self.remote is not None
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "if test -f \"$GIT_DIR/workspace-mgr-e2e-reject\"; then\n"
+            "  echo 'workspace-mgr E2E intentional rejection' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+        return self.remote / "workspace-mgr-e2e-reject"
+
+    def merge_branch_to_main(self, branch: str) -> str:
+        assert self.seed is not None
+        self.git(self.seed, "fetch", "origin", branch)
+        target = self.git(self.seed, "rev-parse", "FETCH_HEAD").stdout.strip()
+        self.git(self.seed, "push", "origin", f"{target}:refs/heads/main")
+        self.check(self.remote_ref("main") == target, "server main fast-forwarded", branch=branch)
+        return target
+
+    def assert_shared_head(self, expected_oid: str | None = None) -> None:
+        assert self.shared is not None
+        branch = self.git(self.shared, "branch", "--show-current").stdout.strip()
+        self.check(branch == "main", "shared checkout remains on main", branch=branch)
+        if expected_oid:
+            oid = self.git(self.shared, "rev-parse", "main").stdout.strip()
+            self.check(oid == expected_oid, "shared main has expected object ID", oid=oid)
+
+    def initialize_workspace(self) -> None:
+        assert self.shared is not None
+        self.section("init, configuration, instructions, and doctor")
+        common = (
+            "init",
+            "--s3-url",
+            f"s3://{self.bucket}/dvc",
+            "--s3-endpoint-url",
+            self.endpoint,
+        )
+        collision = self.root / "first-init-collision"
+        self.run(["git", "clone", self.remote_url, collision], cwd=self.root)
+        existing_agents = "# Existing repository policy\n\nPreserve this file.\n"
+        (collision / "AGENTS.md").write_text(existing_agents, encoding="utf-8")
+        rejected_collision = self.wm(collision, *common, expected=2)
+        self.check(
+            "reserved workspace-mgr scaffold paths" in rejected_collision["stderr"],
+            "first init reports a reserved-path collision without classifying content",
+        )
+        self.check(
+            (collision / "AGENTS.md").read_text(encoding="utf-8")
+            == existing_agents,
+            "failed first init preserves the colliding policy exactly",
+        )
+        self.check(
+            not (collision / ".workspace-mgr.toml").exists()
+            and not (collision / ".workspace-mgr").exists()
+            and not (collision / ".dvc").exists(),
+            "reserved-path refusal leaves no partial scaffolding",
+        )
+
+        storage_collision = self.root / "first-init-storage-collision"
+        self.run(["git", "clone", self.remote_url, storage_collision], cwd=self.root)
+        (storage_collision / ".dvc").mkdir()
+        existing_dvc_config = "[core]\n    remote = preexisting\n"
+        (storage_collision / ".dvc" / "config").write_text(
+            existing_dvc_config, encoding="utf-8"
+        )
+        rejected_storage = self.wm(storage_collision, *common, expected=2)
+        self.check(
+            ".dvc" in rejected_storage["stderr"],
+            "first init treats the internal storage path as a reserved collision",
+        )
+        self.check(
+            (storage_collision / ".dvc" / "config").read_text(encoding="utf-8")
+            == existing_dvc_config,
+            "storage collision is preserved without content classification",
+        )
+        self.check(
+            not (storage_collision / ".workspace-mgr.toml").exists()
+            and not (storage_collision / "AGENTS.md").exists(),
+            "storage collision leaves no partial public scaffolding",
+        )
+
+        dry = self.wm(self.shared, *common, "--dry-run")
+        self.check(dry["status"] == "dry_run", "init dry-run reports planned scaffolding")
+        self.check(not (self.shared / ".workspace-mgr.toml").exists(), "init dry-run writes nothing")
+        self.check(not (self.shared / "AGENTS.md").exists(), "init dry-run writes no bootstrap")
+
+        initialized = self.wm(self.shared, *common)
+        self.check(initialized["status"] == "initialized", "repository initialized")
+        config_text = (self.shared / ".workspace-mgr.toml").read_text(encoding="utf-8")
+        dvc_config = (self.shared / ".dvc" / "config").read_text(encoding="utf-8")
+        storage_gitignore = (self.shared / ".dvc" / ".gitignore").read_text(
+            encoding="utf-8"
+        )
+        storage_ignore = (self.shared / ".dvcignore").read_text(encoding="utf-8")
+        bootstrap = (self.shared / "AGENTS.md").read_text(encoding="utf-8")
+        template_collision = self.root / "first-init-template-collision"
+        self.run(["git", "clone", self.remote_url, template_collision], cwd=self.root)
+        (template_collision / "AGENTS.md").write_text(bootstrap, encoding="utf-8")
+        rejected_template = self.wm(template_collision, *common, expected=2)
+        self.check(
+            "AGENTS.md" in rejected_template["stderr"],
+            "first init rejects a reserved path even when its content equals the template",
+        )
+        self.check(
+            (template_collision / "AGENTS.md").read_text(encoding="utf-8")
+            == bootstrap,
+            "template-equal first-init collision remains untouched",
+        )
+        module = (
+            self.shared / ".workspace-mgr" / "instructions" / "repository.md"
+        )
+        module.parent.mkdir(parents=True)
+        module.write_text(
+            "# Repository policy\n\nPreserve this repository-specific rule.\n",
+            encoding="utf-8",
+        )
+        self.check("workspace-mgr instructions" in bootstrap, "thin AGENTS bootstrap installed")
+        self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
+        self.check("[git]" in config_text, "Git topology is configured")
+        self.check("[s3]" in config_text, "S3 location is configured")
+        for forbidden in (
+            "schema_version",
+            "required_cli",
+            "profile",
+            "[publication]",
+            "[tasks]",
+            "[review]",
+            "[storage]",
+            "[agent]",
+            "branch_prefix",
+            "auto_s3_above_bytes",
+        ):
+            self.check(
+                forbidden not in config_text,
+                "public config contains no strategy switch",
+                forbidden=forbidden,
+            )
+        self.check("version_aware = true" in dvc_config, "internal storage engine is version-aware")
+        self.check("Managed by workspace-mgr" in dvc_config, "internal storage configuration records ownership")
+        self.check(f"s3://{self.bucket}/dvc" in dvc_config, "internal storage URL selects test bucket")
+        self.check(self.endpoint in dvc_config, "internal storage endpoint selects virtual S3")
+        self.check("[dvc]" not in config_text.lower(), "public configuration does not expose a DVC section")
+        self.check("require_version_aware" not in config_text, "public configuration hides engine-specific versioning")
+        self.check("python" not in config_text.lower(), "public configuration does not expose its adapter")
+        self.check(
+            "*.dvc whitespace=-blank-at-eol"
+            in (self.shared / ".gitattributes").read_text(encoding="utf-8"),
+            "init installs the narrow generated-metadata whitespace rule",
+        )
+        repeated = self.wm(self.shared, "init")
+        self.check(repeated["status"] == "no_changes", "init is idempotent")
+
+        (self.shared / "AGENTS.md").write_text(
+            "# Legacy or locally edited bootstrap\n", encoding="utf-8"
+        )
+        (self.shared / ".dvc" / "config").write_text(
+            "# damaged generated configuration without an ownership marker\n",
+            encoding="utf-8",
+        )
+        (self.shared / ".dvc" / ".gitignore").write_text(
+            "/locally-edited\n", encoding="utf-8"
+        )
+        (self.shared / ".dvcignore").write_text(
+            "locally-edited/**\n", encoding="utf-8"
+        )
+        drifted = self.wm(self.shared, "doctor", expected=2)
+        self.check("configuration drifted" in drifted["stdout"], "doctor rejects internal storage drift")
+        drift_report = json.loads(drifted["stdout"])
+        self.check(
+            any(
+                check["name"] == "repository-scaffold"
+                and check["status"] == "error"
+                and "AGENTS.md" in check["detail"]
+                and ".dvcignore" in check["detail"]
+                for check in drift_report["checks"]
+            ),
+            "doctor reports every drifted product-owned scaffold",
+        )
+        repaired = self.wm(self.shared, "init")
+        self.check(repaired["status"] == "initialized", "init repairs owned scaffold drift")
+        self.check(
+            (self.shared / ".dvc" / "config").read_text(encoding="utf-8") == dvc_config,
+            "repair restores deterministic internal storage config without a content marker",
+        )
+        self.check(
+            (self.shared / "AGENTS.md").read_text(encoding="utf-8") == bootstrap,
+            "repair restores the current AGENTS bootstrap regardless of prior content",
+        )
+        self.check(
+            (self.shared / ".dvc" / ".gitignore").read_text(encoding="utf-8")
+            == storage_gitignore
+            and (self.shared / ".dvcignore").read_text(encoding="utf-8")
+            == storage_ignore,
+            "repair restores all whole-file internal storage scaffolds",
+        )
+
+        (self.shared / "refresh-update.txt").write_text("old refresh value\n", encoding="utf-8")
+        (self.shared / "refresh-delete.txt").write_text("delete during refresh\n", encoding="utf-8")
+        self.git(self.shared, "add", "-A")
+        staged = self.git(self.shared, "diff", "--cached", "--name-only").stdout.splitlines()
+        self.check(".dvc/config.local" not in staged, "local storage credentials are not staged")
+        self.git(self.shared, "commit", "-m", "Initialize managed workspace")
+        self.git(self.shared, "push", "origin", "main")
+        main_oid = self.remote_ref("main")
+        self.check(main_oid is not None, "initialized main exists on Git server")
+
+        config = self.wm(self.shared, "config", "show")
+        self.check(set(config) == {"git", "s3"}, "config exposes only Git and S3 facts")
+        self.check(config["git"]["remote"] == "origin", "config resolves Git remote")
+        self.check(config["git"]["branch"] == "main", "config resolves shared branch")
+        self.check(config["s3"]["url"] == f"s3://{self.bucket}/dvc", "config resolves S3 location")
+        self.check("dvc" not in config, "public config JSON hides the internal storage engine")
+
+        for topic in (
+            "all",
+            "model",
+            "core",
+            "task",
+            "publish",
+            "artifacts",
+            "storage",
+            "shared-checkout",
+            "infrastructure",
+        ):
+            document = self.wm(self.shared, "instructions", topic)
+            self.check(document["topic"] == topic, "instruction topic renders", topic=topic)
+            self.check(len(document["policy_hash"]) == 64, "instruction policy hash is complete", topic=topic)
+        all_instructions = self.wm(self.shared, "instructions")
+        model_heading = all_instructions["markdown"].find("# How this workspace works")
+        rules_heading = all_instructions["markdown"].find("# Effective repository instructions")
+        self.check(
+            0 <= model_heading < rules_heading,
+            "management model precedes effective operational rules",
+        )
+        self.check(
+            "one writable conversation (chat) = one task" in all_instructions["markdown"],
+            "instructions explain the conversation-task-branch-PR relationship",
+        )
+        self.check(
+            "general-purpose collaborator" in all_instructions["markdown"],
+            "instructions explain the workspace purpose before its mechanics",
+        )
+        self.check(
+            "The agent owns pull-request operations" in all_instructions["markdown"]
+            and "must not merge" in all_instructions["markdown"],
+            "instructions fix agent PR ownership and user merge authority",
+        )
+        self.check(
+            "deterministic scaffold reconciliation and upgrade operation"
+            in all_instructions["markdown"]
+            and "never by their old contents" in all_instructions["markdown"],
+            "instructions define structural scaffold ownership and upgrade behavior",
+        )
+        self.check(
+            "collaboration and control plane" in all_instructions["markdown"]
+            and "artifact and data plane" in all_instructions["markdown"]
+            and "small-s3-boundary" in all_instructions["markdown"],
+            "instructions teach semantic placement and tiny-boundary economics",
+        )
+        self.check(
+            "Preserve this repository-specific rule" in all_instructions["markdown"],
+            "repository-specific instructions are composed into output",
+        )
+        self.check(
+            "They do not change the fixed task, storage, publication, or review policy"
+            in all_instructions["markdown"],
+            "repository-specific content cannot redefine workspace strategy",
+        )
+        human = self.run([self.binary, "instructions"], cwd=self.shared)
+        self.check("Effective repository instructions" in human.stdout, "human instructions render")
+
+        doctor = self.wm(self.shared, "doctor")
+        self.check(doctor["status"] == "ok", "doctor accepts full virtual environment")
+        self.check(
+            all(check["status"] == "ok" for check in doctor["checks"]),
+            "every doctor check passes",
+            checks=doctor["checks"],
+        )
+        adapter = next(
+            check
+            for check in doctor["checks"]
+            if check["name"] == "managed-storage-version-adapter"
+        )
+        self.check(
+            adapter["detail"] == "internal adapter 3.67.1",
+            "doctor verifies the provisioned private runtime's exact adapter version",
+        )
+        self.check(
+            str(self.home) not in adapter["detail"],
+            "doctor does not expose the private runtime path",
+        )
+
+    def create_and_publish_task(self) -> tuple[str, Path, str]:
+        assert self.shared is not None
+        self.section("task scaffolding, scope planning, and Git publication")
+        task_id = "20260829-180000-e2e-flow"
+        branch = "codex/e2e-flow"
+        dry = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-flow",
+            "--title",
+            "E2E flow",
+            "--purpose",
+            "Exercise every managed transaction against virtual services.",
+            "--timestamp",
+            "20260829-180000",
+            "--dry-run",
+        )
+        self.check(dry["status"] == "dry_run", "task create dry-run succeeds")
+        self.check(not (self.shared / task_id).exists(), "task dry-run creates no directory")
+        self.check(self.remote_ref(branch) is None, "task dry-run creates no remote branch")
+
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-flow",
+            "--title",
+            "E2E flow",
+            "--purpose",
+            "Exercise every managed transaction against virtual services.",
+            "--timestamp",
+            "20260829-180000",
+        )
+        task = self.shared / task_id
+        self.check(created["status"] == "created", "task scaffold created")
+        self.check(created["branch"] == branch, "task branch follows fixed codex prefix")
+        self.check(task.joinpath("README.md").is_file(), "task README created")
+        self.check(task.joinpath(".workspace-mgr-task.toml").is_file(), "task manifest created")
+        readme_before_collision = task.joinpath("README.md").read_bytes()
+        collision = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-flow",
+            "--title",
+            "Replacement title",
+            "--purpose",
+            "This duplicate must not replace the existing task.",
+            "--timestamp",
+            "20260829-180000",
+            expected=2,
+        )
+        self.check(collision["stderr"], "duplicate task creation is rejected")
+        self.check(
+            task.joinpath("README.md").read_bytes() == readme_before_collision,
+            "duplicate task creation preserves existing scaffolding",
+        )
+        self.assert_shared_head()
+        base_oid = self.remote_ref("main")
+        local_task_oid = self.git(self.shared, "rev-parse", branch).stdout.strip()
+        self.check(local_task_oid == base_oid, "unmounted task branch starts at remote main")
+
+        status = self.wm(task, "task", "status")
+        self.check(status["task_id"] == task_id, "task status discovers manifest")
+        self.check(status["scopes"] == [task_id], "task status reports exact initial scope")
+        explicit = self.wm(
+            self.shared,
+            "task",
+            "status",
+            "--manifest",
+            str(task / ".workspace-mgr-task.toml"),
+        )
+        self.check(explicit["branch"] == branch, "explicit manifest resolution matches discovery")
+
+        self.git(self.shared, "switch", "-c", "e2e-alternate-checkout")
+        wrong_checkout = self.wm(task, "plan", expected=2)
+        self.check(
+            "--allow-non-shared-head" in wrong_checkout["stderr"],
+            "deliverable plan rejects an unexpected shared-checkout branch",
+        )
+        authorized_checkout = self.wm(
+            task,
+            "plan",
+            "--allow-non-shared-head",
+            "--scope-note",
+            "The E2E scenario explicitly exercises the exceptional checkout override.",
+        )
+        self.check(
+            authorized_checkout["status"] == "dry_run",
+            "explicitly authorized alternate checkout can plan",
+        )
+        self.git(self.shared, "switch", "main")
+
+        (task / "notes.txt").write_text("task-only content\n", encoding="utf-8")
+        git_move_source = task / "move me - α.txt"
+        git_move_source.write_text("ordinary Git move payload\n", encoding="utf-8")
+        unicode_path = task / "notes with spaces - 结果.txt"
+        unicode_path.write_text("Unicode repository path\n", encoding="utf-8")
+        (self.shared / "authorized.txt").write_text("authorized root content\n", encoding="utf-8")
+        (self.shared / "unrelated.txt").write_text("another active task\n", encoding="utf-8")
+        plan = self.wm(task, "plan")
+        self.check(plan["status"] == "dry_run", "plan reports task changes")
+        self.check(all(path.startswith(task_id + "/") for path in plan["changed_paths"]), "plan stays in task scope")
+        self.check(self.remote_ref(branch) is None, "plan does not push target branch")
+        self.check(self.list_s3_versions() == [], "plan does not write S3")
+
+        publish_preview = self.wm(
+            task,
+            "publish",
+            "-m",
+            "Preview the first publication",
+            "--dry-run",
+        )
+        self.check(publish_preview["status"] == "dry_run", "publish dry-run previews the transaction")
+        self.check(self.remote_ref(branch) is None, "publish dry-run creates no remote branch")
+        self.check(self.list_s3_versions() == [], "publish dry-run writes no S3 objects")
+
+        rejected = self.wm(
+            task,
+            "publish",
+            "-m",
+            "Unauthorized root scope",
+            "--include",
+            "authorized.txt",
+            expected=2,
+        )
+        self.check("--scope-note" in rejected["stderr"], "additional scope requires an authorization reason")
+        self.check(self.remote_ref(branch) is None, "rejected scope does not create branch")
+
+        published = self.wm(
+            task,
+            "publish",
+            "-m",
+            "Publish scoped E2E task",
+            "--include",
+            "authorized.txt",
+            "--scope-note",
+            "The E2E scenario explicitly authorizes this shared file.",
+        )
+        commit = published["commit_oid"]
+        self.check(published["status"] == "pushed", "task publication succeeds")
+        self.check(published["remote_oid"] == commit, "publish verifies remote object ID")
+        self.check(self.remote_ref(branch) == commit, "network Git server has published branch")
+        self.check(self.remote_path_exists(commit, f"{task_id}/notes.txt"), "task file exists in remote tree")
+        self.check(
+            self.remote_path_exists(commit, f"{task_id}/notes with spaces - 结果.txt"),
+            "Unicode and spaces survive network Git publication",
+        )
+        self.check(self.remote_path_exists(commit, "authorized.txt"), "authorized extra scope exists in remote tree")
+        self.check(not self.remote_path_exists(commit, "unrelated.txt"), "unrelated overlay is absent from remote tree")
+        message = self.run(
+            ["git", "--git-dir", self.remote, "show", "-s", "--format=%B", commit],
+            cwd=self.root,
+        ).stdout
+        self.check("Scope-Authorization: authorized.txt" in message, "commit records scope authorization")
+        self.check(
+            f"Workspace-Task: {task_id}" in message,
+            "commit records the task identity that owns its remote branch",
+        )
+        self.check(published["review"]["pull_request"] == "required", "deliverable review handoff requires one PR")
+        self.check(published["review"]["managed_by"] == "agent", "deliverable review handoff assigns the agent")
+        self.check(published["review"]["merge_authority"] == "user", "deliverable review handoff reserves merge for user")
+        self.assert_shared_head(base_oid)
+
+        remote_before_move = self.remote_ref(branch)
+        versions_before_move = self.list_s3_versions()
+        moved_git = self.wm(
+            task,
+            "move",
+            f"{task_id}/move me - α.txt",
+            f"{task_id}/renamed/结果.txt",
+        )
+        self.check(moved_git["placements"][0]["target"] == "git", "ordinary Git move preserves placement")
+        self.check(self.remote_ref(branch) == remote_before_move, "ordinary Git move is local-only")
+        self.check(self.list_s3_versions() == versions_before_move, "ordinary Git move writes no S3 object")
+        moved_git_publish = self.wm(task, "publish", "-m", "Publish ordinary Git move")
+        moved_git_oid = moved_git_publish["commit_oid"]
+        self.check(
+            not self.remote_path_exists(moved_git_oid, f"{task_id}/move me - α.txt")
+            and self.remote_path_exists(moved_git_oid, f"{task_id}/renamed/结果.txt"),
+            "ordinary Git move is represented exactly in the remote tree",
+        )
+
+        no_changes = self.wm(task, "plan")
+        self.check(no_changes["status"] == "no_changes", "post-publish plan is clean")
+        common_dir_text = self.git(self.shared, "rev-parse", "--git-common-dir").stdout.strip()
+        common_dir = Path(common_dir_text)
+        if not common_dir.is_absolute():
+            common_dir = self.shared / common_dir
+        repository_lock = common_dir / "workspace-mgr" / "repository.lock"
+        repository_lock.parent.mkdir(parents=True, exist_ok=True)
+        with repository_lock.open("a+", encoding="utf-8") as locked:
+            fcntl.flock(locked.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.wm(task, "plan", expected=2)
+            self.check(
+                "repository operation is running" in blocked["stderr"],
+                "a second process cannot enter a repository transaction",
+            )
+            fcntl.flock(locked.fileno(), fcntl.LOCK_UN)
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "transaction resumes after lock release")
+        return task_id, task, branch
+
+    def create_and_publish_infrastructure_task(self) -> None:
+        assert self.shared is not None
+        self.section("isolated infrastructure task and review handoff")
+        branch = "codex/infra-e2e-policy"
+        private_config = self.shared / ".dvc" / "config.local"
+        private_config.write_text("# Virtual private storage state.\n", encoding="utf-8")
+        dry = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-policy",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "E2E shared policy",
+            "--purpose",
+            "Exercise isolated repository-wide publication.",
+            "--scope",
+            "e2e-shared-policy.md",
+            "--scope",
+            "e2e-infra-assets",
+            "--scope-note",
+            "The E2E scenario authorizes this repository-wide policy file.",
+            "--dry-run",
+        )
+        self.check(dry["status"] == "dry_run", "infrastructure dry-run succeeds")
+        self.check(self.remote_ref(branch) is None, "infrastructure dry-run publishes no branch")
+
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-policy",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "E2E shared policy",
+            "--purpose",
+            "Exercise isolated repository-wide publication.",
+            "--scope",
+            "e2e-shared-policy.md",
+            "--scope",
+            "e2e-infra-assets",
+            "--scope-note",
+            "The E2E scenario authorizes this repository-wide policy file.",
+        )
+        worktree = Path(created["path"])
+        self.check(created["kind"] == "infrastructure", "infrastructure kind is explicit")
+        self.check(worktree.is_dir(), "infrastructure worktree exists")
+        self.check(Path(created["manifest"]).is_file(), "infrastructure manifest is private state")
+        self.check(
+            not (self.shared / "infra-e2e-policy").exists(),
+            "infrastructure task creates no repository task directory",
+        )
+        self.check(
+            self.git(worktree, "branch", "--show-current").stdout.strip() == branch,
+            "infrastructure branch is mounted only in its worktree",
+        )
+        self.check(
+            worktree.joinpath(".dvc", "cache").is_symlink(),
+            "infrastructure worktree reuses the repository-private storage cache",
+        )
+        self.check(
+            worktree.joinpath(".dvc", "config.local").is_symlink()
+            and worktree.joinpath(".dvc", "config.local").resolve()
+            == private_config.resolve(),
+            "infrastructure worktree reuses private storage configuration",
+        )
+        status = self.wm(worktree, "task", "status")
+        self.check(
+            status["scopes"] == ["e2e-infra-assets", "e2e-shared-policy.md"],
+            "infrastructure scopes are exact",
+        )
+
+        (worktree / "e2e-shared-policy.md").write_text("isolated policy\n", encoding="utf-8")
+        infra_assets = worktree / "e2e-infra-assets"
+        infra_assets.mkdir()
+        infra_payload = b"infrastructure managed payload\n"
+        (infra_assets / "data.bin").write_bytes(infra_payload)
+        (worktree / "outside-scope.txt").write_text("must not publish\n", encoding="utf-8")
+        rejected = self.wm(worktree, "plan", expected=2)
+        self.check(
+            "outside its declared scope" in rejected["stderr"],
+            "infrastructure worktree rejects undeclared changes",
+        )
+        (worktree / "outside-scope.txt").unlink()
+        infra_placement = self.wm(
+            worktree,
+            "storage",
+            "set",
+            "e2e-infra-assets/data.bin",
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise private managed storage from an infrastructure worktree.",
+        )
+        self.check(infra_placement["status"] == "updated", "infrastructure content can select S3")
+        self.check(infra_placement["remote_writes"] is False, "infrastructure placement is local-only")
+        infra_status = self.wm(
+            worktree,
+            "storage",
+            "status",
+            "e2e-infra-assets/data.bin",
+        )
+        self.check(
+            infra_status["placements"][0]["target"] == "s3"
+            and infra_status["placements"][0]["basis"] == "explicit",
+            "infrastructure storage status resolves its private task identity",
+        )
+        plan = self.wm(worktree, "plan")
+        self.check(
+            all(
+                path == "e2e-shared-policy.md" or path.startswith("e2e-infra-assets/")
+                for path in plan["changed_paths"]
+            ),
+            "infrastructure plan contains only declared shared paths",
+        )
+        self.check(
+            "e2e-infra-assets/data.bin.dvc" in plan["changed_paths"],
+            "infrastructure plan includes managed-storage metadata",
+        )
+        published = self.wm(worktree, "publish", "-m", "Publish E2E shared policy")
+        oid = published["commit_oid"]
+        self.check(self.remote_ref(branch) == oid, "infrastructure branch is published")
+        self.check(
+            self.remote_path_exists(oid, "e2e-shared-policy.md"),
+            "infrastructure path exists in the published tree",
+        )
+        self.check(
+            self.remote_path_exists(oid, "e2e-infra-assets/data.bin.dvc")
+            and not self.remote_path_exists(oid, "e2e-infra-assets/data.bin"),
+            "infrastructure publication stores metadata in Git and payload in S3",
+        )
+        self.check(infra_payload in self.s3_bodies(), "infrastructure payload reaches versioned S3")
+        self.check(published["review"]["pull_request"] == "required", "review handoff requires one PR")
+        self.check(published["review"]["initial_state"] == "draft", "review handoff starts draft")
+        self.check(published["review"]["managed_by"] == "agent", "review handoff assigns the agent")
+        self.check(published["review"]["merge_authority"] == "user", "review handoff reserves merge for user")
+        self.check(
+            self.git(worktree, "status", "--short").stdout == "",
+            "published infrastructure worktree is clean",
+        )
+        self.check(self.wm(worktree, "plan")["status"] == "no_changes", "infrastructure plan ends clean")
+        (worktree / "e2e-shared-policy.md").unlink()
+        removed = self.wm(worktree, "publish", "-m", "Remove E2E shared policy")
+        removed_oid = removed["commit_oid"]
+        self.check(
+            removed["changed_paths"] == ["e2e-shared-policy.md"],
+            "infrastructure deletion publishes only its missing file scope",
+        )
+        self.check(
+            not self.remote_path_exists(removed_oid, "e2e-shared-policy.md"),
+            "published infrastructure deletion removes the remote path",
+        )
+        self.check(
+            self.git(worktree, "status", "--short").stdout == "",
+            "deleted infrastructure scope leaves a clean worktree",
+        )
+        self.check(
+            self.wm(worktree, "plan")["status"] == "no_changes",
+            "missing published infrastructure scope remains a clean plan",
+        )
+        versions_before_discard = self.list_s3_versions()
+        discard_preview = self.wm(worktree, "task", "discard", "--dry-run")
+        self.check(discard_preview["status"] == "dry_run", "infrastructure discard previews cleanup")
+        self.check(
+            discard_preview["review"]["provider_state_verified_by_cli"] is False
+            and "close" in discard_preview["review"]["required_before_confirm"],
+            "infrastructure discard hands PR closure to the agent",
+        )
+        self.check(
+            discard_preview["local_actions"][0]["action"] == "delete-worktree",
+            "infrastructure discard names the managed worktree deletion",
+        )
+        self.check(
+            any(item["boundary"] == "e2e-infra-assets/data.bin" for item in discard_preview["retained_s3"]),
+            "infrastructure discard reports retained S3 boundary versions",
+        )
+        discarded = self.wm(
+            self.shared,
+            "task",
+            "discard",
+            "--manifest",
+            str(created["manifest"]),
+            "--confirm",
+            "infra-e2e-policy",
+        )
+        self.check(discarded["status"] == "discarded", "infrastructure discard succeeds after review handoff")
+        self.check(
+            discarded.get("cleanup_warnings", []) == [],
+            "infrastructure discard completes without cleanup warnings",
+        )
+        self.check(not worktree.exists(), "infrastructure discard removes its worktree")
+        self.check(self.remote_ref(branch) is None, "infrastructure discard deletes its network branch")
+        local_branch = self.git(
+            self.shared,
+            "rev-parse",
+            "--verify",
+            branch,
+            expected=(0, 128),
+        )
+        self.check(local_branch.returncode == 128, "infrastructure discard deletes its local branch")
+        self.check(
+            self.list_s3_versions() == versions_before_discard,
+            "infrastructure discard does not purge versioned S3 content",
+        )
+        self.assert_shared_head()
+
+    def exercise_dvc(self, task_id: str, task: Path, branch: str) -> None:
+        assert self.shared is not None
+        self.section("Git/S3 placement, failure atomicity, hydrate, move, and reset")
+        data = task / "data.bin"
+        git_to_s3 = task / "notes.txt"
+        bundle = task / "bundle"
+        bundle.mkdir()
+        v1 = b"single-file version one\n"
+        bundle_v1_a = b"bundle alpha version one\n"
+        bundle_v1_b = b"bundle beta version one\n"
+        bundle_bulk = b"x" * 1_048_576
+        data.write_bytes(v1)
+        (bundle / "alpha.txt").write_bytes(bundle_v1_a)
+        (bundle / "beta.txt").write_bytes(bundle_v1_b)
+        (bundle / "bulk.bin").write_bytes(bundle_bulk)
+        remote_before = self.remote_ref(branch)
+        dry = self.wm(
+            task,
+            "storage",
+            "set",
+            "--dry-run",
+            f"{task_id}/data.bin",
+            f"{task_id}/notes.txt",
+            f"{task_id}/bundle",
+            "--to",
+            "s3",
+            "--reason",
+            "Retained E2E binary data.",
+        )
+        self.check(dry["status"] == "dry_run", "S3 placement dry-run succeeds")
+        self.check(dry["remote_writes"] is False, "placement dry-run reports no remote writes")
+        dry_placements = {item["path"]: item for item in dry["placements"]}
+        self.check(
+            dry_placements[f"{task_id}/data.bin"]["warnings"][0]["code"]
+            == "small-s3-boundary",
+            "tiny explicit S3 file receives an efficiency warning",
+        )
+        self.check(
+            "warnings" not in dry_placements[f"{task_id}/bundle"]
+            and dry_placements[f"{task_id}/bundle"]["payload_bytes"] > 1_048_576,
+            "aggregate S3 directory clears the small-boundary warning",
+        )
+        self.check(not task.joinpath("data.bin.dvc").exists(), "placement dry-run creates no metadata")
+        self.check(not task.joinpath("notes.txt.dvc").exists(), "Git-to-S3 dry-run creates no metadata")
+        self.check(self.remote_ref(branch) == remote_before, "placement dry-run leaves Git remote unchanged")
+        self.check(self.list_s3_versions() == [], "placement dry-run leaves S3 empty")
+
+        placed = self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/data.bin",
+            f"{task_id}/notes.txt",
+            f"{task_id}/bundle",
+            "--to",
+            "s3",
+            "--reason",
+            "Retained E2E binary data.",
+        )
+        self.check(placed["status"] == "updated", "two paths are placed in S3 locally")
+        self.check(placed["remote_writes"] is False, "S3 placement performs no remote writes")
+        self.check(self.remote_ref(branch) == remote_before, "placement leaves Git remote unchanged")
+        self.check(self.list_s3_versions() == [], "placement leaves S3 remote unchanged")
+        statuses = self.wm(task, "storage", "status")
+        status_paths = {item["path"] for item in statuses["placements"]}
+        self.check(
+            {f"{task_id}/data.bin", f"{task_id}/notes.txt", f"{task_id}/bundle"}.issubset(status_paths),
+            "storage status finds all explicit boundaries alongside Git content",
+        )
+        self.check(
+            all(
+                item["target"] == "s3" and item["basis"] == "explicit"
+                for item in statuses["placements"]
+                if item["path"] in {f"{task_id}/data.bin", f"{task_id}/notes.txt", f"{task_id}/bundle"}
+            ),
+            "storage status explains explicit S3 placement",
+        )
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Suspended"}
+        )
+        disabled_doctor = self.wm(self.shared, "doctor", expected=2)
+        self.check(
+            "does not have object versioning enabled" in disabled_doctor["stdout"],
+            "doctor detects disabled S3 bucket versioning",
+        )
+        disabled_publish = self.wm(
+            task,
+            "publish",
+            "-m",
+            "This must fail before an unversioned upload",
+            expected=2,
+        )
+        self.check(
+            "object versioning" in disabled_publish["stderr"],
+            "publish rejects disabled bucket versioning before upload",
+        )
+        self.check(self.list_s3_versions() == [], "disabled versioning uploads no S3 object")
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        placement_plan = self.wm(task, "plan")
+        small_boundaries = {
+            decision["boundary"]
+            for decision in placement_plan["storage"]["placement"]["decisions"]
+            if any(warning["code"] == "small-s3-boundary" for warning in decision.get("warnings", []))
+        }
+        self.check(
+            {f"{task_id}/data.bin", f"{task_id}/notes.txt"}.issubset(small_boundaries)
+            and f"{task_id}/bundle" not in small_boundaries,
+            "plan surfaces tiny S3 boundaries without warning on an aggregate boundary",
+        )
+        tracked = self.wm(task, "publish", "-m", "Publish S3 file and directory")
+        self.check(tracked["status"] == "pushed", "two S3 boundaries publish atomically")
+        verification = tracked["storage"]["s3"]["verification"]
+        self.check(verification["mode"] == "version-aware", "exact S3 version verification ran")
+        self.check(len(verification["checked_objects"]) >= 3, "each payload object was exactly verified")
+        data_pointer = task / "data.bin.dvc"
+        bundle_pointer = task / "bundle.dvc"
+        self.check(data_pointer.is_file() and bundle_pointer.is_file(), "file and directory pointers exist")
+        self.check("version_id" in data_pointer.read_text(encoding="utf-8"), "file pointer records S3 version ID")
+        self.check("version_id" in bundle_pointer.read_text(encoding="utf-8"), "directory pointer records S3 version IDs")
+        tracked_oid = self.remote_ref(branch)
+        assert tracked_oid is not None
+        self.check(not self.remote_path_exists(tracked_oid, f"{task_id}/data.bin"), "DVC payload is absent from Git tree")
+        self.check(not self.remote_path_exists(tracked_oid, f"{task_id}/notes.txt"), "published Git payload is removed when moved to S3")
+        self.check(self.remote_path_exists(tracked_oid, f"{task_id}/notes.txt.dvc"), "Git-to-S3 transition publishes a pointer")
+        self.check(not self.remote_path_exists(tracked_oid, f"{task_id}/bundle"), "DVC directory is absent from Git tree")
+        self.check(self.remote_path_exists(tracked_oid, f"{task_id}/data.bin.dvc"), "file pointer is in Git tree")
+        versions_v1 = self.list_s3_versions()
+        self.check(len(versions_v1) >= 3, "MinIO contains DVC payload versions")
+        self.check(all(item["version_id"] not in ("", "null") for item in versions_v1), "all S3 objects have version IDs")
+        config_before_relocation = (self.shared / ".workspace-mgr.toml").read_bytes()
+        internal_before_repair = (self.shared / ".dvc" / "config").read_bytes()
+        damaged_internal = b"# damaged generated configuration with live pointers\n"
+        (self.shared / ".dvc" / "config").write_bytes(damaged_internal)
+        relocation = self.wm(
+            self.shared,
+            "init",
+            "--s3-url",
+            "s3://workspace-mgr-other/dvc",
+            expected=2,
+        )
+        self.check(
+            "cannot change the managed S3 location" in relocation["stderr"]
+            and (self.shared / ".workspace-mgr.toml").read_bytes()
+            == config_before_relocation,
+            "committed repository facts prevent relocation even when generated config is damaged",
+        )
+        self.check(
+            (self.shared / ".dvc" / "config").read_bytes() == damaged_internal,
+            "failed relocation leaves the damaged scaffold untouched for explicit repair",
+        )
+        repaired_with_pointers = self.wm(self.shared, "init")
+        self.check(
+            repaired_with_pointers["status"] == "initialized"
+            and (self.shared / ".dvc" / "config").read_bytes()
+            == internal_before_repair,
+            "init repairs marker-free generated config while live pointers remain",
+        )
+        bodies_v1 = self.s3_bodies()
+        for payload in (v1, bundle_v1_a, bundle_v1_b, bundle_bulk):
+            self.check(payload in bodies_v1, "S3 contains exact version-one payload", payload=payload.decode().strip())
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "published S3 state is clean")
+        inherited = self.wm(task, "storage", "status", f"{task_id}/bundle/alpha.txt")
+        self.check(
+            inherited["placements"][0]["target"] == "s3"
+            and inherited["placements"][0]["basis"] == "explicit-ancestor",
+            "a descendant inherits its directory S3 boundary",
+        )
+        remote_before_overlap = self.remote_ref(branch)
+        versions_before_overlap = self.list_s3_versions()
+        overlap = self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/bundle/alpha.txt",
+            "--to",
+            "git",
+            "--reason",
+            "This nested override must be rejected.",
+            expected=2,
+        )
+        self.check("existing placement boundary" in overlap["stderr"], "nested placement is rejected")
+        nested_reset = self.wm(
+            task,
+            "storage",
+            "reset",
+            f"{task_id}/bundle/alpha.txt",
+            expected=2,
+        )
+        self.check("existing placement boundary" in nested_reset["stderr"], "nested reset is rejected")
+        self.check(self.remote_ref(branch) == remote_before_overlap, "nested-boundary guards leave Git unchanged")
+        self.check(self.list_s3_versions() == versions_before_overlap, "nested-boundary guards leave S3 unchanged")
+
+        v2 = b"single-file version two\n"
+        bundle_v2_a = b"bundle alpha version two\n"
+        bundle_v2_c = b"bundle gamma version two\n"
+        data.write_bytes(v2)
+        (bundle / "alpha.txt").write_bytes(bundle_v2_a)
+        (bundle / "beta.txt").unlink()
+        (bundle / "gamma.txt").write_bytes(bundle_v2_c)
+        pointer_before_plan = data_pointer.read_bytes()
+        s3_before_plan = self.list_s3_versions()
+        remote_before_plan = self.remote_ref(branch)
+        planned = self.wm(task, "plan")
+        self.check(planned["status"] == "dry_run", "dirty DVC outputs appear in plan")
+        self.check(set(planned["storage"]["s3"]["dirty_files"]) == {f"{task_id}/data.bin.dvc", f"{task_id}/bundle.dvc"}, "plan finds both dirty S3 boundaries")
+        self.check(data_pointer.read_bytes() == pointer_before_plan, "plan does not rewrite DVC metadata")
+        self.check(self.list_s3_versions() == s3_before_plan, "plan does not upload new S3 versions")
+        self.check(self.remote_ref(branch) == remote_before_plan, "plan does not move Git branch")
+
+        bad_credentials = {
+            "AWS_ACCESS_KEY_ID": "invalid-e2e-key",
+            "AWS_SECRET_ACCESS_KEY": "invalid-e2e-secret",
+        }
+        failed_s3 = self.wm(
+            task,
+            "publish",
+            "-m",
+            "This must fail before Git publication",
+            expected=2,
+            env=bad_credentials,
+        )
+        self.check(failed_s3["stderr"], "S3 authentication failure is reported")
+        self.check(
+            "invalid-e2e-key" not in failed_s3["stderr"]
+            and "invalid-e2e-secret" not in failed_s3["stderr"],
+            "S3 authentication failure does not echo credentials",
+        )
+        self.check(self.remote_ref(branch) == remote_before_plan, "S3 failure leaves remote Git ref unchanged")
+        self.check(self.git(self.shared, "rev-parse", branch).stdout.strip() == remote_before_plan, "S3 failure leaves local target ref unchanged")
+        self.check(self.list_s3_versions() == s3_before_plan, "S3 authentication failure uploads no object")
+
+        published_v2 = self.wm(task, "publish", "-m", "Publish DVC version two")
+        self.check(published_v2["status"] == "pushed", "retry after S3 failure succeeds")
+        self.check(published_v2["storage"]["s3"]["verification"]["mode"] == "version-aware", "retry verifies exact S3 versions")
+        versions_v2 = self.list_s3_versions()
+        self.check(len(versions_v2) > len(versions_v1), "S3 retains additional immutable versions")
+        bodies_v2 = self.s3_bodies()
+        for payload in (v2, bundle_v2_a, bundle_v2_c):
+            self.check(payload in bodies_v2, "S3 contains exact version-two payload", payload=payload.decode().strip())
+
+        reject_flag = self.install_rejecting_hook()
+        reject_flag.write_text("reject\n", encoding="utf-8")
+        v3 = b"single-file version three\n"
+        bundle_v3_a = b"bundle alpha version three\n"
+        data.write_bytes(v3)
+        (bundle / "alpha.txt").write_bytes(bundle_v3_a)
+        remote_before_reject = self.remote_ref(branch)
+        local_before_reject = self.git(self.shared, "rev-parse", branch).stdout.strip()
+        versions_before_reject = self.list_s3_versions()
+        rejected_git = self.wm(
+            task,
+            "publish",
+            "-m",
+            "Upload before intentional Git rejection",
+            expected=2,
+        )
+        self.check("rejection" in rejected_git["stderr"].lower() or "rejected" in rejected_git["stderr"].lower(), "Git server rejection is visible")
+        self.check(self.remote_ref(branch) == remote_before_reject, "Git rejection leaves remote branch unchanged")
+        local_after_reject = self.git(self.shared, "rev-parse", branch).stdout.strip()
+        self.check(local_after_reject != local_before_reject, "failed Git push retains retryable local commit")
+        self.check(local_after_reject != remote_before_reject, "local and remote refs expose interrupted publication")
+        versions_after_reject = self.list_s3_versions()
+        self.check(len(versions_after_reject) > len(versions_before_reject), "DVC data is uploaded before Git publication")
+        self.check(v3 in self.s3_bodies() and bundle_v3_a in self.s3_bodies(), "unreferenced retryable S3 versions contain exact payloads")
+        reject_flag.unlink()
+        retried = self.wm(task, "publish", "-m", "Retry Git publication after rejection")
+        self.check(retried["status"] == "pushed", "Git publication retry succeeds")
+        self.check(self.remote_ref(branch) == retried["commit_oid"], "retry reconciles local and remote refs")
+
+        cache = self.shared / ".dvc" / "cache"
+        if cache.exists():
+            shutil.rmtree(cache)
+        unpublished_edit = b"unpublished local edit that hydrate must preserve\n"
+        data.write_bytes(unpublished_edit)
+        remote_before_conflict = self.remote_ref(branch)
+        versions_before_conflict = self.list_s3_versions()
+        conflict = self.wm(
+            task,
+            "storage",
+            "hydrate",
+            f"{task_id}/data.bin",
+            expected=2,
+        )
+        self.check("locally changed outputs" in conflict["stderr"], "hydrate rejects a locally modified output")
+        self.check(data.read_bytes() == unpublished_edit, "failed hydrate preserves the local modification")
+        self.check(self.remote_ref(branch) == remote_before_conflict, "hydrate conflict leaves Git unchanged")
+        self.check(self.list_s3_versions() == versions_before_conflict, "hydrate conflict leaves S3 unchanged")
+        data.write_bytes(v3)
+
+        remote_before_missing = self.remote_ref(branch)
+        data.unlink()
+        missing = self.wm(task, "publish", "-m", "Do not interpret missing data as deletion", expected=2)
+        self.check("missing locally" in missing["stderr"], "missing DVC output is rejected")
+        self.check(self.remote_ref(branch) == remote_before_missing, "missing output leaves Git remote unchanged")
+        self.check(not data.exists(), "failed missing-output publication does not synthesize data")
+
+        if cache.exists():
+            shutil.rmtree(cache)
+        if bundle.exists():
+            shutil.rmtree(bundle)
+        dry_hydrate = self.wm(task, "storage", "hydrate", "--dry-run", f"{task_id}/data.bin")
+        self.check(dry_hydrate["status"] == "dry_run", "hydrate dry-run reports work")
+        self.check(not data.exists(), "hydrate dry-run does not materialize output")
+        hydrated_file = self.wm(task, "storage", "hydrate", f"{task_id}/data.bin")
+        self.check(hydrated_file["status"] == "hydrated", "targeted hydrate succeeds from empty cache")
+        self.check(data.read_bytes() == v3, "targeted hydrate restores exact S3 version")
+        self.check(not bundle.exists(), "targeted hydrate does not materialize another boundary")
+        hydrated_all = self.wm(task, "storage", "hydrate")
+        self.check(hydrated_all["status"] == "hydrated", "scope-wide hydrate succeeds")
+        self.check((bundle / "alpha.txt").read_bytes() == bundle_v3_a, "directory hydrate restores latest alpha")
+        self.check((bundle / "gamma.txt").read_bytes() == bundle_v2_c, "directory hydrate preserves unchanged file")
+        self.check(not (bundle / "beta.txt").exists(), "directory hydrate preserves a published deletion")
+
+        old_path = f"{task_id}/data.bin"
+        new_path = f"{task_id}/moved.bin"
+        move_dry = self.wm(task, "move", "--dry-run", old_path, new_path)
+        self.check(move_dry["status"] == "dry_run", "move dry-run succeeds")
+        self.check(data.exists() and not task.joinpath("moved.bin").exists(), "move dry-run changes no files")
+        versions_before_move = self.list_s3_versions()
+        remote_before_move = self.remote_ref(branch)
+        moved = self.wm(task, "move", old_path, new_path)
+        self.check(moved["status"] == "updated", "S3 boundary moves locally")
+        self.check(moved["remote_writes"] is False, "move reports no remote writes")
+        self.check(self.remote_ref(branch) == remote_before_move, "move leaves Git remote unchanged")
+        self.check(self.list_s3_versions() == versions_before_move, "move leaves S3 unchanged")
+        moved_output = task / "moved.bin"
+        moved_pointer = task / "moved.bin.dvc"
+        self.check(not data.exists() and not data_pointer.exists(), "old DVC boundary is removed")
+        self.check(moved_output.read_bytes() == v3 and moved_pointer.is_file(), "moved DVC boundary preserves payload")
+        moved_publish = self.wm(task, "publish", "-m", "Publish moved S3 boundary")
+        self.check(moved_publish["status"] == "pushed", "moved S3 boundary publishes")
+        moved_oid = self.remote_ref(branch)
+        assert moved_oid is not None
+        self.check(self.remote_path_exists(moved_oid, f"{task_id}/moved.bin.dvc"), "moved pointer exists in remote Git tree")
+        self.check(not self.remote_path_exists(moved_oid, f"{task_id}/data.bin.dvc"), "old pointer is absent from remote Git tree")
+
+        reset_dry = self.wm(task, "storage", "reset", "--dry-run", f"{task_id}/moved.bin")
+        self.check(reset_dry["status"] == "dry_run", "placement reset dry-run succeeds")
+        self.check(reset_dry["placements"][0]["target"] == "s3", "published S3 placement stays stable after reset")
+        self.check(moved_pointer.is_file() and moved_output.is_file(), "reset dry-run preserves boundary")
+        remote_before_reset = self.remote_ref(branch)
+        reset = self.wm(task, "storage", "reset", f"{task_id}/moved.bin")
+        self.check(reset["status"] == "updated", "reset returns path to automatic placement")
+        self.check(reset["remote_writes"] is False, "reset performs no remote writes")
+        self.check(self.remote_ref(branch) == remote_before_reset, "reset leaves Git remote unchanged")
+        self.check(moved_pointer.exists(), "reset preserves published S3 metadata locally")
+        self.check(moved_output.read_bytes() == v3, "reset preserves output")
+        reset_status = self.wm(task, "storage", "status", f"{task_id}/moved.bin")
+        self.check(reset_status["placements"][0]["target"] == "s3", "status keeps the published S3 placement")
+        to_git = self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/moved.bin",
+            "--to",
+            "git",
+            "--reason",
+            "Exercise the explicit S3-to-Git transition.",
+        )
+        self.check(to_git["status"] == "updated", "explicit placement moves published S3 content to Git")
+        self.check(not moved_pointer.exists(), "explicit Git placement removes S3 metadata locally")
+        reset_publish = self.wm(task, "publish", "-m", "Publish explicit Git placement")
+        self.check(reset_publish["status"] == "pushed", "Git placement publishes")
+        untracked_oid = self.remote_ref(branch)
+        assert untracked_oid is not None
+        self.check(self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin"), "reset output becomes ordinary Git content")
+        self.check(not self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin.dvc"), "reset S3 metadata is absent from Git")
+        self.check(self.remote_path_exists(untracked_oid, f"{task_id}/bundle.dvc"), "other S3 boundary remains stored")
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "storage lifecycle ends cleanly")
+
+    def refresh_and_cross_clone(self, task_id: str, task: Path, branch: str) -> None:
+        assert self.shared is not None
+        self.section("shared-checkout refresh and independent clone hydration")
+        merged_oid = self.merge_branch_to_main(branch)
+        assert self.seed is not None
+        refresh_source = self.root / "refresh-source"
+        self.git(self.seed, "worktree", "add", "--detach", refresh_source, merged_oid)
+        self.configure_git(refresh_source)
+        (refresh_source / "refresh-update.txt").write_text("new refresh value\n", encoding="utf-8")
+        (refresh_source / "refresh-delete.txt").unlink()
+        (refresh_source / "refresh-added.txt").write_text("added by remote\n", encoding="utf-8")
+        self.git(refresh_source, "add", "-A")
+        self.git(refresh_source, "commit", "-m", "Update ordinary Git files for refresh")
+        merged_oid = self.git(refresh_source, "rev-parse", "HEAD").stdout.strip()
+        self.git(refresh_source, "push", "origin", "HEAD:refs/heads/main")
+        self.git(self.seed, "worktree", "remove", "--force", refresh_source)
+        original_main = self.git(self.shared, "rev-parse", "main").stdout.strip()
+        self.check(original_main != merged_oid, "shared main remains stale before refresh")
+        (self.shared / "README.md").write_text("# Active tracked overlay\n", encoding="utf-8")
+        overlay = (self.shared / "README.md").read_bytes()
+        unrelated = (self.shared / "unrelated.txt").read_bytes()
+        bundle = task / "bundle"
+        if bundle.exists():
+            shutil.rmtree(bundle)
+        cache = self.shared / ".dvc" / "cache"
+        if cache.exists():
+            shutil.rmtree(cache)
+
+        dry = self.wm(self.shared, "refresh", "--dry-run")
+        self.check(dry["status"] == "dry_run", "refresh dry-run sees incoming main")
+        self.check(self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main, "refresh dry-run does not move local main")
+        self.check(not bundle.exists(), "refresh dry-run does not hydrate DVC output")
+
+        self.git(self.shared, "add", "README.md")
+        staged_guard = self.wm(self.shared, "refresh", expected=2)
+        self.check("staged changes" in staged_guard["stderr"], "refresh refuses a staged shared index")
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "staged-index refusal leaves the local main ref unchanged",
+        )
+        self.git(self.shared, "restore", "--staged", "--", "README.md")
+
+        bad_credentials = {
+            "AWS_ACCESS_KEY_ID": "invalid-refresh-key",
+            "AWS_SECRET_ACCESS_KEY": "invalid-refresh-secret",
+        }
+        failed_prefetch = self.wm(
+            self.shared,
+            "refresh",
+            expected=2,
+            env=bad_credentials,
+        )
+        self.check(failed_prefetch["stderr"], "refresh reports provider authorization failure")
+        self.check(
+            "invalid-refresh-key" not in failed_prefetch["stderr"]
+            and "invalid-refresh-secret" not in failed_prefetch["stderr"],
+            "refresh provider failure does not echo credentials",
+        )
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "provider failure before refresh leaves the local main ref unchanged",
+        )
+        self.check(
+            (self.shared / "refresh-update.txt").read_text(encoding="utf-8")
+            == "old refresh value\n"
+            and (self.shared / "refresh-delete.txt").is_file()
+            and not (self.shared / "refresh-added.txt").exists(),
+            "provider failure before refresh leaves ordinary Git files unchanged",
+        )
+        self.check(not bundle.exists(), "provider failure before refresh materializes no stored output")
+        self.check((self.shared / "README.md").read_bytes() == overlay, "provider failure preserves tracked overlay")
+        self.check(
+            self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
+            "provider failure preserves a clean shared index",
+        )
+        runtime_dvc = (
+            self.home
+            / ".local"
+            / "share"
+            / "workspace-mgr"
+            / "storage-3.67.1"
+            / "bin"
+            / "dvc"
+        )
+        real_dvc = runtime_dvc.with_name("dvc.workspace-mgr-e2e-real")
+        checkout_counter = self.root / "refresh-checkout-counter"
+        runtime_dvc.rename(real_dvc)
+        runtime_dvc.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' '3.67.1'; exit 0; fi\n"
+            "if [ \"${1:-}\" = \"checkout\" ] && [ ! -f \"$CHECKOUT_COUNTER\" ]; then\n"
+            "  : > \"$CHECKOUT_COUNTER\"\n"
+            "  exit 23\n"
+            "fi\n"
+            "exec \"$WORKSPACE_MGR_E2E_REAL_DVC\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        runtime_dvc.chmod(0o755)
+        try:
+            failed_refresh = self.wm(
+                self.shared,
+                "refresh",
+                expected=2,
+                env={
+                    "CHECKOUT_COUNTER": str(checkout_counter),
+                    "WORKSPACE_MGR_E2E_REAL_DVC": str(real_dvc),
+                },
+            )
+        finally:
+            runtime_dvc.unlink(missing_ok=True)
+            real_dvc.rename(runtime_dvc)
+        self.check("rolled back" in failed_refresh["stderr"], "post-ref refresh failure is rolled back")
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "failed refresh restores the original main ref",
+        )
+        self.check(
+            (self.shared / "refresh-update.txt").read_text(encoding="utf-8")
+            == "old refresh value\n",
+            "failed refresh restores an ordinary modified Git file",
+        )
+        self.check(
+            (self.shared / "refresh-delete.txt").is_file()
+            and not (self.shared / "refresh-added.txt").exists(),
+            "failed refresh restores ordinary additions and deletions",
+        )
+        self.check(not bundle.exists(), "failed refresh removes newly hydrated output")
+        self.check((self.shared / "README.md").read_bytes() == overlay, "failed refresh preserves tracked overlay")
+        self.check(
+            self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
+            "failed refresh restores a clean shared index",
+        )
+        refreshed = self.wm(self.shared, "refresh")
+        self.check(refreshed["status"] == "updated", "refresh fast-forwards shared main")
+        self.check(refreshed["new_oid"] == merged_oid, "refresh reports merged object ID")
+        self.check(refreshed["storage"]["mode"] == "hydrate", "refresh uses managed-storage hydration")
+        self.check(f"{task_id}/bundle.dvc" in refreshed["storage"]["changed_files"], "refresh identifies incoming storage metadata")
+        self.assert_shared_head(merged_oid)
+        self.check((self.shared / "README.md").read_bytes() == overlay, "refresh preserves tracked overlay")
+        self.check((self.shared / "unrelated.txt").read_bytes() == unrelated, "refresh preserves unrelated untracked overlay")
+        self.check((self.shared / "refresh-update.txt").read_text(encoding="utf-8") == "new refresh value\n", "refresh materializes a modified Git file")
+        self.check((self.shared / "refresh-added.txt").read_text(encoding="utf-8") == "added by remote\n", "refresh materializes a new Git file")
+        self.check(not (self.shared / "refresh-delete.txt").exists(), "refresh removes a clean deleted Git file")
+        self.check("refresh-added.txt" in refreshed["materialized_git_paths"], "refresh reports ordinary Git materialization")
+        self.check((bundle / "alpha.txt").read_bytes() == b"bundle alpha version three\n", "refresh hydrates exact S3 directory version")
+        staged = self.git(self.shared, "diff", "--cached", "--name-only").stdout
+        self.check(staged == "", "refresh leaves shared index clean")
+        self.check(self.wm(self.shared, "refresh")["status"] == "no_changes", "repeat refresh is idempotent")
+
+        consumer = self.root / "consumer"
+        self.run(["git", "clone", self.remote_url, consumer], cwd=self.root)
+        self.configure_git(consumer)
+        consumer_task = consumer / task_id
+        self.check(not (consumer_task / "bundle").exists(), "fresh clone has no DVC payload")
+        self.check((consumer_task / "moved.bin").read_bytes() == b"single-file version three\n", "fresh clone receives untracked Git payload")
+        doctor = self.wm(consumer, "doctor")
+        self.check(doctor["status"] == "ok", "fresh network clone passes doctor")
+        hydrated = self.wm(consumer_task, "storage", "hydrate")
+        self.check(hydrated["status"] == "hydrated", "fresh clone hydrates from MinIO")
+        self.check((consumer_task / "bundle" / "alpha.txt").read_bytes() == b"bundle alpha version three\n", "cross-clone S3 hydration is exact")
+        self.check((consumer_task / "notes.txt").read_text(encoding="utf-8") == "task-only content\n", "cross-clone hydration restores Git-to-S3 content")
+
+    def exercise_automatic_and_explicit_git(self) -> None:
+        assert self.shared is not None
+        self.section("automatic S3 placement and explicit large-file Git override")
+        task_id = "20260829-190000-placement-policy"
+        branch = "codex/placement-policy"
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "placement-policy",
+            "--title",
+            "Placement policy",
+            "--purpose",
+            "Exercise automatic S3 and explicit Git placement.",
+            "--timestamp",
+            "20260829-190000",
+        )
+        self.check(created["status"] == "created", "second task scaffold created")
+        task = self.shared / task_id
+        explicit_git = task / "explicit-git.bin"
+        automatic_s3 = task / "automatic-s3.bin"
+        review_band = task / "review-band.bin"
+        small_default = task / "small-default.bin"
+        explicit_git.write_bytes(b"g" * 10_485_761)
+        automatic_s3.write_bytes(b"s" * 10_485_762)
+        review_band.write_bytes(b"r" * 2_097_152)
+        small_default.write_bytes(b"d" * 1_048_575)
+        remote_before = self.remote_ref(branch)
+        versions_before = self.list_s3_versions()
+        placed = self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/explicit-git.bin",
+            "--to",
+            "git",
+            "--reason",
+            "This E2E artifact must remain directly reviewable in Git.",
+        )
+        self.check(placed["status"] == "updated", "large file receives explicit Git placement")
+        self.check(placed["remote_writes"] is False, "explicit Git placement writes no remote")
+        self.check(self.remote_ref(branch) == remote_before, "placement leaves Git branch absent")
+        self.check(self.list_s3_versions() == versions_before, "placement leaves S3 unchanged")
+        status = self.wm(
+            task,
+            "storage",
+            "status",
+            f"{task_id}/explicit-git.bin",
+        )
+        self.check(status["placements"][0]["target"] == "git", "status reports explicit Git")
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Suspended"}
+        )
+        disabled_plan = self.wm(task, "plan", expected=2)
+        self.check(
+            "does not have object versioning enabled" in disabled_plan["stderr"],
+            "plan rejects automatic S3 placement when bucket versioning is disabled",
+        )
+        self.check(not task.joinpath("automatic-s3.bin.dvc").exists(), "rejected plan creates no S3 metadata")
+        self.check(self.list_s3_versions() == versions_before, "rejected plan performs no S3 upload")
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        plan = self.wm(task, "plan")
+        self.check(plan["status"] == "dry_run", "automatic S3 placement appears in plan")
+        decisions = {
+            decision["path"]: decision
+            for decision in plan["storage"]["placement"]["decisions"]
+        }
+        self.check(
+            decisions[f"{task_id}/automatic-s3.bin"]["target"] == "s3"
+            and decisions[f"{task_id}/automatic-s3.bin"]["basis"]
+            == "automatic-size-fallback",
+            "plan routes the unplaced large file to S3",
+        )
+        self.check(
+            decisions[f"{task_id}/review-band.bin"]["target"] == "git"
+            and decisions[f"{task_id}/review-band.bin"]["warnings"][0]["code"]
+            == "semantic-placement-review",
+            "plan asks the agent to review semantic placement in the 1-10 MiB band",
+        )
+        self.check(
+            f"{task_id}/small-default.bin" not in decisions,
+            "sub-1 MiB content uses the strong Git default without plan noise",
+        )
+        self.check(not task.joinpath("automatic-s3.bin.dvc").exists(), "plan does not create S3 metadata")
+        self.check(self.list_s3_versions() == versions_before, "plan performs no S3 upload")
+        published = self.wm(task, "publish", "-m", "Publish automatic and explicit placement")
+        self.check(published["status"] == "pushed", "mixed Git and S3 placement publishes")
+        oid = self.remote_ref(branch)
+        assert oid is not None
+        self.check(self.remote_path_exists(oid, f"{task_id}/explicit-git.bin"), "explicit large file is stored in Git")
+        self.check(self.remote_path_exists(oid, f"{task_id}/review-band.bin"), "review-band fallback is stored in Git")
+        self.check(self.remote_path_exists(oid, f"{task_id}/small-default.bin"), "sub-1 MiB fallback is stored in Git")
+        self.check(not self.remote_path_exists(oid, f"{task_id}/automatic-s3.bin"), "automatic S3 payload is absent from Git")
+        self.check(self.remote_path_exists(oid, f"{task_id}/automatic-s3.bin.dvc"), "automatic S3 metadata is stored in Git")
+        self.check(len(self.list_s3_versions()) > len(versions_before), "automatic placement uploads a versioned S3 object")
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "mixed placement ends cleanly")
+
+        stored_version = self.s3_version_for_body(automatic_s3.read_bytes())
+        remote_before_loss = self.remote_ref(branch)
+        self.s3.delete_object(
+            Bucket=self.bucket,
+            Key=stored_version["key"],
+            VersionId=stored_version["version_id"],
+        )
+        self.record("s3-fault", {"operation": "delete-version", **stored_version})
+        automatic_s3.unlink()
+        cache = self.shared / ".dvc" / "cache"
+        if cache.exists():
+            shutil.rmtree(cache)
+        missing_remote = self.wm(
+            task,
+            "storage",
+            "hydrate",
+            f"{task_id}/automatic-s3.bin",
+            expected=2,
+        )
+        self.check(missing_remote["stderr"], "hydrate reports a missing exact S3 version")
+        self.check(not automatic_s3.exists(), "failed exact-version hydrate leaves output absent")
+        self.check(self.remote_ref(branch) == remote_before_loss, "missing S3 version leaves Git unchanged")
+
+    def discard_published_deliverable(self) -> None:
+        assert self.shared is not None
+        self.section("explicit abandonment and deliverable task discard")
+        task_id = "20260829-193000-discard-flow"
+        branch = "codex/discard-flow"
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "discard-flow",
+            "--title",
+            "Disposable E2E task",
+            "--purpose",
+            "Verify complete unmerged task abandonment.",
+            "--timestamp",
+            "20260829-193000",
+        )
+        task = Path(created["path"])
+        manifest = Path(created["manifest"])
+        payload = b"discarded task payload retained in versioned S3\n"
+        (task / "artifact.bin").write_bytes(payload)
+        self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/artifact.bin",
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise discard reporting without permanent S3 deletion.",
+        )
+        published = self.wm(task, "publish", "-m", "Publish disposable E2E task")
+        self.check(self.remote_ref(branch) == published["remote_oid"], "disposable task reaches network Git")
+        self.check(payload in self.s3_bodies(), "disposable task reaches versioned S3")
+        versions_before_discard = self.list_s3_versions()
+        shared_head = self.git(self.shared, "rev-parse", "main").stdout.strip()
+
+        preview = self.wm(task, "task", "discard", "--dry-run")
+        self.check(preview["status"] == "dry_run", "deliverable discard dry-run succeeds")
+        self.check(preview["remote_branch_oid"] == published["remote_oid"], "discard binds the published branch revision")
+        self.check(
+            preview["review"]["managed_by"] == "agent"
+            and "close" in preview["review"]["required_before_confirm"],
+            "discard requires the agent to close the unmerged PR",
+        )
+        self.check(
+            preview["local_actions"][0]["path"] == task_id
+            and preview["local_actions"][0]["action"] == "delete",
+            "discard reports the exact deliverable directory",
+        )
+        retained = next(
+            item
+            for item in preview["retained_s3"]
+            if item["boundary"] == f"{task_id}/artifact.bin"
+        )
+        self.check(
+            retained["version_ids"] and retained["disposition"] == "retained-not-purged",
+            "discard reports exact S3 retention without purging",
+        )
+        confirmation_plan = Path(preview["confirmation_plan"])
+        self.check(confirmation_plan.is_file(), "discard dry-run saves private confirmation state")
+
+        discarded = self.wm(
+            self.shared,
+            "task",
+            "discard",
+            "--manifest",
+            str(manifest),
+            "--confirm",
+            task_id,
+        )
+        self.check(discarded["status"] == "discarded", "confirmed deliverable discard succeeds")
+        self.check(
+            discarded.get("cleanup_warnings", []) == [],
+            "deliverable discard completes without cleanup warnings",
+        )
+        self.check(not task.exists(), "deliverable discard removes its local directory")
+        self.check(not confirmation_plan.exists(), "deliverable discard removes private task state")
+        self.check(self.remote_ref(branch) is None, "deliverable discard deletes its network branch")
+        local_branch = self.git(
+            self.shared,
+            "rev-parse",
+            "--verify",
+            branch,
+            expected=(0, 128),
+        )
+        self.check(local_branch.returncode == 128, "deliverable discard deletes its local branch")
+        self.check(
+            self.list_s3_versions() == versions_before_discard,
+            "deliverable discard preserves all versioned S3 objects",
+        )
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == shared_head,
+            "deliverable discard does not move the shared branch",
+        )
+        self.check((self.shared / "unrelated.txt").is_file(), "deliverable discard preserves another task overlay")
+
+    def exercise_non_fast_forward_refresh_guard(self) -> None:
+        assert self.shared is not None
+        self.section("network non-fast-forward refresh guard")
+        local_main = self.git(self.shared, "rev-parse", "main").stdout.strip()
+        tree = self.git(self.shared, "show", "-s", "--format=%T", local_main).stdout.strip()
+        divergent = self.git(
+            self.shared,
+            "commit-tree",
+            tree,
+            "-m",
+            "Intentional divergent E2E root",
+        ).stdout.strip()
+        self.git(
+            self.shared,
+            "push",
+            "--force",
+            "origin",
+            f"{divergent}:refs/heads/main",
+        )
+        self.check(self.remote_ref("main") == divergent, "network Git server exposes divergent main")
+        overlay = (self.shared / "README.md").read_bytes()
+        rejected = self.wm(self.shared, "refresh", expected=2)
+        self.check("cannot fast-forward" in rejected["stderr"], "refresh rejects a non-fast-forward remote")
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == local_main,
+            "non-fast-forward refusal preserves local main",
+        )
+        self.check((self.shared / "README.md").read_bytes() == overlay, "non-fast-forward refusal preserves overlays")
+        self.check(
+            self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
+            "non-fast-forward refusal preserves a clean shared index",
+        )
+
+    def close(self) -> None:
+        if self.git_daemon is not None:
+            self.git_daemon.terminate()
+            try:
+                self.git_daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.git_daemon.kill()
+                self.git_daemon.wait(timeout=5)
+        if self.git_daemon_log is not None:
+            self.git_daemon_log.close()
+
+    def execute(self) -> None:
+        self.section("virtual services")
+        self.setup_s3()
+        self.provision_runtime()
+        self.setup_repository()
+        self.initialize_workspace()
+        task_id, task, branch = self.create_and_publish_task()
+        self.exercise_dvc(task_id, task, branch)
+        self.create_and_publish_infrastructure_task()
+        self.refresh_and_cross_clone(task_id, task, branch)
+        self.exercise_automatic_and_explicit_git()
+        self.discard_published_deliverable()
+        self.exercise_non_fast_forward_refresh_guard()
+        summary = {
+            "status": "passed",
+            "assertions": self.assertions,
+            "evidence": str(self.evidence_path),
+            "git_remote": self.remote_url,
+            "s3_endpoint": self.endpoint,
+            "s3_versions": len(self.list_s3_versions()),
+        }
+        self.record("summary", summary)
+        print("\n" + json.dumps(summary, indent=2, sort_keys=True), flush=True)
+
+
+def main() -> int:
+    harness: Harness | None = None
+    try:
+        harness = Harness()
+        harness.execute()
+        return 0
+    except Exception as error:  # noqa: BLE001 - top-level evidence boundary
+        if harness is not None:
+            harness.record("summary", {"status": "failed", "error": repr(error)})
+        print(f"workspace-mgr E2E failed: {error}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if harness is not None:
+            harness.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

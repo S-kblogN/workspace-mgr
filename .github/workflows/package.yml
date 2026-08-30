@@ -1,0 +1,43 @@
+name: Package native binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build and assemble native archive
+        run: sh scripts/package-native.sh ${{ matrix.target }}
+      - name: Upload immutable workflow artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: workspace-mgr-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
