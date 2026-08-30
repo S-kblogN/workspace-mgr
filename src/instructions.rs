@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
+use crate::hex::encode_lower;
 use crate::path::reject_symlink_traversal;
 use crate::policy::{
     AUTO_S3_ABOVE_BYTES, INSTRUCTION_POLICY_VERSION, RECOMMENDED_S3_MINIMUM_BYTES,
@@ -108,7 +109,7 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     hasher.update(config.render()?);
     hasher.update(topic);
     hasher.update(&body);
-    let policy_hash = format!("{:x}", hasher.finalize());
+    let policy_hash = encode_lower(hasher.finalize());
     let markdown = format!(
         "<!-- workspace-mgr: cli={} policy-version={} policy={} topic={} -->\n{}\n",
         env!("CARGO_PKG_VERSION"),
