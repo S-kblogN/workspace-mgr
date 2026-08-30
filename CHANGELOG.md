@@ -12,8 +12,8 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   scaffolding.
 - Scoped repository and managed-storage transaction commands with strict
   repository and task schemas.
-- A public storage schema with deterministic internal configuration, exact DVC
-  3.67.1 runtime provisioning and enforcement, and mandatory S3 object-version
+- A public storage schema with deterministic internal configuration, exact
+  private-runtime provisioning and enforcement, and mandatory S3 object-version
   verification.
 - Shared-checkout refresh and rollback support.
 - Isolated local-storage and repository transaction integration tests, including

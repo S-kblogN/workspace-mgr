@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::config::{CONFIG_NAME, Config};
 use crate::dvc;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::git::GitRepo;
 use crate::process::command_exists;
 
@@ -210,14 +210,5 @@ fn command_check(command: &str, required: bool) -> DoctorCheck {
         } else {
             "not found on PATH".to_owned()
         },
-    }
-}
-
-pub fn require_healthy(path: &Path) -> Result<DoctorReport> {
-    let report = inspect(path)?;
-    if report.healthy() {
-        Ok(report)
-    } else {
-        Err(Error::message("workspace-mgr doctor found errors"))
     }
 }

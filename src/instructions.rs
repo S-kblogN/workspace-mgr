@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::Path;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -191,8 +190,4 @@ fn shared_checkout_section(config: &Config) -> String {
 fn infrastructure_section() -> String {
     "## Repository infrastructure\n\n- Treat a change to shared policy, root entrypoints, CI, or repository-wide storage configuration as one infrastructure task with one target branch and one draft pull request.\n- Keep its declared shared paths and task metadata isolated from ordinary deliverable content. Every path outside the task directory requires an explicit scope reason.\n- Infrastructure storage tests use fresh temporary repositories and local or mock remotes. They must not read user cloud credentials or contact a real storage service."
         .to_owned()
-}
-
-pub fn write_bootstrap(path: &Path) -> Result<()> {
-    fs::write(path, BOOTSTRAP).at(path)
 }

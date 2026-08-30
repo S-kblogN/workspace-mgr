@@ -1,22 +1,38 @@
 use clap::Parser;
 
-use workspace_mgr::cli::{
+mod cli;
+mod config;
+mod doctor;
+mod dvc;
+mod error;
+mod git;
+mod instructions;
+mod lock;
+mod manifest;
+mod output;
+mod path;
+mod process;
+mod refresh;
+mod runtime;
+mod scaffold;
+mod storage;
+mod transaction;
+
+use crate::cli::{
     Cli, Command, ConfigCommand, PlanArgs, PublishCommandArgs, ScopedArgs, StorageCommand,
     TaskCommand,
 };
-use workspace_mgr::config::Config;
-use workspace_mgr::error::{Error, Result};
-use workspace_mgr::git::GitRepo;
-use workspace_mgr::instructions;
-use workspace_mgr::lock::RepositoryLock;
-use workspace_mgr::manifest::{AdditionalScope, ResolvedTask, one_line};
-use workspace_mgr::output::{Format, print_human, print_json};
-use workspace_mgr::path::repo_path;
-use workspace_mgr::refresh::{RefreshOptions, execute as refresh};
-use workspace_mgr::runtime::{SetupOptions, setup};
-use workspace_mgr::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
-use workspace_mgr::storage;
-use workspace_mgr::transaction::{Operation, TransactionOptions, execute as transact, task_status};
+use crate::config::Config;
+use crate::error::{Error, Result};
+use crate::git::GitRepo;
+use crate::lock::RepositoryLock;
+use crate::manifest::{AdditionalScope, ResolvedTask, one_line};
+use crate::output::{Format, print_human, print_json};
+use crate::path::repo_path;
+use crate::refresh::{RefreshOptions, execute as refresh};
+use crate::runtime::{SetupOptions, setup};
+use crate::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
+use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
     let cli = Cli::parse();
@@ -57,7 +73,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Doctor(args) => {
-            let report = workspace_mgr::doctor::inspect(&args.repo)?;
+            let report = doctor::inspect(&args.repo)?;
             if cli.format == Format::Json {
                 print_json(&report)?;
             } else {

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, SCHEMA_VERSION};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
-use crate::path::{relative_to, repo_path};
+use crate::path::repo_path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -172,8 +172,4 @@ pub fn one_line(value: &str, field: &str) -> Result<String> {
         return Err(Error::message(format!("{field} must not be empty")));
     }
     Ok(value)
-}
-
-pub fn manifest_relative_path(repo: &GitRepo, path: &Path) -> Result<String> {
-    relative_to(path, &repo.root, "manifest path")
 }

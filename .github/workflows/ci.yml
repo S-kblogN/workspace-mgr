@@ -56,7 +56,7 @@ jobs:
       - name: Test
         run: cargo test --locked --all-features --no-fail-fast
       - name: Test production configuration boundary
-        run: cargo test --locked --lib --no-default-features production_build_rejects_filesystem_storage
+        run: cargo test --locked --bin workspace-mgr --no-default-features production_build_rejects_filesystem_storage
       - name: Assemble crate package
         run: cargo package --locked
       - name: Package native archive

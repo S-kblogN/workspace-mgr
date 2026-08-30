@@ -112,10 +112,7 @@ fn setup_dry_run_reports_private_runtime_without_installing_it() {
         ],
     );
     assert_eq!(json(&report)["status"], "dry_run");
-    assert_eq!(
-        json(&report)["storage_runtime"],
-        workspace_mgr::dvc::REQUIRED_DVC_VERSION
-    );
+    assert_eq!(json(&report)["storage_runtime"], "3.67.1");
     assert!(!runtime.exists());
 }
 

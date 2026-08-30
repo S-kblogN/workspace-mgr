@@ -83,13 +83,13 @@ pub fn setup(options: &SetupOptions) -> Result<SetupReport> {
             ))
         })?,
     };
-    let expected = format!("dvc[s3]=={REQUIRED_DVC_VERSION}");
+    let requirement = format!("dvc[s3]=={REQUIRED_DVC_VERSION}");
     let actions = vec![
         format!(
             "create an isolated Python environment at {}",
             runtime_dir.display()
         ),
-        format!("install private storage runtime {expected}"),
+        format!("install private storage runtime {REQUIRED_DVC_VERSION}"),
         "verify the isolated executable and Python module versions".to_owned(),
     ];
     if runtime_is_compatible(&runtime_dir)? {
@@ -177,7 +177,7 @@ pub fn setup(options: &SetupOptions) -> Result<SetupReport> {
                 "--isolated",
                 "--no-input",
                 "--disable-pip-version-check",
-                &expected,
+                &requirement,
             ],
             parent,
         )?;
