@@ -26,7 +26,7 @@ path = "src/main.rs"
 chrono = { version = "0.4.42", features = ["clock"] }
 clap = { version = "4.5.48", features = ["derive", "env"] }
 fs2 = "0.4.3"
-md-5 = "0.10.6"
+md-5 = "0.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
