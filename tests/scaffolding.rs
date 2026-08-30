@@ -402,7 +402,7 @@ fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
         ["init", "--s3-url", remote.to_str().unwrap()],
     );
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not owned"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not managed"));
     assert_eq!(
         std::fs::read_to_string(&dvc_config).unwrap(),
         "[core]\n    remote = preexisting\n"
