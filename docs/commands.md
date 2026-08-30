@@ -51,10 +51,15 @@ workspace-mgr init [--repo <path>]
 `--s3-url` must use `s3://` and is a tracked, non-secret storage location; userinfo,
 queries, fragments, and other credential-bearing URL forms are rejected.
 Re-running `init` validates public configuration and deterministically repairs
-managed internal storage scaffolding. It never overwrites an existing unmanaged
-`AGENTS.md` or internal storage configuration, and it refuses to change the S3
-location while retained S3 boundaries exist. This command never contacts or
-writes a remote.
+or upgrades product-owned scaffolding. Ownership is established by the
+initialized repository and reserved path, not inferred from file content, so
+old, edited, or damaged `AGENTS.md` and internal storage configuration are
+replaced with their current deterministic forms, as are the private engine's
+ignore files. Before the first successful initialization, an existing
+`AGENTS.md` or private internal-storage scaffold is instead an atomic collision
+that the caller must move or remove explicitly. `init` refuses to change the S3
+location while retained S3 boundaries exist. It never contacts or writes a
+remote.
 
 ```sh
 workspace-mgr init
@@ -87,7 +92,7 @@ workspace-mgr --format json instructions publish
 
 ## `workspace-mgr doctor`
 
-Diagnose the repository configuration, Git state, and
+Diagnose the repository configuration, product-owned scaffold, Git state, and
 required private execution engines.
 
 ```text

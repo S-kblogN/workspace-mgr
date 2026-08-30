@@ -12,6 +12,17 @@ mutating repository, placement, publication, hydration, and refresh operations
 share a repository lock; task and storage-boundary locks add narrower
 diagnostics.
 
+Scaffold ownership is structural. In a repository established by
+`.workspace-mgr.toml`, `AGENTS.md`, `.dvc/config`, `.dvc/.gitignore`, and
+`.dvcignore` have fixed roles: the TOML file is the user-editable source of
+Git/S3 facts, while the other four are whole-file generated paths owned by the
+product and reconciled by `init`, regardless of their prior content.
+`.workspace-mgr/instructions/repository.md` remains repository-owned content.
+Shared aggregate files such as `.gitattributes` keep unrelated repository
+content while the product enforces only its required rules. Before first
+initialization, existing reserved scaffold paths are reported as collisions
+rather than classified from their contents.
+
 The task layout, branch prefix, shared-checkout behavior, semantic storage
 model, 1 MiB S3 recommendation, 10 MiB automatic threshold, instruction set,
 pull-request ownership, and merge authority are compiled product policy. They

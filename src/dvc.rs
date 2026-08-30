@@ -89,7 +89,6 @@ pub fn write_internal_config(repo: &GitRepo, config: &Config) -> Result<bool> {
         return Ok(false);
     };
     let path = internal_config_path(repo)?;
-    validate_internal_config_ownership(repo)?;
     if fs::read_to_string(&path).ok().as_deref() == Some(&rendered) {
         return Ok(false);
     }
@@ -107,36 +106,16 @@ pub fn write_internal_config(repo: &GitRepo, config: &Config) -> Result<bool> {
     Ok(true)
 }
 
-pub fn validate_internal_config_ownership(repo: &GitRepo) -> Result<()> {
+pub fn internal_config_exists(repo: &GitRepo) -> Result<bool> {
     let path = internal_config_path(repo)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(&path).at(&path)?;
-    if raw.trim().is_empty() || raw.starts_with(INTERNAL_CONFIG_HEADER) {
-        return Ok(());
-    }
-    Err(Error::message(
-        "existing .dvc/config is not managed by workspace-mgr and will not be overwritten; resolve it explicitly before rerunning init",
-    ))
+    Ok(path.is_file())
 }
 
-pub fn managed_internal_config_exists(repo: &GitRepo) -> Result<bool> {
-    let path = internal_config_path(repo)?;
-    if !path.is_file() {
-        return Ok(false);
-    }
-    Ok(fs::read_to_string(&path)
-        .at(&path)?
-        .starts_with(INTERNAL_CONFIG_HEADER))
-}
-
-pub fn managed_internal_location(repo: &GitRepo) -> Result<Option<(String, Option<String>)>> {
+pub fn internal_location(repo: &GitRepo) -> Result<Option<(String, Option<String>)>> {
     let path = internal_config_path(repo)?;
     if !path.is_file() {
         return Ok(None);
     }
-    validate_internal_config_ownership(repo)?;
     let raw = fs::read_to_string(&path).at(&path)?;
     let mut url = None;
     let mut endpoint = None;
@@ -164,7 +143,7 @@ pub fn managed_internal_location(repo: &GitRepo) -> Result<Option<(String, Optio
 }
 
 pub fn remove_internal_config(repo: &GitRepo) -> Result<bool> {
-    if !managed_internal_config_exists(repo)? {
+    if !internal_config_exists(repo)? {
         return Ok(false);
     }
     let path = internal_config_path(repo)?;

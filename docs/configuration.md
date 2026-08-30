@@ -47,6 +47,11 @@ platform-standard identity and environment mechanisms.
 public facts and deterministically generates the private storage-engine
 configuration. Every S3 operation rejects drift in that derived file. Users and
 agents should edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
+The generated file remains product-owned even if its content is old, edited, or
+damaged; content comparison detects drift but does not determine ownership. If
+retained S3 boundaries exist and that generated file can no longer identify its
+location, `init` uses the committed public facts as the relocation-safety anchor
+before repairing it.
 Once S3 boundaries exist, `init` will not relocate them to another URL or
 endpoint; place all retained boundaries in Git before changing the repository's
 S3 location.

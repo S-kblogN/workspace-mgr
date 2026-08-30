@@ -362,22 +362,51 @@ fn concurrent_runtime_install_is_rejected_before_provisioning() {
 }
 
 #[test]
-fn init_refuses_to_overwrite_unmanaged_agents() {
+fn first_init_treats_reserved_paths_as_collisions_without_inspecting_content() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    std::fs::write(
-        fixture.shared.join("AGENTS.md"),
-        "# Existing policy\n\n- Keep this rule.\n",
-    )
-    .unwrap();
+    workspace(&fixture.shared, ["init"]);
+    let agents_path = fixture.shared.join("AGENTS.md");
+    let canonical = std::fs::read_to_string(&agents_path).unwrap();
+    std::fs::remove_file(fixture.shared.join(".workspace-mgr.toml")).unwrap();
 
     let rejected = workspace_unchecked(&fixture.shared, ["init"]);
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("will not be overwritten"));
-    let agents = std::fs::read_to_string(fixture.shared.join("AGENTS.md")).unwrap();
-    assert_eq!(agents, "# Existing policy\n\n- Keep this rule.\n");
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("reserved workspace-mgr scaffold paths"));
+    assert!(stderr.contains("AGENTS.md"));
+    assert_eq!(std::fs::read_to_string(&agents_path).unwrap(), canonical);
     assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
-    assert!(!fixture.shared.join(".workspace-mgr").exists());
+}
+
+#[test]
+fn init_reconciles_the_owned_agents_bootstrap_regardless_of_content() {
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    workspace(&fixture.shared, ["init"]);
+    let agents_path = fixture.shared.join("AGENTS.md");
+    let canonical = std::fs::read_to_string(&agents_path).unwrap();
+
+    std::fs::write(&agents_path, "# Legacy or locally edited bootstrap\n").unwrap();
+    let unhealthy = workspace_unchecked(&fixture.shared, ["doctor"]);
+    assert_eq!(unhealthy.status.code(), Some(2));
+    let report = json(&unhealthy);
+    assert!(report["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "repository-scaffold"
+            && check["status"] == "error"
+            && check["detail"].as_str().unwrap().contains("AGENTS.md")
+    }));
+    let updated = workspace(&fixture.shared, ["init"]);
+    assert_eq!(json(&updated)["status"], "initialized");
+    assert_eq!(json(&updated)["actions"][0]["action"], "update");
+    assert_eq!(json(&updated)["actions"][0]["path"], "AGENTS.md");
+    assert_eq!(std::fs::read_to_string(&agents_path).unwrap(), canonical);
+
+    std::fs::remove_file(&agents_path).unwrap();
+    let recreated = workspace(&fixture.shared, ["init"]);
+    assert_eq!(json(&recreated)["status"], "initialized");
+    assert_eq!(json(&recreated)["actions"][0]["action"], "create");
+    assert_eq!(std::fs::read_to_string(&agents_path).unwrap(), canonical);
 }
 
 #[test]
@@ -606,7 +635,9 @@ fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
         ["init", "--s3-url", remote.to_str().unwrap()],
     );
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not managed"));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("reserved workspace-mgr scaffold paths")
+    );
     assert_eq!(
         std::fs::read_to_string(&dvc_config).unwrap(),
         "[core]\n    remote = preexisting\n"
@@ -617,12 +648,57 @@ fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
         &fixture.shared,
         ["init", "--s3-url", remote.to_str().unwrap()],
     );
+    let managed_config = std::fs::read_to_string(&dvc_config).unwrap();
+    let storage_gitignore = fixture.shared.join(".dvc/.gitignore");
+    let managed_storage_gitignore = std::fs::read_to_string(&storage_gitignore).unwrap();
+    let storage_ignore = fixture.shared.join(".dvcignore");
+    let managed_storage_ignore = std::fs::read_to_string(&storage_ignore).unwrap();
+    let config_path = fixture.shared.join(".workspace-mgr.toml");
+    let public_config = std::fs::read_to_string(&config_path).unwrap();
+    git(&fixture.shared, ["add", "-A"]);
+    git(
+        &fixture.shared,
+        ["commit", "-m", "Initialize managed repository"],
+    );
+    let pointer = fixture.shared.join("retained.bin.dvc");
+    std::fs::write(&pointer, "outs:\n- path: retained.bin\n").unwrap();
+    std::fs::write(&dvc_config, "# old or damaged generated configuration\n").unwrap();
+    std::fs::write(&storage_gitignore, "/locally-edited\n").unwrap();
+    std::fs::write(&storage_ignore, "locally-edited/**\n").unwrap();
+
+    let relocated = public_config.replace(
+        remote.to_str().unwrap(),
+        fixture.root.join("other-storage").to_str().unwrap(),
+    );
+    std::fs::write(&config_path, relocated).unwrap();
+    let rejected_relocation = workspace_unchecked(&fixture.shared, ["init"]);
+    assert_eq!(rejected_relocation.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&rejected_relocation.stderr)
+            .contains("cannot change the managed S3 location")
+    );
+
+    std::fs::write(&config_path, &public_config).unwrap();
+    let repaired = workspace(&fixture.shared, ["init"]);
+    assert_eq!(json(&repaired)["status"], "initialized");
+    assert_eq!(
+        std::fs::read_to_string(&dvc_config).unwrap(),
+        managed_config
+    );
+    assert_eq!(
+        std::fs::read_to_string(&storage_gitignore).unwrap(),
+        managed_storage_gitignore
+    );
+    assert_eq!(
+        std::fs::read_to_string(&storage_ignore).unwrap(),
+        managed_storage_ignore
+    );
+    std::fs::remove_file(&pointer).unwrap();
     assert!(
         std::fs::read_to_string(fixture.shared.join(".gitattributes"))
             .unwrap()
             .contains("*.dvc whitespace=-blank-at-eol")
     );
-    let config_path = fixture.shared.join(".workspace-mgr.toml");
     let mut config: toml::Value =
         toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config.as_table_mut().unwrap().remove("s3");
@@ -630,4 +706,12 @@ fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
     let disabled = workspace(&fixture.shared, ["init"]);
     assert_eq!(json(&disabled)["status"], "initialized");
     assert!(!dvc_config.exists());
+    assert_eq!(
+        std::fs::read_to_string(&storage_gitignore).unwrap(),
+        managed_storage_gitignore
+    );
+    assert_eq!(
+        std::fs::read_to_string(&storage_ignore).unwrap(),
+        managed_storage_ignore
+    );
 }

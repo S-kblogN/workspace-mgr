@@ -425,25 +425,48 @@ class Harness:
             "--s3-endpoint-url",
             self.endpoint,
         )
-        unmanaged = self.root / "unmanaged-init"
-        self.run(["git", "clone", self.remote_url, unmanaged], cwd=self.root)
-        unmanaged_agents = "# Existing repository policy\n\nKeep this unmanaged rule.\n"
-        (unmanaged / "AGENTS.md").write_text(unmanaged_agents, encoding="utf-8")
-        rejected_unmanaged = self.wm(unmanaged, *common, expected=2)
+        collision = self.root / "first-init-collision"
+        self.run(["git", "clone", self.remote_url, collision], cwd=self.root)
+        existing_agents = "# Existing repository policy\n\nPreserve this file.\n"
+        (collision / "AGENTS.md").write_text(existing_agents, encoding="utf-8")
+        rejected_collision = self.wm(collision, *common, expected=2)
         self.check(
-            "will not be overwritten" in rejected_unmanaged["stderr"],
-            "init refuses to replace an unmanaged AGENTS bootstrap",
+            "reserved workspace-mgr scaffold paths" in rejected_collision["stderr"],
+            "first init reports a reserved-path collision without classifying content",
         )
         self.check(
-            (unmanaged / "AGENTS.md").read_text(encoding="utf-8")
-            == unmanaged_agents,
-            "failed init preserves the unmanaged policy exactly",
+            (collision / "AGENTS.md").read_text(encoding="utf-8")
+            == existing_agents,
+            "failed first init preserves the colliding policy exactly",
         )
         self.check(
-            not (unmanaged / ".workspace-mgr.toml").exists()
-            and not (unmanaged / ".workspace-mgr").exists()
-            and not (unmanaged / ".dvc").exists(),
-            "unmanaged bootstrap refusal leaves no partial scaffolding",
+            not (collision / ".workspace-mgr.toml").exists()
+            and not (collision / ".workspace-mgr").exists()
+            and not (collision / ".dvc").exists(),
+            "reserved-path refusal leaves no partial scaffolding",
+        )
+
+        storage_collision = self.root / "first-init-storage-collision"
+        self.run(["git", "clone", self.remote_url, storage_collision], cwd=self.root)
+        (storage_collision / ".dvc").mkdir()
+        existing_dvc_config = "[core]\n    remote = preexisting\n"
+        (storage_collision / ".dvc" / "config").write_text(
+            existing_dvc_config, encoding="utf-8"
+        )
+        rejected_storage = self.wm(storage_collision, *common, expected=2)
+        self.check(
+            ".dvc" in rejected_storage["stderr"],
+            "first init treats the internal storage path as a reserved collision",
+        )
+        self.check(
+            (storage_collision / ".dvc" / "config").read_text(encoding="utf-8")
+            == existing_dvc_config,
+            "storage collision is preserved without content classification",
+        )
+        self.check(
+            not (storage_collision / ".workspace-mgr.toml").exists()
+            and not (storage_collision / "AGENTS.md").exists(),
+            "storage collision leaves no partial public scaffolding",
         )
 
         dry = self.wm(self.shared, *common, "--dry-run")
@@ -455,7 +478,24 @@ class Harness:
         self.check(initialized["status"] == "initialized", "repository initialized")
         config_text = (self.shared / ".workspace-mgr.toml").read_text(encoding="utf-8")
         dvc_config = (self.shared / ".dvc" / "config").read_text(encoding="utf-8")
+        storage_gitignore = (self.shared / ".dvc" / ".gitignore").read_text(
+            encoding="utf-8"
+        )
+        storage_ignore = (self.shared / ".dvcignore").read_text(encoding="utf-8")
         bootstrap = (self.shared / "AGENTS.md").read_text(encoding="utf-8")
+        template_collision = self.root / "first-init-template-collision"
+        self.run(["git", "clone", self.remote_url, template_collision], cwd=self.root)
+        (template_collision / "AGENTS.md").write_text(bootstrap, encoding="utf-8")
+        rejected_template = self.wm(template_collision, *common, expected=2)
+        self.check(
+            "AGENTS.md" in rejected_template["stderr"],
+            "first init rejects a reserved path even when its content equals the template",
+        )
+        self.check(
+            (template_collision / "AGENTS.md").read_text(encoding="utf-8")
+            == bootstrap,
+            "template-equal first-init collision remains untouched",
+        )
         module = (
             self.shared / ".workspace-mgr" / "instructions" / "repository.md"
         )
@@ -500,14 +540,48 @@ class Harness:
         repeated = self.wm(self.shared, "init")
         self.check(repeated["status"] == "no_changes", "init is idempotent")
 
-        (self.shared / ".dvc" / "config").write_text(dvc_config + "# drift\n", encoding="utf-8")
+        (self.shared / "AGENTS.md").write_text(
+            "# Legacy or locally edited bootstrap\n", encoding="utf-8"
+        )
+        (self.shared / ".dvc" / "config").write_text(
+            "# damaged generated configuration without an ownership marker\n",
+            encoding="utf-8",
+        )
+        (self.shared / ".dvc" / ".gitignore").write_text(
+            "/locally-edited\n", encoding="utf-8"
+        )
+        (self.shared / ".dvcignore").write_text(
+            "locally-edited/**\n", encoding="utf-8"
+        )
         drifted = self.wm(self.shared, "doctor", expected=2)
         self.check("configuration drifted" in drifted["stdout"], "doctor rejects internal storage drift")
+        drift_report = json.loads(drifted["stdout"])
+        self.check(
+            any(
+                check["name"] == "repository-scaffold"
+                and check["status"] == "error"
+                and "AGENTS.md" in check["detail"]
+                and ".dvcignore" in check["detail"]
+                for check in drift_report["checks"]
+            ),
+            "doctor reports every drifted product-owned scaffold",
+        )
         repaired = self.wm(self.shared, "init")
-        self.check(repaired["status"] == "initialized", "init repairs internal storage drift")
+        self.check(repaired["status"] == "initialized", "init repairs owned scaffold drift")
         self.check(
             (self.shared / ".dvc" / "config").read_text(encoding="utf-8") == dvc_config,
-            "repair restores deterministic internal storage config",
+            "repair restores deterministic internal storage config without a content marker",
+        )
+        self.check(
+            (self.shared / "AGENTS.md").read_text(encoding="utf-8") == bootstrap,
+            "repair restores the current AGENTS bootstrap regardless of prior content",
+        )
+        self.check(
+            (self.shared / ".dvc" / ".gitignore").read_text(encoding="utf-8")
+            == storage_gitignore
+            and (self.shared / ".dvcignore").read_text(encoding="utf-8")
+            == storage_ignore,
+            "repair restores all whole-file internal storage scaffolds",
         )
 
         (self.shared / "refresh-update.txt").write_text("old refresh value\n", encoding="utf-8")
@@ -560,6 +634,12 @@ class Harness:
             "The agent owns pull-request operations" in all_instructions["markdown"]
             and "must not merge" in all_instructions["markdown"],
             "instructions fix agent PR ownership and user merge authority",
+        )
+        self.check(
+            "deterministic scaffold reconciliation and upgrade operation"
+            in all_instructions["markdown"]
+            and "never by their old contents" in all_instructions["markdown"],
+            "instructions define structural scaffold ownership and upgrade behavior",
         )
         self.check(
             "collaboration and control plane" in all_instructions["markdown"]
@@ -1143,6 +1223,9 @@ class Harness:
         self.check(len(versions_v1) >= 3, "MinIO contains DVC payload versions")
         self.check(all(item["version_id"] not in ("", "null") for item in versions_v1), "all S3 objects have version IDs")
         config_before_relocation = (self.shared / ".workspace-mgr.toml").read_bytes()
+        internal_before_repair = (self.shared / ".dvc" / "config").read_bytes()
+        damaged_internal = b"# damaged generated configuration with live pointers\n"
+        (self.shared / ".dvc" / "config").write_bytes(damaged_internal)
         relocation = self.wm(
             self.shared,
             "init",
@@ -1154,7 +1237,18 @@ class Harness:
             "cannot change the managed S3 location" in relocation["stderr"]
             and (self.shared / ".workspace-mgr.toml").read_bytes()
             == config_before_relocation,
-            "init cannot relocate retained S3 boundaries or rewrite tracked facts",
+            "committed repository facts prevent relocation even when generated config is damaged",
+        )
+        self.check(
+            (self.shared / ".dvc" / "config").read_bytes() == damaged_internal,
+            "failed relocation leaves the damaged scaffold untouched for explicit repair",
+        )
+        repaired_with_pointers = self.wm(self.shared, "init")
+        self.check(
+            repaired_with_pointers["status"] == "initialized"
+            and (self.shared / ".dvc" / "config").read_bytes()
+            == internal_before_repair,
+            "init repairs marker-free generated config while live pointers remain",
         )
         bodies_v1 = self.s3_bodies()
         for payload in (v1, bundle_v1_a, bundle_v1_b, bundle_bulk):

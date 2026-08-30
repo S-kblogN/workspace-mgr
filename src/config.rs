@@ -71,7 +71,11 @@ impl Config {
 
     pub fn load_path(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path).at(path)?;
-        let config: Self = toml::from_str(&raw).map_err(|source| Error::Toml {
+        Self::parse(&raw, path)
+    }
+
+    pub fn parse(raw: &str, path: &Path) -> Result<Self> {
+        let config: Self = toml::from_str(raw).map_err(|source| Error::Toml {
             path: path.to_path_buf(),
             source,
         })?;

@@ -83,7 +83,10 @@ begins with the same [workspace model](docs/management-model.md) read by users,
 then renders the complete product-owned policy using the repository's Git and
 S3 facts and appends an optional repository-specific content module. Every
 initialized repository gets the same management strategy; policy evolves with
-the CLI rather than through per-repository switches.
+the CLI rather than through per-repository switches. Re-running `init` after a
+CLI update deterministically replaces product-owned scaffold files with the
+current versions; their ownership comes from the initialized repository and
+reserved path, never from matching old file content.
 
 ## Installation
 

@@ -50,11 +50,23 @@ Initialization creates:
 - a thin `AGENTS.md` bootstrap;
 - internal storage scaffolding when S3 is configured.
 
-`init` refuses to overwrite an existing unmanaged `AGENTS.md` or internal
-storage configuration. Repository-specific additions may be maintained in
-`.workspace-mgr/instructions/repository.md`; `init` does not import existing
-files into that module. `--dry-run` reports every planned action without writing
-files.
+On first initialization, `AGENTS.md` and the private internal-storage scaffold
+paths are reserved. If any already exists, `init` reports the complete
+collision before writing anything; it does not inspect content to guess whether
+the path is managed. After `.workspace-mgr.toml` establishes the repository as
+initialized, `AGENTS.md`, generated internal storage configuration, and the
+private engine's ignore files are product-owned. Every `init` deterministically
+creates, replaces, or removes them according to the installed CLI and current
+Git/S3 facts. This is also the scaffold-upgrade operation after installing a
+newer CLI. In an initialized repository, an agent performs this reconciliation
+inside an infrastructure task so the generated repository-wide diff is
+reviewed like any other shared change.
+
+Repository-specific additions belong in
+`.workspace-mgr/instructions/repository.md`, which `init` preserves. Shared
+files such as `.gitattributes` retain repository-owned content while `init`
+ensures the product-required rules. `--dry-run` reports every planned action
+without writing files.
 
 Every initialized repository uses the same shared-checkout, task, storage, and
 review strategy. There are no policy profiles. The configuration records only

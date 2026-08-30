@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::git::GitRepo;
 use crate::manifest::{ResolvedTask, TaskKind};
 use crate::process::command_exists;
+use crate::scaffold;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
@@ -58,6 +59,18 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
     };
 
     if let Some(config) = &config {
+        checks.push(match scaffold::validate_owned_files(&repo, config) {
+            Ok(()) => DoctorCheck {
+                name: "repository-scaffold".to_owned(),
+                status: "ok".to_owned(),
+                detail: "product-owned files match the installed CLI".to_owned(),
+            },
+            Err(error) => DoctorCheck {
+                name: "repository-scaffold".to_owned(),
+                status: "error".to_owned(),
+                detail: error.to_string(),
+            },
+        });
         let head = repo
             .current_branch()?
             .unwrap_or_else(|| "detached".to_owned());

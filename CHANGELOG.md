@@ -10,6 +10,10 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Initial standalone Rust CLI project.
 - Repository initialization, effective instructions, diagnostics, and task
   scaffolding.
+- Structural scaffold ownership: first initialization reports reserved-path
+  collisions without inspecting content, while later `init` runs replace old,
+  edited, or damaged product-owned files with the current deterministic forms
+  and `doctor` reports any remaining drift.
 - Scoped repository and managed-storage transaction commands with strict
   repository and task schemas.
 - A public storage schema with deterministic internal configuration, exact
