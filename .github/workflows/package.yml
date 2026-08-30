@@ -32,20 +32,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Build locked release binary
-        run: cargo build --locked --release
-      - name: Verify binary
-        run: |
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
-          target/release/workspace-mgr --version
-      - name: Assemble archive and checksum
-        run: |
-          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          NAME="workspace-mgr-${VERSION}-${{ matrix.target }}"
-          mkdir -p "dist/${NAME}"
-          cp target/release/workspace-mgr LICENSE README.md "dist/${NAME}/"
-          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
-          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+      - name: Build and assemble native archive
+        run: sh scripts/package-native.sh ${{ matrix.target }}
       - name: Upload immutable workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

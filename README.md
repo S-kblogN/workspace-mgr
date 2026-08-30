@@ -64,6 +64,9 @@ cargo test --all-features
 cargo package --allow-dirty
 ```
 
+`sh scripts/package-native.sh "$(rustc -vV | sed -n 's/^host: //p')"`
+assembles the release archive and checksum for a supported native host.
+
 Integration tests create isolated temporary Git repositories and local
 filesystem DVC remotes. They do not read user DVC configuration or cloud
 credentials.

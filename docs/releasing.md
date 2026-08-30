@@ -3,8 +3,9 @@
 Phase 1 produces release candidates but does not publish a public package.
 
 1. Run the local quality gate documented in the README.
-2. Push a review branch and let both CI jobs pass.
-3. Run the **Package release candidate** workflow from the reviewed commit.
+2. Push a review branch and let CI produce the four native candidate artifacts.
+3. After the workflow exists on the default branch, the standalone **Package
+   release candidate** workflow can reproduce them from a reviewed commit.
 4. Download each immutable workflow artifact, verify its SHA-256 checksum, and
    exercise the binary on its named architecture.
 
