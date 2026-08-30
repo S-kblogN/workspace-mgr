@@ -8,7 +8,7 @@ fi
 
 expected_target="$1"
 case "$expected_target" in
-    x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin)
+    x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin)
         ;;
     *)
         echo "unsupported release target: $expected_target" >&2

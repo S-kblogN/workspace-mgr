@@ -7,11 +7,11 @@
 5. Run the package workflow for that tag and verify every SHA-256 checksum on
    its named architecture.
 6. Publish the crate from the tagged source with `cargo publish --locked`.
-7. Create a GitHub Release for the same tag and attach the four verified native
+7. Create a GitHub Release for the same tag and attach the three verified native
    archives and checksum files.
 
 The packaging workflow builds native archives for Linux x86-64 and arm64 and
-macOS arm64 and Intel. Each archive contains the executable, MIT License, and
+macOS on Apple Silicon. Each archive contains the executable, MIT License, and
 README.
 
 Publishing crates.io packages, tags, or durable GitHub Release assets is an
