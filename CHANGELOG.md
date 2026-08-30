@@ -24,3 +24,11 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Bidirectional Git/S3 placement transitions, ordinary Git refresh
   materialization, repository-wide operation locking, and tracked-input
   hardening.
+
+### Fixed
+
+- Failed refresh prefetches now identify object-read credentials and provider
+  download or read-transaction caps as likely causes without exposing the
+  internal engine command.
+- Temporary detached worktrees are forcibly removed, pruned, and verified even
+  when managed-storage prefetch fails.

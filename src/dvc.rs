@@ -882,16 +882,108 @@ pub fn prepare_revision(
             .into_iter()
             .chain(pointers.iter().cloned())
             .collect::<Vec<_>>();
-        run(&dvc_program(), args, &checkout)?;
+        run(&dvc_program(), args, &checkout).map_err(|source| prefetch_error(oid, source))?;
         Ok(PreparedRevision {
             prepared_files: pointers.to_vec(),
             outputs,
             mode: "fetched_to_shared_cache".to_owned(),
         })
     })();
-    let _ = repo.run_unchecked(["worktree", "remove", "--force", &checkout.to_string_lossy()]);
-    let _ = repo.run_unchecked(["worktree", "prune"]);
-    result
+    let cleanup = cleanup_preparation_worktree(repo, &checkout, container);
+    match (result, cleanup) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(source), Ok(())) => Err(source),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(source), Err(cleanup_error)) => Err(Error::message(format!(
+            "{source}; temporary worktree cleanup also failed: {cleanup_error}"
+        ))),
+    }
+}
+
+fn prefetch_error(oid: &str, source: Error) -> Error {
+    let detail = match source {
+        Error::Command { detail, .. } => detail
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("storage engine command failed")
+            .trim()
+            .to_owned(),
+        other => other.to_string(),
+    };
+    Error::message(format!(
+        "managed-storage prefetch for repository revision {oid} failed; check object-read credentials and provider download or read-transaction caps. Provider detail: {detail}"
+    ))
+}
+
+fn cleanup_preparation_worktree(
+    repo: &GitRepo,
+    checkout: &Path,
+    container: tempfile::TempDir,
+) -> Result<()> {
+    let removal = repo.run_unchecked([
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        &checkout.to_string_lossy(),
+    ]);
+    let removal_detail = match removal {
+        Ok(output) if output.success() => None,
+        Ok(output) => Some(output.stderr.trim().to_owned()),
+        Err(error) => Some(error.to_string()),
+    };
+    let close_error = container.close().err().map(|error| error.to_string());
+    let prune = repo.run_unchecked(["worktree", "prune"]);
+    let prune_error = match prune {
+        Ok(output) if output.success() => None,
+        Ok(output) => Some(output.stderr.trim().to_owned()),
+        Err(error) => Some(error.to_string()),
+    };
+    let listing = repo.run_unchecked(["worktree", "list", "--porcelain"]);
+    let marker = format!("worktree {}", checkout.display());
+    let (registered, listing_error) = match listing {
+        Ok(output) if output.success() => (output.stdout.lines().any(|line| line == marker), None),
+        Ok(output) => (false, Some(output.stderr.trim().to_owned())),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    let checkout_exists = match fs::symlink_metadata(checkout) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(Error::message(format!(
+                "could not verify temporary worktree cleanup at {}: {error}",
+                checkout.display()
+            )));
+        }
+    };
+    if !registered && !checkout_exists && close_error.is_none() && prune_error.is_none() {
+        return Ok(());
+    }
+
+    let mut details = Vec::new();
+    if let Some(detail) = removal_detail.filter(|_| registered || checkout_exists) {
+        details.push(format!("Git removal: {detail}"));
+    }
+    if let Some(detail) = close_error {
+        details.push(format!("filesystem removal: {detail}"));
+    }
+    if let Some(detail) = prune_error {
+        details.push(format!("Git prune: {detail}"));
+    }
+    if let Some(detail) = listing_error {
+        details.push(format!("Git verification: {detail}"));
+    }
+    if registered {
+        details.push("worktree remains registered".to_owned());
+    }
+    if checkout_exists {
+        details.push("worktree directory remains on disk".to_owned());
+    }
+    Err(Error::message(format!(
+        "failed to clean temporary worktree {}: {}",
+        checkout.display(),
+        details.join("; ")
+    )))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -934,6 +1026,65 @@ impl EmptyFallback for str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_error_is_actionable_without_exposing_the_engine_command() {
+        let error = prefetch_error(
+            "deadbeef",
+            Error::Command {
+                command: "dvc".to_owned(),
+                code: 255,
+                detail: "ERROR: HeadObject returned 403\nSee https://dvc.org/support".to_owned(),
+            },
+        )
+        .to_string();
+
+        assert!(error.contains("download or read-transaction caps"));
+        assert!(error.contains("HeadObject returned 403"));
+        assert!(!error.contains("dvc"));
+    }
+
+    #[test]
+    fn temporary_preparation_worktree_is_removed_and_unregistered() {
+        let repository = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: repository.path().to_path_buf(),
+        };
+        repo.run(["init", "-b", "main"]).unwrap();
+        repo.run(["config", "user.name", "workspace-mgr test"])
+            .unwrap();
+        repo.run(["config", "user.email", "test@example.invalid"])
+            .unwrap();
+        fs::write(repository.path().join("README.md"), "base\n").unwrap();
+        repo.run(["add", "README.md"]).unwrap();
+        repo.run(["commit", "-m", "Initial commit"]).unwrap();
+
+        let container = tempfile::tempdir().unwrap();
+        let checkout = container.path().join("checkout");
+        repo.run([
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ])
+        .unwrap();
+        fs::write(checkout.join("untracked.txt"), "temporary\n").unwrap();
+        repo.run(["worktree", "lock", &checkout.to_string_lossy()])
+            .unwrap();
+
+        cleanup_preparation_worktree(&repo, &checkout, container).unwrap();
+
+        assert!(!checkout.exists());
+        assert!(
+            !repo
+                .run(["worktree", "list", "--porcelain"])
+                .unwrap()
+                .stdout
+                .contains(&checkout.to_string_lossy().into_owned())
+        );
+    }
 
     #[test]
     fn moved_pointer_drops_path_bound_cloud_versions() {
