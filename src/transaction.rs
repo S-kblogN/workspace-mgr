@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
+use crate::hex::encode_lower;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
     AdditionalScope, ResolvedTask, TaskKind, one_line, validate_additional_scopes,
@@ -586,7 +587,7 @@ pub(crate) fn task_state_dir(common_dir: &Path, task: &ResolvedTask) -> PathBuf 
     hasher.update(task.branch.as_bytes());
     common_dir
         .join("workspace-mgr/state")
-        .join(format!("{:x}", hasher.finalize()))
+        .join(encode_lower(hasher.finalize()))
 }
 
 struct LockGuard {
@@ -624,7 +625,7 @@ fn acquire_dvc_locks(common_dir: &Path, names: &[String]) -> Result<Vec<LockGuar
     for name in names {
         let mut hasher = Sha256::new();
         hasher.update(name.as_bytes());
-        let path = lock_dir.join(format!("{:x}.lock", hasher.finalize()));
+        let path = lock_dir.join(format!("{}.lock", encode_lower(hasher.finalize())));
         guards.push(LockGuard::acquire(
             &path,
             &format!("another transaction is updating the same storage boundary: {name}"),
