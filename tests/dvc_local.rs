@@ -381,6 +381,65 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
     assert!(!task.join(".gitignore").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+    );
+    fixture.commit_seed("Initialize automatic storage rollback");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "automatic-rollback",
+            "--title",
+            "Automatic rollback",
+            "--purpose",
+            "Reject partial automatic placement metadata.",
+            "--timestamp",
+            "20260829-171200",
+        ],
+    );
+    let task_id = "20260829-171200-automatic-rollback";
+    let task = fixture.shared.join(task_id);
+    std::fs::write(task.join("large.bin"), vec![9_u8; 10_485_761]).unwrap();
+
+    let fake_dvc = fixture.root.join("partial-automatic-dvc");
+    std::fs::write(
+        &fake_dvc,
+        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"add\" ]; then\n  path=$3\n  name=${path##*/}\n  dir=${path%/*}\n  printf 'outs:\\n- path: %s\\n' \"$name\" > \"$path.dvc\"\n  printf '/%s\\n' \"$name\" > \"$dir/.gitignore\"\n  exit 23\nfi\nexit 23\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_dvc, permissions).unwrap();
+
+    let output = std::process::Command::new(binary())
+        .args(["publish", "-m", "This automatic placement must fail"])
+        .current_dir(&task)
+        .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("was rolled back"));
+    assert!(task.join("large.bin").is_file());
+    assert!(!task.join("large.bin.dvc").exists());
+    assert!(!task.join(".gitignore").exists());
+}
+
 #[test]
 fn publish_refuses_a_missing_dirty_dvc_output() {
     if which::which("dvc").is_err() {
@@ -461,6 +520,7 @@ fn object_version_adapter_and_engine_config_are_internal() {
         ])
         .current_dir(&fixture.seed)
         .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_STORAGE_DVC", which::which("dvc").unwrap())
         .env("WORKSPACE_MGR_STORAGE_PYTHON", &fake_python)
         .output()
         .unwrap();

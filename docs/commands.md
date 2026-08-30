@@ -32,7 +32,10 @@ The default location follows `WORKSPACE_MGR_RUNTIME_DIR`, then
 `XDG_DATA_HOME`, then `${HOME}/.local/share`. Setup creates an isolated Python
 environment and installs the exact compatible storage runtime. It requires Git
 and Python for provisioning, but users and agents do not invoke the private
-engine directly. `--dry-run` performs no installation or package download.
+engine directly. `--dry-run` performs no installation or package download. An
+existing target is replaced only when it carries workspace-mgr's private
+ownership marker; an arbitrary file, directory, or symlink is refused without
+modification.
 
 ## `workspace-mgr init`
 
@@ -48,7 +51,8 @@ workspace-mgr init [--repo <path>]
 queries, fragments, and other credential-bearing URL forms are rejected.
 Re-running `init` validates public configuration and deterministically repairs
 managed internal storage scaffolding. It never overwrites an existing unmanaged
-`AGENTS.md` or internal storage configuration. This command never contacts or
+`AGENTS.md` or internal storage configuration, and it refuses to change the S3
+location while retained S3 boundaries exist. This command never contacts or
 writes a remote.
 
 ```sh
@@ -116,13 +120,13 @@ workspace-mgr task create <slug> --title <title> --purpose <purpose>
 ```
 
 The slug is lowercase kebab case. The default `deliverable` kind creates a
-timestamped top-level directory, README, tracked manifest, and unmounted target
-branch. The `infrastructure` kind requires at least one `--scope` plus a
-`--scope-note`; it creates `codex/infra-<slug>` and an isolated worktree below
-private Git common state, with no repository task directory. Its manifest is
-private worktree state and every scope is explicit. Both kinds fetch the
-configured base branch, reject an existing directory or local/remote branch,
-and publish nothing.
+timestamped top-level directory, README, tracked manifest, and the unmounted
+target branch `codex/<slug>`. The `infrastructure` kind requires at least one
+`--scope` plus a `--scope-note`; it creates `codex/infra-<slug>` and an isolated
+worktree below private Git common state, with no repository task directory. Its
+manifest is private worktree state and every scope is explicit. Both kinds
+fetch the configured base branch, reject an existing directory or local/remote
+branch, and publish nothing.
 
 ```sh
 workspace-mgr task create training-report \
@@ -310,19 +314,15 @@ agent uses those facts with the repository hosting workflow.
 Safely fast-forward a shared checkout after remote changes are merged.
 
 ```text
-workspace-mgr refresh [--repo <path>]
-  [--remote <remote>] [--branch <branch>] [--dry-run]
+workspace-mgr refresh [--repo <path>] [--dry-run]
 ```
 
-Defaults come from `[git]`. The checkout must be on the selected branch,
+The remote and shared branch come from `[git]`. The checkout must be on that branch,
 the shared index must have no staged or unresolved entries, and the remote
 revision must be a fast-forward. Refresh preserves unrelated working-tree
 overlays, materializes safe ordinary Git additions, modifications, and
 deletions, and hydrates incoming S3 boundaries. It reads Git and S3 but writes
 no remote.
-
-Use `--remote` or `--branch` only for an explicitly selected alternate shared
-checkout target.
 
 ## Help and version
 

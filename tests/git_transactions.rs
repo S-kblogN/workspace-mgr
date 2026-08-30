@@ -305,7 +305,68 @@ fn additional_scope_requires_and_records_a_reason() {
     );
     let commit = json(&published)["commit_oid"].as_str().unwrap().to_owned();
     let message = git(&fixture.shared, ["show", "-s", "--format=%B", &commit]);
+    assert!(
+        String::from_utf8_lossy(&message.stdout)
+            .contains("Workspace-Task: 20260829-170200-extra-scope")
+    );
     assert!(String::from_utf8_lossy(&message.stdout).contains("Scope-Authorization"));
+}
+
+#[test]
+fn a_remote_branch_cannot_be_shared_by_distinct_tasks() {
+    let fixture = managed_fixture();
+    let competitor = fixture.root.join("competitor");
+    command(
+        &fixture.root,
+        "git",
+        [
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            competitor.to_str().unwrap(),
+        ],
+    );
+    configure_git(&competitor);
+
+    for (repo, timestamp, title) in [
+        (&fixture.shared, "20260829-170210", "First branch owner"),
+        (&competitor, "20260829-170211", "Competing branch owner"),
+    ] {
+        workspace(
+            repo,
+            [
+                "task",
+                "create",
+                "shared-slug",
+                "--title",
+                title,
+                "--purpose",
+                "Verify that one branch cannot combine distinct tasks.",
+                "--timestamp",
+                timestamp,
+            ],
+        );
+    }
+
+    let first = fixture.shared.join("20260829-170210-shared-slug");
+    std::fs::write(first.join("first.txt"), "first task\n").unwrap();
+    let published = workspace(&first, ["publish", "-m", "Publish first branch owner"]);
+    let remote_oid = json(&published)["remote_oid"].as_str().unwrap().to_owned();
+
+    let second = competitor.join("20260829-170211-shared-slug");
+    std::fs::write(second.join("second.txt"), "second task\n").unwrap();
+    let rejected = workspace_unchecked(&second, ["plan"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("another task"));
+    let remote = git(
+        &fixture.shared,
+        ["ls-remote", "origin", "refs/heads/codex/shared-slug"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&remote.stdout)
+            .split_whitespace()
+            .next(),
+        Some(remote_oid.as_str())
+    );
 }
 
 #[test]
@@ -430,6 +491,35 @@ fn refresh_preserves_working_tree_overlays() {
         String::from_utf8_lossy(&git(&fixture.shared, ["rev-parse", "main"]).stdout).trim(),
         new_main
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_rejects_new_storage_metadata_below_a_symlink() {
+    let fixture = managed_fixture();
+    let old_oid = String::from_utf8_lossy(&git(&fixture.shared, ["rev-parse", "main"]).stdout)
+        .trim()
+        .to_owned();
+    let outside = fixture.root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.shared.join("linked")).unwrap();
+
+    std::fs::create_dir(fixture.seed.join("linked")).unwrap();
+    std::fs::write(
+        fixture.seed.join("linked/payload.dvc"),
+        "outs:\n- path: payload\n  md5: d41d8cd98f00b204e9800998ecf8427e\n  size: 0\n",
+    )
+    .unwrap();
+    fixture.commit_seed("Add incoming storage metadata");
+
+    let rejected = workspace_unchecked(&fixture.shared, ["refresh"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("symlink"));
+    assert_eq!(
+        String::from_utf8_lossy(&git(&fixture.shared, ["rev-parse", "main"]).stdout).trim(),
+        old_oid
+    );
+    assert!(std::fs::read_dir(outside).unwrap().next().is_none());
 }
 
 #[test]

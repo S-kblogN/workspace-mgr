@@ -90,7 +90,7 @@ its exact private storage runtime in an isolated user data directory. Set
 For a source installation:
 
 ```sh
-cargo install workspace-mgr --version 0.1.0-alpha.1
+cargo install --locked workspace-mgr --version 0.1.0-alpha.1
 workspace-mgr setup
 workspace-mgr --help
 ```

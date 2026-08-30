@@ -19,7 +19,6 @@ with DvcRepo(str(repo_path)) as dvc_repo:
         raise RuntimeError(
             f"configured remote {default_remote.name!r} is not version-aware"
         )
-    remotes = {default_remote.name: default_remote}
     raw_fs = default_remote.fs.fs
     bucket, _, _ = raw_fs.split_path(default_remote.path)
     if not bucket:
@@ -43,15 +42,12 @@ with DvcRepo(str(repo_path)) as dvc_repo:
 
     def remote_for(name):
         remote_name = name or default_remote.name
-        if remote_name not in remotes:
-            remotes[remote_name] = dvc_repo.cloud.get_remote(remote_name)
-        remote = remotes[remote_name]
-        if not remote.fs.version_aware:
+        if remote_name != default_remote.name:
             raise RuntimeError(
-                f"DVC metadata selects non-version-aware remote {remote_name!r} "
-                "while exact version verification is required"
+                f"managed-storage metadata selects unexpected remote {remote_name!r}; "
+                f"expected {default_remote.name!r}"
             )
-        return remote
+        return default_remote
 
     def check_entry(object_parts, version_id, remote_name, expected_size, expected_etag):
         object_name = PurePosixPath(*object_parts).as_posix()
@@ -65,14 +61,6 @@ with DvcRepo(str(repo_path)) as dvc_repo:
         except (FileNotFoundError, KeyError):
             missing_versions.append(object_name)
             return
-        except (AttributeError, TypeError):
-            versioned_path = remote.fs.version_path(remote_path, version_id)
-            if not remote.fs.exists(versioned_path):
-                missing_versions.append(object_name)
-                return
-            checked.append(object_name)
-            return
-
         actual_version = info.get("VersionId") or info.get("version_id")
         actual_size = info.get("size")
         if actual_size is None:
@@ -84,7 +72,7 @@ with DvcRepo(str(repo_path)) as dvc_repo:
             expected_etag.strip('"') if isinstance(expected_etag, str) else None
         )
         mismatches = []
-        if actual_version and actual_version != version_id:
+        if actual_version != version_id:
             mismatches.append("version ID")
         if expected_size is not None and actual_size != expected_size:
             mismatches.append("size")
@@ -100,7 +88,9 @@ with DvcRepo(str(repo_path)) as dvc_repo:
     for dvc_file in dvc_files:
         stages = list(dvc_repo.stage.collect(str(repo_path / dvc_file)))
         if not stages:
-            raise RuntimeError(f"DVC metadata did not define an output: {dvc_file}")
+            raise RuntimeError(
+                f"managed-storage metadata did not define an output: {dvc_file}"
+            )
         for stage in stages:
             for out in stage.outs:
                 if not out.is_in_repo or not out.can_push:
@@ -146,7 +136,7 @@ with DvcRepo(str(repo_path)) as dvc_repo:
 
 if missing_metadata:
     raise RuntimeError(
-        "DVC push did not record a cloud version ID for: "
+        "managed-storage publication did not record a cloud version ID for: "
         + ", ".join(sorted(set(missing_metadata)))
     )
 if missing_versions:

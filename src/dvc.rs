@@ -11,13 +11,14 @@ use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
-use crate::process::{run, run_unchecked};
+use crate::process::{CommandOutput, run as run_process, run_unchecked as run_process_unchecked};
 
 const VERSION_VERIFY_SCRIPT: &str = include_str!("../assets/dvc_version_verify.py");
 const INTERNAL_CONFIG_HEADER: &str =
     "# Managed by workspace-mgr. Edit .workspace-mgr.toml and rerun workspace-mgr init.\n";
 pub const REQUIRED_DVC_VERSION: &str = "3.67.1";
 pub const INTERNAL_REMOTE: &str = "workspace-mgr";
+#[cfg(feature = "test-storage")]
 pub const STORAGE_PYTHON_ENV: &str = "WORKSPACE_MGR_STORAGE_PYTHON";
 
 pub fn storage_python() -> String {
@@ -29,7 +30,7 @@ pub fn dvc_program() -> String {
 }
 
 pub fn require_runtime(repo: &GitRepo) -> Result<String> {
-    let output = run_unchecked(&dvc_program(), ["--version"], &repo.root)?;
+    let output = inspect_engine(&repo.root, ["--version"])?;
     if !output.success() {
         return Err(Error::message(
             "managed-storage runtime is unavailable; install workspace-mgr with its required storage runtime",
@@ -46,15 +47,16 @@ pub fn require_runtime(repo: &GitRepo) -> Result<String> {
 
 pub fn require_version_adapter(repo: &GitRepo) -> Result<String> {
     let python = storage_python();
-    let output = run_unchecked(
+    let output = run_process_unchecked(
         &python,
         ["-c", "import dvc; print(dvc.__version__)"],
         &repo.root,
-    )?;
+    )
+    .map_err(private_engine_error)?;
     if !output.success() {
-        return Err(Error::message(format!(
-            "managed-storage version adapter is unavailable through {python:?}"
-        )));
+        return Err(Error::message(
+            "managed-storage version adapter is unavailable; run `workspace-mgr setup`",
+        ));
     }
     let actual = output.stdout.trim();
     if actual != REQUIRED_DVC_VERSION {
@@ -62,7 +64,7 @@ pub fn require_version_adapter(repo: &GitRepo) -> Result<String> {
             "managed-storage version adapter {actual:?} is incompatible; workspace-mgr requires exactly {REQUIRED_DVC_VERSION}"
         )));
     }
-    Ok(format!("{python} ({actual})"))
+    Ok(format!("internal adapter {actual}"))
 }
 
 pub fn render_internal_config(config: &Config) -> Result<Option<String>> {
@@ -127,6 +129,38 @@ pub fn managed_internal_config_exists(repo: &GitRepo) -> Result<bool> {
     Ok(fs::read_to_string(&path)
         .at(&path)?
         .starts_with(INTERNAL_CONFIG_HEADER))
+}
+
+pub fn managed_internal_location(repo: &GitRepo) -> Result<Option<(String, Option<String>)>> {
+    let path = internal_config_path(repo)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    validate_internal_config_ownership(repo)?;
+    let raw = fs::read_to_string(&path).at(&path)?;
+    let mut url = None;
+    let mut endpoint = None;
+    for line in raw.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("url = ") {
+            if value.is_empty() || url.replace(value.to_owned()).is_some() {
+                return Err(Error::message(
+                    "managed-storage configuration has an ambiguous storage URL; restore it with `workspace-mgr init` after removing all storage boundaries",
+                ));
+            }
+        } else if let Some(value) = line.strip_prefix("endpointurl = ") {
+            if value.is_empty() || endpoint.replace(value.to_owned()).is_some() {
+                return Err(Error::message(
+                    "managed-storage configuration has an ambiguous endpoint URL; restore it with `workspace-mgr init` after removing all storage boundaries",
+                ));
+            }
+        }
+    }
+    let url = url.ok_or_else(|| {
+        Error::message(
+            "managed-storage configuration has no storage URL; restore it with `workspace-mgr init` after removing all storage boundaries",
+        )
+    })?;
+    Ok(Some((url, endpoint)))
 }
 
 pub fn remove_internal_config(repo: &GitRepo) -> Result<bool> {
@@ -203,7 +237,7 @@ pub fn verify_object_versioning(repo: &GitRepo, config: &Config) -> Result<serde
         return Ok(serde_json::json!({"mode": "not-required"}));
     }
     let python = storage_python();
-    let output = run_unchecked(
+    let output = run_process_unchecked(
         &python,
         [
             "-c",
@@ -213,15 +247,12 @@ pub fn verify_object_versioning(repo: &GitRepo, config: &Config) -> Result<serde
             "--check-versioning-only",
         ],
         &repo.root,
-    )?;
+    )
+    .map_err(private_engine_error)?;
     if !output.success() {
         return Err(Error::message(format!(
             "failed to verify S3 bucket object versioning: {}",
-            if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            }
+            private_detail(&output)
         )));
     }
     serde_json::from_str(output.stdout.trim()).map_err(|error| {
@@ -359,19 +390,11 @@ pub fn output_paths(repo: &GitRepo, pointers: &[String]) -> Result<BTreeMap<Stri
 }
 
 pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
-    let output = run_unchecked(
-        &dvc_program(),
-        ["status", "--json", "--", pointer],
-        &repo.root,
-    )?;
+    let output = inspect_engine(&repo.root, ["status", "--json", "--", pointer])?;
     if !output.success() {
         return Err(Error::message(format!(
             "managed-storage status failed for {pointer}: {}",
-            if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            }
+            private_detail(&output)
         )));
     }
     serde_json::from_str(output.stdout.trim().if_empty("{}")).map_err(|error| {
@@ -432,16 +455,12 @@ pub fn reconcile(
         return Ok(report);
     }
     for pointer in &dirty {
-        run(
-            &dvc_program(),
-            ["commit", "--force", "--", pointer],
-            &repo.root,
-        )?;
+        execute_engine(&repo.root, ["commit", "--force", "--", pointer])?;
     }
     if !pointers.is_empty() {
         let mut args = vec!["push".to_owned(), "--".to_owned()];
         args.extend(pointers.iter().cloned());
-        run(&dvc_program(), args, &repo.root)?;
+        execute_engine(&repo.root, args)?;
         report.verification = Some(verify(repo, config, pointers)?);
     }
     report.committed = dirty;
@@ -457,7 +476,7 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
         .chain(["--quiet".to_owned(), "--".to_owned()])
         .chain(pointers.iter().cloned())
         .collect::<Vec<_>>();
-    let local = run_unchecked(&dvc_program(), local_args, &repo.root)?;
+    let local = inspect_engine(&repo.root, local_args)?;
     if !local.success() {
         return Err(Error::message(format!(
             "managed-storage metadata does not match local data for: {}",
@@ -472,7 +491,7 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
         let serialized = serde_json::to_string(pointers).map_err(|error| {
             Error::message(format!("failed to encode storage metadata files: {error}"))
         })?;
-        let output = run_unchecked(
+        let output = run_process_unchecked(
             &python,
             [
                 "-c",
@@ -481,15 +500,12 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
                 &serialized,
             ],
             &repo.root,
-        )?;
+        )
+        .map_err(private_engine_error)?;
         if !output.success() {
             return Err(Error::message(format!(
                 "failed to verify versioned storage content: {}",
-                if output.stderr.trim().is_empty() {
-                    output.stdout.trim()
-                } else {
-                    output.stderr.trim()
-                }
+                private_detail(&output)
             )));
         }
         return serde_json::from_str(output.stdout.trim()).map_err(|error| {
@@ -503,7 +519,7 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
         .chain(["--cloud".to_owned(), "--quiet".to_owned(), "--".to_owned()])
         .chain(pointers.iter().cloned())
         .collect::<Vec<_>>();
-    let cloud = run_unchecked(&dvc_program(), cloud_args, &repo.root)?;
+    let cloud = inspect_engine(&repo.root, cloud_args)?;
     if !cloud.success() {
         return Err(Error::message(format!(
             "stored content is missing from the configured remote for: {}",
@@ -572,7 +588,7 @@ pub fn hydrate(
         .into_iter()
         .chain(pointers.iter().cloned())
         .collect::<Vec<_>>();
-    run(&dvc_program(), fetch, &repo.root)?;
+    execute_engine(&repo.root, fetch)?;
     // DVC reports an exact local output as "not in cache" when the cache was
     // cleared. Fetching first restores the comparison object without touching
     // the worktree, allowing the conflict check to distinguish identical
@@ -582,7 +598,7 @@ pub fn hydrate(
         .into_iter()
         .chain(pointers.iter().cloned())
         .collect::<Vec<_>>();
-    run(&dvc_program(), checkout, &repo.root)?;
+    execute_engine(&repo.root, checkout)?;
     report.verification = Some(verify(repo, config, &pointers)?);
     report.status = "hydrated".to_owned();
     Ok(report)
@@ -754,7 +770,7 @@ pub fn management(
             }
         };
         args.extend(paths.iter().cloned());
-        run(&dvc_program(), args, &repo.root)?;
+        execute_engine(&repo.root, args)?;
         if operation == "move" {
             reset_moved_cloud_metadata(repo, &paths[1])?;
         }
@@ -872,7 +888,7 @@ pub fn prepare_revision(
             .into_iter()
             .chain(pointers.iter().cloned())
             .collect::<Vec<_>>();
-        run(&dvc_program(), args, &checkout).map_err(|source| prefetch_error(oid, source))?;
+        execute_engine(&checkout, args).map_err(|source| prefetch_error(oid, source))?;
         Ok(PreparedRevision {
             prepared_files: pointers.to_vec(),
             outputs,
@@ -1031,6 +1047,78 @@ impl EmptyFallback for str {
     }
 }
 
+pub fn execute_engine<I, S>(cwd: &Path, args: I) -> Result<CommandOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_process(&dvc_program(), args, cwd).map_err(private_engine_error)
+}
+
+fn inspect_engine<I, S>(cwd: &Path, args: I) -> Result<CommandOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_process_unchecked(&dvc_program(), args, cwd).map_err(private_engine_error)
+}
+
+fn private_engine_error(error: Error) -> Error {
+    match error {
+        Error::Command { code, detail, .. } => Error::Command {
+            command: "managed-storage".to_owned(),
+            code,
+            detail: sanitize_private_detail(&detail),
+        },
+        Error::MissingCommand(_) => {
+            Error::message("managed-storage runtime is unavailable; run `workspace-mgr setup`")
+        }
+        other => other,
+    }
+}
+
+fn private_detail(output: &CommandOutput) -> String {
+    let detail = if output.stderr.trim().is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    sanitize_private_detail(detail)
+}
+
+fn sanitize_private_detail(detail: &str) -> String {
+    let candidates = detail
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !(line.is_empty()
+                || line.starts_with("Traceback")
+                || line.starts_with("File \"")
+                || line.starts_with("See ")
+                || line.starts_with("http://")
+                || line.starts_with("https://")
+                || line.starts_with('<') && line.ends_with('>'))
+        })
+        .collect::<Vec<_>>();
+    let line = candidates
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("ERROR:") || line.contains("Error:"))
+        .or_else(|| candidates.last())
+        .copied()
+        .unwrap_or("internal engine reported a failure");
+    let mut sanitized = line
+        .replace("DVC", "internal engine")
+        .replace("dvc", "internal engine");
+    if let Some(runtime) = crate::runtime::managed_runtime_dir() {
+        let runtime = runtime.to_string_lossy();
+        if !runtime.is_empty() {
+            sanitized = sanitized.replace(runtime.as_ref(), "<private-runtime>");
+        }
+    }
+    sanitized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,6 +1138,38 @@ mod tests {
         assert!(error.contains("download or read-transaction caps"));
         assert!(error.contains("HeadObject returned 403"));
         assert!(!error.contains("dvc"));
+    }
+
+    #[test]
+    fn private_engine_errors_hide_runtime_details_and_tracebacks() {
+        let runtime = crate::runtime::managed_runtime_dir().unwrap();
+        let error = private_engine_error(Error::Command {
+            command: runtime.join("bin/dvc").display().to_string(),
+            code: 23,
+            detail: format!(
+                "Traceback: internal Python frame\nDVC failed in {}",
+                runtime.join("lib/dvc/cache").display()
+            ),
+        });
+        let detail = error.to_string();
+        assert!(detail.contains("managed-storage failed"));
+        assert!(detail.contains("exit code 23"));
+        assert!(detail.contains("internal engine failed"));
+        assert!(!detail.contains("Traceback"));
+        assert!(!detail.contains(&runtime.display().to_string()));
+        assert!(!detail.contains("DVC"));
+        assert!(!detail.contains("dvc"));
+    }
+
+    #[test]
+    fn private_diagnostics_skip_internal_documentation_links() {
+        let detail = sanitize_private_detail(
+            "ERROR: DVC could not retrieve stored content\nSee troubleshooting details\n<https://error.dvc.org/missing-files>\n",
+        );
+        assert_eq!(
+            detail,
+            "ERROR: internal engine could not retrieve stored content"
+        );
     }
 
     #[test]

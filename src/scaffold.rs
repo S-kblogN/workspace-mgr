@@ -12,11 +12,10 @@ use crate::instructions::BOOTSTRAP;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
     AdditionalScope, INFRASTRUCTURE_MANIFEST_NAME, TASK_SCHEMA_VERSION, TaskKind, TaskManifest,
-    one_line,
+    build_task_branch, build_task_id, one_line, validate_additional_scopes,
 };
 use crate::path::{reject_symlink_traversal, repo_path};
-use crate::policy::{TASK_BRANCH_PREFIX, TASK_DIRECTORY_PATTERN, TASK_MANIFEST_NAME};
-use crate::process::run;
+use crate::policy::TASK_MANIFEST_NAME;
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
@@ -109,6 +108,23 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     let mut attributes_changed = false;
     let mut remove_storage_config = false;
     if config.s3_enabled() {
+        let pointers = dvc::repository_pointers(&repo)?;
+        if !pointers.is_empty() {
+            let configured = dvc::managed_internal_location(&repo)?.ok_or_else(|| {
+                Error::message(
+                    "cannot assign an S3 location while storage boundaries already exist without workspace-mgr ownership",
+                )
+            })?;
+            let requested = config.s3.as_ref().ok_or_else(|| {
+                Error::message("managed S3 configuration disappeared during initialization")
+            })?;
+            if configured != (requested.url.clone(), requested.endpoint_url.clone()) {
+                return Err(Error::message(format!(
+                    "cannot change the managed S3 location while storage boundaries remain: {}; place them in Git first",
+                    pointers.join(", ")
+                )));
+            }
+        }
         dvc::require_runtime(&repo)?;
         if config.requires_object_versioning() {
             dvc::require_version_adapter(&repo)?;
@@ -176,7 +192,7 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
             }
             if config.s3_enabled() {
                 if initialize_storage_engine {
-                    run(&dvc::dvc_program(), ["init"], &repo.root)?;
+                    dvc::execute_engine(&repo.root, ["init"])?;
                 }
                 dvc::write_internal_config(&repo, &config)?;
                 ensure_line(&repo.root.join(".dvc/.gitignore"), "/config.local")?;
@@ -272,34 +288,20 @@ pub struct TaskCreateReport {
 }
 
 pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
-    validate_slug(&options.slug)?;
     let title = one_line(&options.title, "task title")?;
     let purpose = one_line(&options.purpose, "task purpose")?;
     let repo = GitRepo::discover(&options.repo)?;
     let _repository_lock = RepositoryLock::acquire(&repo)?;
     let config = Config::load_compatible(&repo)?;
     repo.validate_remote_name(&config.git.remote)?;
-    let additional_scopes = create_scopes(options)?;
+    let mut additional_scopes = create_scopes(options)?;
     let (task_id, task_dir) = match options.kind {
         TaskKind::Deliverable => {
             let timestamp = match &options.timestamp {
-                Some(value) => validate_timestamp(value)?,
+                Some(value) => value.clone(),
                 None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
             };
-            let pattern = TASK_DIRECTORY_PATTERN
-                .replace("%Y%m%d-%H%M%S", &timestamp)
-                .replace("{slug}", &options.slug);
-            if pattern.contains('%') {
-                return Err(Error::message(
-                    "the fixed task directory pattern contains unsupported chrono directives",
-                ));
-            }
-            let task_id = repo_path(&pattern, "generated task directory")?;
-            if task_id.contains('/') {
-                return Err(Error::message(
-                    "generated task directory must be directly below the repository root",
-                ));
-            }
+            let task_id = build_task_id(options.kind, &options.slug, Some(&timestamp))?;
             let task_dir = repo.root.join(&task_id);
             if task_dir.exists() {
                 return Err(Error::message(format!(
@@ -310,15 +312,12 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             (task_id, task_dir)
         }
         TaskKind::Infrastructure => {
-            if options.timestamp.is_some() {
-                return Err(Error::message("infrastructure tasks do not use timestamps"));
-            }
+            let task_id = build_task_id(options.kind, &options.slug, options.timestamp.as_deref())?;
             if additional_scopes.is_empty() {
                 return Err(Error::message(
                     "infrastructure task creation requires --scope and --scope-note",
                 ));
             }
-            let task_id = format!("infra-{}", options.slug);
             let checkout = repo
                 .common_dir()?
                 .join("workspace-mgr/checkouts")
@@ -332,10 +331,11 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             (task_id, checkout)
         }
     };
-    let branch = match options.kind {
-        TaskKind::Deliverable => format!("{}{}", TASK_BRANCH_PREFIX, options.slug),
-        TaskKind::Infrastructure => format!("{}infra-{}", TASK_BRANCH_PREFIX, options.slug),
-    };
+    additional_scopes = validate_additional_scopes(
+        (options.kind == TaskKind::Deliverable).then_some(task_id.as_str()),
+        additional_scopes,
+    )?;
+    let branch = build_task_branch(options.kind, &options.slug)?;
     repo.validate_branch(&branch)?;
     if repo
         .optional_oid(&format!("refs/heads/{branch}"))?
@@ -365,8 +365,8 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         id: task_id.clone(),
         path: (options.kind == TaskKind::Deliverable).then(|| task_id.clone()),
         branch: branch.clone(),
-        title: Some(title.clone()),
-        purpose: Some(purpose.clone()),
+        title: title.clone(),
+        purpose: purpose.clone(),
         additional_scopes,
     };
     let readme = format!(
@@ -535,35 +535,6 @@ fn write_task_files(
         };
     }
     Ok(())
-}
-
-fn validate_slug(slug: &str) -> Result<()> {
-    let valid = !slug.is_empty()
-        && !slug.starts_with('-')
-        && !slug.ends_with('-')
-        && !slug.contains("--")
-        && slug
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if !valid {
-        return Err(Error::message(
-            "task slug must be lowercase kebab case using ASCII letters and digits",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_timestamp(timestamp: &str) -> Result<String> {
-    let valid = timestamp.len() == 15
-        && timestamp.as_bytes()[8] == b'-'
-        && timestamp
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| index == 8 || byte.is_ascii_digit());
-    if !valid {
-        return Err(Error::message("timestamp must use YYYYMMDD-HHMMSS"));
-    }
-    Ok(timestamp.to_owned())
 }
 
 fn ensure_line(path: &Path, line: &str) -> Result<()> {

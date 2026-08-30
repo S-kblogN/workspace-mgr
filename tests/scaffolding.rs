@@ -140,6 +140,8 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
         ["task", "status", "--manifest", manifest.to_str().unwrap()],
     );
     assert_eq!(json(&explicit)["branch"], "codex/infra-shared-policy");
+    let doctor = workspace(&worktree, ["doctor"]);
+    assert_eq!(json(&doctor)["status"], "ok");
     std::fs::write(worktree.join("shared-policy.md"), "shared policy\n").unwrap();
     let published = workspace(&worktree, ["publish", "-m", "Publish shared policy"]);
     let published = json(&published);
@@ -212,6 +214,10 @@ fn setup_installs_and_reuses_a_verified_private_runtime() {
     assert!(runtime.join("bin/dvc").is_file());
     assert!(runtime.join("bin/python").is_file());
     assert_eq!(
+        std::fs::read_to_string(runtime.join(".workspace-mgr-runtime")).unwrap(),
+        "workspace-mgr private runtime v1\n"
+    );
+    assert_eq!(
         std::fs::read_to_string(runtime.join("bin/generated-launcher")).unwrap(),
         format!("#!{}/bin/python\n", runtime.display())
     );
@@ -241,6 +247,11 @@ fn failed_runtime_install_restores_the_previous_directory() {
     let runtime = fixture.root.join("private-runtime");
     std::fs::create_dir(&runtime).unwrap();
     std::fs::write(runtime.join("sentinel"), "previous runtime\n").unwrap();
+    std::fs::write(
+        runtime.join(".workspace-mgr-runtime"),
+        "workspace-mgr private runtime v1\n",
+    )
+    .unwrap();
     let bootstrap = fixture.root.join("failing-bootstrap-python");
     std::fs::write(
         &bootstrap,
@@ -264,7 +275,7 @@ fn failed_runtime_install_restores_the_previous_directory() {
     );
     assert_eq!(
         std::fs::read_dir(runtime).unwrap().count(),
-        1,
+        2,
         "partial replacement files must be removed"
     );
     assert!(std::fs::read_dir(&fixture.root).unwrap().all(|entry| {
@@ -274,6 +285,30 @@ fn failed_runtime_install_restores_the_previous_directory() {
             .to_string_lossy()
             .starts_with(".workspace-mgr-runtime-backup-")
     }));
+}
+
+#[test]
+fn setup_refuses_to_replace_an_unmanaged_directory() {
+    let fixture = GitFixture::new();
+    let runtime = fixture.root.join("ordinary-data");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::write(runtime.join("sentinel"), "must survive\n").unwrap();
+
+    let rejected = workspace_unchecked(
+        &fixture.root,
+        [
+            "setup",
+            "--runtime-dir",
+            runtime.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not owned"));
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
+        "must survive\n"
+    );
 }
 
 #[test]
@@ -390,16 +425,41 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     let manifest = fixture
         .shared
         .join("20260829-170010-fixed-branch/.workspace-mgr-task.toml");
-    let altered = std::fs::read_to_string(&manifest)
-        .unwrap()
-        .replace("codex/fixed-branch", "review/fixed-branch");
-    std::fs::write(&manifest, altered).unwrap();
-    let rejected = workspace_unchecked(
-        &fixture.shared.join("20260829-170010-fixed-branch"),
-        ["task", "status"],
-    );
-    assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("fixed \"codex/\" prefix"));
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    let task = fixture.shared.join("20260829-170010-fixed-branch");
+    let cases = [
+        (
+            original.replace("codex/fixed-branch", "codex/other-branch"),
+            "task branch must be",
+        ),
+        (original.replace("kind = \"deliverable\"\n", ""), "kind"),
+        (original.replace("title = \"Fixed branch\"\n", ""), "title"),
+        (
+            original.replace(
+                "purpose = \"Verify the product-owned branch strategy.\"\n",
+                "",
+            ),
+            "purpose",
+        ),
+        (
+            original.replace(
+                "additional_scopes = []\n",
+                "[[additional_scopes]]\npath = \"20260829-170010-fixed-branch/nested\"\nreason = \"This is already inside the task.\"\n",
+            ),
+            "must not overlap",
+        ),
+    ];
+    for (altered, expected) in cases {
+        std::fs::write(&manifest, altered).unwrap();
+        let rejected = workspace_unchecked(&task, ["task", "status"]);
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(expected),
+            "missing {expected:?} in {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+    std::fs::write(&manifest, original).unwrap();
 }
 
 #[cfg(unix)]
@@ -486,7 +546,21 @@ fn tracked_configuration_rejects_credentials_and_policy_keys() {
 
     workspace(&fixture.shared, ["init"]);
     let config_path = fixture.shared.join(".workspace-mgr.toml");
-    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    let original = std::fs::read_to_string(&config_path).unwrap();
+    for field in ["remote", "branch"] {
+        let prefix = format!("{field} = ");
+        let incomplete = original
+            .lines()
+            .filter(|line| !line.starts_with(&prefix))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&config_path, incomplete).unwrap();
+        let rejected = workspace_unchecked(&fixture.shared, ["instructions"]);
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(field));
+    }
+    let mut config = original;
     config.push_str("\n[review]\nmanaged_by = \"agent\"\n");
     std::fs::write(&config_path, config).unwrap();
     let instructions = workspace_unchecked(&fixture.shared, ["instructions"]);

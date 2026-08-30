@@ -9,8 +9,11 @@ use crate::error::{Error, IoContext, Result};
 use crate::process::{run, run_unchecked};
 
 pub const RUNTIME_DIR_ENV: &str = "WORKSPACE_MGR_RUNTIME_DIR";
+#[cfg(feature = "test-storage")]
 pub const STORAGE_DVC_ENV: &str = "WORKSPACE_MGR_STORAGE_DVC";
 pub const BOOTSTRAP_PYTHON_ENV: &str = "WORKSPACE_MGR_BOOTSTRAP_PYTHON";
+const RUNTIME_MARKER_NAME: &str = ".workspace-mgr-runtime";
+const RUNTIME_MARKER: &str = "workspace-mgr private runtime v1\n";
 
 #[derive(Debug, Clone)]
 pub struct SetupOptions {
@@ -49,6 +52,7 @@ pub fn managed_runtime_dir() -> Option<PathBuf> {
 }
 
 pub fn dvc_program() -> String {
+    #[cfg(feature = "test-storage")]
     if let Ok(program) = std::env::var(STORAGE_DVC_ENV) {
         if !program.trim().is_empty() {
             return program;
@@ -56,12 +60,12 @@ pub fn dvc_program() -> String {
     }
     managed_runtime_dir()
         .map(|root| runtime_program(&root, "dvc"))
-        .filter(|path| path.is_file())
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "dvc".to_owned())
+        .unwrap_or_else(|| unavailable_runtime_program("dvc"))
 }
 
 pub fn storage_python() -> String {
+    #[cfg(feature = "test-storage")]
     if let Ok(program) = std::env::var(crate::dvc::STORAGE_PYTHON_ENV) {
         if !program.trim().is_empty() {
             return program;
@@ -69,9 +73,8 @@ pub fn storage_python() -> String {
     }
     managed_runtime_dir()
         .map(|root| runtime_program(&root, "python"))
-        .filter(|path| path.is_file())
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "python3".to_owned())
+        .unwrap_or_else(|| unavailable_runtime_program("python"))
 }
 
 pub fn setup(options: &SetupOptions) -> Result<SetupReport> {
@@ -92,15 +95,16 @@ pub fn setup(options: &SetupOptions) -> Result<SetupReport> {
         format!("install private storage runtime {REQUIRED_DVC_VERSION}"),
         "verify the isolated executable and Python module versions".to_owned(),
     ];
-    if runtime_is_compatible(&runtime_dir)? {
-        return Ok(SetupReport {
-            status: "no_changes".to_owned(),
-            runtime_dir: runtime_dir.display().to_string(),
-            storage_runtime: REQUIRED_DVC_VERSION.to_owned(),
-            actions: Vec::new(),
-        });
-    }
+    require_owned_or_absent(&runtime_dir)?;
     if options.dry_run {
+        if runtime_is_compatible(&runtime_dir)? {
+            return Ok(SetupReport {
+                status: "no_changes".to_owned(),
+                runtime_dir: runtime_dir.display().to_string(),
+                storage_runtime: REQUIRED_DVC_VERSION.to_owned(),
+                actions: Vec::new(),
+            });
+        }
         return Ok(SetupReport {
             status: "dry_run".to_owned(),
             runtime_dir: runtime_dir.display().to_string(),
@@ -132,8 +136,8 @@ pub fn setup(options: &SetupOptions) -> Result<SetupReport> {
     setup_lock
         .try_lock_exclusive()
         .map_err(|_| Error::message("another workspace-mgr setup operation is running"))?;
-    // Another installer may have completed between the optimistic check above
-    // and lock acquisition.
+    // The target may have changed while this process was waiting for the lock.
+    require_owned_or_absent(&runtime_dir)?;
     if runtime_is_compatible(&runtime_dir)? {
         return Ok(SetupReport {
             status: "no_changes".to_owned(),
@@ -181,6 +185,8 @@ pub fn setup(options: &SetupOptions) -> Result<SetupReport> {
             ],
             parent,
         )?;
+        let marker = runtime_dir.join(RUNTIME_MARKER_NAME);
+        fs::write(&marker, RUNTIME_MARKER).at(&marker)?;
         if !runtime_is_compatible(&runtime_dir)? {
             return Err(Error::message(
                 "new private storage runtime failed its compatibility check",
@@ -238,6 +244,9 @@ fn path_exists(path: &Path) -> Result<bool> {
 }
 
 fn runtime_is_compatible(root: &Path) -> Result<bool> {
+    if !runtime_is_owned(root)? {
+        return Ok(false);
+    }
     let dvc = runtime_program(root, "dvc");
     let python = runtime_program(root, "python");
     if !dvc.is_file() || !python.is_file() {
@@ -255,8 +264,57 @@ fn runtime_is_compatible(root: &Path) -> Result<bool> {
     Ok(module_version.success() && module_version.stdout.trim() == REQUIRED_DVC_VERSION)
 }
 
+fn require_owned_or_absent(root: &Path) -> Result<()> {
+    if path_exists(root)? && !runtime_is_owned(root)? {
+        return Err(Error::message(format!(
+            "private runtime target already exists but is not owned by workspace-mgr: {}; choose an empty path or move the existing data explicitly",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+fn runtime_is_owned(root: &Path) -> Result<bool> {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(Error::Io {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let marker = root.join(RUNTIME_MARKER_NAME);
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(Error::Io {
+                path: marker,
+                source,
+            });
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    Ok(fs::read_to_string(&marker).at(&marker)? == RUNTIME_MARKER)
+}
+
 fn runtime_program(root: &Path, name: &str) -> PathBuf {
     root.join("bin").join(name)
+}
+
+fn unavailable_runtime_program(name: &str) -> String {
+    Path::new(std::path::MAIN_SEPARATOR_STR)
+        .join("workspace-mgr-private-runtime-unavailable")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn absolute_target(path: &Path) -> Result<PathBuf> {

@@ -22,10 +22,19 @@ if [ "$actual_target" != "$expected_target" ]; then
     exit 2
 fi
 
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+if [ -z "$version" ]; then
+    echo "could not read the package version from Cargo.toml" >&2
+    exit 2
+fi
+if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME:-}" != "v${version}" ]; then
+    echo "release tag ${GITHUB_REF_NAME:-<missing>} does not match package version v${version}" >&2
+    exit 2
+fi
+
 cargo build --locked --release
 target/release/workspace-mgr --version
 
-version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 archive_name="workspace-mgr-${version}-${expected_target}"
 if [ -e "dist/${archive_name}" ]; then
     rm -rf -- "dist/${archive_name}"

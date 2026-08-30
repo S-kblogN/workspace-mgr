@@ -6,6 +6,7 @@ use crate::config::{CONFIG_NAME, Config};
 use crate::dvc;
 use crate::error::Result;
 use crate::git::GitRepo;
+use crate::manifest::{ResolvedTask, TaskKind};
 use crate::process::command_exists;
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,7 +38,7 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
     checks.push(repository_runtime);
 
     let config_path = repo.root.join(CONFIG_NAME);
-    let config = match Config::load(&repo) {
+    let config = match Config::load_compatible(&repo) {
         Ok(config) => {
             checks.push(DoctorCheck {
                 name: "repository-config".to_owned(),
@@ -61,11 +62,25 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
             .current_branch()?
             .unwrap_or_else(|| "detached".to_owned());
         let expected = &config.git.branch;
-        let branch_ok = head == *expected;
+        let infrastructure_task = if head == *expected {
+            None
+        } else {
+            ResolvedTask::discover(&repo, &repo.root)
+                .and_then(|path| ResolvedTask::load(&repo, config, &path))
+                .ok()
+                .filter(|task| task.kind == TaskKind::Infrastructure && task.branch == head)
+        };
+        let branch_ok = head == *expected || infrastructure_task.is_some();
         checks.push(DoctorCheck {
             name: "checkout-branch".to_owned(),
             status: if branch_ok { "ok" } else { "error" }.to_owned(),
-            detail: format!("current {head}, configured shared branch {expected}"),
+            detail: match infrastructure_task {
+                Some(task) => format!(
+                    "current {head}, valid isolated infrastructure task {}",
+                    task.task_id
+                ),
+                None => format!("current {head}, configured shared branch {expected}"),
+            },
         });
         let identity = repo.run_unchecked(["var", "GIT_AUTHOR_IDENT"])?;
         checks.push(DoctorCheck {

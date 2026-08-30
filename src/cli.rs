@@ -10,7 +10,7 @@ use crate::output::Format;
 #[command(
     name = "workspace-mgr",
     version,
-    about = "Policy-driven repository workspace manager for coding agents",
+    about = "Fixed-policy repository workspace manager for coding agents",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -314,12 +314,6 @@ pub struct RefreshArgs {
     pub repo: PathBuf,
 
     #[arg(long)]
-    pub remote: Option<String>,
-
-    #[arg(long)]
-    pub branch: Option<String>,
-
-    #[arg(long)]
     pub dry_run: bool,
 }
 
@@ -437,14 +431,7 @@ mod tests {
                 "The user requested this shared documentation update",
                 "--dry-run",
             ],
-            &[
-                "refresh",
-                "--remote",
-                "origin",
-                "--branch",
-                "main",
-                "--dry-run",
-            ],
+            &["refresh", "--dry-run"],
         ];
 
         for args in examples {

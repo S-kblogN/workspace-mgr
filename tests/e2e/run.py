@@ -222,6 +222,11 @@ class Harness:
         self.check(installed["status"] == "installed", "setup provisions private runtime")
         self.check((runtime / "bin" / "dvc").is_file(), "private storage executable exists")
         self.check((runtime / "bin" / "python").is_file(), "private Python adapter exists")
+        self.check(
+            runtime.joinpath(".workspace-mgr-runtime").read_text(encoding="utf-8")
+            == "workspace-mgr private runtime v1\n",
+            "private runtime records explicit workspace-mgr ownership",
+        )
         repeated = self.wm(self.root, "setup")
         self.check(repeated["status"] == "no_changes", "setup is idempotent")
 
@@ -581,9 +586,12 @@ class Harness:
             if check["name"] == "managed-storage-version-adapter"
         )
         self.check(
-            str(self.home / ".local" / "share" / "workspace-mgr")
-            in adapter["detail"],
-            "repository operations use the provisioned private runtime",
+            adapter["detail"] == "internal adapter 3.67.1",
+            "doctor verifies the provisioned private runtime's exact adapter version",
+        )
+        self.check(
+            str(self.home) not in adapter["detail"],
+            "doctor does not expose the private runtime path",
         )
 
     def create_and_publish_task(self) -> tuple[str, Path, str]:
@@ -742,6 +750,10 @@ class Harness:
             cwd=self.root,
         ).stdout
         self.check("Scope-Authorization: authorized.txt" in message, "commit records scope authorization")
+        self.check(
+            f"Workspace-Task: {task_id}" in message,
+            "commit records the task identity that owns its remote branch",
+        )
         self.check(published["review"]["pull_request"] == "required", "deliverable review handoff requires one PR")
         self.check(published["review"]["managed_by"] == "agent", "deliverable review handoff assigns the agent")
         self.check(published["review"]["merge_authority"] == "user", "deliverable review handoff reserves merge for user")
@@ -883,6 +895,17 @@ class Harness:
         )
         self.check(infra_placement["status"] == "updated", "infrastructure content can select S3")
         self.check(infra_placement["remote_writes"] is False, "infrastructure placement is local-only")
+        infra_status = self.wm(
+            worktree,
+            "storage",
+            "status",
+            "e2e-infra-assets/data.bin",
+        )
+        self.check(
+            infra_status["placements"][0]["target"] == "s3"
+            and infra_status["placements"][0]["selected_by"] == "explicit",
+            "infrastructure storage status resolves its private task identity",
+        )
         plan = self.wm(worktree, "plan")
         self.check(
             all(
@@ -1026,6 +1049,20 @@ class Harness:
         versions_v1 = self.list_s3_versions()
         self.check(len(versions_v1) >= 3, "MinIO contains DVC payload versions")
         self.check(all(item["version_id"] not in ("", "null") for item in versions_v1), "all S3 objects have version IDs")
+        config_before_relocation = (self.shared / ".workspace-mgr.toml").read_bytes()
+        relocation = self.wm(
+            self.shared,
+            "init",
+            "--s3-url",
+            "s3://workspace-mgr-other/dvc",
+            expected=2,
+        )
+        self.check(
+            "cannot change the managed S3 location" in relocation["stderr"]
+            and (self.shared / ".workspace-mgr.toml").read_bytes()
+            == config_before_relocation,
+            "init cannot relocate retained S3 boundaries or rewrite tracked facts",
+        )
         bodies_v1 = self.s3_bodies()
         for payload in (v1, bundle_v1_a, bundle_v1_b):
             self.check(payload in bodies_v1, "S3 contains exact version-one payload", payload=payload.decode().strip())
@@ -1228,7 +1265,7 @@ class Harness:
             "--reason",
             "Exercise the explicit S3-to-Git transition.",
         )
-        self.check(to_git["status"] == "updated", "explicit placement migrates published S3 content to Git")
+        self.check(to_git["status"] == "updated", "explicit placement moves published S3 content to Git")
         self.check(not moved_pointer.exists(), "explicit Git placement removes S3 metadata locally")
         reset_publish = self.wm(task, "publish", "-m", "Publish explicit Git placement")
         self.check(reset_publish["status"] == "pushed", "Git placement publishes")
@@ -1323,9 +1360,10 @@ class Harness:
             / "bin"
             / "dvc"
         )
-        failing_dvc = self.root / "fail-first-refresh-checkout"
+        real_dvc = runtime_dvc.with_name("dvc.workspace-mgr-e2e-real")
         checkout_counter = self.root / "refresh-checkout-counter"
-        failing_dvc.write_text(
+        runtime_dvc.rename(real_dvc)
+        runtime_dvc.write_text(
             "#!/bin/sh\n"
             "set -eu\n"
             "if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' '3.67.1'; exit 0; fi\n"
@@ -1333,20 +1371,23 @@ class Harness:
             "  : > \"$CHECKOUT_COUNTER\"\n"
             "  exit 23\n"
             "fi\n"
-            "exec \"$REAL_DVC\" \"$@\"\n",
+            "exec \"$WORKSPACE_MGR_E2E_REAL_DVC\" \"$@\"\n",
             encoding="utf-8",
         )
-        failing_dvc.chmod(0o755)
-        failed_refresh = self.wm(
-            self.shared,
-            "refresh",
-            expected=2,
-            env={
-                "WORKSPACE_MGR_STORAGE_DVC": str(failing_dvc),
-                "CHECKOUT_COUNTER": str(checkout_counter),
-                "REAL_DVC": str(runtime_dvc),
-            },
-        )
+        runtime_dvc.chmod(0o755)
+        try:
+            failed_refresh = self.wm(
+                self.shared,
+                "refresh",
+                expected=2,
+                env={
+                    "CHECKOUT_COUNTER": str(checkout_counter),
+                    "WORKSPACE_MGR_E2E_REAL_DVC": str(real_dvc),
+                },
+            )
+        finally:
+            runtime_dvc.unlink(missing_ok=True)
+            real_dvc.rename(runtime_dvc)
         self.check("rolled back" in failed_refresh["stderr"], "post-ref refresh failure is rolled back")
         self.check(
             self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,

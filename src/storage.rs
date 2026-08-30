@@ -374,7 +374,10 @@ pub fn apply_automatic(
     candidates.sort();
     candidates.dedup();
     if !dry_run && !candidates.is_empty() {
-        dvc::management(repo, config, "track", &candidates, false)?;
+        let snapshot = MetadataSnapshot::capture(repo, &candidates)?;
+        if let Err(error) = dvc::management(repo, config, "track", &candidates, false) {
+            return Err(rollback_error(error, snapshot.restore()));
+        }
     }
     Ok(AutomaticPlacementReport {
         mode: if dry_run { "plan" } else { "apply" }.to_owned(),
@@ -514,13 +517,10 @@ fn placement_status(
 }
 
 fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Result<Option<String>> {
-    let task_path = scopes
-        .iter()
-        .find(|scope| {
-            resolved_under(&repo.root, &format!("{scope}/{TASK_MANIFEST_NAME}")).is_file()
-        })
-        .or_else(|| scopes.first());
-    let manifest = match task_path {
+    let task_manifest = scopes.iter().find(|scope| {
+        resolved_under(&repo.root, &format!("{scope}/{TASK_MANIFEST_NAME}")).is_file()
+    });
+    let manifest = match task_manifest {
         Some(task_path) => resolved_under(&repo.root, &format!("{task_path}/{TASK_MANIFEST_NAME}")),
         None => match ResolvedTask::discover(repo, &repo.root) {
             Ok(path) => path,

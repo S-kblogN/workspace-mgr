@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{AdditionalScope, ResolvedTask, one_line};
+use crate::manifest::{AdditionalScope, ResolvedTask, one_line, validate_additional_scopes};
 use crate::output::{Format, print_human, print_json};
 use crate::path::repo_path;
 use crate::refresh::{RefreshOptions, execute as refresh};
@@ -176,8 +176,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Refresh(args) => emit(
             &refresh(&RefreshOptions {
                 repo: args.repo,
-                remote: args.remote,
-                branch: args.branch,
                 dry_run: args.dry_run,
             })?,
             cli.format,
@@ -237,10 +235,13 @@ fn hydrate_scopes(
             });
         }
     }
-    let mut scopes = task.task_path.iter().cloned().collect::<Vec<_>>();
-    scopes.extend(additional.iter().map(|scope| scope.path.clone()));
-    let mut seen = std::collections::BTreeSet::new();
-    scopes.retain(|scope| seen.insert(scope.clone()));
+    let additional = validate_additional_scopes(task.task_path.as_deref(), additional)?;
+    let scopes = task
+        .task_path
+        .iter()
+        .cloned()
+        .chain(additional.iter().map(|scope| scope.path.clone()))
+        .collect();
     Ok((scopes, additional))
 }
 

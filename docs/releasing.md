@@ -20,3 +20,7 @@ License, README, and linked user documentation.
 Publishing crates.io packages, tags, or durable GitHub Release assets is an
 explicit maintainer action. Credentials and release permissions must never be
 available to pull-request workflows.
+
+The packaging script refuses a tag whose `v<version>` name does not exactly
+match the package version in `Cargo.toml`; workflow dispatches may still build
+review artifacts without claiming a release tag.

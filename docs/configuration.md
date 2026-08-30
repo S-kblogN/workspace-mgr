@@ -18,9 +18,10 @@ url = "s3://example-bucket/workspace"
 endpoint_url = "https://s3.example.invalid"
 ```
 
-`[git]` is always present. `[s3]` is optional. Unknown fields are rejected so a
-repository cannot silently invent or retain policy knobs that the product does
-not support.
+`[git]`, `git.remote`, and `git.branch` are required. `[s3]` is optional.
+Unknown fields and incomplete sections are rejected so a repository cannot
+silently invent or retain policy knobs—or fall back to unstated repository
+facts—that the product does not support.
 
 ## Git facts
 
@@ -46,6 +47,9 @@ platform-standard identity and environment mechanisms.
 public facts and deterministically generates the private storage-engine
 configuration. Every S3 operation rejects drift in that derived file. Users and
 agents should edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
+Once S3 boundaries exist, `init` will not relocate them to another URL or
+endpoint; place all retained boundaries in Git before changing the repository's
+S3 location.
 
 ## Fixed workspace policy
 
@@ -94,3 +98,11 @@ An infrastructure manifest uses `kind = "infrastructure"`, omits `path`, and
 requires at least one `additional_scopes` entry. It is stored in private
 worktree Git state rather than committed to the repository. The manifest schema
 version describes serialized task state; it is not a strategy selector.
+
+Every field shown above except `additional_scopes` is required. A deliverable
+ID and path must be exactly `YYYYMMDD-HHMMSS-<slug>` and its branch must be
+`codex/<slug>`. An infrastructure ID must be `infra-<slug>` and its branch must
+be `codex/infra-<slug>`. Slugs are lowercase ASCII kebab case. Declared scopes
+must be distinct and non-overlapping. These constraints are validated whenever
+a manifest is loaded, so hand-editing task state cannot select another
+repository-management strategy.

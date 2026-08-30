@@ -107,12 +107,13 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .output()
-        .expect("run command");
+        .env("WORKSPACE_MGR_FORMAT", "json");
+    inject_test_storage_engine(&mut command);
+    let output = command.output().expect("run command");
     if !output.status.success() {
         panic!(
             "{program} failed\nstdout:\n{}\nstderr:\n{}",
@@ -140,12 +141,20 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    Command::new(binary())
+    let mut command = Command::new(binary());
+    command
         .args(args)
         .current_dir(cwd)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .output()
-        .expect("run workspace-mgr")
+        .env("WORKSPACE_MGR_FORMAT", "json");
+    inject_test_storage_engine(&mut command);
+    command.output().expect("run workspace-mgr")
+}
+
+fn inject_test_storage_engine(command: &mut Command) {
+    #[cfg(feature = "test-storage")]
+    if let Ok(program) = which::which("dvc") {
+        command.env("WORKSPACE_MGR_STORAGE_DVC", program);
+    }
 }
 
 pub fn json(output: &Output) -> serde_json::Value {

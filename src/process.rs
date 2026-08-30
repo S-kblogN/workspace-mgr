@@ -68,15 +68,19 @@ where
     })?;
     if let Some(input) = input {
         use std::io::Write;
-        child
+        let write_result = child
             .stdin
-            .as_mut()
-            .expect("stdin was piped")
-            .write_all(input.as_bytes())
-            .map_err(|source| Error::Io {
+            .take()
+            .ok_or_else(|| Error::message("child stdin was not available"))?
+            .write_all(input.as_bytes());
+        if let Err(source) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Io {
                 path: cwd.to_path_buf(),
                 source,
-            })?;
+            });
+        }
     }
     let output = child.wait_with_output().map_err(|source| Error::Io {
         path: cwd.to_path_buf(),
@@ -106,4 +110,24 @@ where
 
 pub fn command_exists(program: &str) -> bool {
     which::which(program).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_and_closes_child_stdin_before_waiting() {
+        let output = run_with(
+            "sh",
+            ["-c", "read line; printf '%s' \"$line\""],
+            Path::new("."),
+            &BTreeMap::new(),
+            Some("input line\n"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(output.stdout, "input line");
+    }
 }

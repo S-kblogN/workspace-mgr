@@ -9,14 +9,11 @@ use crate::dvc::{self, PreparedRevision};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::path::{repo_path, resolved_under};
-use crate::process::run;
+use crate::path::{reject_symlink_traversal, repo_path, resolved_under};
 
 #[derive(Debug, Clone)]
 pub struct RefreshOptions {
     pub repo: PathBuf,
-    pub remote: Option<String>,
-    pub branch: Option<String>,
     pub dry_run: bool,
 }
 
@@ -55,14 +52,8 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let repo = GitRepo::discover(&options.repo)?;
     let _repository_lock = RepositoryLock::acquire(&repo)?;
     let config = Config::load_compatible(&repo)?;
-    let remote = options
-        .remote
-        .clone()
-        .unwrap_or_else(|| config.git.remote.clone());
-    let branch = options
-        .branch
-        .clone()
-        .unwrap_or_else(|| config.git.branch.clone());
+    let remote = config.git.remote.clone();
+    let branch = config.git.branch.clone();
     repo.validate_remote_name(&remote)?;
     repo.validate_branch(&branch)?;
     let head = repo.current_branch()?;
@@ -160,6 +151,9 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     if !incoming_dvc.is_empty() {
         let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_dvc)?;
         let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &new_dvc)?;
+        for output in new_prepared.outputs.values().flatten() {
+            reject_symlink_traversal(&repo.root, output, "incoming managed-storage output")?;
+        }
         let unsafe_outputs: Vec<String> = new_dvc
             .iter()
             .filter(|pointer| !resolved_under(&repo.root, pointer).is_file())
@@ -206,7 +200,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
                     .into_iter()
                     .chain(new_dvc.iter().cloned())
                     .collect::<Vec<_>>();
-                run(&dvc::dvc_program(), args, &repo.root)?;
+                dvc::execute_engine(&repo.root, args)?;
                 dvc::verify(&repo, &config, &new_dvc)?;
             }
         }
@@ -282,15 +276,28 @@ fn tree_changed_paths(repo: &GitRepo, old: &str, new: &str) -> Result<Vec<String
 }
 
 fn file_at(repo: &GitRepo, oid: &str, path: &str) -> Result<Option<String>> {
-    let output = repo.run_unchecked(["show", &format!("{oid}:{path}")])?;
-    match output.code {
-        0 => Ok(Some(output.stdout)),
-        128 => Ok(None),
-        _ => Err(Error::message(format!(
-            "failed to inspect {path} at {oid}: {}",
-            output.stderr.trim()
-        ))),
+    let tree = repo.run(["ls-tree", "-z", oid, "--", path])?;
+    let mut exact = tree
+        .stdout
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| entry.split_once('\t'));
+    let Some((metadata, actual_path)) = exact.find(|(_, actual_path)| *actual_path == path) else {
+        return Ok(None);
+    };
+    if exact.any(|(_, duplicate)| duplicate == path) {
+        return Err(Error::message(format!(
+            "repository tree repeats path {path:?} at {oid}"
+        )));
     }
+    if metadata.split_whitespace().nth(1) != Some("blob") {
+        return Err(Error::message(format!(
+            "expected a file at {path:?} in {oid}"
+        )));
+    }
+    Ok(Some(
+        repo.run(["show", &format!("{oid}:{actual_path}")])?.stdout,
+    ))
 }
 
 fn existing_at(repo: &GitRepo, oid: &str, paths: &[String]) -> Result<Vec<String>> {
@@ -312,6 +319,7 @@ fn capture_overlays(
     let mut conflicts = Vec::new();
     let mut overlays = BTreeMap::new();
     for path in paths {
+        reject_symlink_traversal(&repo.root, path, "incoming managed-storage metadata")?;
         let candidate = resolved_under(&repo.root, path);
         let old_content = file_at(repo, old, path)?;
         let new_content = file_at(repo, new, path)?;
@@ -344,6 +352,7 @@ fn capture_overlays(
 fn materialize_metadata(repo: &GitRepo, oid: &str, paths: &[String]) -> Result<Vec<String>> {
     let mut materialized = Vec::new();
     for path in paths {
+        reject_symlink_traversal(&repo.root, path, "incoming managed-storage metadata")?;
         let candidate = resolved_under(&repo.root, path);
         match file_at(repo, oid, path)? {
             Some(content) => {
@@ -384,6 +393,7 @@ fn rollback(
     materialize_git_paths(repo, old_oid, materialized_git_paths)?;
     let mut restored = Vec::new();
     for (path, content) in overlays {
+        reject_symlink_traversal(&repo.root, path, "rollback managed-storage metadata")?;
         let candidate = resolved_under(&repo.root, path);
         match content {
             Some(content) => {
@@ -405,10 +415,11 @@ fn rollback(
             .into_iter()
             .chain(restored)
             .collect::<Vec<_>>();
-        run(&dvc::dvc_program(), args, &repo.root)?;
+        dvc::execute_engine(&repo.root, args)?;
     }
     for output in outputs_absent_before {
         let normalized = repo_path(output, "rollback storage output")?;
+        reject_symlink_traversal(&repo.root, &normalized, "rollback managed-storage output")?;
         let candidate = resolved_under(&repo.root, &normalized);
         if candidate.is_symlink() || candidate.is_file() {
             fs::remove_file(&candidate).at(&candidate)?;

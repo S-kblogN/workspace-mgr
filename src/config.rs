@@ -18,7 +18,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct GitConfig {
     pub remote: String,
     pub branch: String,
@@ -221,6 +221,16 @@ mod tests {
             endpoint_url: Some("https://user:secret@example.invalid".to_owned()),
         });
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn tracked_git_facts_are_required() {
+        for raw in ["[git]\nbranch = \"main\"\n", "[git]\nremote = \"origin\"\n"] {
+            assert!(
+                toml::from_str::<Config>(raw).is_err(),
+                "incomplete configuration was accepted: {raw:?}"
+            );
+        }
     }
 
     #[cfg(not(feature = "test-storage"))]

@@ -12,7 +12,9 @@ use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{AdditionalScope, ResolvedTask, TaskKind, one_line};
+use crate::manifest::{
+    AdditionalScope, ResolvedTask, TaskKind, one_line, validate_additional_scopes,
+};
 use crate::path::{allowed, relative_to, repo_path, resolved_under};
 use crate::policy::{
     AUTO_S3_ABOVE_BYTES, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
@@ -159,6 +161,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
                 "target branch changed while it was being fetched; retry",
             ));
         }
+        validate_remote_task_identity(&repo, &task, &fetched)?;
         (
             format!("refs/remotes/{}/{}", task.remote, task.branch),
             fetched,
@@ -321,6 +324,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         message
             .as_deref()
             .ok_or_else(|| Error::message("publish requires -m/--message"))?,
+        &task.task_id,
         &scopes,
         &authorizations,
     );
@@ -348,7 +352,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         repo.run(["read-tree", &commit_oid])?;
     }
     let refspec = format!("{commit_oid}:refs/heads/{}", task.branch);
-    let push = repo.run(["push", "--porcelain", &task.remote, &refspec])?;
+    repo.run(["push", "--porcelain", &task.remote, &refspec])?;
     let observed = repo
         .remote_branch_oid(&task.remote, &task.branch)?
         .ok_or_else(|| Error::message("remote branch disappeared after push"))?;
@@ -367,7 +371,6 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     report.status = "pushed".to_owned();
     report.commit_oid = Some(commit_oid);
     report.remote_oid = Some(observed);
-    let _ = push;
     report.push = Some("explicit refspec pushed and remote object ID verified".to_owned());
     Ok(report)
 }
@@ -539,10 +542,13 @@ fn resolve_scopes(
             });
         }
     }
-    let mut scopes = task.task_path.iter().cloned().collect::<Vec<_>>();
-    scopes.extend(additional.iter().map(|entry| entry.path.clone()));
-    let mut seen = BTreeSet::new();
-    scopes.retain(|scope| seen.insert(scope.clone()));
+    let additional = validate_additional_scopes(task.task_path.as_deref(), additional)?;
+    let scopes = task
+        .task_path
+        .iter()
+        .cloned()
+        .chain(additional.iter().map(|entry| entry.path.clone()))
+        .collect();
     Ok((scopes, additional))
 }
 
@@ -717,12 +723,14 @@ fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<usiz
 
 fn build_commit_message(
     message: &str,
+    task_id: &str,
     scopes: &[String],
     authorizations: &[AdditionalScope],
 ) -> String {
     let mut lines = vec![
         message.to_owned(),
         String::new(),
+        format!("Workspace-Task: {task_id}"),
         format!("Workspace-Scope: {}", scopes.join(", ")),
     ];
     for authorization in authorizations {
@@ -732,6 +740,28 @@ fn build_commit_message(
         ));
     }
     lines.join("\n") + "\n"
+}
+
+fn validate_remote_task_identity(
+    repo: &GitRepo,
+    task: &ResolvedTask,
+    remote_oid: &str,
+) -> Result<()> {
+    if commit_belongs_to_task(repo, remote_oid, task)? {
+        return Ok(());
+    }
+    Err(Error::message(format!(
+        "target branch {:?} already belongs to another task; choose a different task slug",
+        task.branch
+    )))
+}
+
+fn commit_belongs_to_task(repo: &GitRepo, oid: &str, task: &ResolvedTask) -> Result<bool> {
+    let message = repo.run(["show", "-s", "--format=%B", oid])?.stdout;
+    Ok(message.lines().any(|line| {
+        line.strip_prefix("Workspace-Task:")
+            .is_some_and(|value| value.trim() == task.task_id)
+    }))
 }
 
 pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> {
@@ -772,10 +802,8 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
 pub struct TaskStatus {
     pub kind: TaskKind,
     pub task_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<String>,
+    pub title: String,
+    pub purpose: String,
     pub manifest: String,
     pub branch: String,
     pub remote: String,

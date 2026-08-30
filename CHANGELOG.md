@@ -33,8 +33,24 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Fixed
 
+- Task manifests now enforce the product-owned task identity, branch mapping,
+  required purpose metadata, and non-overlapping scopes on every load.
+- Distinct tasks can no longer claim the same remote branch after a concurrent
+  cross-clone task creation race.
+- Runtime setup refuses unmanaged existing targets, records explicit ownership,
+  and rechecks the target only after acquiring the setup lock.
+- Shared-checkout refresh rejects incoming storage metadata and outputs that
+  would traverse local symlink ancestors before advancing the shared ref.
+- Private storage-engine failures now expose managed-storage diagnostics without
+  leaking internal executables, runtime paths, or tracebacks.
 - Failed refresh prefetches now identify object-read credentials and provider
   download or read-transaction caps as likely causes without exposing the
   internal engine command.
 - Temporary detached worktrees are forcibly removed, pruned, and verified even
   when managed-storage prefetch fails.
+- Repository operations no longer fall back to an ambient storage executable;
+  only the provisioned private runtime is used in production builds.
+- Refresh always uses the tracked Git remote and shared branch, and repository
+  initialization refuses to relocate existing S3 boundaries.
+- Failed automatic large-file placement restores partial metadata, while
+  infrastructure storage status resolves the private task manifest correctly.

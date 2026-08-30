@@ -30,7 +30,9 @@ workspace-mgr setup
 
 Setup uses an isolated user data directory and verifies the exact private
 storage runtime. `workspace-mgr setup --dry-run` reports the intended location
-and actions without changing the host.
+and actions without changing the host. A custom `--runtime-dir` must be absent
+or already carry workspace-mgr's private ownership marker; setup never replaces
+an arbitrary existing directory.
 
 ### 2. Initialize a repository
 
