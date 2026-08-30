@@ -14,6 +14,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  minimum-rust:
+    name: Rust 1.85 compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+      - name: Set up minimum supported Rust
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Check production build
+        run: cargo check --locked --all-targets --no-default-features
+
   quality:
     name: Quality and isolated integration tests
     runs-on: ubuntu-24.04
@@ -36,14 +49,30 @@ jobs:
           dvc version
       - name: Check formatting
         run: cargo fmt --check
+      - name: Audit dependencies and licenses
+        uses: EmbarkStudios/cargo-deny-action@v2
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all-features --no-fail-fast
+      - name: Test production configuration boundary
+        run: cargo test --locked --lib --no-default-features production_build_rejects_filesystem_storage
       - name: Assemble crate package
         run: cargo package --locked
       - name: Package native archive
         run: sh scripts/package-native.sh x86_64-unknown-linux-gnu
+      - name: Exercise native installer
+        run: |
+          install_root="$(mktemp -d)"
+          archive="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          tar -C "${install_root}" -xzf "${archive}"
+          package_dir="$(find "${install_root}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          HOME="${install_root}/home" \
+            XDG_DATA_HOME="${install_root}/data" \
+            WORKSPACE_MGR_PREFIX="${install_root}/prefix" \
+            "${package_dir}/install.sh"
+          test -x "${install_root}/prefix/bin/workspace-mgr"
+          "${install_root}/prefix/bin/workspace-mgr" --version
       - name: Upload native archive
         uses: actions/upload-artifact@v7.0.1
         with:

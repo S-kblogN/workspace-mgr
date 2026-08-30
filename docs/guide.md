@@ -21,13 +21,30 @@ Five concepts describe the complete workflow.
 | Placement | Whether retained content is stored in Git or S3 | `storage status`, `set`, `reset`, `hydrate`, `move` |
 | Publication | One scoped, verified Git-and-S3 transaction | `plan`, `publish`, `refresh` |
 
+Installation has one separate host-level operation, `workspace-mgr setup`, which
+provisions the private execution runtime. It is not repository policy and does
+not add another repository-management concept.
+
 The task manifest defines the paths and branch involved in one transaction.
 Placement answers where content is stored. Publication is the only operation
 that makes the task visible on a remote.
 
 ## Repository lifecycle
 
-### 1. Initialize or adopt a repository
+### 1. Provision the CLI runtime
+
+Native archives include `install.sh`, which installs the executable and runs
+`workspace-mgr setup`. After `cargo install`, run setup explicitly:
+
+```sh
+workspace-mgr setup
+```
+
+Setup uses an isolated user data directory and verifies the exact private
+storage runtime. `workspace-mgr setup --dry-run` reports the intended location
+and actions without changing the host.
+
+### 2. Initialize or adopt a repository
 
 Run `init` once from the Git repository:
 
@@ -52,7 +69,7 @@ Use the `standard` profile for an ordinary checkout. Use `shared-checkout` when
 multiple tasks may leave independent working-tree overlays in one checkout
 that remains on a shared branch such as `main`.
 
-### 2. Load the policy for an agent session
+### 3. Load the policy for an agent session
 
 The generated `AGENTS.md` asks every agent to run:
 
@@ -72,7 +89,7 @@ task scope, publication, artifact hygiene, storage, shared-checkout, and
 infrastructure rules are independent modules. Requesting a disabled topic is an
 error instead of silently returning incomplete policy.
 
-### 3. Create one task
+### 4. Create one task
 
 ```sh
 workspace-mgr task create model-report \
@@ -90,7 +107,7 @@ directory is the default scope. A manifest may declare durable additional
 scopes, while `--include <path> --scope-note <reason>` authorizes an additional
 scope for one invocation.
 
-### 4. Choose where retained content lives
+### 5. Choose where retained content lives
 
 Most files need no manual choice. With the default automatic policy, a new file
 above the configured threshold goes to S3 and a smaller file goes to Git.
@@ -114,10 +131,12 @@ are rejected: set or reset the existing boundary instead. `storage set`,
 remote.
 
 `storage reset <path>` removes an explicit choice and returns the path to
-automatic policy. Resetting a directory removes its atomic directory choice;
-its files may then be evaluated independently during planning and publication.
+automatic policy. If that directory has not been published, removing its atomic
+choice allows its files to be evaluated independently during planning and
+publication. A published S3 directory remains one sticky S3 boundary until an
+explicit `storage set --to git` moves it.
 
-### 5. Inspect and materialize placement
+### 6. Inspect and materialize placement
 
 ```sh
 workspace-mgr storage status
@@ -142,7 +161,7 @@ shown once rather than once per descendant. For a selected path,
 hydrates every S3 boundary in scope. It refuses to overwrite locally modified
 content.
 
-### 6. Plan, then publish
+### 7. Plan, then publish
 
 ```sh
 workspace-mgr plan
@@ -150,9 +169,11 @@ workspace-mgr publish -m "Publish the model report"
 ```
 
 `plan` resolves the task branch and scopes, fetches relevant Git refs, evaluates
-placement, validates the private prospective Git tree, and reports the exact
-changes. It may update ignored local transaction state, but it creates no
-commit, uploads no S3 content, and publishes no branch.
+placement, validates a private preview tree with would-be S3 payloads excluded,
+and reports Git changes plus pending placement. Exact generated S3 metadata is
+established during `publish`, because plan does not rewrite it. Plan may update
+ignored local transaction state, but it creates no commit, uploads no S3
+content, and publishes no branch.
 
 `publish` repeats the validation. It first reconciles and uploads every in-scope
 S3 boundary, verifies the exact remote content, builds a Git commit from only
@@ -166,7 +187,7 @@ does not call a GitHub or other hosting API. If repository policy asks for one
 draft pull request per task, the user or agent creates and updates it separately.
 Merging is likewise an explicit reviewer or maintainer action.
 
-### 7. Refresh after merge
+### 8. Refresh after merge
 
 In a shared checkout, use:
 
@@ -176,9 +197,10 @@ workspace-mgr refresh
 
 `refresh` fetches the configured shared branch, permits only a fast-forward,
 prefetches incoming S3 content, updates the local branch and index without
-overwriting unrelated working-tree overlays, then materializes and verifies
-incoming S3 content. If the update fails after the local ref changes, it
-attempts to restore the previous ref, index, metadata, and outputs.
+overwriting unrelated working-tree overlays, then materializes safe ordinary
+Git changes and verifies incoming S3 content. If the update fails after the
+local ref changes, it attempts to restore the previous ref, index, ordinary Git
+files, metadata, and outputs.
 
 ## Git versus S3
 
@@ -203,13 +225,15 @@ configuration or platform-standard identity mechanisms.
 
 | Command | Local effect | Remote reads | Remote writes |
 | --- | --- | --- | --- |
+| `setup` | Installs an isolated private runtime | Python package index | None |
 | `init` | Creates or repairs scaffolding | None | None |
-| `instructions`, `doctor`, `config show` | Read-only checks/output | None | None |
+| `instructions`, `config show` | Read-only checks/output | None | None |
+| `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task status`, `storage status` | Read-only report | None | None |
 | `storage set`, `storage reset`, `move` | Changes local content/placement metadata | None | None |
 | `storage hydrate` | Materializes S3 content | S3 | None |
-| `plan` | Creates ignored/private preview state | Fetches Git refs | None |
+| `plan` | Creates ignored/private preview state | Git refs and S3 bucket settings when configured | None |
 | `publish` | Updates private state and a local target ref | Git and S3 verification | S3 first, then Git |
 | `refresh` | Fast-forwards and materializes incoming content | Git and, when needed, S3 | None |
 

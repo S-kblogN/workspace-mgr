@@ -27,10 +27,18 @@ target/release/workspace-mgr --version
 
 version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 archive_name="workspace-mgr-${version}-${expected_target}"
+if [ -e "dist/${archive_name}" ]; then
+    rm -rf -- "dist/${archive_name}"
+fi
 mkdir -p "dist/${archive_name}"
-cp target/release/workspace-mgr LICENSE README.md "dist/${archive_name}/"
+cp target/release/workspace-mgr scripts/install.sh LICENSE README.md "dist/${archive_name}/"
+cp -R docs "dist/${archive_name}/docs"
+chmod 0755 "dist/${archive_name}/install.sh"
+sh -n "dist/${archive_name}/install.sh"
+"dist/${archive_name}/workspace-mgr" setup --dry-run >/dev/null
 tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
 (
     cd dist
     shasum -a 256 "${archive_name}.tar.gz" > "${archive_name}.tar.gz.sha256"
+    shasum -a 256 -c "${archive_name}.tar.gz.sha256"
 )

@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use clap::Parser;
 
 use workspace_mgr::cli::{
@@ -10,10 +8,12 @@ use workspace_mgr::config::Config;
 use workspace_mgr::error::{Error, Result};
 use workspace_mgr::git::GitRepo;
 use workspace_mgr::instructions;
+use workspace_mgr::lock::RepositoryLock;
 use workspace_mgr::manifest::{AdditionalScope, ResolvedTask, one_line};
 use workspace_mgr::output::{Format, print_human, print_json};
 use workspace_mgr::path::repo_path;
 use workspace_mgr::refresh::{RefreshOptions, execute as refresh};
+use workspace_mgr::runtime::{SetupOptions, setup};
 use workspace_mgr::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
 use workspace_mgr::storage;
 use workspace_mgr::transaction::{Operation, TransactionOptions, execute as transact, task_status};
@@ -28,6 +28,13 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Setup(args) => emit(
+            &setup(&SetupOptions {
+                runtime_dir: args.runtime_dir,
+                dry_run: args.dry_run,
+            })?,
+            cli.format,
+        ),
         Command::Init(args) => {
             let report = init(&InitOptions {
                 repo: args.repo,
@@ -41,7 +48,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Instructions(args) => {
             let repo = GitRepo::discover(&args.repo)?;
-            let config = Config::load(&repo)?;
+            let config = Config::load_compatible(&repo)?;
             let document = instructions::render(&repo, &config, args.topic.as_deref())?;
             if cli.format == Format::Json {
                 print_json(&document)
@@ -68,7 +75,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Config(args) => match args.command {
             ConfigCommand::Show(args) => {
                 let repo = GitRepo::discover(&args.repo)?;
-                let config = Config::load(&repo)?;
+                let config = Config::load_compatible(&repo)?;
                 if cli.format == Format::Json {
                     print_json(&config)
                 } else {
@@ -99,14 +106,14 @@ fn run(cli: Cli) -> Result<()> {
         Command::Publish(args) => run_publish(args, cli.format),
         Command::Storage(args) => match args.command {
             StorageCommand::Status(args) => {
-                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                let (repo, config, scopes, _lock) = scoped_context(&args.scoped, false)?;
                 emit(
                     &storage::status(&repo, &config, &scopes, &args.paths)?,
                     cli.format,
                 )
             }
             StorageCommand::Set(args) => {
-                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
                 emit(
                     &storage::set(
                         &repo,
@@ -121,14 +128,14 @@ fn run(cli: Cli) -> Result<()> {
                 )
             }
             StorageCommand::Reset(args) => {
-                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
                 emit(
                     &storage::reset(&repo, &config, &scopes, &args.paths, args.dry_run)?,
                     cli.format,
                 )
             }
             StorageCommand::Hydrate(args) => {
-                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
                 emit(
                     &storage::hydrate(&repo, &config, &scopes, &args.paths, args.dry_run)?,
                     cli.format,
@@ -136,7 +143,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Move(args) => {
-            let (repo, config, scopes) = scoped_context(&args.scoped)?;
+            let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
             emit(
                 &storage::move_path(
                     &repo,
@@ -215,21 +222,29 @@ fn hydrate_scopes(
     }
     let mut scopes = vec![task.task_path.clone()];
     scopes.extend(additional.iter().map(|scope| scope.path.clone()));
-    scopes.sort();
-    scopes.dedup();
+    let mut seen = std::collections::BTreeSet::new();
+    scopes.retain(|scope| seen.insert(scope.clone()));
     Ok((scopes, additional))
 }
 
-fn scoped_context(args: &ScopedArgs) -> Result<(GitRepo, Config, Vec<String>)> {
+fn scoped_context(
+    args: &ScopedArgs,
+    exclusive: bool,
+) -> Result<(GitRepo, Config, Vec<String>, Option<RepositoryLock>)> {
     let repo = GitRepo::discover(&args.repo)?;
-    let config = Config::load(&repo)?;
+    let lock = if exclusive {
+        Some(RepositoryLock::acquire(&repo)?)
+    } else {
+        None
+    };
+    let config = Config::load_compatible(&repo)?;
     let manifest_path = match &args.manifest {
         Some(path) => path.clone(),
         None => ResolvedTask::discover(&repo, &config, &args.repo)?,
     };
     let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
     let (scopes, _) = hydrate_scopes(&task, &args.include, args.scope_note.as_deref())?;
-    Ok((repo, config, scopes))
+    Ok((repo, config, scopes, lock))
 }
 
 fn emit<T: serde::Serialize>(value: &T, format: Format) -> Result<()> {
@@ -237,9 +252,4 @@ fn emit<T: serde::Serialize>(value: &T, format: Format) -> Result<()> {
         Format::Human => print_human(value),
         Format::Json => print_json(value),
     }
-}
-
-#[allow(dead_code)]
-fn absolute(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }

@@ -73,6 +73,11 @@ impl ResolvedTask {
             )));
         }
         let task_path = repo_path(&manifest.path, "task path")?;
+        if task_path.contains('/') {
+            return Err(Error::message(
+                "task path must be a directory directly below the repository root",
+            ));
+        }
         let task_id = one_line(&manifest.id, "task id")?;
         if task_id != task_path {
             return Err(Error::message(format!(
@@ -159,7 +164,10 @@ fn validate_scopes(scopes: Vec<AdditionalScope>) -> Result<Vec<AdditionalScope>>
 }
 
 pub fn one_line(value: &str, field: &str) -> Result<String> {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.contains(['\n', '\r']) {
+        return Err(Error::message(format!("{field} must be a single line")));
+    }
+    let value = value.trim().to_owned();
     if value.is_empty() {
         return Err(Error::message(format!("{field} must not be empty")));
     }

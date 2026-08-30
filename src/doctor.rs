@@ -92,7 +92,18 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
                 "publication author name or email is not configured".to_owned()
             },
         });
-        let remote = repo.run_unchecked(["remote", "get-url", &config.publication.remote])?;
+        let remote_name_ok = repo
+            .validate_remote_name(&config.publication.remote)
+            .is_ok();
+        let remote = if remote_name_ok {
+            repo.run_unchecked(["remote", "get-url", "--", &config.publication.remote])?
+        } else {
+            crate::process::CommandOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: "invalid configured remote name".to_owned(),
+            }
+        };
         checks.push(DoctorCheck {
             name: "publication-remote".to_owned(),
             status: if remote.success() { "ok" } else { "error" }.to_owned(),
@@ -144,11 +155,17 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
                         detail: error.to_string(),
                     },
                 });
-                checks.push(DoctorCheck {
-                    name: "managed-storage-object-versioning".to_owned(),
-                    status: "ok".to_owned(),
-                    detail: "required; exact object versions are verified on every publication"
-                        .to_owned(),
+                checks.push(match dvc::verify_object_versioning(&repo, config) {
+                    Ok(detail) => DoctorCheck {
+                        name: "managed-storage-object-versioning".to_owned(),
+                        status: "ok".to_owned(),
+                        detail: detail.to_string(),
+                    },
+                    Err(error) => DoctorCheck {
+                        name: "managed-storage-object-versioning".to_owned(),
+                        status: "error".to_owned(),
+                        detail: error.to_string(),
+                    },
                 });
             }
             let local = repo.root.join(".dvc/config.local");

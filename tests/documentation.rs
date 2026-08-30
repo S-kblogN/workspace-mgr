@@ -19,6 +19,7 @@ fn user_documentation_covers_the_complete_public_model() {
         assert!(guide.contains(concept), "guide is missing {concept}");
     }
     for command in [
+        "setup",
         "init",
         "instructions",
         "doctor",
@@ -50,6 +51,13 @@ fn user_documentation_covers_the_complete_public_model() {
 #[test]
 fn documented_command_shapes_are_accepted_by_clap() {
     let examples: &[&[&str]] = &[
+        &["setup", "--dry-run"],
+        &[
+            "setup",
+            "--runtime-dir",
+            "/tmp/workspace-mgr-runtime",
+            "--dry-run",
+        ],
         &["init", "--profile", "standard"],
         &[
             "init",

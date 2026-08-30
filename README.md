@@ -21,6 +21,7 @@ command, option, side effect, and example.
 ## Core workflow
 
 ```sh
+workspace-mgr setup
 workspace-mgr init --profile shared-checkout \
   --s3-url s3://example-bucket/workspace \
   --s3-endpoint-url https://s3.example.invalid
@@ -64,15 +65,30 @@ combines product-owned policy modules, repository configuration, and an optional
 repository-specific module. This keeps the bootstrap stable while allowing the
 effective policy to evolve with the CLI.
 
-## Installation from source
+## Installation
+
+Download the native archive for Linux x86-64/arm64 or Apple Silicon macOS,
+extract it, and run:
 
 ```sh
-cargo build --release
-./target/release/workspace-mgr --help
+./install.sh
 ```
 
-The alpha build expects its private execution engines to be provisioned by the
-installer. The exact compatibility contract is in
+The installer copies the CLI to `${HOME}/.local/bin` by default and provisions
+its exact private storage runtime in an isolated user data directory. Set
+`WORKSPACE_MGR_PREFIX` to choose another executable prefix.
+
+For a source installation:
+
+```sh
+cargo install workspace-mgr --version 0.1.0-alpha.1
+workspace-mgr setup
+workspace-mgr --help
+```
+
+`setup` checks Git, creates a private Python environment, installs the pinned
+storage engine, and verifies both its executable and Python module. Users and
+agents never invoke that engine directly. The exact compatibility contract is in
 [docs/platform-support.md](docs/platform-support.md).
 
 Configuration is documented in
@@ -85,6 +101,7 @@ Configuration is documented in
 
 ```sh
 cargo fmt --check
+cargo deny check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo package --allow-dirty

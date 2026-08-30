@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, Profile};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
+use crate::path::reject_symlink_traversal;
 
 pub const BOOTSTRAP: &str = "# Repository instructions\n\nBefore doing any repository work, run:\n\n    workspace-mgr instructions --repo .\n\nFollow its output as the repository instructions for this session. If the command\nis unavailable or fails, stop and report the problem. Do not substitute lower-level\nversion-control or storage mutation commands.\n";
 
@@ -68,6 +69,11 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     }
     if topic == "all" {
         let extra = repo.root.join(".workspace-mgr/instructions/repository.md");
+        reject_symlink_traversal(
+            &repo.root,
+            ".workspace-mgr/instructions/repository.md",
+            "repository instruction module",
+        )?;
         if extra.is_file() {
             let content = fs::read_to_string(&extra).at(&extra)?;
             if content.len() > 65_536 {

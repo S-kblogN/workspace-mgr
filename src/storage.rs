@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -10,8 +10,8 @@ use crate::config::{Config, StorageDefault, StorageTarget};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
-use crate::manifest::one_line;
-use crate::path::{allowed, relative_to, repo_path, resolved_under};
+use crate::manifest::{ResolvedTask, one_line};
+use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
 
 pub const PLACEMENT_SUFFIX: &str = ".workspace-mgr-storage.toml";
 const PLACEMENT_SCHEMA: u32 = 1;
@@ -56,9 +56,10 @@ pub fn status(
     paths: &[String],
 ) -> Result<StorageOperationReport> {
     let paths = resolve_status_paths(repo, scopes, paths)?;
+    let history_oid = task_history_oid(repo, config, scopes)?;
     let placements = paths
         .iter()
-        .map(|path| placement_status(repo, config, path))
+        .map(|path| placement_status(repo, config, path, history_oid.as_deref()))
         .collect::<Result<Vec<_>>>()?;
     Ok(StorageOperationReport {
         status: "ok".to_owned(),
@@ -86,10 +87,22 @@ pub fn set(
             "cannot place content in S3 because [storage.s3] is not configured",
         ));
     }
-    if !dry_run {
+    if target == StorageTarget::S3 {
         for path in &paths {
-            apply_target(repo, config, path, target)?;
-            write_placement(repo, path, target, &reason)?;
+            reject_symlink_traversal(&repo.root, path, "S3 storage path")?;
+        }
+    }
+    if !dry_run {
+        let snapshot = MetadataSnapshot::capture(repo, &paths)?;
+        let result = (|| {
+            for path in &paths {
+                apply_target(repo, config, path, target)?;
+                write_placement(repo, path, target, &reason)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(rollback_error(error, snapshot.restore()));
         }
     }
     let placements = paths
@@ -103,7 +116,7 @@ pub fn set(
                     reason: Some(reason.clone()),
                 })
             } else {
-                placement_status(repo, config, path)
+                placement_status(repo, config, path, None)
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -125,17 +138,30 @@ pub fn reset(
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
     validate_boundary_targets(repo, scopes, &paths)?;
+    let history_oid = task_history_oid(repo, config, scopes)?;
     let desired = paths
         .iter()
-        .map(|path| Ok((path.clone(), automatic_target(repo, config, path)?)))
+        .map(|path| {
+            Ok((
+                path.clone(),
+                automatic_target_after_reset(repo, config, path, history_oid.as_deref())?,
+            ))
+        })
         .collect::<Result<Vec<_>>>()?;
     if !dry_run {
-        for (path, target) in &desired {
-            let sidecar = sidecar_path(repo, path);
-            if sidecar.is_file() {
-                fs::remove_file(&sidecar).at(&sidecar)?;
+        let snapshot = MetadataSnapshot::capture(repo, &paths)?;
+        let result = (|| {
+            for (path, target) in &desired {
+                let sidecar = sidecar_path(repo, path);
+                if sidecar.is_file() {
+                    fs::remove_file(&sidecar).at(&sidecar)?;
+                }
+                apply_target(repo, config, path, *target)?;
             }
-            apply_target(repo, config, path, *target)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(rollback_error(error, snapshot.restore()));
         }
     }
     let placements = desired
@@ -172,6 +198,7 @@ pub fn move_path(
                 "move path escapes the declared scope: {path}"
             )));
         }
+        reject_symlink_traversal(&repo.root, path, "move path")?;
     }
     let old = resolved_under(&repo.root, &old_path);
     let new = resolved_under(&repo.root, &new_path);
@@ -197,26 +224,34 @@ pub fn move_path(
             "move may not cross an existing directory placement boundary; move the boundary itself or reset it first",
         ));
     }
-    let before = placement_status(repo, config, &old_path)?;
+    let history_oid = task_history_oid(repo, config, scopes)?;
+    let before = placement_status(repo, config, &old_path, history_oid.as_deref())?;
     if !dry_run {
-        if pointer_path(repo, &old_path).is_file() {
-            dvc::management(
-                repo,
-                config,
-                "move",
-                &[old_path.clone(), new_path.clone()],
-                false,
-            )?;
-        } else {
-            if let Some(parent) = new.parent() {
-                fs::create_dir_all(parent).at(parent)?;
+        let snapshot = MetadataSnapshot::capture(repo, &[old_path.clone(), new_path.clone()])?;
+        let result = (|| {
+            if pointer_path(repo, &old_path).is_file() {
+                dvc::management(
+                    repo,
+                    config,
+                    "move",
+                    &[old_path.clone(), new_path.clone()],
+                    false,
+                )?;
+            } else {
+                if let Some(parent) = new.parent() {
+                    fs::create_dir_all(parent).at(parent)?;
+                }
+                fs::rename(&old, &new).at(&old)?;
             }
-            fs::rename(&old, &new).at(&old)?;
-        }
-        let old_sidecar = sidecar_path(repo, &old_path);
-        if old_sidecar.is_file() {
-            let new_sidecar = sidecar_path(repo, &new_path);
-            fs::rename(&old_sidecar, &new_sidecar).at(&old_sidecar)?;
+            let old_sidecar = sidecar_path(repo, &old_path);
+            if old_sidecar.is_file() {
+                let new_sidecar = sidecar_path(repo, &new_path);
+                fs::rename(&old_sidecar, &new_sidecar).at(&old_sidecar)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(rollback_error(error, rollback_move(&old, &new, snapshot)));
         }
     }
     Ok(StorageOperationReport {
@@ -401,7 +436,35 @@ fn automatic_target(repo: &GitRepo, config: &Config, path: &str) -> Result<Stora
     Ok(target)
 }
 
-fn placement_status(repo: &GitRepo, config: &Config, path: &str) -> Result<PlacementStatus> {
+fn automatic_target_after_reset(
+    repo: &GitRepo,
+    config: &Config,
+    path: &str,
+    history_oid: Option<&str>,
+) -> Result<StorageTarget> {
+    if let Some(oid) = history_oid {
+        if repo
+            .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}.dvc")])?
+            .success()
+        {
+            return Ok(StorageTarget::S3);
+        }
+        if repo
+            .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}")])?
+            .success()
+        {
+            return Ok(StorageTarget::Git);
+        }
+    }
+    automatic_target(repo, config, path)
+}
+
+fn placement_status(
+    repo: &GitRepo,
+    config: &Config,
+    path: &str,
+    history_oid: Option<&str>,
+) -> Result<PlacementStatus> {
     if let Some(placement) = read_placement(repo, path)? {
         return Ok(PlacementStatus {
             path: path.to_owned(),
@@ -410,11 +473,24 @@ fn placement_status(repo: &GitRepo, config: &Config, path: &str) -> Result<Place
             reason: Some(placement.reason),
         });
     }
+    if let Some(oid) = history_oid {
+        if repo
+            .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}.dvc")])?
+            .success()
+        {
+            return Ok(PlacementStatus {
+                path: path.to_owned(),
+                target: StorageTarget::S3,
+                selected_by: "published-history".to_owned(),
+                reason: None,
+            });
+        }
+    }
     if pointer_path(repo, path).is_file() {
         return Ok(PlacementStatus {
             path: path.to_owned(),
             target: StorageTarget::S3,
-            selected_by: "published-history".to_owned(),
+            selected_by: "automatic".to_owned(),
             reason: None,
         });
     }
@@ -426,8 +502,13 @@ fn placement_status(repo: &GitRepo, config: &Config, path: &str) -> Result<Place
             reason: boundary.reason,
         });
     }
-    let history = repo.run_unchecked(["log", "--all", "--format=%H", "-n", "1", "--", path])?;
-    if history.success() && !history.stdout.trim().is_empty() {
+    let published_in_git = if let Some(oid) = history_oid {
+        repo.run_unchecked(["cat-file", "-e", &format!("{oid}:{path}")])?
+            .success()
+    } else {
+        false
+    };
+    if published_in_git {
         return Ok(PlacementStatus {
             path: path.to_owned(),
             target: StorageTarget::Git,
@@ -441,6 +522,40 @@ fn placement_status(repo: &GitRepo, config: &Config, path: &str) -> Result<Place
         selected_by: "automatic".to_owned(),
         reason: None,
     })
+}
+
+fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Result<Option<String>> {
+    let task_path = scopes
+        .iter()
+        .find(|scope| {
+            resolved_under(
+                &repo.root,
+                &format!("{scope}/{}", config.tasks.manifest_name),
+            )
+            .is_file()
+        })
+        .or_else(|| scopes.first());
+    let Some(task_path) = task_path else {
+        return Ok(None);
+    };
+    let manifest = resolved_under(
+        &repo.root,
+        &format!("{task_path}/{}", config.tasks.manifest_name),
+    );
+    if !manifest.is_file() {
+        return Ok(None);
+    }
+    let task = ResolvedTask::load(repo, config, &manifest)?;
+    for reference in [
+        format!("refs/remotes/{}/{}", task.remote, task.branch),
+        format!("refs/remotes/{}/{}", task.remote, task.base_branch),
+        format!("refs/heads/{}", task.base_branch),
+    ] {
+        if let Some(oid) = repo.optional_oid(&reference)? {
+            return Ok(Some(oid));
+        }
+    }
+    Ok(None)
 }
 
 fn validate_targets(
@@ -466,6 +581,7 @@ fn validate_targets(
                 "storage path does not exist: {path}"
             )));
         }
+        reject_symlink_traversal(&repo.root, path, "storage path")?;
     }
     Ok(result)
 }
@@ -665,6 +781,11 @@ fn sidecar_path(repo: &GitRepo, path: &str) -> std::path::PathBuf {
 
 fn read_placement(repo: &GitRepo, path: &str) -> Result<Option<PlacementFile>> {
     let sidecar = sidecar_path(repo, path);
+    reject_symlink_traversal(
+        &repo.root,
+        &format!("{path}{PLACEMENT_SUFFIX}"),
+        "storage placement metadata",
+    )?;
     if !sidecar.is_file() {
         return Ok(None);
     }
@@ -699,6 +820,129 @@ fn write_placement(repo: &GitRepo, path: &str, target: StorageTarget, reason: &s
     temporary.flush().at(&sidecar)?;
     temporary.persist(&sidecar).map_err(|error| Error::Io {
         path: sidecar,
+        source: error.error,
+    })?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MetadataSnapshot {
+    files: Vec<FileSnapshot>,
+}
+
+#[derive(Debug)]
+struct FileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl MetadataSnapshot {
+    fn capture(repo: &GitRepo, paths: &[String]) -> Result<Self> {
+        let mut candidates = BTreeSet::new();
+        for path in paths {
+            candidates.insert(pointer_path(repo, path));
+            candidates.insert(sidecar_path(repo, path));
+            let output = resolved_under(&repo.root, path);
+            let parent = output
+                .parent()
+                .ok_or_else(|| Error::message("storage output has no parent"))?;
+            candidates.insert(parent.join(".gitignore"));
+        }
+        let mut files = Vec::new();
+        for path in candidates {
+            let contents = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    Some(fs::read(&path).at(&path)?)
+                }
+                Ok(_) => {
+                    return Err(Error::message(format!(
+                        "storage metadata path is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(Error::Io { path, source }),
+            };
+            files.push(FileSnapshot { path, contents });
+        }
+        Ok(Self { files })
+    }
+
+    fn restore(self) -> Result<()> {
+        for file in self.files {
+            match file.contents {
+                Some(contents) => atomic_write_bytes(&file.path, &contents)?,
+                None => match fs::symlink_metadata(&file.path) {
+                    Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                        fs::remove_file(&file.path).at(&file.path)?;
+                    }
+                    Ok(_) => {
+                        return Err(Error::message(format!(
+                            "cannot roll back non-file storage metadata path: {}",
+                            file.path.display()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(Error::Io {
+                            path: file.path,
+                            source,
+                        });
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+fn rollback_move(old: &Path, new: &Path, snapshot: MetadataSnapshot) -> Result<()> {
+    let output_result = match (old.exists(), new.exists()) {
+        (false, true) => {
+            if let Some(parent) = old.parent() {
+                fs::create_dir_all(parent).at(parent)?;
+            }
+            fs::rename(new, old).at(new)
+        }
+        (true, false) => Ok(()),
+        (false, false) => Err(Error::message(
+            "move rollback could not find either source or destination output",
+        )),
+        (true, true) => Err(Error::message(
+            "move rollback found both source and destination outputs",
+        )),
+    };
+    let metadata_result = snapshot.restore();
+    match (output_result, metadata_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(output), Err(metadata)) => Err(Error::message(format!(
+            "output rollback failed: {output}; metadata rollback failed: {metadata}"
+        ))),
+    }
+}
+
+fn rollback_error(error: Error, rollback: Result<()>) -> Error {
+    match rollback {
+        Ok(()) => Error::message(format!(
+            "storage operation failed and was rolled back: {error}"
+        )),
+        Err(rollback) => Error::message(format!(
+            "storage operation failed: {error}; rollback also failed: {rollback}"
+        )),
+    }
+}
+
+fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::message("storage metadata path has no parent"))?;
+    fs::create_dir_all(parent).at(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
+    temporary.write_all(contents).at(path)?;
+    temporary.flush().at(path)?;
+    temporary.persist(path).map_err(|error| Error::Io {
+        path: path.to_path_buf(),
         source: error.error,
     })?;
     Ok(())

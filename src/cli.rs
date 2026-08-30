@@ -29,6 +29,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Provision the private execution runtime used by managed storage.
+    Setup(SetupArgs),
+
     /// Initialize or adopt repository policy and scaffolding.
     Init(InitArgs),
 
@@ -58,6 +61,16 @@ pub enum Command {
 
     /// Safely update a shared checkout and hydrate incoming stored data.
     Refresh(RefreshArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Override the private runtime directory.
+    #[arg(long)]
+    pub runtime_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

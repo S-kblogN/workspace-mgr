@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use fs2::FileExt;
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
@@ -98,6 +99,24 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
         json(&status)["placements"][0]["selected_by"],
         "published-history"
     );
+    workspace(
+        &task,
+        [
+            "storage",
+            "set",
+            &format!("{task_id}/retained.bin"),
+            "--to",
+            "git",
+            "--reason",
+            "Keep the published Git placement explicit for this check.",
+        ],
+    );
+    let reset = workspace(
+        &task,
+        ["storage", "reset", &format!("{task_id}/retained.bin")],
+    );
+    assert_eq!(json(&reset)["placements"][0]["target"], "git");
+    assert!(!task.join("retained.bin.dvc").exists());
     let plan = workspace(&task, ["plan"]);
     assert_eq!(json(&plan)["status"], "dry_run");
     assert!(
@@ -106,6 +125,92 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_storage_paths_may_not_escape_through_symlinks() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "symlink-boundary",
+            "--title",
+            "Symlink boundary",
+            "--purpose",
+            "Reject repository metadata writes through symlinks.",
+            "--timestamp",
+            "20260829-170152",
+        ],
+    );
+    let task_id = "20260829-170152-symlink-boundary";
+    let task = fixture.shared.join(task_id);
+    let outside = fixture.root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("data.txt"), "outside\n").unwrap();
+    std::os::unix::fs::symlink(&outside, task.join("linked")).unwrap();
+
+    let rejected = workspace_unchecked(
+        &task,
+        [
+            "storage",
+            "set",
+            &format!("{task_id}/linked/data.txt"),
+            "--to",
+            "git",
+            "--reason",
+            "This path must not escape.",
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("symlink"));
+    assert!(!outside.join("data.txt.workspace-mgr-storage.toml").exists());
+}
+
+#[test]
+fn storage_status_uses_the_task_history_not_unrelated_branches() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "history-context",
+            "--title",
+            "History context",
+            "--purpose",
+            "Keep placement history task-specific.",
+            "--timestamp",
+            "20260829-170155",
+        ],
+    );
+    let task_id = "20260829-170155-history-context";
+    let task = fixture.shared.join(task_id);
+    std::fs::write(task.join("data.txt"), "new task content\n").unwrap();
+
+    let unrelated = fixture.root.join("unrelated-worktree");
+    git(
+        &fixture.shared,
+        [
+            "worktree",
+            "add",
+            "-b",
+            "unrelated-history",
+            unrelated.to_str().unwrap(),
+            "main",
+        ],
+    );
+    configure_git(&unrelated);
+    let unrelated_task = unrelated.join(task_id);
+    std::fs::create_dir(&unrelated_task).unwrap();
+    std::fs::write(unrelated_task.join("data.txt"), "unrelated branch\n").unwrap();
+    git(&unrelated, ["add", "-A"]);
+    git(&unrelated, ["commit", "-m", "Add unrelated path history"]);
+
+    let status = workspace(&task, ["storage", "status", &format!("{task_id}/data.txt")]);
+    assert_eq!(json(&status)["placements"][0]["selected_by"], "automatic");
 }
 
 #[test]
@@ -218,6 +323,23 @@ fn additional_scope_requires_and_records_a_reason() {
 #[test]
 fn refresh_preserves_working_tree_overlays() {
     let fixture = managed_fixture();
+    std::fs::write(fixture.seed.join("refresh-update.txt"), "old update\n").unwrap();
+    std::fs::write(fixture.seed.join("refresh-delete.txt"), "delete me\n").unwrap();
+    std::fs::write(fixture.seed.join("refresh-file-to-dir"), "old file\n").unwrap();
+    std::fs::create_dir(fixture.seed.join("refresh-dir-to-file")).unwrap();
+    std::fs::write(
+        fixture.seed.join("refresh-dir-to-file/old.txt"),
+        "old child\n",
+    )
+    .unwrap();
+    std::fs::create_dir(fixture.seed.join("refresh-overlay-dir")).unwrap();
+    std::fs::write(
+        fixture.seed.join("refresh-overlay-dir/old.txt"),
+        "old overlay child\n",
+    )
+    .unwrap();
+    fixture.commit_seed("Add refresh fixtures");
+    git(&fixture.shared, ["pull", "--ff-only", "origin", "main"]);
     workspace(
         &fixture.shared,
         [
@@ -234,15 +356,44 @@ fn refresh_preserves_working_tree_overlays() {
     );
     let task = fixture.shared.join("20260829-170400-refresh-flow");
     let published = workspace(&task, ["publish", "-m", "Publish refresh task"]);
-    let new_main = json(&published)["commit_oid"].as_str().unwrap().to_owned();
+    let mut new_main = json(&published)["commit_oid"].as_str().unwrap().to_owned();
     git(
         &fixture.remote,
         ["update-ref", "refs/heads/main", &new_main],
     );
+    git(&fixture.seed, ["fetch", "origin", "main"]);
+    git(&fixture.seed, ["merge", "--ff-only", "FETCH_HEAD"]);
+    std::fs::write(fixture.seed.join("refresh-update.txt"), "new update\n").unwrap();
+    std::fs::remove_file(fixture.seed.join("refresh-delete.txt")).unwrap();
+    std::fs::write(fixture.seed.join("refresh-added.txt"), "new file\n").unwrap();
+    std::fs::remove_file(fixture.seed.join("refresh-file-to-dir")).unwrap();
+    std::fs::create_dir(fixture.seed.join("refresh-file-to-dir")).unwrap();
+    std::fs::write(
+        fixture.seed.join("refresh-file-to-dir/new.txt"),
+        "new child\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(fixture.seed.join("refresh-dir-to-file")).unwrap();
+    std::fs::write(fixture.seed.join("refresh-dir-to-file"), "new file\n").unwrap();
+    std::fs::remove_dir_all(fixture.seed.join("refresh-overlay-dir")).unwrap();
+    std::fs::write(
+        fixture.seed.join("refresh-overlay-dir"),
+        "remote replacement\n",
+    )
+    .unwrap();
+    fixture.commit_seed("Change ordinary Git files for refresh");
+    new_main = String::from_utf8_lossy(&git(&fixture.seed, ["rev-parse", "main"]).stdout)
+        .trim()
+        .to_owned();
     std::fs::write(fixture.shared.join("README.md"), "active tracked overlay\n").unwrap();
     std::fs::write(
         fixture.shared.join("unrelated.txt"),
         "active untracked overlay\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.shared.join("refresh-overlay-dir/local.txt"),
+        "active directory overlay\n",
     )
     .unwrap();
 
@@ -257,6 +408,35 @@ fn refresh_preserves_working_tree_overlays() {
     assert_eq!(
         std::fs::read_to_string(fixture.shared.join("unrelated.txt")).unwrap(),
         "active untracked overlay\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.shared.join("refresh-update.txt")).unwrap(),
+        "new update\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.shared.join("refresh-added.txt")).unwrap(),
+        "new file\n"
+    );
+    assert!(!fixture.shared.join("refresh-delete.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.shared.join("refresh-file-to-dir/new.txt")).unwrap(),
+        "new child\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.shared.join("refresh-dir-to-file")).unwrap(),
+        "new file\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.shared.join("refresh-overlay-dir/local.txt")).unwrap(),
+        "active directory overlay\n"
+    );
+    assert!(fixture.shared.join("refresh-overlay-dir").is_dir());
+    assert!(
+        json(&refreshed)["materialized_git_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "refresh-added.txt")
     );
     assert_eq!(
         String::from_utf8_lossy(&git(&fixture.shared, ["rev-parse", "main"]).stdout).trim(),
@@ -358,6 +538,66 @@ fn refresh_refuses_staged_changes_and_non_fast_forwards() {
     let non_fast_forward = workspace_unchecked(&fixture.shared, ["refresh"]);
     assert_eq!(non_fast_forward.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&non_fast_forward.stderr).contains("cannot fast-forward"));
+}
+
+#[test]
+fn repository_mutations_share_one_cross_command_lock() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "operation-lock",
+            "--title",
+            "Operation lock",
+            "--purpose",
+            "Prevent cross-command repository races.",
+            "--timestamp",
+            "20260829-170850",
+        ],
+    );
+    let task = fixture.shared.join("20260829-170850-operation-lock");
+    let common_dir =
+        String::from_utf8_lossy(&git(&fixture.shared, ["rev-parse", "--git-common-dir"]).stdout)
+            .trim()
+            .to_owned();
+    let common_dir = {
+        let path = std::path::PathBuf::from(common_dir);
+        if path.is_absolute() {
+            path
+        } else {
+            fixture.shared.join(path)
+        }
+    };
+    let lock_path = common_dir.join("workspace-mgr/repository.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let publish = workspace_unchecked(&task, ["publish", "-m", "Must wait for lock"]);
+    assert_eq!(publish.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&publish.stderr).contains("repository operation"));
+    let set = workspace_unchecked(
+        &task,
+        [
+            "storage",
+            "set",
+            "20260829-170850-operation-lock/README.md",
+            "--to",
+            "git",
+            "--reason",
+            "Must also honor the lock.",
+        ],
+    );
+    assert_eq!(set.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&set.stderr).contains("repository operation"));
 }
 
 #[test]

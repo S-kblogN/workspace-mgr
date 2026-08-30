@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
+use crate::lock::RepositoryLock;
 use crate::manifest::{AdditionalScope, ResolvedTask, one_line};
 use crate::path::{allowed, relative_to, repo_path, resolved_under};
 use crate::storage;
@@ -80,7 +81,8 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     } else {
         GitRepo::discover(&options.start)?
     };
-    let config = Config::load(&repo)?;
+    let _repository_lock = RepositoryLock::acquire(&repo)?;
+    let config = Config::load_compatible(&repo)?;
     let manifest_path = match &options.manifest {
         Some(path) => path.clone(),
         None => ResolvedTask::discover(&repo, &config, &options.start)?,
@@ -95,9 +97,29 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         )));
     }
     repo.validate_branch(&task.branch)?;
+    repo.validate_remote_name(&task.remote)?;
     repo.ensure_branch_not_checked_out(&task.branch)?;
     validate_checkout(&repo, &task, options)?;
-
+    let message = match options.operation {
+        Operation::Plan => None,
+        Operation::Publish => Some(one_line(
+            options
+                .message
+                .as_deref()
+                .ok_or_else(|| Error::message("publish requires -m/--message"))?,
+            "commit message",
+        )?),
+    };
+    if options.operation == Operation::Publish && !options.dry_run {
+        for identity_name in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
+            let identity = repo.run_unchecked(["var", identity_name])?;
+            if !identity.success() {
+                return Err(Error::message(
+                    "publication author and committer names and emails must be configured before publish",
+                ));
+            }
+        }
+    }
     let (scopes, authorizations) = resolve_scopes(&task, options)?;
     let dry_run = options.operation.dry_run(options.dry_run);
     let common_dir = repo.common_dir()?;
@@ -131,8 +153,33 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         )
     };
 
-    let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
     let initial_dvc = dvc::discover(&repo, &scopes)?;
+    let initial_outputs = dvc::output_paths(&repo, &initial_dvc)?;
+    let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
+    let preview_index = state_dir.join("preview-index");
+    if preview_index.exists() {
+        fs::remove_file(&preview_index).at(&preview_index)?;
+    }
+    repo.run_with_index(&preview_index, ["read-tree", &base_oid], None, true)?;
+    let mut preview_add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
+    preview_add.extend(scopes.iter().cloned());
+    repo.run_with_index(&preview_index, preview_add, None, true)?;
+    remove_stored_outputs_from_index(&repo, &preview_index, &initial_outputs)?;
+    remove_output_paths_from_index(
+        &repo,
+        &preview_index,
+        placement_preview.would_place_in_s3.iter(),
+    )?;
+    let preview_paths = changed_paths(&repo, &preview_index, &base_oid)?;
+    validate_private_index(
+        &repo,
+        &preview_index,
+        &base_oid,
+        &scopes,
+        &preview_paths,
+        config.storage.auto_s3_above_bytes,
+        &placement_preview.would_place_in_s3,
+    )?;
     let mut lock_names = initial_dvc
         .iter()
         .map(|path| format!("pointer:{path}"))
@@ -146,6 +193,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     lock_names.sort();
     lock_names.dedup();
     let _dvc_locks = acquire_dvc_locks(&common_dir, &lock_names)?;
+    if config.storage.requires_object_versioning()
+        && (!initial_dvc.is_empty() || !placement_preview.would_place_in_s3.is_empty())
+    {
+        dvc::verify_object_versioning(&repo, &config)?;
+    }
 
     let placement = if dry_run {
         placement_preview
@@ -153,6 +205,28 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         storage::apply_automatic(&repo, &config, &scopes, &base_oid, false)?
     };
     let pointers = dvc::discover(&repo, &scopes)?;
+    if !dry_run {
+        let preflight_outputs = dvc::output_paths(&repo, &pointers)?;
+        let preflight_index = state_dir.join("preflight-index");
+        if preflight_index.exists() {
+            fs::remove_file(&preflight_index).at(&preflight_index)?;
+        }
+        repo.run_with_index(&preflight_index, ["read-tree", &base_oid], None, true)?;
+        let mut preflight_add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
+        preflight_add.extend(scopes.iter().cloned());
+        repo.run_with_index(&preflight_index, preflight_add, None, true)?;
+        remove_stored_outputs_from_index(&repo, &preflight_index, &preflight_outputs)?;
+        let preflight_paths = changed_paths(&repo, &preflight_index, &base_oid)?;
+        validate_private_index(
+            &repo,
+            &preflight_index,
+            &base_oid,
+            &scopes,
+            &preflight_paths,
+            config.storage.auto_s3_above_bytes,
+            &placement.would_place_in_s3,
+        )?;
+    }
     let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
     let storage_report = serde_json::json!({"placement": placement, "s3": s3});
 
@@ -164,31 +238,17 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let mut add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
     add.extend(scopes.iter().cloned());
     repo.run_with_index(&index, add, None, true)?;
+    remove_stored_outputs_from_index(&repo, &index, &s3.outputs)?;
+    remove_output_paths_from_index(&repo, &index, placement.would_place_in_s3.iter())?;
     let paths = changed_paths(&repo, &index, &base_oid)?;
-    let escaped: Vec<String> = paths
-        .iter()
-        .filter(|path| !allowed(path, &scopes))
-        .cloned()
-        .collect();
-    if !escaped.is_empty() {
-        return Err(Error::message(format!(
-            "private index escaped the declared scope: {}",
-            escaped.join(", ")
-        )));
-    }
-    check_gitlinks(&repo, &index, &paths)?;
-    check_large_files(
+    validate_private_index(
         &repo,
-        &scopes,
+        &index,
         &base_oid,
+        &scopes,
+        &paths,
         config.storage.auto_s3_above_bytes,
         &placement.would_place_in_s3,
-    )?;
-    repo.run_with_index(
-        &index,
-        ["diff", "--cached", "--check", &base_oid, "--"],
-        None,
-        true,
     )?;
     let ignored_entries = count_ignored(&repo, &index, &scopes)?;
     let tree_oid = repo
@@ -201,6 +261,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .and_then(|value| value.get("dirty_files"))
         .and_then(|value| value.as_array())
         .is_some_and(|files| !files.is_empty());
+    let placement_pending = !placement.would_place_in_s3.is_empty();
     let mut report = TransactionReport {
         status: if dry_run { "dry_run" } else { "pending" }.to_owned(),
         operation: options.operation.name().to_owned(),
@@ -218,7 +279,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         remote_oid: None,
         push: None,
     };
-    if paths.is_empty() && !storage_dirty {
+    if paths.is_empty() && !storage_dirty && !placement_pending {
         report.status = "no_changes".to_owned();
         return Ok(report);
     }
@@ -230,14 +291,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         return Ok(report);
     }
 
-    let message = one_line(
-        options
-            .message
+    let commit_message = build_commit_message(
+        message
             .as_deref()
             .ok_or_else(|| Error::message("publish requires -m/--message"))?,
-        "commit message",
-    )?;
-    let commit_message = build_commit_message(&message, &scopes, &authorizations);
+        &scopes,
+        &authorizations,
+    );
     let commit_oid = repo
         .run_with_index(
             &index,
@@ -281,6 +341,72 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let _ = push;
     report.push = Some("explicit refspec pushed and remote object ID verified".to_owned());
     Ok(report)
+}
+
+fn validate_private_index(
+    repo: &GitRepo,
+    index: &Path,
+    base_oid: &str,
+    scopes: &[String],
+    paths: &[String],
+    large_file_threshold: u64,
+    automatic_s3: &[String],
+) -> Result<()> {
+    let escaped: Vec<String> = paths
+        .iter()
+        .filter(|path| !allowed(path, scopes))
+        .cloned()
+        .collect();
+    if !escaped.is_empty() {
+        return Err(Error::message(format!(
+            "private index escaped the declared scope: {}",
+            escaped.join(", ")
+        )));
+    }
+    check_gitlinks(repo, index, paths)?;
+    check_large_files(repo, scopes, base_oid, large_file_threshold, automatic_s3)?;
+    repo.run_with_index(
+        index,
+        ["diff", "--cached", "--check", base_oid, "--"],
+        None,
+        true,
+    )?;
+    Ok(())
+}
+
+fn remove_stored_outputs_from_index(
+    repo: &GitRepo,
+    index: &Path,
+    outputs: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    remove_output_paths_from_index(repo, index, outputs.values().flatten())
+}
+
+fn remove_output_paths_from_index<'a>(
+    repo: &GitRepo,
+    index: &Path,
+    outputs: impl IntoIterator<Item = &'a String>,
+) -> Result<()> {
+    let mut tracked = BTreeSet::new();
+    for output in outputs {
+        let listed = repo.run_with_index(index, ["ls-files", "-z", "--", output], None, true)?;
+        tracked.extend(
+            listed
+                .stdout
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    for path in tracked {
+        repo.run_with_index(
+            index,
+            ["update-index", "--force-remove", "--", &path],
+            None,
+            true,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_checkout(
@@ -527,7 +653,7 @@ fn build_commit_message(
 
 pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> {
     let repo = GitRepo::discover(start)?;
-    let config = Config::load(&repo)?;
+    let config = Config::load_compatible(&repo)?;
     let path = match manifest {
         Some(path) => path.to_path_buf(),
         None => ResolvedTask::discover(&repo, &config, start)?,

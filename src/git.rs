@@ -169,6 +169,22 @@ impl GitRepo {
         self.run(["check-ref-format", &format!("refs/heads/{branch}")])?;
         Ok(())
     }
+
+    pub fn validate_remote_name(&self, remote: &str) -> Result<()> {
+        if remote.starts_with('-') || remote.chars().any(char::is_whitespace) {
+            return Err(Error::message(format!(
+                "unsafe Git remote name {remote:?}; configure a named remote"
+            )));
+        }
+        let probe = format!("refs/remotes/{remote}/workspace-mgr-probe");
+        let checked = self.run_unchecked(["check-ref-format", &probe])?;
+        if !checked.success() {
+            return Err(Error::message(format!(
+                "invalid Git remote name {remote:?}; configure a named remote"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn command_detail(stderr: &str, fallback: &str) -> String {

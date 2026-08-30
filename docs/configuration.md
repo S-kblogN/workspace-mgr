@@ -43,7 +43,8 @@ modules = [
 
 `publication` identifies where task branches are published and which branch a
 shared checkout must keep mounted. Repository URLs are discovered through the
-named Git remote; they are never compiled into the binary.
+named Git remote; they are never compiled into the binary. `remote` must be a
+safe Git remote name, not a URL or command-line option.
 
 ## Storage
 
@@ -52,18 +53,23 @@ larger than `auto_s3_above_bytes` is placed in S3 and a smaller file is placed i
 Git. Published placement is sticky. An explicit per-path choice made with
 `storage set` overrides the default until `storage reset`.
 
-`[storage.s3]` enables S3. Any `s3://` URL has one fixed product contract:
+`[storage.s3]` enables S3 and `url` must use `s3://`. It has one fixed product contract:
 bucket object versioning is required and exact version IDs are verified before
 Git publication. There is no configuration switch that weakens this guarantee.
 `endpoint_url` supports S3-compatible services.
 
-Embedded URL credentials are rejected. Authentication belongs in ignored local
+URL userinfo, queries, and fragments are rejected so tracked locations cannot
+carry credentials or signed URLs. Authentication belongs in ignored local
 configuration or platform-standard identity and environment mechanisms.
 
 `workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes this public
 configuration and deterministically generates the private engine configuration.
 Every S3 operation rejects drift in that derived file. Users and agents should
 edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
+
+`required_cli` is enforced by every repository operation. `doctor` remains able
+to load an incompatible configuration so it can report the required and
+installed versions without mutating the repository.
 
 ## Tasks
 

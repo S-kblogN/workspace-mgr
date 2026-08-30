@@ -20,6 +20,12 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     );
     assert_eq!(json(&dry)["status"], "dry_run");
     assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+    assert!(
+        !fixture
+            .shared
+            .join(".git/workspace-mgr/repository.lock")
+            .exists()
+    );
 
     let initialized = workspace(
         &fixture.shared,
@@ -75,6 +81,151 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
         ["rev-parse", "--verify", "codex/sample-task"],
     );
     assert!(!branch.stdout.is_empty());
+}
+
+#[test]
+fn setup_dry_run_reports_private_runtime_without_installing_it() {
+    let fixture = GitFixture::new();
+    let runtime = fixture.root.join("private-runtime");
+    let report = workspace(
+        &fixture.root,
+        [
+            "setup",
+            "--runtime-dir",
+            runtime.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert_eq!(json(&report)["status"], "dry_run");
+    assert_eq!(
+        json(&report)["storage_runtime"],
+        workspace_mgr::dvc::REQUIRED_DVC_VERSION
+    );
+    assert!(!runtime.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_installs_and_reuses_a_verified_private_runtime() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = GitFixture::new();
+    let runtime = fixture.root.join("private-runtime");
+    let bootstrap = fixture.root.join("bootstrap-python");
+    std::fs::write(
+        &bootstrap,
+        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ]; then\n  mkdir -p \"$3/bin\"\n  cp \"$0\" \"$3/bin/python\"\n  cp \"$0\" \"$3/bin/dvc\"\n  printf '#!%s/bin/python\\n' \"$3\" > \"$3/bin/generated-launcher\"\n  exit 0\nfi\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"pip\" ]; then\n  exit 0\nfi\nif [ \"${1:-}\" = \"-c\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nexit 23\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bootstrap).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bootstrap, permissions).unwrap();
+
+    let install = std::process::Command::new(binary())
+        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
+        .current_dir(&fixture.root)
+        .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "setup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(json(&install)["status"], "installed");
+    assert!(runtime.join("bin/dvc").is_file());
+    assert!(runtime.join("bin/python").is_file());
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("bin/generated-launcher")).unwrap(),
+        format!("#!{}/bin/python\n", runtime.display())
+    );
+
+    let repeated = std::process::Command::new(binary())
+        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
+        .current_dir(&fixture.root)
+        .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
+        .output()
+        .unwrap();
+    assert!(
+        repeated.status.success(),
+        "repeat setup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&repeated.stdout),
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(json(&repeated)["status"], "no_changes");
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_runtime_install_restores_the_previous_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = GitFixture::new();
+    let runtime = fixture.root.join("private-runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::write(runtime.join("sentinel"), "previous runtime\n").unwrap();
+    let bootstrap = fixture.root.join("failing-bootstrap-python");
+    std::fs::write(
+        &bootstrap,
+        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ]; then\n  mkdir -p \"$3/bin\"\n  cp \"$0\" \"$3/bin/python\"\n  exit 0\nfi\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"pip\" ]; then\n  exit 23\nfi\nexit 23\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bootstrap).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bootstrap, permissions).unwrap();
+
+    let failed = std::process::Command::new(binary())
+        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
+        .current_dir(&fixture.root)
+        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
+        "previous runtime\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(runtime).unwrap().count(),
+        1,
+        "partial replacement files must be removed"
+    );
+    assert!(std::fs::read_dir(&fixture.root).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".workspace-mgr-runtime-backup-")
+    }));
+}
+
+#[test]
+fn concurrent_runtime_install_is_rejected_before_provisioning() {
+    use fs2::FileExt;
+
+    let fixture = GitFixture::new();
+    let runtime = fixture.root.join("private-runtime");
+    let lock_path = fixture.root.join(".workspace-mgr-setup.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let blocked = std::process::Command::new(binary())
+        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(blocked.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("setup operation is running"));
+    assert!(!runtime.exists());
 }
 
 #[test]
@@ -156,4 +307,115 @@ fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {
     assert_eq!(output.status.code(), Some(2));
     assert!(!fixture.shared.join("AGENTS.md").exists());
     assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn partially_failing_storage_initialization_rolls_back_all_scaffolding() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    let fake_dvc = fixture.root.join("partial-dvc");
+    std::fs::write(
+        &fake_dvc,
+        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"init\" ]; then\n  mkdir -p .dvc\n  printf '%s\\n' 'partial' > .dvc/config\n  printf '%s\\n' 'partial' > .dvcignore\n  exit 23\nfi\nexit 23\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_dvc, permissions).unwrap();
+    let storage = fixture.root.join("storage");
+    let output = std::process::Command::new(binary())
+        .args(["init", "--s3-url", storage.to_str().unwrap()])
+        .current_dir(&fixture.shared)
+        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rolled back"));
+    for path in [
+        ".workspace-mgr.toml",
+        "AGENTS.md",
+        ".dvc",
+        ".dvcignore",
+        ".gitattributes",
+    ] {
+        assert!(!fixture.shared.join(path).exists(), "{path} remained");
+    }
+}
+
+#[test]
+fn tracked_configuration_rejects_credential_urls_and_incompatible_cli_versions() {
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    let credentials = workspace_unchecked(
+        &fixture.shared,
+        [
+            "init",
+            "--s3-url",
+            "s3://bucket/prefix?X-Amz-Signature=tracked-secret",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(credentials.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&credentials.stderr).contains("query or fragment"));
+    assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+
+    workspace(&fixture.shared, ["init"]);
+    let config_path = fixture.shared.join(".workspace-mgr.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(">=0.1.0-alpha.1,<0.2.0", ">=9.0.0");
+    std::fs::write(&config_path, config).unwrap();
+    let instructions = workspace_unchecked(&fixture.shared, ["instructions"]);
+    assert_eq!(instructions.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&instructions.stderr).contains("does not satisfy"));
+    let doctor = workspace_unchecked(&fixture.shared, ["doctor"]);
+    assert_eq!(doctor.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("cli-version"));
+}
+
+#[test]
+fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    let dvc_dir = fixture.shared.join(".dvc");
+    std::fs::create_dir(&dvc_dir).unwrap();
+    let dvc_config = dvc_dir.join("config");
+    std::fs::write(&dvc_config, "[core]\n    remote = preexisting\n").unwrap();
+    let remote = fixture.root.join("storage");
+    let rejected = workspace_unchecked(
+        &fixture.shared,
+        ["init", "--s3-url", remote.to_str().unwrap()],
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not owned"));
+    assert_eq!(
+        std::fs::read_to_string(&dvc_config).unwrap(),
+        "[core]\n    remote = preexisting\n"
+    );
+
+    std::fs::remove_dir_all(&dvc_dir).unwrap();
+    workspace(
+        &fixture.shared,
+        ["init", "--s3-url", remote.to_str().unwrap()],
+    );
+    assert!(
+        std::fs::read_to_string(fixture.shared.join(".gitattributes"))
+            .unwrap()
+            .contains("*.dvc whitespace=-blank-at-eol")
+    );
+    let config_path = fixture.shared.join(".workspace-mgr.toml");
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["storage"].as_table_mut().unwrap().remove("s3");
+    std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+    let disabled = workspace(&fixture.shared, ["init"]);
+    assert_eq!(json(&disabled)["status"], "initialized");
+    assert!(!dvc_config.exists());
 }

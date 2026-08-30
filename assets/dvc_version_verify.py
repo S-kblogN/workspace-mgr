@@ -7,6 +7,7 @@ from dvc.repo import Repo as DvcRepo
 
 repo_path = Path(sys.argv[1])
 dvc_files = json.loads(sys.argv[2])
+check_versioning_only = len(sys.argv) > 3 and sys.argv[3] == "--check-versioning-only"
 missing_metadata = []
 missing_versions = []
 checked = []
@@ -19,6 +20,26 @@ with DvcRepo(str(repo_path)) as dvc_repo:
             f"configured remote {default_remote.name!r} is not version-aware"
         )
     remotes = {default_remote.name: default_remote}
+    raw_fs = default_remote.fs.fs
+    bucket, _, _ = raw_fs.split_path(default_remote.path)
+    if not bucket:
+        raise RuntimeError("configured S3 remote does not name a bucket")
+    if not raw_fs.is_bucket_versioned(bucket):
+        raise RuntimeError(f"S3 bucket {bucket!r} does not have object versioning enabled")
+
+    if check_versioning_only:
+        print(
+            json.dumps(
+                {
+                    "mode": "bucket-versioning",
+                    "remote": default_remote.name,
+                    "bucket": bucket,
+                    "status": "enabled",
+                },
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(0)
 
     def remote_for(name):
         remote_name = name or default_remote.name
@@ -83,7 +104,9 @@ with DvcRepo(str(repo_path)) as dvc_repo:
         for stage in stages:
             for out in stage.outs:
                 if not out.is_in_repo or not out.can_push:
-                    continue
+                    raise RuntimeError(
+                        f"managed-storage output in {dvc_file!r} must be pushable and inside the repository"
+                    )
                 _, base_parts = out.index_key
                 if out.isdir():
                     if out.files is None:

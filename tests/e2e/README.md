@@ -7,10 +7,12 @@ lifecycle against two local network services:
 - a bare repository through `git daemon`, including an intentional server-side
   rejection.
 
-The scenario covers initialization and adoption, instructions, diagnostics,
-task creation, storage status, explicit Git and S3 placement, automatic
-placement, reset, hydrate, move, scoped plan and publish, configuration drift and
-repair, failure ordering, shared-checkout refresh, and fresh-clone hydration.
+The scenario covers private-runtime setup, initialization and adoption,
+instructions, diagnostics, task creation, storage status, explicit Git and S3
+placement, automatic placement, reset, hydrate, move, scoped plan and publish,
+configuration drift and repair, disabled-versioning refusal before upload,
+Git-to-S3 and S3-to-Git transitions, failure ordering, successful and rolled-back
+ordinary Git/S3 shared-checkout refresh, and fresh-clone hydration.
 It checks that placement commands never write either remote, that S3 object
 versions exist before the corresponding Git ref, and that remote failure cannot
 produce a Git commit pointing to missing content. Every command and assertion is

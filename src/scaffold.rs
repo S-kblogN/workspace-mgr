@@ -9,7 +9,9 @@ use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::instructions::BOOTSTRAP;
+use crate::lock::RepositoryLock;
 use crate::manifest::{TaskManifest, one_line};
+use crate::path::reject_symlink_traversal;
 use crate::process::run;
 
 #[derive(Debug, Clone)]
@@ -38,12 +40,29 @@ pub struct InitAction {
 
 pub fn init(options: &InitOptions) -> Result<InitReport> {
     let repo = GitRepo::discover(&options.repo)?;
+    let _repository_lock = if options.dry_run {
+        None
+    } else {
+        Some(RepositoryLock::acquire(&repo)?)
+    };
+    for path in [
+        CONFIG_NAME,
+        "AGENTS.md",
+        ".workspace-mgr/instructions/repository.md",
+        ".dvc",
+        ".dvc/config",
+        ".dvc/.gitignore",
+        ".dvcignore",
+        ".gitattributes",
+    ] {
+        reject_symlink_traversal(&repo.root, path, "managed scaffold path")?;
+    }
     let config_path = repo.root.join(CONFIG_NAME);
     let agents_path = repo.root.join("AGENTS.md");
     let mut actions = Vec::new();
     let existing_config = config_path.is_file();
     let mut config = if existing_config {
-        Config::load(&repo)?
+        Config::load_compatible(&repo)?
     } else {
         let mut config = Config::defaults(options.profile);
         detect_git_defaults(&repo, &mut config)?;
@@ -56,6 +75,7 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         });
     }
     config.validate()?;
+    repo.validate_remote_name(&config.publication.remote)?;
 
     let rendered = config.render()?;
     let config_changed = fs::read_to_string(&config_path).ok().as_deref() != Some(&rendered);
@@ -119,20 +139,22 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         install_bootstrap = true;
     }
 
+    let mut initialize_storage_engine = false;
+    let mut attributes_changed = false;
+    let mut remove_storage_config = false;
     if config.storage.s3_enabled() {
         dvc::require_runtime(&repo)?;
         if config.storage.requires_object_versioning() {
             dvc::require_version_adapter(&repo)?;
         }
+        dvc::validate_internal_config_ownership(&repo)?;
         if !repo.root.join(".dvc").exists() {
+            initialize_storage_engine = true;
             actions.push(InitAction {
                 action: "run".to_owned(),
                 path: ".dvc/".to_owned(),
                 detail: "initialize the internal managed-storage engine".to_owned(),
             });
-            if !options.dry_run {
-                run("dvc", ["init"], &repo.root)?;
-            }
         }
         if let Some(rendered) = dvc::render_internal_config(&config)? {
             let internal_path = repo.root.join(".dvc/config");
@@ -149,23 +171,76 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
                 });
             }
         }
-        if !options.dry_run {
-            dvc::write_internal_config(&repo, &config)?;
-            ensure_line(&repo.root.join(".dvc/.gitignore"), "/config.local")?;
+        let attributes_path = repo.root.join(".gitattributes");
+        let attributes = fs::read_to_string(&attributes_path).unwrap_or_default();
+        attributes_changed = !attributes
+            .lines()
+            .any(|line| line.trim() == "*.dvc whitespace=-blank-at-eol");
+        if attributes_changed {
+            actions.push(InitAction {
+                action: "configure".to_owned(),
+                path: ".gitattributes".to_owned(),
+                detail: "allow generated version-aware storage metadata".to_owned(),
+            });
         }
+    } else if dvc::managed_internal_config_exists(&repo)? {
+        let pointers = dvc::repository_pointers(&repo)?;
+        if !pointers.is_empty() {
+            return Err(Error::message(format!(
+                "cannot disable managed S3 while storage boundaries remain: {}; move or reset them to Git first",
+                pointers.join(", ")
+            )));
+        }
+        actions.push(InitAction {
+            action: "remove".to_owned(),
+            path: ".dvc/config".to_owned(),
+            detail: "remove disabled workspace-mgr storage configuration".to_owned(),
+        });
+        remove_storage_config = true;
     }
 
     if !options.dry_run {
-        if config_changed {
-            atomic_write(&config_path, &rendered)?;
-        }
-        if let Some((module, existing)) = adopted_module {
-            if !module.exists() {
-                atomic_write(&module, &existing)?;
+        let snapshot = ScaffoldSnapshot::capture(&repo)?;
+        let applied: Result<()> = (|| {
+            if config_changed {
+                atomic_write(&config_path, &rendered)?;
             }
-        }
-        if install_bootstrap {
-            atomic_write(&agents_path, BOOTSTRAP)?;
+            if let Some((module, existing)) = &adopted_module {
+                if !module.exists() {
+                    atomic_write(module, existing)?;
+                }
+            }
+            if install_bootstrap {
+                atomic_write(&agents_path, BOOTSTRAP)?;
+            }
+            if config.storage.s3_enabled() {
+                if initialize_storage_engine {
+                    run(&dvc::dvc_program(), ["init"], &repo.root)?;
+                }
+                dvc::write_internal_config(&repo, &config)?;
+                ensure_line(&repo.root.join(".dvc/.gitignore"), "/config.local")?;
+                if attributes_changed {
+                    let attributes_path = repo.root.join(".gitattributes");
+                    ensure_line(
+                        &attributes_path,
+                        "# Version-aware storage metadata may contain a generated folded key line with trailing space.",
+                    )?;
+                    ensure_line(&attributes_path, "*.dvc whitespace=-blank-at-eol")?;
+                }
+            } else if remove_storage_config {
+                dvc::remove_internal_config(&repo)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            return match snapshot.restore(&repo) {
+                Ok(()) => Err(Error::message(format!(
+                    "repository initialization failed and was rolled back: {error}"
+                ))),
+                Err(rollback) => Err(Error::message(format!(
+                    "repository initialization failed: {error}; rollback also failed: {rollback}"
+                ))),
+            };
         }
     }
     Ok(InitReport {
@@ -237,7 +312,9 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
     let title = one_line(&options.title, "task title")?;
     let purpose = one_line(&options.purpose, "task purpose")?;
     let repo = GitRepo::discover(&options.repo)?;
-    let config = Config::load(&repo)?;
+    let _repository_lock = RepositoryLock::acquire(&repo)?;
+    let config = Config::load_compatible(&repo)?;
+    repo.validate_remote_name(&config.publication.remote)?;
     if !config.tasks.enabled {
         return Err(Error::message(
             "task scaffolding is disabled by repository config",
@@ -286,8 +363,17 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             "task branch already exists: {branch}"
         )));
     }
-    let base_oid =
-        repo.fetch_branch(&config.publication.remote, &config.publication.base_branch)?;
+    let base_oid = if options.dry_run {
+        repo.remote_branch_oid(&config.publication.remote, &config.publication.base_branch)?
+            .ok_or_else(|| {
+                Error::message(format!(
+                    "remote base branch does not exist: {}/{}",
+                    config.publication.remote, config.publication.base_branch
+                ))
+            })?
+    } else {
+        repo.fetch_branch(&config.publication.remote, &config.publication.base_branch)?
+    };
     let manifest = TaskManifest {
         schema_version: SCHEMA_VERSION,
         id: task_id.clone(),
@@ -315,13 +401,20 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         if let Err(error) =
             write_task_files(&task_dir, &config.tasks.manifest_name, &readme, &manifest)
         {
-            let _ = repo.run_unchecked([
+            let rollback = repo.run_unchecked([
                 "update-ref",
                 "-d",
                 &format!("refs/heads/{branch}"),
                 &base_oid,
-            ]);
-            return Err(error);
+            ])?;
+            return if rollback.success() {
+                Err(error)
+            } else {
+                Err(Error::message(format!(
+                    "task scaffolding failed: {error}; local branch rollback also failed: {}",
+                    rollback.stderr.trim()
+                )))
+            };
         }
     }
     Ok(TaskCreateReport {
@@ -351,10 +444,15 @@ fn write_task_files(
         atomic_write(&task_dir.join(manifest_name), &manifest.render()?)?;
         Ok(())
     })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(task_dir);
+    if let Err(error) = result {
+        return match fs::remove_dir_all(task_dir) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(Error::message(format!(
+                "task file creation failed: {error}; directory rollback also failed: {rollback}"
+            ))),
+        };
     }
-    result
+    Ok(())
 }
 
 fn validate_slug(slug: &str) -> Result<()> {
@@ -400,17 +498,116 @@ fn ensure_line(path: &Path, line: &str) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    atomic_write_bytes(path, content.as_bytes())
+}
+
+fn atomic_write_bytes(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::message(format!("path has no parent: {}", path.display())))?;
     fs::create_dir_all(parent).at(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     use std::io::Write;
-    temporary.write_all(content.as_bytes()).at(path)?;
+    temporary.write_all(content).at(path)?;
     temporary.flush().at(path)?;
     temporary.persist(path).map_err(|error| Error::Io {
         path: path.to_path_buf(),
         source: error.error,
     })?;
+    Ok(())
+}
+
+struct ScaffoldSnapshot {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    dvc_directory_existed: bool,
+}
+
+impl ScaffoldSnapshot {
+    fn capture(repo: &GitRepo) -> Result<Self> {
+        let relative_paths = [
+            CONFIG_NAME,
+            "AGENTS.md",
+            ".workspace-mgr/instructions/repository.md",
+            ".dvc/config",
+            ".dvc/.gitignore",
+            ".dvcignore",
+            ".gitattributes",
+        ];
+        let mut files = Vec::new();
+        for relative in relative_paths {
+            let path = repo.root.join(relative);
+            let contents = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    Some(fs::read(&path).at(&path)?)
+                }
+                Ok(_) => {
+                    return Err(Error::message(format!(
+                        "managed scaffold path is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(Error::Io { path, source }),
+            };
+            files.push((path, contents));
+        }
+        Ok(Self {
+            files,
+            dvc_directory_existed: repo.root.join(".dvc").is_dir(),
+        })
+    }
+
+    fn restore(self, repo: &GitRepo) -> Result<()> {
+        for (path, contents) in self.files.into_iter().rev() {
+            match contents {
+                Some(contents) => atomic_write_bytes(&path, &contents)?,
+                None => match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                        fs::remove_file(&path).at(&path)?;
+                        prune_empty_parents(&path, &repo.root)?;
+                    }
+                    Ok(_) => {
+                        return Err(Error::message(format!(
+                            "cannot roll back non-file scaffold path: {}",
+                            path.display()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(Error::Io { path, source }),
+                },
+            }
+        }
+        let dvc_dir = repo.root.join(".dvc");
+        if !self.dvc_directory_existed && dvc_dir.exists() {
+            fs::remove_dir_all(&dvc_dir).at(&dvc_dir)?;
+        }
+        Ok(())
+    }
+}
+
+fn prune_empty_parents(path: &Path, root: &Path) -> Result<()> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory == root {
+            break;
+        }
+        match fs::remove_dir(directory) {
+            Ok(()) => current = directory.parent(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                break;
+            }
+            Err(source) => {
+                return Err(Error::Io {
+                    path: directory.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
     Ok(())
 }

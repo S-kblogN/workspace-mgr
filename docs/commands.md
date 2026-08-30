@@ -20,6 +20,20 @@ The [user guide](guide.md) explains how the commands form one workflow.
   `WORKSPACE_MGR_FORMAT=json` for stable structured output.
 - Errors exit with status 2 and start with `workspace-mgr:`.
 
+## `workspace-mgr setup`
+
+Provision and verify the private managed-storage runtime.
+
+```text
+workspace-mgr setup [--runtime-dir <path>] [--dry-run]
+```
+
+The default location follows `WORKSPACE_MGR_RUNTIME_DIR`, then
+`XDG_DATA_HOME`, then `${HOME}/.local/share`. Setup creates an isolated Python
+environment and installs the exact compatible storage runtime. It requires Git
+and Python for provisioning, but users and agents do not invoke the private
+engine directly. `--dry-run` performs no installation or package download.
+
 ## `workspace-mgr init`
 
 Initialize a repository or reconcile its managed scaffolding.
@@ -32,8 +46,9 @@ workspace-mgr init [--repo <path>]
 ```
 
 `--profile` selects defaults only when creating a new configuration. `--s3-url`
-is a tracked, non-secret storage location; credentials embedded in a URL are
-rejected. `--adopt` preserves an existing unmanaged `AGENTS.md` as a repository
+must use `s3://` and is a tracked, non-secret storage location; userinfo,
+queries, fragments, and other credential-bearing URL forms are rejected.
+`--adopt` preserves an existing unmanaged `AGENTS.md` as a repository
 instruction module before replacing it with the bootstrap. Re-running `init`
 validates public configuration and deterministically repairs internal storage
 scaffolding. This command never contacts or writes a remote.
@@ -74,8 +89,9 @@ required private execution engines.
 workspace-mgr doctor [--repo <path>]
 ```
 
-The command is read-only. It exits with status 2 if any reported check is not
-healthy.
+The command is read-only. When S3 is configured it reads the bucket-versioning
+setting and rejects a bucket that is not enabled. It exits with status 2 if any
+reported check is not healthy.
 
 ## `workspace-mgr config show`
 
@@ -172,7 +188,9 @@ workspace-mgr storage set 20260829-180000-report/data \
 
 ## `workspace-mgr storage reset`
 
-Remove an explicit choice and return paths to automatic policy.
+Remove an explicit choice and return paths to automatic policy. Published
+placement remains sticky: resetting a published S3 boundary keeps it in S3;
+use `storage set --to git` for an intentional migration.
 
 ```text
 workspace-mgr storage reset <path>...
@@ -232,9 +250,11 @@ workspace-mgr plan [--manifest <path>]
 
 Plan fetches the configured base and target Git refs, evaluates automatic
 placement, validates S3 metadata and local outputs, constructs a private
-prospective Git tree, and reports changed paths and object IDs. It may create
-ignored local locks or preview state. It never creates a commit, uploads S3
-content, or pushes a Git branch.
+preview tree that excludes payloads destined for S3, and reports changed paths,
+object IDs, and pending placement. Exact generated S3 metadata is established by
+`publish`, because `plan` does not rewrite it. Plan may create ignored local
+locks or preview state. It never creates a commit, uploads S3 content, or pushes
+a Git branch.
 
 `--allow-non-shared-head` is an exceptional checkout override and requires a
 scope note. It still refuses when the target task branch is currently checked
@@ -285,8 +305,9 @@ workspace-mgr refresh [--repo <path>]
 Defaults come from `[publication]`. The checkout must be on the selected branch,
 the shared index must have no staged or unresolved entries, and the remote
 revision must be a fast-forward. Refresh preserves unrelated working-tree
-overlays and hydrates incoming S3 boundaries. It reads Git and S3 but writes no
-remote.
+overlays, materializes safe ordinary Git additions, modifications, and
+deletions, and hydrates incoming S3 boundaries. It reads Git and S3 but writes
+no remote.
 
 Use `--remote` or `--branch` only for an explicitly selected alternate shared
 checkout target.

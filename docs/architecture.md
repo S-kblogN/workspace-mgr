@@ -5,7 +5,10 @@
 `workspace-mgr` separates package defaults, tracked repository policy, scoped
 task state, and private runtime state. `.workspace-mgr.toml` contains public
 policy and non-secret locations. Task manifests contain only scope and branch
-state. Private indexes and locks live below the Git common directory.
+state. Private indexes and locks live below the Git common directory. All
+mutating repository, placement, publication, hydration, and refresh operations
+share a repository lock; task and storage-boundary locks add narrower
+diagnostics.
 
 An explicit storage choice is recorded beside its path as workspace-mgr-owned
 metadata. This makes the choice reviewable and keeps independently active task
@@ -57,8 +60,9 @@ rewrites the shared checkout's working files.
 The S3 adapter currently uses DVC 3.67.1 internally. S3 remotes require exact
 object-version metadata and existence checks through an embedded verifier using
 the same exact DVC release. This is a maintainer compatibility boundary, not a
-public command or repository concept. A filesystem remote is retained only as
-an isolated-test adapter and uses remote-presence verification.
+public command or repository concept. A filesystem remote is compiled only by
+the `test-storage` feature for isolated tests and uses remote-presence
+verification. Release builds reject it in the public S3 schema.
 
 Moving an S3 boundary clears path-bound cloud metadata before upload so the new
 object path receives and records its own version ID. Existing remote versions
@@ -68,6 +72,8 @@ are retained.
 
 `refresh` requires the configured shared branch and a clean shared Git index. It
 verifies a fast-forward, prefetches incoming S3 revisions, compare-and-swap
-updates the local branch ref, resets only the index, and materializes changed
-content. Existing working-tree overlays are preserved. A failure after the ref
-update rolls back the ref, index, metadata, and outputs created by the refresh.
+updates the local branch ref, resets the index, materializes ordinary Git paths
+whose prior working state was clean or absent, and hydrates stored content.
+Existing working-tree overlays are preserved. A failure after the ref update
+rolls back the ref, index, ordinary files, metadata, and outputs created by the
+refresh.

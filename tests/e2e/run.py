@@ -205,6 +205,25 @@ class Harness:
         self.check(status.get("Status") == "Enabled", "S3 bucket versioning enabled")
         self.check(self.list_s3_versions() == [], "S3 bucket starts empty")
 
+    def provision_runtime(self) -> None:
+        self.section("private runtime provisioning")
+        runtime = (
+            self.home
+            / ".local"
+            / "share"
+            / "workspace-mgr"
+            / "storage-3.67.1"
+        )
+        dry = self.wm(self.root, "setup", "--dry-run")
+        self.check(dry["status"] == "dry_run", "setup dry-run reports provisioning")
+        self.check(not runtime.exists(), "setup dry-run creates no runtime")
+        installed = self.wm(self.root, "setup")
+        self.check(installed["status"] == "installed", "setup provisions private runtime")
+        self.check((runtime / "bin" / "dvc").is_file(), "private storage executable exists")
+        self.check((runtime / "bin" / "python").is_file(), "private Python adapter exists")
+        repeated = self.wm(self.root, "setup")
+        self.check(repeated["status"] == "no_changes", "setup is idempotent")
+
     def list_s3_versions(self) -> list[dict[str, Any]]:
         versions: list[dict[str, Any]] = []
         paginator = self.s3.get_paginator("list_object_versions")
@@ -421,11 +440,17 @@ class Harness:
         self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
         self.check("[storage.s3]" in config_text, "S3 placement is configured")
         self.check("version_aware = true" in dvc_config, "internal storage engine is version-aware")
+        self.check("Managed by workspace-mgr" in dvc_config, "internal storage configuration records ownership")
         self.check(f"s3://{self.bucket}/dvc" in dvc_config, "internal storage URL selects test bucket")
         self.check(self.endpoint in dvc_config, "internal storage endpoint selects virtual S3")
         self.check("[dvc]" not in config_text.lower(), "public configuration does not expose a DVC section")
         self.check("require_version_aware" not in config_text, "public configuration hides engine-specific versioning")
         self.check("python" not in config_text.lower(), "public configuration does not expose its adapter")
+        self.check(
+            "*.dvc whitespace=-blank-at-eol"
+            in (self.shared / ".gitattributes").read_text(encoding="utf-8"),
+            "init installs the narrow generated-metadata whitespace rule",
+        )
         repeated = self.wm(self.shared, "init", "--adopt")
         self.check(repeated["status"] == "no_changes", "init is idempotent")
 
@@ -439,6 +464,8 @@ class Harness:
             "repair restores deterministic internal storage config",
         )
 
+        (self.shared / "refresh-update.txt").write_text("old refresh value\n", encoding="utf-8")
+        (self.shared / "refresh-delete.txt").write_text("delete during refresh\n", encoding="utf-8")
         self.git(self.shared, "add", "-A")
         staged = self.git(self.shared, "diff", "--cached", "--name-only").stdout.splitlines()
         self.check(".dvc/config.local" not in staged, "local storage credentials are not staged")
@@ -481,6 +508,16 @@ class Harness:
             all(check["status"] == "ok" for check in doctor["checks"]),
             "every doctor check passes",
             checks=doctor["checks"],
+        )
+        adapter = next(
+            check
+            for check in doctor["checks"]
+            if check["name"] == "managed-storage-version-adapter"
+        )
+        self.check(
+            str(self.home / ".local" / "share" / "workspace-mgr")
+            in adapter["detail"],
+            "repository operations use the provisioned private runtime",
         )
 
     def create_and_publish_task(self) -> tuple[str, Path, str]:
@@ -591,6 +628,7 @@ class Harness:
         assert self.shared is not None
         self.section("Git/S3 placement, failure atomicity, hydrate, move, and reset")
         data = task / "data.bin"
+        git_to_s3 = task / "notes.txt"
         bundle = task / "bundle"
         bundle.mkdir()
         v1 = b"single-file version one\n"
@@ -606,6 +644,7 @@ class Harness:
             "set",
             "--dry-run",
             f"{task_id}/data.bin",
+            f"{task_id}/notes.txt",
             f"{task_id}/bundle",
             "--to",
             "s3",
@@ -615,6 +654,7 @@ class Harness:
         self.check(dry["status"] == "dry_run", "S3 placement dry-run succeeds")
         self.check(dry["remote_writes"] is False, "placement dry-run reports no remote writes")
         self.check(not task.joinpath("data.bin.dvc").exists(), "placement dry-run creates no metadata")
+        self.check(not task.joinpath("notes.txt.dvc").exists(), "Git-to-S3 dry-run creates no metadata")
         self.check(self.remote_ref(branch) == remote_before, "placement dry-run leaves Git remote unchanged")
         self.check(self.list_s3_versions() == [], "placement dry-run leaves S3 empty")
 
@@ -623,6 +663,7 @@ class Harness:
             "storage",
             "set",
             f"{task_id}/data.bin",
+            f"{task_id}/notes.txt",
             f"{task_id}/bundle",
             "--to",
             "s3",
@@ -636,16 +677,39 @@ class Harness:
         statuses = self.wm(task, "storage", "status")
         status_paths = {item["path"] for item in statuses["placements"]}
         self.check(
-            {f"{task_id}/data.bin", f"{task_id}/bundle"}.issubset(status_paths),
-            "storage status finds both explicit boundaries alongside Git content",
+            {f"{task_id}/data.bin", f"{task_id}/notes.txt", f"{task_id}/bundle"}.issubset(status_paths),
+            "storage status finds all explicit boundaries alongside Git content",
         )
         self.check(
             all(
                 item["target"] == "s3" and item["selected_by"] == "explicit"
                 for item in statuses["placements"]
-                if item["path"] in {f"{task_id}/data.bin", f"{task_id}/bundle"}
+                if item["path"] in {f"{task_id}/data.bin", f"{task_id}/notes.txt", f"{task_id}/bundle"}
             ),
             "storage status explains explicit S3 placement",
+        )
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Suspended"}
+        )
+        disabled_doctor = self.wm(self.shared, "doctor", expected=2)
+        self.check(
+            "does not have object versioning enabled" in disabled_doctor["stdout"],
+            "doctor detects disabled S3 bucket versioning",
+        )
+        disabled_publish = self.wm(
+            task,
+            "publish",
+            "-m",
+            "This must fail before an unversioned upload",
+            expected=2,
+        )
+        self.check(
+            "object versioning" in disabled_publish["stderr"],
+            "publish rejects disabled bucket versioning before upload",
+        )
+        self.check(self.list_s3_versions() == [], "disabled versioning uploads no S3 object")
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
         )
         tracked = self.wm(task, "publish", "-m", "Publish S3 file and directory")
         self.check(tracked["status"] == "pushed", "two S3 boundaries publish atomically")
@@ -660,6 +724,8 @@ class Harness:
         tracked_oid = self.remote_ref(branch)
         assert tracked_oid is not None
         self.check(not self.remote_path_exists(tracked_oid, f"{task_id}/data.bin"), "DVC payload is absent from Git tree")
+        self.check(not self.remote_path_exists(tracked_oid, f"{task_id}/notes.txt"), "published Git payload is removed when moved to S3")
+        self.check(self.remote_path_exists(tracked_oid, f"{task_id}/notes.txt.dvc"), "Git-to-S3 transition publishes a pointer")
         self.check(not self.remote_path_exists(tracked_oid, f"{task_id}/bundle"), "DVC directory is absent from Git tree")
         self.check(self.remote_path_exists(tracked_oid, f"{task_id}/data.bin.dvc"), "file pointer is in Git tree")
         versions_v1 = self.list_s3_versions()
@@ -790,16 +856,30 @@ class Harness:
 
         reset_dry = self.wm(task, "storage", "reset", "--dry-run", f"{task_id}/moved.bin")
         self.check(reset_dry["status"] == "dry_run", "placement reset dry-run succeeds")
-        self.check(reset_dry["placements"][0]["target"] == "git", "automatic policy selects Git for small file")
+        self.check(reset_dry["placements"][0]["target"] == "s3", "published S3 placement stays stable after reset")
         self.check(moved_pointer.is_file() and moved_output.is_file(), "reset dry-run preserves boundary")
         remote_before_reset = self.remote_ref(branch)
         reset = self.wm(task, "storage", "reset", f"{task_id}/moved.bin")
         self.check(reset["status"] == "updated", "reset returns path to automatic placement")
         self.check(reset["remote_writes"] is False, "reset performs no remote writes")
         self.check(self.remote_ref(branch) == remote_before_reset, "reset leaves Git remote unchanged")
-        self.check(not moved_pointer.exists(), "reset to Git removes S3 metadata locally")
+        self.check(moved_pointer.exists(), "reset preserves published S3 metadata locally")
         self.check(moved_output.read_bytes() == v3, "reset preserves output")
-        reset_publish = self.wm(task, "publish", "-m", "Publish automatic Git placement")
+        reset_status = self.wm(task, "storage", "status", f"{task_id}/moved.bin")
+        self.check(reset_status["placements"][0]["target"] == "s3", "status keeps the published S3 placement")
+        to_git = self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/moved.bin",
+            "--to",
+            "git",
+            "--reason",
+            "Exercise the explicit S3-to-Git transition.",
+        )
+        self.check(to_git["status"] == "updated", "explicit placement migrates published S3 content to Git")
+        self.check(not moved_pointer.exists(), "explicit Git placement removes S3 metadata locally")
+        reset_publish = self.wm(task, "publish", "-m", "Publish explicit Git placement")
         self.check(reset_publish["status"] == "pushed", "Git placement publishes")
         untracked_oid = self.remote_ref(branch)
         assert untracked_oid is not None
@@ -812,6 +892,18 @@ class Harness:
         assert self.shared is not None
         self.section("shared-checkout refresh and independent clone hydration")
         merged_oid = self.merge_branch_to_main(branch)
+        assert self.seed is not None
+        refresh_source = self.root / "refresh-source"
+        self.git(self.seed, "worktree", "add", "--detach", refresh_source, merged_oid)
+        self.configure_git(refresh_source)
+        (refresh_source / "refresh-update.txt").write_text("new refresh value\n", encoding="utf-8")
+        (refresh_source / "refresh-delete.txt").unlink()
+        (refresh_source / "refresh-added.txt").write_text("added by remote\n", encoding="utf-8")
+        self.git(refresh_source, "add", "-A")
+        self.git(refresh_source, "commit", "-m", "Update ordinary Git files for refresh")
+        merged_oid = self.git(refresh_source, "rev-parse", "HEAD").stdout.strip()
+        self.git(refresh_source, "push", "origin", "HEAD:refs/heads/main")
+        self.git(self.seed, "worktree", "remove", "--force", refresh_source)
         original_main = self.git(self.shared, "rev-parse", "main").stdout.strip()
         self.check(original_main != merged_oid, "shared main remains stale before refresh")
         (self.shared / "README.md").write_text("# Active tracked overlay\n", encoding="utf-8")
@@ -828,6 +920,60 @@ class Harness:
         self.check(dry["status"] == "dry_run", "refresh dry-run sees incoming main")
         self.check(self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main, "refresh dry-run does not move local main")
         self.check(not bundle.exists(), "refresh dry-run does not hydrate DVC output")
+        runtime_dvc = (
+            self.home
+            / ".local"
+            / "share"
+            / "workspace-mgr"
+            / "storage-3.67.1"
+            / "bin"
+            / "dvc"
+        )
+        failing_dvc = self.root / "fail-first-refresh-checkout"
+        checkout_counter = self.root / "refresh-checkout-counter"
+        failing_dvc.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' '3.67.1'; exit 0; fi\n"
+            "if [ \"${1:-}\" = \"checkout\" ] && [ ! -f \"$CHECKOUT_COUNTER\" ]; then\n"
+            "  : > \"$CHECKOUT_COUNTER\"\n"
+            "  exit 23\n"
+            "fi\n"
+            "exec \"$REAL_DVC\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        failing_dvc.chmod(0o755)
+        failed_refresh = self.wm(
+            self.shared,
+            "refresh",
+            expected=2,
+            env={
+                "WORKSPACE_MGR_STORAGE_DVC": str(failing_dvc),
+                "CHECKOUT_COUNTER": str(checkout_counter),
+                "REAL_DVC": str(runtime_dvc),
+            },
+        )
+        self.check("rolled back" in failed_refresh["stderr"], "post-ref refresh failure is rolled back")
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "failed refresh restores the original main ref",
+        )
+        self.check(
+            (self.shared / "refresh-update.txt").read_text(encoding="utf-8")
+            == "old refresh value\n",
+            "failed refresh restores an ordinary modified Git file",
+        )
+        self.check(
+            (self.shared / "refresh-delete.txt").is_file()
+            and not (self.shared / "refresh-added.txt").exists(),
+            "failed refresh restores ordinary additions and deletions",
+        )
+        self.check(not bundle.exists(), "failed refresh removes newly hydrated output")
+        self.check((self.shared / "README.md").read_bytes() == overlay, "failed refresh preserves tracked overlay")
+        self.check(
+            self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
+            "failed refresh restores a clean shared index",
+        )
         refreshed = self.wm(self.shared, "refresh")
         self.check(refreshed["status"] == "updated", "refresh fast-forwards shared main")
         self.check(refreshed["new_oid"] == merged_oid, "refresh reports merged object ID")
@@ -836,6 +982,10 @@ class Harness:
         self.assert_shared_head(merged_oid)
         self.check((self.shared / "README.md").read_bytes() == overlay, "refresh preserves tracked overlay")
         self.check((self.shared / "unrelated.txt").read_bytes() == unrelated, "refresh preserves unrelated untracked overlay")
+        self.check((self.shared / "refresh-update.txt").read_text(encoding="utf-8") == "new refresh value\n", "refresh materializes a modified Git file")
+        self.check((self.shared / "refresh-added.txt").read_text(encoding="utf-8") == "added by remote\n", "refresh materializes a new Git file")
+        self.check(not (self.shared / "refresh-delete.txt").exists(), "refresh removes a clean deleted Git file")
+        self.check("refresh-added.txt" in refreshed["materialized_git_paths"], "refresh reports ordinary Git materialization")
         self.check((bundle / "alpha.txt").read_bytes() == b"bundle alpha version three\n", "refresh hydrates exact S3 directory version")
         staged = self.git(self.shared, "diff", "--cached", "--name-only").stdout
         self.check(staged == "", "refresh leaves shared index clean")
@@ -852,6 +1002,7 @@ class Harness:
         hydrated = self.wm(consumer_task, "storage", "hydrate")
         self.check(hydrated["status"] == "hydrated", "fresh clone hydrates from MinIO")
         self.check((consumer_task / "bundle" / "alpha.txt").read_bytes() == b"bundle alpha version three\n", "cross-clone S3 hydration is exact")
+        self.check((consumer_task / "notes.txt").read_text(encoding="utf-8") == "task-only content\n", "cross-clone hydration restores Git-to-S3 content")
 
     def exercise_automatic_and_explicit_git(self) -> None:
         assert self.shared is not None
@@ -899,6 +1050,19 @@ class Harness:
             f"{task_id}/explicit-git.bin",
         )
         self.check(status["placements"][0]["target"] == "git", "status reports explicit Git")
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Suspended"}
+        )
+        disabled_plan = self.wm(task, "plan", expected=2)
+        self.check(
+            "does not have object versioning enabled" in disabled_plan["stderr"],
+            "plan rejects automatic S3 placement when bucket versioning is disabled",
+        )
+        self.check(not task.joinpath("automatic-s3.bin.dvc").exists(), "rejected plan creates no S3 metadata")
+        self.check(self.list_s3_versions() == versions_before, "rejected plan performs no S3 upload")
+        self.s3.put_bucket_versioning(
+            Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
         plan = self.wm(task, "plan")
         self.check(plan["status"] == "dry_run", "automatic S3 placement appears in plan")
         self.check(
@@ -932,6 +1096,7 @@ class Harness:
     def execute(self) -> None:
         self.section("virtual services")
         self.setup_s3()
+        self.provision_runtime()
         self.setup_repository()
         self.initialize_workspace()
         task_id, task, branch = self.create_and_publish_task()
