@@ -109,18 +109,23 @@ does not expose private engine configuration or credentials.
 
 ## `workspace-mgr task create`
 
-Create one task directory, README, manifest, and local target-branch ref.
+Create one deliverable workspace or repository-infrastructure workspace.
 
 ```text
 workspace-mgr task create <slug> --title <title> --purpose <purpose>
+  [--kind deliverable|infrastructure]
+  [--scope <path>... --scope-note <reason>]
   [--branch <branch>] [--repo <path>] [--dry-run]
 ```
 
-The slug is lowercase kebab case. The generated directory follows
-`tasks.directory_pattern`; the default branch uses
-`publication.branch_prefix`. The command fetches the configured base branch to
-anchor the local target ref. It refuses existing directories or local/remote
-branch names and does not publish the new branch.
+The slug is lowercase kebab case. The default `deliverable` kind creates a
+timestamped top-level directory, README, tracked manifest, and unmounted target
+branch. The `infrastructure` kind requires at least one `--scope` plus a
+`--scope-note`; it creates `codex/infra-<slug>` and an isolated worktree below
+private Git common state, with no repository task directory. Its manifest is
+private worktree state and every scope is explicit. Both kinds fetch the
+configured base branch, reject an existing directory or local/remote branch,
+and publish nothing.
 
 ```sh
 workspace-mgr task create training-report \
@@ -128,6 +133,10 @@ workspace-mgr task create training-report \
   --purpose "Produce the final training report"
 workspace-mgr task create urgent-fix --title "Urgent fix" \
   --purpose "Repair the release input" --branch review/urgent-fix --dry-run
+workspace-mgr task create shared-policy --kind infrastructure \
+  --title "Shared policy" --purpose "Update repository-wide policy" \
+  --scope AGENTS.md --scope .github/workflows/ci.yml \
+  --scope-note "The user requested this infrastructure change"
 ```
 
 ## `workspace-mgr task status`
@@ -294,7 +303,10 @@ still requiring a message argument.
 workspace-mgr publish -m "Publish the training report"
 ```
 
-The command does not create, update, merge, or close a pull request.
+The command does not create, update, merge, or close a pull request. Its output
+contains a provider-neutral review handoff: pull-request policy, initial state,
+manager, merge authority, remote, base branch, and head branch. The responsible
+agent uses those facts with the repository hosting workflow.
 
 ## `workspace-mgr refresh`
 

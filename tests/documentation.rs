@@ -54,6 +54,19 @@ fn user_documentation_covers_the_complete_public_model() {
     }
     assert!(guide.contains("remote branch or a pull request"));
     assert!(guide.contains("does not call a GitHub or other hosting API"));
+    for responsibility in [
+        "create exactly one",
+        "never create a duplicate",
+        "living description",
+        "head revision",
+        "must not merge",
+        "enable auto-merge",
+    ] {
+        assert!(
+            guide.contains(responsibility) || normalized_model.contains(responsibility),
+            "documentation is missing pull-request responsibility {responsibility:?}"
+        );
+    }
     assert!(guide.contains("S3 first, then Git"));
     assert!(guide.contains("Nested placement boundaries"));
     assert!(!model.to_ascii_lowercase().contains("dvc"));

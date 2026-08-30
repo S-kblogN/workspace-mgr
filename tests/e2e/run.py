@@ -463,6 +463,9 @@ class Harness:
         self.check(config["publication"]["remote"] == "origin", "config resolves publication remote")
         self.check(config["storage"]["s3"]["url"] == f"s3://{self.bucket}/dvc", "config resolves S3 storage")
         self.check(config["storage"]["default"] == "auto", "config defaults to automatic placement")
+        self.check(config["review"]["pull_request"] == "required", "config requires review")
+        self.check(config["review"]["managed_by"] == "agent", "config assigns PR metadata to agent")
+        self.check(config["review"]["merge_authority"] == "user", "config reserves merge authority")
         self.check("dvc" not in config, "public config JSON hides the internal storage engine")
 
         for topic in (
@@ -623,6 +626,92 @@ class Harness:
         no_changes = self.wm(task, "plan")
         self.check(no_changes["status"] == "no_changes", "post-publish plan is clean")
         return task_id, task, branch
+
+    def create_and_publish_infrastructure_task(self) -> None:
+        assert self.shared is not None
+        self.section("isolated infrastructure task and review handoff")
+        branch = "codex/infra-e2e-policy"
+        dry = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-policy",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "E2E shared policy",
+            "--purpose",
+            "Exercise isolated repository-wide publication.",
+            "--scope",
+            "e2e-shared-policy.md",
+            "--scope-note",
+            "The E2E scenario authorizes this repository-wide policy file.",
+            "--dry-run",
+        )
+        self.check(dry["status"] == "dry_run", "infrastructure dry-run succeeds")
+        self.check(self.remote_ref(branch) is None, "infrastructure dry-run publishes no branch")
+
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-policy",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "E2E shared policy",
+            "--purpose",
+            "Exercise isolated repository-wide publication.",
+            "--scope",
+            "e2e-shared-policy.md",
+            "--scope-note",
+            "The E2E scenario authorizes this repository-wide policy file.",
+        )
+        worktree = Path(created["path"])
+        self.check(created["kind"] == "infrastructure", "infrastructure kind is explicit")
+        self.check(worktree.is_dir(), "infrastructure worktree exists")
+        self.check(Path(created["manifest"]).is_file(), "infrastructure manifest is private state")
+        self.check(
+            not (self.shared / "infra-e2e-policy").exists(),
+            "infrastructure task creates no repository task directory",
+        )
+        self.check(
+            self.git(worktree, "branch", "--show-current").stdout.strip() == branch,
+            "infrastructure branch is mounted only in its worktree",
+        )
+        status = self.wm(worktree, "task", "status")
+        self.check(status["scopes"] == ["e2e-shared-policy.md"], "infrastructure scope is exact")
+
+        (worktree / "e2e-shared-policy.md").write_text("isolated policy\n", encoding="utf-8")
+        (worktree / "outside-scope.txt").write_text("must not publish\n", encoding="utf-8")
+        rejected = self.wm(worktree, "plan", expected=2)
+        self.check(
+            "outside its declared scope" in rejected["stderr"],
+            "infrastructure worktree rejects undeclared changes",
+        )
+        (worktree / "outside-scope.txt").unlink()
+        plan = self.wm(worktree, "plan")
+        self.check(
+            plan["changed_paths"] == ["e2e-shared-policy.md"],
+            "infrastructure plan contains only its declared shared path",
+        )
+        published = self.wm(worktree, "publish", "-m", "Publish E2E shared policy")
+        oid = published["commit_oid"]
+        self.check(self.remote_ref(branch) == oid, "infrastructure branch is published")
+        self.check(
+            self.remote_path_exists(oid, "e2e-shared-policy.md"),
+            "infrastructure path exists in the published tree",
+        )
+        self.check(published["review"]["pull_request"] == "required", "review handoff requires one PR")
+        self.check(published["review"]["initial_state"] == "draft", "review handoff starts draft")
+        self.check(published["review"]["managed_by"] == "agent", "review handoff assigns the agent")
+        self.check(published["review"]["merge_authority"] == "user", "review handoff reserves merge for user")
+        self.check(
+            self.git(worktree, "status", "--short").stdout == "",
+            "published infrastructure worktree is clean",
+        )
+        self.check(self.wm(worktree, "plan")["status"] == "no_changes", "infrastructure plan ends clean")
+        self.assert_shared_head()
 
     def exercise_dvc(self, task_id: str, task: Path, branch: str) -> None:
         assert self.shared is not None
@@ -1099,6 +1188,7 @@ class Harness:
         self.provision_runtime()
         self.setup_repository()
         self.initialize_workspace()
+        self.create_and_publish_infrastructure_task()
         task_id, task, branch = self.create_and_publish_task()
         self.exercise_dvc(task_id, task, branch)
         self.refresh_and_cross_clone(task_id, task, branch)

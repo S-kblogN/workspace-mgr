@@ -106,6 +106,9 @@ fn run(cli: Cli) -> Result<()> {
                     slug: args.slug,
                     title: args.title,
                     purpose: args.purpose,
+                    kind: args.kind,
+                    scopes: args.scopes,
+                    scope_note: args.scope_note,
                     branch: args.branch,
                     timestamp: args.timestamp,
                     dry_run: args.dry_run,
@@ -235,7 +238,7 @@ fn hydrate_scopes(
             });
         }
     }
-    let mut scopes = vec![task.task_path.clone()];
+    let mut scopes = task.task_path.iter().cloned().collect::<Vec<_>>();
     scopes.extend(additional.iter().map(|scope| scope.path.clone()));
     let mut seen = std::collections::BTreeSet::new();
     scopes.retain(|scope| seen.insert(scope.clone()));
@@ -246,7 +249,10 @@ fn scoped_context(
     args: &ScopedArgs,
     exclusive: bool,
 ) -> Result<(GitRepo, Config, Vec<String>, Option<RepositoryLock>)> {
-    let repo = GitRepo::discover(&args.repo)?;
+    let repo = match &args.manifest {
+        Some(path) => GitRepo::discover_for_manifest(path)?,
+        None => GitRepo::discover(&args.repo)?,
+    };
     let lock = if exclusive {
         Some(RepositoryLock::acquire(&repo)?)
     } else {

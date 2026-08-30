@@ -34,6 +34,9 @@ workspace-mgr instructions
 workspace-mgr task create example-task \
   --title "Example task" \
   --purpose "Produce one reviewable deliverable"
+workspace-mgr task create shared-policy --kind infrastructure \
+  --title "Shared policy" --purpose "Update repository policy" \
+  --scope AGENTS.md --scope-note "The user requested this shared change"
 ```
 
 Inside a task:

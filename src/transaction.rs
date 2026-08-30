@@ -7,12 +7,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::config::Config;
+use crate::config::{Config, MergeAuthority, PullRequestPolicy, PullRequestState, ReviewManager};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{AdditionalScope, ResolvedTask, one_line};
+use crate::manifest::{AdditionalScope, ResolvedTask, TaskKind, one_line};
 use crate::path::{allowed, relative_to, repo_path, resolved_under};
 use crate::storage;
 
@@ -59,6 +59,7 @@ pub struct TransactionReport {
     pub base_oid: String,
     pub remote_base_oid: String,
     pub scopes: Vec<String>,
+    pub review: ReviewHandoff,
     pub changed_paths: Vec<String>,
     pub storage: serde_json::Value,
     pub ignored_entries: usize,
@@ -71,13 +72,20 @@ pub struct TransactionReport {
     pub push: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewHandoff {
+    pub pull_request: PullRequestPolicy,
+    pub initial_state: PullRequestState,
+    pub managed_by: ReviewManager,
+    pub merge_authority: MergeAuthority,
+    pub remote: String,
+    pub base_branch: String,
+    pub head_branch: String,
+}
+
 pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let repo = if let Some(manifest) = &options.manifest {
-        GitRepo::discover(
-            manifest
-                .parent()
-                .ok_or_else(|| Error::message("manifest path has no parent"))?,
-        )?
+        GitRepo::discover_for_manifest(manifest)?
     } else {
         GitRepo::discover(&options.start)?
     };
@@ -88,18 +96,24 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         None => ResolvedTask::discover(&repo, &config, &options.start)?,
     };
     let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
-    if config.tasks.require_readme
-        && !resolved_under(&repo.root, &format!("{}/README.md", task.task_path)).is_file()
-    {
-        return Err(Error::message(format!(
-            "task README is required but missing: {}/README.md",
-            task.task_path
-        )));
+    if config.tasks.require_readme && task.kind == TaskKind::Deliverable {
+        let task_path = task
+            .task_path
+            .as_deref()
+            .ok_or_else(|| Error::message("deliverable task is missing its task path"))?;
+        if !resolved_under(&repo.root, &format!("{task_path}/README.md")).is_file() {
+            return Err(Error::message(format!(
+                "task README is required but missing: {task_path}/README.md"
+            )));
+        }
     }
     repo.validate_branch(&task.branch)?;
     repo.validate_remote_name(&task.remote)?;
-    repo.ensure_branch_not_checked_out(&task.branch)?;
-    validate_checkout(&repo, &task, options)?;
+    if task.kind == TaskKind::Deliverable {
+        repo.ensure_branch_not_checked_out(&task.branch)?;
+    }
+    let (scopes, authorizations) = resolve_scopes(&task, options)?;
+    validate_checkout(&repo, &task, &scopes, options)?;
     let message = match options.operation {
         Operation::Plan => None,
         Operation::Publish => Some(one_line(
@@ -120,7 +134,6 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             }
         }
     }
-    let (scopes, authorizations) = resolve_scopes(&task, options)?;
     let dry_run = options.operation.dry_run(options.dry_run);
     let common_dir = repo.common_dir()?;
     let state_dir = state_dir(&common_dir, &task);
@@ -129,7 +142,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &state_dir.join("transaction.lock"),
         &format!(
             "another workspace-mgr transaction is running for {}",
-            task.task_path
+            task.task_id
         ),
     )?;
 
@@ -271,6 +284,15 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         base_oid: base_oid.clone(),
         remote_base_oid,
         scopes: scopes.clone(),
+        review: ReviewHandoff {
+            pull_request: config.review.pull_request,
+            initial_state: config.review.initial_state,
+            managed_by: config.review.managed_by,
+            merge_authority: config.review.merge_authority,
+            remote: task.remote.clone(),
+            base_branch: task.base_branch.clone(),
+            head_branch: task.branch.clone(),
+        },
         changed_paths: paths.clone(),
         storage: storage_report,
         ignored_entries,
@@ -313,11 +335,14 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     repo.run([
         "update-ref",
         "-m",
-        &format!("workspace-mgr publish for {}", task.task_path),
+        &format!("workspace-mgr publish for {}", task.task_id),
         &local_ref,
         &commit_oid,
         old_local_oid.as_deref().unwrap_or(ZERO_OID),
     ])?;
+    if task.kind == TaskKind::Infrastructure {
+        repo.run(["read-tree", &commit_oid])?;
+    }
     let refspec = format!("{commit_oid}:refs/heads/{}", task.branch);
     let push = repo.run(["push", "--porcelain", &task.remote, &refspec])?;
     let observed = repo
@@ -331,7 +356,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     repo.run([
         "update-ref",
         "-m",
-        &format!("record push for {}", task.task_path),
+        &format!("record push for {}", task.task_id),
         &format!("refs/remotes/{}/{}", task.remote, task.branch),
         &commit_oid,
     ])?;
@@ -412,9 +437,63 @@ fn remove_output_paths_from_index<'a>(
 fn validate_checkout(
     repo: &GitRepo,
     task: &ResolvedTask,
+    scopes: &[String],
     options: &TransactionOptions,
 ) -> Result<()> {
     let head = repo.current_branch()?;
+    if task.kind == TaskKind::Infrastructure {
+        if head.as_deref() != Some(&task.branch) {
+            return Err(Error::message(format!(
+                "infrastructure task must run in its isolated worktree on {:?}; current branch is {:?}",
+                task.branch,
+                head.as_deref().unwrap_or("detached HEAD")
+            )));
+        }
+        let root = repo.root.canonicalize().map_err(|source| Error::Io {
+            path: repo.root.clone(),
+            source,
+        })?;
+        let worktrees = repo.branch_worktrees(&task.branch)?;
+        if worktrees.len() != 1
+            || worktrees[0].canonicalize().map_err(|source| Error::Io {
+                path: worktrees[0].clone(),
+                source,
+            })? != root
+        {
+            return Err(Error::message(
+                "infrastructure branch is not mounted only in the current isolated worktree",
+            ));
+        }
+        let staged = repo.run_unchecked(["diff", "--cached", "--quiet", "--"])?;
+        if staged.code != 0 && staged.code != 1 {
+            return Err(Error::message(
+                "failed to inspect the infrastructure worktree index",
+            ));
+        }
+        if staged.code == 1 {
+            return Err(Error::message(
+                "infrastructure worktree index has staged changes; unstage them before workspace-mgr publication",
+            ));
+        }
+        let tracked = repo.run(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])?;
+        let untracked = repo.run(["ls-files", "--others", "--exclude-standard", "-z", "--"])?;
+        let mut escaped = tracked
+            .stdout
+            .split('\0')
+            .chain(untracked.stdout.split('\0'))
+            .filter(|path| !path.is_empty() && !allowed(path, scopes))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        escaped.sort();
+        escaped.dedup();
+        if !escaped.is_empty() {
+            return Err(Error::message(format!(
+                "infrastructure worktree has changes outside its declared scope: {}",
+                escaped.join(", ")
+            )));
+        }
+        return Ok(());
+    }
     if head.as_deref() != Some(&task.shared_head) {
         if !options.allow_non_shared_head {
             return Err(Error::message(format!(
@@ -456,7 +535,7 @@ fn resolve_scopes(
             });
         }
     }
-    let mut scopes = vec![task.task_path.clone()];
+    let mut scopes = task.task_path.iter().cloned().collect::<Vec<_>>();
     scopes.extend(additional.iter().map(|entry| entry.path.clone()));
     let mut seen = BTreeSet::new();
     scopes.retain(|scope| seen.insert(scope.clone()));
@@ -465,7 +544,7 @@ fn resolve_scopes(
 
 fn state_dir(common_dir: &Path, task: &ResolvedTask) -> PathBuf {
     let mut hasher = Sha256::new();
-    hasher.update(task.task_path.as_bytes());
+    hasher.update(task.task_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(task.branch.as_bytes());
     common_dir
@@ -652,7 +731,10 @@ fn build_commit_message(
 }
 
 pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> {
-    let repo = GitRepo::discover(start)?;
+    let repo = match manifest {
+        Some(path) => GitRepo::discover_for_manifest(path)?,
+        None => GitRepo::discover(start)?,
+    };
     let config = Config::load_compatible(&repo)?;
     let path = match manifest {
         Some(path) => path.to_path_buf(),
@@ -669,7 +751,10 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
         .map(ToOwned::to_owned)
         .collect();
     Ok(TaskStatus {
+        kind: task.kind,
         task_id: task.task_id,
+        title: task.title,
+        purpose: task.purpose,
         manifest: task.manifest_path.display().to_string(),
         branch: task.branch,
         remote: task.remote,
@@ -681,7 +766,12 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskStatus {
+    pub kind: TaskKind,
     pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
     pub manifest: String,
     pub branch: String,
     pub remote: String,

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -34,6 +35,28 @@ impl GitRepo {
         Ok(Self {
             root: PathBuf::from(output.stdout.trim()),
         })
+    }
+
+    pub fn discover_for_manifest(path: &Path) -> Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::message("manifest path has no parent"))?;
+        if let Ok(repo) = Self::discover(parent) {
+            return Ok(repo);
+        }
+        let worktree_git_dir = parent
+            .parent()
+            .ok_or_else(|| Error::message("private manifest has no worktree Git directory"))?;
+        let pointer = worktree_git_dir.join("gitdir");
+        let git_file = fs::read_to_string(&pointer).map_err(|source| crate::error::Error::Io {
+            path: pointer.clone(),
+            source,
+        })?;
+        let checkout = PathBuf::from(git_file.trim())
+            .parent()
+            .ok_or_else(|| Error::message("worktree Git pointer has no checkout parent"))?
+            .to_path_buf();
+        Self::discover(&checkout)
     }
 
     pub fn run<I, S>(&self, args: I) -> Result<CommandOutput>
@@ -84,6 +107,36 @@ impl GitRepo {
         } else {
             Ok(self.root.join(path))
         }
+    }
+
+    pub fn git_dir(&self) -> Result<PathBuf> {
+        let raw = self.run(["rev-parse", "--git-dir"])?.stdout;
+        let path = PathBuf::from(raw.trim());
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Ok(self.root.join(path))
+        }
+    }
+
+    pub fn branch_worktrees(&self, branch: &str) -> Result<Vec<PathBuf>> {
+        let target = format!("branch refs/heads/{branch}");
+        let mut worktree = None;
+        let mut matches = Vec::new();
+        for line in self
+            .run(["worktree", "list", "--porcelain"])?
+            .stdout
+            .lines()
+        {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                worktree = Some(PathBuf::from(path));
+            } else if line == target {
+                if let Some(path) = worktree.take() {
+                    matches.push(path);
+                }
+            }
+        }
+        Ok(matches)
     }
 
     pub fn current_branch(&self) -> Result<Option<String>> {
@@ -151,13 +204,7 @@ impl GitRepo {
     }
 
     pub fn ensure_branch_not_checked_out(&self, branch: &str) -> Result<()> {
-        let target = format!("branch refs/heads/{branch}");
-        if self
-            .run(["worktree", "list", "--porcelain"])?
-            .stdout
-            .lines()
-            .any(|line| line == target)
-        {
+        if !self.branch_worktrees(branch)?.is_empty() {
             return Err(Error::message(format!(
                 "target branch {branch:?} is checked out in a worktree"
             )));

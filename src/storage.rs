@@ -535,16 +535,16 @@ fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Resul
             .is_file()
         })
         .or_else(|| scopes.first());
-    let Some(task_path) = task_path else {
-        return Ok(None);
+    let manifest = match task_path {
+        Some(task_path) => resolved_under(
+            &repo.root,
+            &format!("{task_path}/{}", config.tasks.manifest_name),
+        ),
+        None => match ResolvedTask::discover(repo, config, &repo.root) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        },
     };
-    let manifest = resolved_under(
-        &repo.root,
-        &format!("{task_path}/{}", config.tasks.manifest_name),
-    );
-    if !manifest.is_file() {
-        return Ok(None);
-    }
     let task = ResolvedTask::load(repo, config, &manifest)?;
     for reference in [
         format!("refs/remotes/{}/{}", task.remote, task.branch),

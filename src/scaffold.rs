@@ -10,8 +10,10 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::instructions::BOOTSTRAP;
 use crate::lock::RepositoryLock;
-use crate::manifest::{TaskManifest, one_line};
-use crate::path::reject_symlink_traversal;
+use crate::manifest::{
+    AdditionalScope, INFRASTRUCTURE_MANIFEST_NAME, TaskKind, TaskManifest, one_line,
+};
+use crate::path::{reject_symlink_traversal, repo_path};
 use crate::process::run;
 
 #[derive(Debug, Clone)]
@@ -250,6 +252,9 @@ pub struct TaskCreateOptions {
     pub slug: String,
     pub title: String,
     pub purpose: String,
+    pub kind: TaskKind,
+    pub scopes: Vec<String>,
+    pub scope_note: Option<String>,
     pub branch: Option<String>,
     pub timestamp: Option<String>,
     pub dry_run: bool,
@@ -258,8 +263,10 @@ pub struct TaskCreateOptions {
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskCreateReport {
     pub status: String,
+    pub kind: TaskKind,
     pub task_id: String,
     pub path: String,
+    pub manifest: String,
     pub branch: String,
     pub base_oid: String,
     pub files: Vec<String>,
@@ -278,37 +285,72 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             "task scaffolding is disabled by repository config",
         ));
     }
-    let timestamp = match &options.timestamp {
-        Some(value) => validate_timestamp(value)?,
-        None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
+    let additional_scopes = create_scopes(options)?;
+    let (task_id, task_dir) = match options.kind {
+        TaskKind::Deliverable => {
+            let timestamp = match &options.timestamp {
+                Some(value) => validate_timestamp(value)?,
+                None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
+            };
+            let pattern = config
+                .tasks
+                .directory_pattern
+                .replace("%Y%m%d-%H%M%S", &timestamp)
+                .replace("{slug}", &options.slug);
+            if pattern.contains('%') {
+                return Err(Error::message(
+                    "tasks.directory_pattern contains unsupported chrono directives; use %Y%m%d-%H%M%S and {slug}",
+                ));
+            }
+            let task_id = repo_path(&pattern, "generated task directory")?;
+            if task_id.contains('/') {
+                return Err(Error::message(
+                    "generated task directory must be directly below the repository root",
+                ));
+            }
+            let task_dir = repo.root.join(&task_id);
+            if task_dir.exists() {
+                return Err(Error::message(format!(
+                    "task directory already exists: {}",
+                    task_dir.display()
+                )));
+            }
+            (task_id, task_dir)
+        }
+        TaskKind::Infrastructure => {
+            if options.timestamp.is_some() {
+                return Err(Error::message("infrastructure tasks do not use timestamps"));
+            }
+            if additional_scopes.is_empty() {
+                return Err(Error::message(
+                    "infrastructure task creation requires --scope and --scope-note",
+                ));
+            }
+            let task_id = format!("infra-{}", options.slug);
+            let checkout = repo
+                .common_dir()?
+                .join("workspace-mgr/checkouts")
+                .join(&task_id);
+            if checkout.exists() {
+                return Err(Error::message(format!(
+                    "infrastructure worktree already exists: {}",
+                    checkout.display()
+                )));
+            }
+            (task_id, checkout)
+        }
     };
-    let pattern = config
-        .tasks
-        .directory_pattern
-        .replace("%Y%m%d-%H%M%S", &timestamp)
-        .replace("{slug}", &options.slug);
-    if pattern.contains('%') {
-        return Err(Error::message(
-            "tasks.directory_pattern contains unsupported chrono directives; use %Y%m%d-%H%M%S and {slug}",
-        ));
-    }
-    let task_id = crate::path::repo_path(&pattern, "generated task directory")?;
-    if task_id.contains('/') {
-        return Err(Error::message(
-            "generated task directory must be directly below the repository root",
-        ));
-    }
-    let task_dir = repo.root.join(&task_id);
-    if task_dir.exists() {
-        return Err(Error::message(format!(
-            "task directory already exists: {}",
-            task_dir.display()
-        )));
-    }
     let branch = options
         .branch
         .clone()
-        .unwrap_or_else(|| format!("{}{}", config.publication.branch_prefix, options.slug));
+        .unwrap_or_else(|| match options.kind {
+            TaskKind::Deliverable => {
+                format!("{}{}", config.publication.branch_prefix, options.slug)
+            }
+            TaskKind::Infrastructure => {
+                format!("{}infra-{}", config.publication.branch_prefix, options.slug)
+            }
+        });
     repo.validate_branch(&branch)?;
     if repo
         .optional_oid(&format!("refs/heads/{branch}"))?
@@ -334,19 +376,29 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
     };
     let manifest = TaskManifest {
         schema_version: SCHEMA_VERSION,
+        kind: options.kind,
         id: task_id.clone(),
-        path: task_id.clone(),
+        path: (options.kind == TaskKind::Deliverable).then(|| task_id.clone()),
         branch: branch.clone(),
-        additional_scopes: Vec::new(),
+        title: Some(title.clone()),
+        purpose: Some(purpose.clone()),
+        additional_scopes,
     };
     let readme = format!(
         "# {}\n\n{}\n\n## Directory map\n\n- `README.md` describes this task and its retained outputs.\n- `{}` declares the task scope and target branch.\n",
         title, purpose, config.tasks.manifest_name
     );
-    let files = vec![
-        format!("{task_id}/README.md"),
-        format!("{task_id}/{}", config.tasks.manifest_name),
-    ];
+    let mut manifest_path = match options.kind {
+        TaskKind::Deliverable => task_dir.join(&config.tasks.manifest_name),
+        TaskKind::Infrastructure => task_dir.join("<private-git-state>/task.toml"),
+    };
+    let files = match options.kind {
+        TaskKind::Deliverable => vec![
+            format!("{task_id}/README.md"),
+            format!("{task_id}/{}", config.tasks.manifest_name),
+        ],
+        TaskKind::Infrastructure => Vec::new(),
+    };
     if !options.dry_run {
         repo.run([
             "update-ref",
@@ -356,9 +408,15 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             &base_oid,
             &"0".repeat(40),
         ])?;
-        if let Err(error) =
-            write_task_files(&task_dir, &config.tasks.manifest_name, &readme, &manifest)
-        {
+        let created = match options.kind {
+            TaskKind::Deliverable => {
+                write_task_files(&task_dir, &config.tasks.manifest_name, &readme, &manifest)
+            }
+            TaskKind::Infrastructure => {
+                create_infrastructure_worktree(&repo, &task_dir, &branch, &manifest)
+            }
+        };
+        if let Err(error) = created {
             let rollback = repo.run_unchecked([
                 "update-ref",
                 "-d",
@@ -374,6 +432,11 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
                 )))
             };
         }
+        if options.kind == TaskKind::Infrastructure {
+            manifest_path = GitRepo::discover(&task_dir)?
+                .git_dir()?
+                .join(INFRASTRUCTURE_MANIFEST_NAME);
+        }
     }
     Ok(TaskCreateReport {
         status: if options.dry_run {
@@ -382,12 +445,88 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             "created"
         }
         .to_owned(),
+        kind: options.kind,
         task_id,
         path: task_dir.display().to_string(),
+        manifest: manifest_path.display().to_string(),
         branch,
         base_oid,
         files,
     })
+}
+
+fn create_scopes(options: &TaskCreateOptions) -> Result<Vec<AdditionalScope>> {
+    if options.scopes.is_empty() {
+        if options.scope_note.is_some() {
+            return Err(Error::message("--scope-note requires at least one --scope"));
+        }
+        return Ok(Vec::new());
+    }
+    let reason = one_line(
+        options
+            .scope_note
+            .as_deref()
+            .ok_or_else(|| Error::message("--scope requires --scope-note"))?,
+        "scope note",
+    )?;
+    let mut paths = options
+        .scopes
+        .iter()
+        .map(|path| repo_path(path, "task scope"))
+        .collect::<Result<Vec<_>>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths
+        .into_iter()
+        .map(|path| AdditionalScope {
+            path,
+            reason: reason.clone(),
+        })
+        .collect())
+}
+
+fn create_infrastructure_worktree(
+    repo: &GitRepo,
+    checkout: &Path,
+    branch: &str,
+    manifest: &TaskManifest,
+) -> Result<()> {
+    let parent = checkout
+        .parent()
+        .ok_or_else(|| Error::message("infrastructure worktree has no parent"))?;
+    fs::create_dir_all(parent).at(parent)?;
+    let added = repo.run_unchecked([
+        "worktree",
+        "add",
+        "--quiet",
+        &checkout.to_string_lossy(),
+        branch,
+    ])?;
+    if !added.success() {
+        return Err(Error::message(format!(
+            "failed to create infrastructure worktree: {}",
+            added.stderr.trim()
+        )));
+    }
+    let result = (|| {
+        let worktree = GitRepo::discover(checkout)?;
+        dvc::link_private_worktree_state(repo, &worktree)?;
+        let path = worktree.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
+        atomic_write(&path, &manifest.render()?)
+    })();
+    if let Err(error) = result {
+        let cleanup =
+            repo.run_unchecked(["worktree", "remove", "--force", &checkout.to_string_lossy()])?;
+        return if cleanup.success() {
+            Err(error)
+        } else {
+            Err(Error::message(format!(
+                "infrastructure task creation failed: {error}; worktree cleanup also failed: {}",
+                cleanup.stderr.trim()
+            )))
+        };
+    }
+    Ok(())
 }
 
 fn write_task_files(

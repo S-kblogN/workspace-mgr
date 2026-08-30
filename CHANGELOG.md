@@ -24,6 +24,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Bidirectional Git/S3 placement transitions, ordinary Git refresh
   materialization, repository-wide operation locking, and tracked-input
   hardening.
+- First-class infrastructure tasks with explicit shared scopes, private task
+  metadata, isolated worktrees, private storage-state handoff, and scoped
+  publication without timestamped repository task directories.
+- A provider-neutral review policy and publication handoff that assigns
+  pull-request creation, living metadata, verification, and merge authority
+  while keeping hosting-provider API calls outside the CLI.
 
 ### Fixed
 

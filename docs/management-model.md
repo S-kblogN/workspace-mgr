@@ -48,10 +48,13 @@ These are four views of one reviewable intention:
 - The **target branch** is the task's publication lane.
 - The **draft pull request** is the task's review and merge record.
 
-The task directory holds the conversation's retained inputs, working files,
-tools, evidence, and deliverables. Its README explains the task's current
-purpose and important outputs; it is not a transcript or chronological log.
-Its manifest records the task identity, declared Task scope, and target branch.
+An ordinary deliverable task directory holds the conversation's retained
+inputs, working files, tools, evidence, and deliverables. Its README explains
+the task's current purpose and important outputs; it is not a transcript or
+chronological log. Its manifest records the task identity, declared scope, and
+target branch. An infrastructure task instead has an isolated worktree and a
+private manifest because its content belongs at shared repository paths rather
+than inside a timestamped deliverable directory.
 
 The task directory is the default ownership boundary. If the user asks the
 agent to change a shared path elsewhere in the repository, the agent records
@@ -70,10 +73,11 @@ task when work should be reviewed or merged independently. Unrelated chats must
 not share a task, branch, or pull request.
 
 A repository-infrastructure change follows the same relationship. It is still
-one task with one branch and one pull request, but its explicitly declared
-scope contains shared policy, root entrypoints, CI, or other repository-wide
-mechanisms. Infrastructure is a kind of task, not a bypass around task
-ownership.
+one task with one branch and one pull request, but `task create --kind
+infrastructure` gives it an isolated worktree, private task metadata, no
+timestamped repository task directory, and an explicitly declared scope of
+shared policy, root entrypoints, CI, or other repository-wide mechanisms.
+Infrastructure is a kind of task, not a bypass around task ownership.
 
 The draft-pull-request relationship is the default review model. A repository
 may explicitly disable that hosting requirement; the conversation, task, and
@@ -132,10 +136,21 @@ remote revision. The Git revision is the publication point for the combined
 state: a published branch must never refer to missing S3 content.
 
 Publishing makes the target branch ready for review; it does not merge it. The
-agent or user maintains the corresponding draft pull request through the
-repository's hosting workflow. `workspace-mgr` does not create, edit, approve,
-or merge that pull request through a hosting-provider API. Merging remains an
-explicit user, reviewer, or maintainer decision.
+actor selected by repository review policy maintains the corresponding pull
+request through the repository's hosting workflow. `workspace-mgr` does not
+create, edit, approve, or merge that pull request through a hosting-provider
+API. Merging remains an explicit authorized action.
+
+When repository policy assigns review management to the agent, the agent must
+query by head branch after the first successful publish, reuse an existing open
+pull request or create exactly one, and never create a duplicate. It owns the
+title and living description and updates them whenever the goal, scope,
+deliverables, validation, or known limitations materially change. It then
+verifies the base branch, head branch, review state, and that the pull-request
+head revision equals the revision reported by `publish`. Provider failures are
+blockers to full synchronization. When merge authority belongs to the user, the
+agent must not merge, enable auto-merge, approve, close, or mark the request
+ready.
 
 A task is fully synchronized when its local and remote branch revisions match,
 its pull-request description reflects the same intention, and a final plan

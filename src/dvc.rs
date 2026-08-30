@@ -866,17 +866,7 @@ pub fn prepare_revision(
         let checkout_repo = GitRepo {
             root: checkout.clone(),
         };
-        let shared_cache = repo.root.join(".dvc/cache");
-        fs::create_dir_all(&shared_cache).at(&shared_cache)?;
-        let checkout_cache = checkout.join(".dvc/cache");
-        if !checkout_cache.exists() {
-            symlink_dir(&shared_cache, &checkout_cache)?;
-        }
-        let shared_local = repo.root.join(".dvc/config.local");
-        let checkout_local = checkout.join(".dvc/config.local");
-        if shared_local.is_file() && !checkout_local.exists() {
-            symlink_file(&shared_local, &checkout_local)?;
-        }
+        link_private_worktree_state(repo, &checkout_repo)?;
         let outputs = output_paths(&checkout_repo, pointers)?;
         let args = ["fetch".to_owned(), "--".to_owned()]
             .into_iter()
@@ -898,6 +888,24 @@ pub fn prepare_revision(
             "{source}; temporary worktree cleanup also failed: {cleanup_error}"
         ))),
     }
+}
+
+pub fn link_private_worktree_state(source: &GitRepo, checkout: &GitRepo) -> Result<()> {
+    if !checkout.root.join(".dvc").is_dir() {
+        return Ok(());
+    }
+    let shared_cache = source.root.join(".dvc/cache");
+    fs::create_dir_all(&shared_cache).at(&shared_cache)?;
+    let checkout_cache = checkout.root.join(".dvc/cache");
+    if !checkout_cache.exists() {
+        symlink_dir(&shared_cache, &checkout_cache)?;
+    }
+    let shared_local = source.root.join(".dvc/config.local");
+    let checkout_local = checkout.root.join(".dvc/config.local");
+    if shared_local.is_file() && !checkout_local.exists() {
+        symlink_file(&shared_local, &checkout_local)?;
+    }
+    Ok(())
 }
 
 fn prefetch_error(oid: &str, source: Error) -> Error {

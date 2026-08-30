@@ -99,6 +99,11 @@ directory is the default scope. A manifest may declare durable additional
 scopes, while `--include <path> --scope-note <reason>` authorizes an additional
 scope for one invocation.
 
+For shared repository mechanisms, use `--kind infrastructure` with explicit
+`--scope` paths and a `--scope-note`. Run subsequent commands from the isolated
+worktree reported by `task create`; it discovers the private infrastructure
+manifest automatically and creates no timestamped task directory.
+
 ### 5. Choose where retained content lives
 
 Most files need no manual choice. With the default automatic policy, a new file
@@ -177,8 +182,20 @@ Creating and maintaining the task's one draft pull request remains a
 repository-hosting action.
 `workspace-mgr` is provider-neutral: it publishes the branch transaction but
 does not call a GitHub or other hosting API. If repository policy asks for one
-draft pull request per task, the user or agent creates and updates it separately.
-Merging is likewise an explicit reviewer or maintainer action.
+draft pull request per task and assigns management to the agent, the agent finds
+the request by head branch, reuses it or creates exactly one, and never creates
+a duplicate. It keeps the title and living description aligned with the goal,
+scope, deliverables, validation, and known limitations, then verifies the base,
+head, draft/open state, and head revision after every material publication.
+Hosting failures are reported immediately. With the default user merge
+authority, the agent must not merge, enable auto-merge, approve, close, or mark
+the pull request ready.
+
+Repository-wide policy, root entrypoints, CI, and shared storage mechanisms use
+`task create --kind infrastructure`. The command returns an isolated worktree
+and stores task metadata privately rather than creating a timestamped task
+directory. Work and publication happen from that worktree and remain limited to
+the scopes declared at creation.
 
 ### 8. Refresh after merge
 

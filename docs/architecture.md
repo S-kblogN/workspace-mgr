@@ -4,8 +4,10 @@
 
 `workspace-mgr` separates package defaults, tracked repository policy, scoped
 task state, and private runtime state. `.workspace-mgr.toml` contains public
-policy and non-secret locations. Task manifests contain only scope and branch
-state. Private indexes and locks live below the Git common directory. All
+policy and non-secret locations. Task manifests contain identity, purpose,
+scope, and branch state. Deliverable manifests are tracked inside their task
+directories; infrastructure manifests and isolated worktrees live below the
+Git common directory. Private indexes and locks also live there. All
 mutating repository, placement, publication, hydration, and refresh operations
 share a repository lock; task and storage-boundary locks add narrower
 diagnostics.
@@ -47,8 +49,13 @@ For a task publication, the CLI:
    target exists;
 6. stages only declared scopes and rejects gitlinks, invalid placement, and
    whitespace errors;
-7. creates a commit, updates the unmounted local target ref with compare-and-swap
+7. creates a commit, updates the local target ref with compare-and-swap
    semantics, pushes an explicit refspec, and verifies the remote object ID.
+
+Deliverable target refs remain unmounted, so publication never changes the
+shared checkout. An infrastructure target ref is mounted only in its dedicated
+worktree; after the ref update, the CLI synchronizes that worktree's index to
+the published tree without touching its files or any shared checkout.
 
 The Git commit is the publication point for the combined transaction. A later
 Git error may leave an unreferenced S3 object version, but a published Git

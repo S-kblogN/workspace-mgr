@@ -8,13 +8,30 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::repo_path;
 
+pub const INFRASTRUCTURE_MANIFEST_NAME: &str = "workspace-mgr/task.toml";
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskKind {
+    #[default]
+    Deliverable,
+    Infrastructure,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskManifest {
     pub schema_version: u32,
+    #[serde(default)]
+    pub kind: TaskKind,
     pub id: String,
-    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
     #[serde(default)]
     pub additional_scopes: Vec<AdditionalScope>,
 }
@@ -29,9 +46,12 @@ pub struct AdditionalScope {
 #[derive(Debug, Clone)]
 pub struct ResolvedTask {
     pub manifest_path: PathBuf,
+    pub kind: TaskKind,
     pub task_id: String,
-    pub task_path: String,
+    pub task_path: Option<String>,
     pub branch: String,
+    pub title: Option<String>,
+    pub purpose: Option<String>,
     pub remote: String,
     pub base_branch: String,
     pub shared_head: String,
@@ -51,16 +71,6 @@ impl ResolvedTask {
             path: path.to_path_buf(),
             source,
         })?;
-        let file_name = absolute
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::message("manifest file name is not valid UTF-8"))?;
-        if file_name != config.tasks.manifest_name {
-            return Err(Error::message(format!(
-                "task manifest must be named {:?}",
-                config.tasks.manifest_name
-            )));
-        }
         let raw = fs::read_to_string(&absolute).at(&absolute)?;
         let manifest: TaskManifest = toml::from_str(&raw).map_err(|source| Error::Toml {
             path: absolute.clone(),
@@ -72,32 +82,71 @@ impl ResolvedTask {
                 manifest.schema_version, SCHEMA_VERSION
             )));
         }
-        let task_path = repo_path(&manifest.path, "task path")?;
-        if task_path.contains('/') {
-            return Err(Error::message(
-                "task path must be a directory directly below the repository root",
-            ));
-        }
         let task_id = one_line(&manifest.id, "task id")?;
-        if task_id != task_path {
-            return Err(Error::message(format!(
-                "task id must match task path {task_path:?}; got {task_id:?}"
-            )));
-        }
-        let expected = repo.root.join(&task_path).join(&config.tasks.manifest_name);
-        if absolute != expected {
-            return Err(Error::message(format!(
-                "task manifest must be located at {}; got {}",
-                expected.display(),
-                absolute.display()
-            )));
-        }
         let additional_scopes = validate_scopes(manifest.additional_scopes)?;
+        let task_path = match manifest.kind {
+            TaskKind::Deliverable => {
+                let raw_path = manifest
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| Error::message("deliverable task manifest requires path"))?;
+                let task_path = repo_path(raw_path, "task path")?;
+                if task_path.contains('/') {
+                    return Err(Error::message(
+                        "task path must be a directory directly below the repository root",
+                    ));
+                }
+                if task_id != task_path {
+                    return Err(Error::message(format!(
+                        "task id must match task path {task_path:?}; got {task_id:?}"
+                    )));
+                }
+                let expected = repo.root.join(&task_path).join(&config.tasks.manifest_name);
+                if absolute != expected {
+                    return Err(Error::message(format!(
+                        "deliverable task manifest must be located at {}; got {}",
+                        expected.display(),
+                        absolute.display()
+                    )));
+                }
+                Some(task_path)
+            }
+            TaskKind::Infrastructure => {
+                if manifest.path.is_some() {
+                    return Err(Error::message(
+                        "infrastructure task manifest must not declare a task path",
+                    ));
+                }
+                if additional_scopes.is_empty() {
+                    return Err(Error::message(
+                        "infrastructure task manifest requires at least one declared scope",
+                    ));
+                }
+                let expected = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
+                if absolute != expected {
+                    return Err(Error::message(format!(
+                        "infrastructure task manifest must be private worktree state at {}; got {}",
+                        expected.display(),
+                        absolute.display()
+                    )));
+                }
+                None
+            }
+        };
         Ok(Self {
             manifest_path: absolute,
+            kind: manifest.kind,
             task_id,
             task_path,
             branch: one_line(&manifest.branch, "task branch")?,
+            title: manifest
+                .title
+                .map(|value| one_line(&value, "task title"))
+                .transpose()?,
+            purpose: manifest
+                .purpose
+                .map(|value| one_line(&value, "task purpose"))
+                .transpose()?,
             remote: config.publication.remote.clone(),
             base_branch: config.publication.base_branch.clone(),
             shared_head: config.publication.shared_checkout_branch.clone(),
@@ -133,6 +182,10 @@ impl ResolvedTask {
                 break;
             }
         }
+        let infrastructure = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
+        if infrastructure.is_file() {
+            return Ok(infrastructure);
+        }
         Err(Error::message(format!(
             "no task manifest found from {} to {}",
             start.display(),
@@ -141,7 +194,9 @@ impl ResolvedTask {
     }
 
     pub fn scopes(&self) -> Vec<String> {
-        std::iter::once(self.task_path.clone())
+        self.task_path
+            .iter()
+            .cloned()
             .chain(
                 self.additional_scopes
                     .iter()

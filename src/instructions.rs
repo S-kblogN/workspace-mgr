@@ -3,7 +3,9 @@ use std::fs;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Profile};
+use crate::config::{
+    Config, MergeAuthority, Profile, PullRequestPolicy, PullRequestState, ReviewManager,
+};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::reject_symlink_traversal;
@@ -134,26 +136,62 @@ fn include_module(config: &Config, topic: &str, topic_name: &str, module: &str) 
 }
 
 fn core_section() -> String {
-    "## Operating model\n\n- Read-only requests do not require a task directory.\n- User authorization overrides repository defaults only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level tools.\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
+    "## Operating model\n\n- Read-only requests do not require a task directory.\n- User authorization overrides repository defaults only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-content mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level Git or storage tools. Repository-hosting review metadata remains an agent or user responsibility when the review policy below requires it.\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
         .to_owned()
 }
 
 fn task_section(config: &Config) -> String {
     format!(
-        "## Task lifecycle\n\n- Create a new writable task with `workspace-mgr task create <slug> --title <title> --purpose <purpose>`.\n- Task directories follow `{}` and use branches prefixed with `{}`.\n- Reuse the same task for the full conversation or work item. Do not write into another active task without explicit authorization.\n- Keep the task README concise and current. It describes purpose and outputs, and includes a `## Directory map`; it is not a chronological log.\n- The task manifest is the authoritative task scope. Additional repository paths require a concise authorization reason.\n- Use `workspace-mgr task status` to inspect the resolved task before publishing.",
+        "## Task lifecycle\n\n- Create ordinary writable work with `workspace-mgr task create <slug> --title <title> --purpose <purpose>`. Create repository-wide work with `workspace-mgr task create <slug> --kind infrastructure --title <title> --purpose <purpose> --scope <path> --scope-note <reason>`.\n- Deliverable task directories follow `{}`. Infrastructure tasks use a private manifest and isolated worktree instead of a repository task directory. Both use branches prefixed with `{}`.\n- Reuse the same task for the full conversation or work item. Do not write into another active task without explicit authorization.\n- Keep a deliverable task README concise and current. It describes purpose and outputs, and includes a `## Directory map`; it is not a chronological log.\n- The task manifest is the authoritative task scope. Additional repository paths require a concise authorization reason.\n- Use `workspace-mgr task status` to inspect the resolved task before publishing.",
         config.tasks.directory_pattern, config.publication.branch_prefix
     )
 }
 
 fn publication_section(config: &Config) -> String {
-    let review_note = if config.tasks.draft_pull_request {
-        "Maintain one draft pull request per task branch using the repository hosting workflow. Keep its title and living description current. `workspace-mgr` publishes the branch transaction but does not call a hosting provider API."
-    } else {
-        "Follow the repository hosting workflow when a review request is needed."
+    let review = review_section(config);
+    format!(
+        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming repository content is current.\n- `{}` is the configured base branch on remote `{}`.\n\n{review}",
+        config.publication.base_branch, config.publication.remote
+    )
+}
+
+fn review_section(config: &Config) -> String {
+    if config.review.pull_request == PullRequestPolicy::Disabled {
+        return "## Pull request responsibility\n\n- This repository disables pull requests for workspace-mgr tasks. Do not create one unless the user explicitly overrides this policy. `workspace-mgr` still publishes and verifies the task branch."
+            .to_owned();
+    }
+    let (requirement, creation) = match config.review.pull_request {
+        PullRequestPolicy::Required => (
+            "A task is not fully synchronized until its one matching pull request is current.",
+            "After the first successful publish",
+        ),
+        PullRequestPolicy::Optional => (
+            "Create a pull request when the user or repository workflow requests review.",
+            "When review is requested after a successful publish",
+        ),
+        PullRequestPolicy::Disabled => unreachable!(),
+    };
+    let state = match config.review.initial_state {
+        PullRequestState::Draft => "draft",
+        PullRequestState::Ready => "ready for review",
+    };
+    let management = match config.review.managed_by {
+        ReviewManager::Agent => format!(
+            "- {creation}, the agent must query the hosting provider for the task's head branch. Reuse its existing open pull request or create exactly one {state} pull request; never create a duplicate.\n- The agent owns the pull-request title and living description. Keep them aligned with the current goal, declared scope, important deliverables, validation evidence, and known limitations. Update them after every materially changed publication.\n- After creating or updating the pull request, verify that it is open, its base and head branches are correct, its review state is `{state}`, and its head revision equals the remote revision reported by `workspace-mgr publish`."
+        ),
+        ReviewManager::User => "- The user manages pull-request creation and metadata. The agent must report the verified remote, base branch, head branch, revision, scope, and validation handoff without creating or editing a pull request."
+            .to_owned(),
+    };
+    let merge = match config.review.merge_authority {
+        MergeAuthority::User => {
+            "- The agent must not merge, enable auto-merge, approve, close, or change a draft pull request to ready. Those transitions belong to the user or maintainer unless the user explicitly overrides this repository policy."
+        }
+        MergeAuthority::Agent => {
+            "- The agent may perform merge-state transitions only when the user explicitly requests them and repository review conditions are satisfied."
+        }
     };
     format!(
-        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming publication is current.\n- {review_note}\n- `{}` is the configured base branch on remote `{}`.",
-        config.publication.base_branch, config.publication.remote
+        "## Pull request responsibility\n\n- `workspace-mgr` publishes and verifies repository state but never calls a hosting-provider API. Pull-request operations are a separate agent or user responsibility.\n- {requirement}\n{management}\n- If hosting authentication, permissions, connectivity, or metadata verification fails, report the blocker immediately and do not claim the task is fully synchronized.\n{merge}"
     )
 }
 
@@ -188,6 +226,6 @@ fn shared_checkout_section(config: &Config) -> String {
 }
 
 fn infrastructure_section() -> String {
-    "## Repository infrastructure\n\n- Treat a change to shared policy, root entrypoints, CI, or repository-wide storage configuration as one infrastructure task with one target branch and one draft pull request.\n- Keep its declared shared paths and task metadata isolated from ordinary deliverable content. Every path outside the task directory requires an explicit scope reason.\n- Infrastructure storage tests use fresh temporary repositories and local or mock remotes. They must not read user cloud credentials or contact a real storage service."
+    "## Repository infrastructure\n\n- Treat a change to shared policy, root entrypoints, CI, or repository-wide storage configuration as one infrastructure task with one target branch and one pull request when review policy requires it.\n- Create it with `workspace-mgr task create <slug> --kind infrastructure --title <title> --purpose <purpose> --scope <path> --scope-note <reason>`. Repeat `--scope` for every authorized shared path.\n- Work only in the isolated worktree returned by the command. An infrastructure task has private task metadata and no timestamped repository task directory.\n- Run task, storage, plan, and publish commands from that worktree. Do not add unrelated deliverable paths to its declared infrastructure scope.\n- Infrastructure storage tests use fresh temporary repositories and local or mock remotes. They must not read user cloud credentials or contact a real storage service."
         .to_owned()
 }

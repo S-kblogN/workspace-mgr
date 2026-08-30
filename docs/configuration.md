@@ -19,7 +19,12 @@ enabled = true
 directory_pattern = "%Y%m%d-%H%M%S-{slug}"
 manifest_name = ".workspace-mgr-task.toml"
 require_readme = true
-draft_pull_request = true
+
+[review]
+pull_request = "required"
+initial_state = "draft"
+managed_by = "agent"
+merge_authority = "user"
 
 [storage]
 default = "auto"
@@ -77,18 +82,35 @@ Task manifests contain task-specific state only:
 
 ```toml
 schema_version = 1
+kind = "deliverable"
 id = "20260829-170000-example"
 path = "20260829-170000-example"
 branch = "codex/example"
+title = "Example"
+purpose = "Produce one reviewable example"
 
 [[additional_scopes]]
 path = "docs/shared.md"
 reason = "The user explicitly requested this shared documentation change"
 ```
 
-`require_readme` is checked before publication. `draft_pull_request` affects the
-generated review instructions; provider-specific pull-request API calls remain
-outside the core transaction engine.
+An infrastructure manifest uses `kind = "infrastructure"`, omits `path`, and
+requires at least one `additional_scopes` entry. It is stored in private
+worktree Git state rather than committed to the repository.
+
+`require_readme` is checked for deliverable tasks before publication.
+Infrastructure task metadata is private Git worktree state and has no README or
+timestamped repository directory.
+
+## Review
+
+`review.pull_request` is `required`, `optional`, or `disabled`.
+`initial_state` is `draft` or `ready`; `managed_by` is `agent` or `user`; and
+`merge_authority` is `user` or `agent`. The defaults require the agent to create
+and maintain exactly one draft pull request while reserving merge-state actions
+for the user. These values generate an explicit agent responsibility contract
+and a structured publication handoff. They never make `workspace-mgr` call a
+GitHub or other hosting-provider API.
 
 ## Agent instruction modules
 

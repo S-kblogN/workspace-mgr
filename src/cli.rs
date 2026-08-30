@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Profile, StorageTarget};
+use crate::manifest::TaskKind;
 use crate::output::Format;
 
 #[derive(Debug, Parser)]
@@ -128,7 +129,7 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Create a timestamped task directory, manifest, README, and branch.
+    /// Create a deliverable workspace or isolated infrastructure worktree.
     Create(TaskCreateArgs),
     /// Inspect the resolved task scope and working changes.
     Status(TaskStatusArgs),
@@ -143,6 +144,17 @@ pub struct TaskCreateArgs {
 
     #[arg(long)]
     pub purpose: String,
+
+    #[arg(long, value_enum, default_value = "deliverable")]
+    pub kind: TaskKind,
+
+    /// Declare an infrastructure path. Repeat for multiple paths.
+    #[arg(long = "scope")]
+    pub scopes: Vec<String>,
+
+    /// Explain why the declared infrastructure paths are authorized.
+    #[arg(long, requires = "scopes")]
+    pub scope_note: Option<String>,
 
     #[arg(long)]
     pub branch: Option<String>,
@@ -361,6 +373,23 @@ mod tests {
                 "--branch",
                 "review/training-report",
                 "--dry-run",
+            ],
+            &[
+                "task",
+                "create",
+                "shared-policy",
+                "--kind",
+                "infrastructure",
+                "--title",
+                "Shared policy",
+                "--purpose",
+                "Update repository policy",
+                "--scope",
+                "AGENTS.md",
+                "--scope",
+                ".github/workflows/ci.yml",
+                "--scope-note",
+                "The user requested this infrastructure change",
             ],
             &["task", "status", "--manifest", "task/manifest.toml"],
             &["storage", "status"],

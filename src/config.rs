@@ -28,6 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub tasks: TaskConfig,
     #[serde(default)]
+    pub review: ReviewConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -49,7 +51,48 @@ pub struct TaskConfig {
     pub directory_pattern: String,
     pub manifest_name: String,
     pub require_readme: bool,
-    pub draft_pull_request: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewConfig {
+    pub pull_request: PullRequestPolicy,
+    pub initial_state: PullRequestState,
+    pub managed_by: ReviewManager,
+    pub merge_authority: MergeAuthority,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullRequestPolicy {
+    #[default]
+    Required,
+    Optional,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullRequestState {
+    #[default]
+    Draft,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewManager {
+    #[default]
+    Agent,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeAuthority {
+    #[default]
+    User,
+    Agent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +139,17 @@ impl Default for TaskConfig {
             directory_pattern: "%Y%m%d-%H%M%S-{slug}".to_owned(),
             manifest_name: ".workspace-mgr-task.toml".to_owned(),
             require_readme: true,
-            draft_pull_request: true,
+        }
+    }
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            pull_request: PullRequestPolicy::Required,
+            initial_state: PullRequestState::Draft,
+            managed_by: ReviewManager::Agent,
+            merge_authority: MergeAuthority::User,
         }
     }
 }
@@ -154,6 +207,7 @@ impl Config {
                 branch_prefix: "codex/".to_owned(),
             },
             tasks: TaskConfig::default(),
+            review: ReviewConfig::default(),
             storage: StorageConfig::default(),
             agent: AgentConfig { modules },
         }

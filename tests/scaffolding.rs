@@ -99,6 +99,76 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 }
 
 #[test]
+fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["init", "--profile", "shared-checkout"]);
+    fixture.commit_seed("Add workspace policy");
+    fixture.clone_shared();
+
+    let created = workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "shared-policy",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "Shared policy",
+            "--purpose",
+            "Update one repository-wide policy file.",
+            "--scope",
+            "shared-policy.md",
+            "--scope-note",
+            "The user requested this repository-wide policy change.",
+        ],
+    );
+    let created = json(&created);
+    assert_eq!(created["kind"], "infrastructure");
+    assert_eq!(created["task_id"], "infra-shared-policy");
+    assert_eq!(created["branch"], "codex/infra-shared-policy");
+    let worktree = std::path::PathBuf::from(created["path"].as_str().unwrap());
+    let manifest = std::path::PathBuf::from(created["manifest"].as_str().unwrap());
+    assert!(worktree.is_dir());
+    assert!(manifest.is_file());
+    assert!(!fixture.shared.join("infra-shared-policy").exists());
+    assert_eq!(
+        String::from_utf8_lossy(&git(&worktree, ["branch", "--show-current"]).stdout).trim(),
+        "codex/infra-shared-policy"
+    );
+
+    let status = workspace(&worktree, ["task", "status"]);
+    assert_eq!(json(&status)["kind"], "infrastructure");
+    assert_eq!(
+        json(&status)["scopes"],
+        serde_json::json!(["shared-policy.md"])
+    );
+    let explicit = workspace(
+        &fixture.shared,
+        ["task", "status", "--manifest", manifest.to_str().unwrap()],
+    );
+    assert_eq!(json(&explicit)["branch"], "codex/infra-shared-policy");
+    std::fs::write(worktree.join("shared-policy.md"), "shared policy\n").unwrap();
+    let published = workspace(&worktree, ["publish", "-m", "Publish shared policy"]);
+    let published = json(&published);
+    assert_eq!(published["status"], "pushed");
+    assert_eq!(published["head"], "codex/infra-shared-policy");
+    assert_eq!(published["review"]["pull_request"], "required");
+    assert_eq!(published["review"]["managed_by"], "agent");
+    assert_eq!(published["review"]["merge_authority"], "user");
+    assert!(git(&worktree, ["status", "--short"]).stdout.is_empty());
+    let commit = published["commit_oid"].as_str().unwrap();
+    assert!(
+        git_unchecked(
+            &fixture.shared,
+            ["cat-file", "-e", &format!("{commit}:shared-policy.md")],
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
 fn setup_dry_run_reports_private_runtime_without_installing_it() {
     let fixture = GitFixture::new();
     let runtime = fixture.root.join("private-runtime");
