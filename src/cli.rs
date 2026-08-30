@@ -35,7 +35,7 @@ pub enum Command {
     /// Initialize or adopt repository policy and scaffolding.
     Init(InitArgs),
 
-    /// Print the shared management model and effective repository instructions.
+    /// Print the shared workspace model and effective repository instructions.
     Instructions(InstructionsArgs),
 
     /// Diagnose dependencies, configuration, and repository state.

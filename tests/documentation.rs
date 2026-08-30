@@ -5,6 +5,7 @@ use workspace_mgr::cli::Cli;
 fn user_documentation_covers_the_complete_public_model() {
     let readme = include_str!("../README.md");
     let model = include_str!("../docs/management-model.md");
+    let normalized_model = model.split_whitespace().collect::<Vec<_>>().join(" ");
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
 
@@ -13,22 +14,25 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(readme.contains("docs/guide.md"));
     assert!(readme.contains("docs/commands.md"));
     for concept in [
-        "conversation",
-        "task",
-        "target branch",
-        "draft pull request",
+        "general-purpose collaborator",
+        "user-facing interface",
+        "durable workspace",
         "Task scope",
         "Storage placement",
-        "Publication",
-        "shared checkout",
+        "remote visibility boundary",
+        "multiple chats",
     ] {
-        assert!(model.contains(concept), "model is missing {concept}");
+        assert!(
+            normalized_model.contains(concept),
+            "model is missing {concept}"
+        );
     }
-    assert!(model.contains(
+    assert!(normalized_model.contains(
         "one writable conversation (chat) = one task = one target branch = one draft pull request"
     ));
-    assert!(model.contains("Infrastructure is a kind of task"));
-    assert!(model.contains("Placement and publication are separate"));
+    assert!(normalized_model.contains("Infrastructure is a kind of task"));
+    assert!(normalized_model.contains("the user asks for outcomes"));
+    assert!(normalized_model.contains("None of these operations publishes a task"));
     for command in [
         "setup",
         "init",

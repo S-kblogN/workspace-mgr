@@ -5,12 +5,13 @@ coding agents. It creates the repository and task scaffolding, explains the
 effective repository policy, decides where retained content lives, and
 publishes a task without switching a shared checkout.
 
-Begin with the [repository management model](management-model.md). It explains
-the one-conversation/one-task/one-branch/one-PR relationship, separates task
-scope from Git/S3 placement, and defines publication and shared-checkout
-semantics before introducing commands. The same source document appears first
-in the default output of `workspace-mgr instructions`, so users and agents
-reason from one model rather than parallel summaries.
+Begin with the [workspace model](management-model.md). It explains why this
+repository exists as a durable workspace for general-purpose conversations with
+coding agents, how one writable chat maps to one task/branch/PR, and how scope,
+Git/S3 placement, publication, and concurrent chats fit together. The same
+source document appears first in the default output of `workspace-mgr
+instructions`, so users and agents reason from one model rather than parallel
+summaries.
 
 The sections below apply that model as an operational lifecycle. The public
 storage vocabulary deliberately contains only **Git** and **S3**; users and
@@ -65,7 +66,7 @@ workspace-mgr instructions --repo .
 ```
 
 `instructions` is intentionally different from `help`: help explains command
-syntax, while instructions first establishes the shared management model and
+syntax, while instructions first establishes the shared workspace model and
 then renders the repository's actual operating policy. The output combines the
 canonical model document, built-in policy modules, `.workspace-mgr.toml`, and
 the optional repository-specific module. Run `workspace-mgr doctor` before work

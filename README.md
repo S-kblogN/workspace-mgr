@@ -14,9 +14,10 @@ The public model has two storage locations:
 Users and agents choose between those concepts; the lower-level engines remain
 implementation details.
 
-Start with the [repository management model](docs/management-model.md) for the
-one-conversation/one-task/one-branch/one-PR relationship, scope, placement,
-publication, and shared-checkout semantics. Continue with the
+Start with the [workspace model](docs/management-model.md) to understand how a
+user can treat a coding agent as a general-purpose collaborator, how a writable
+chat becomes one task/branch/PR, and how scope, placement, publication, and the
+shared checkout fit together. Continue with the
 [user guide](docs/guide.md) for the lifecycle. The
 [command reference](docs/commands.md) documents every public command, option,
 side effect, and example.
@@ -64,8 +65,8 @@ path's placement. `storage hydrate` materializes S3 content without publishing.
 
 `workspace-mgr init` installs a deliberately small `AGENTS.md` that tells the
 agent to run `workspace-mgr instructions --repo .`. The generated document
-begins with the same [repository management model](docs/management-model.md)
-read by users, then combines product-owned policy modules, repository
+begins with the same [workspace model](docs/management-model.md) read by users,
+then combines product-owned policy modules, repository
 configuration, and an optional repository-specific module. This keeps the
 bootstrap stable while allowing both the model and effective policy to evolve
 with the CLI.

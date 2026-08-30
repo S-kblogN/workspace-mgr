@@ -49,7 +49,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 
     let instructions = workspace(&fixture.shared, ["--format", "human", "instructions"]);
     let text = String::from_utf8(instructions.stdout).unwrap();
-    let model = text.find("# Repository management model").unwrap();
+    let model = text.find("# How this workspace works").unwrap();
     let rules = text.find("# Effective repository instructions").unwrap();
     assert!(
         model < rules,
@@ -65,7 +65,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
         ["--format", "human", "instructions", "model"],
     );
     let model_only = String::from_utf8(model_only.stdout).unwrap();
-    assert!(model_only.contains("# Repository management model"));
+    assert!(model_only.contains("# How this workspace works"));
     assert!(!model_only.contains("# Effective repository instructions"));
 
     let doctor = workspace(&fixture.shared, ["--format", "json", "doctor"]);

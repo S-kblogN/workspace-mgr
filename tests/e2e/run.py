@@ -496,7 +496,7 @@ class Harness:
         disabled = self.wm(self.shared, "instructions", "infrastructure", expected=2)
         self.check("disabled" in disabled["stderr"], "disabled instruction module is rejected")
         all_instructions = self.wm(self.shared, "instructions")
-        model_heading = all_instructions["markdown"].find("# Repository management model")
+        model_heading = all_instructions["markdown"].find("# How this workspace works")
         rules_heading = all_instructions["markdown"].find("# Effective repository instructions")
         self.check(
             0 <= model_heading < rules_heading,
@@ -505,6 +505,10 @@ class Harness:
         self.check(
             "one writable conversation (chat) = one task" in all_instructions["markdown"],
             "instructions explain the conversation-task-branch-PR relationship",
+        )
+        self.check(
+            "general-purpose collaborator" in all_instructions["markdown"],
+            "instructions explain the workspace purpose before its mechanics",
         )
         self.check(
             "Preserve this repository-specific rule" in all_instructions["markdown"],

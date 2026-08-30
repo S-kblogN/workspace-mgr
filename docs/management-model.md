@@ -1,156 +1,193 @@
-# Repository management model
+# How this workspace works
 
-`workspace-mgr` treats repository work as a set of reviewable intentions, not
-as a collection of ad hoc file and Git commands. Its job is to preserve the
-relationship between why a change exists, which paths belong to it, where its
-content is stored, and how it becomes visible to reviewers.
+## What this repository is for
 
-This model is shared by people and coding agents. A person can use it to reason
-about repository state; an agent must use it as the context for the concrete
-rules that follow it in `workspace-mgr instructions`.
+This repository is a durable workspace for conversations between a user and
+coding agents. `workspace-mgr` exists to make that kind of workspace practical:
+it lets the user treat a coding agent as a general-purpose collaborator, not
+only as a tool for editing an existing software project.
 
-## One writable conversation is one reviewable task
+The user can start a chat and ask for any kind of work the agent can perform:
+research a question, compare products, study a paper, write a report, analyze
+data, prepare media, build software, organize records, or combine several of
+those activities. The chat is the user-facing interface. The repository gives
+that conversation a place to retain inputs, working materials, outputs, and
+reproducibility evidence when the result should outlive the chat.
 
-For work that changes a repository, the central relationship is:
+The user should normally describe the desired outcome rather than plan task
+directories, branches, commits, or storage mechanics. The agent translates the
+request into repository operations and reports the resulting task, artifacts,
+and review state. The user may still make repository-level choices when they
+matter, such as explicitly asking for an artifact to be stored in Git or S3,
+requesting a shared repository change, or deciding when a pull request should
+be merged.
+
+`workspace-mgr` is the management interface behind this workspace. It gives the
+agent a consistent way to create a task, bound its scope, place retained
+content, publish a reviewable result, and coexist with other chats. It is not
+the subject of the user's work; it is the mechanism that keeps the workspace
+safe and understandable while the agent carries out that work.
+
+A chat that remains purely conversational or read-only does not need to create
+repository state. As soon as a chat needs to create, change, download,
+generate, or retain files, it becomes a writable conversation and owns exactly
+one task in this workspace.
+
+## From a chat to a task
+
+For repository-writing work, the central relationship is:
 
 ```text
 one writable conversation (chat) = one task = one target branch = one draft pull request
 ```
 
-These are four views of the same reviewable intention:
+These are four views of one reviewable intention:
 
-- The **conversation** contains the request, decisions, and authorization.
-- The **task** is its durable repository representation: purpose, owned paths,
-  working files, and publication state.
-- The **target branch** is the task's publication lane. It can advance without
-  switching the shared checkout away from its shared branch.
-- The **draft pull request** is the task's review and merge record. Its title and
-  description should continue to describe the same intention as the task.
+- The **conversation** contains the user's goal, decisions, and authorization.
+- The **task** is the durable workspace for that conversation.
+- The **target branch** is the task's publication lane.
+- The **draft pull request** is the task's review and merge record.
 
-This is the default review model. A repository may explicitly disable the draft
-pull-request requirement; that changes only the hosting review surface. The
-conversation, task, and target branch remain one-to-one, and the effective
-repository instructions state whether a pull request is required.
+The task directory holds the conversation's retained inputs, working files,
+tools, evidence, and deliverables. Its README explains the task's current
+purpose and important outputs; it is not a transcript or chronological log.
+Its manifest records the task identity, declared Task scope, and target branch.
 
-A managed task has a dedicated directory, a concise README, and a manifest.
-The README explains what the task is producing; the manifest defines the paths
-the task owns and the branch to which it publishes. Paths outside that declared
-scope require an explicit reason, so a narrow request cannot silently become a
-repository-wide change.
+The task directory is the default ownership boundary. If the user asks the
+agent to change a shared path elsewhere in the repository, the agent records
+that additional scope and the reason it was authorized. This makes the user's
+request auditable without turning a narrow task into permission to modify
+unrelated repository state.
 
-`task create` establishes the local task, scope, and target-branch identity;
-it does not publish a remote branch or create a pull request. `task status`
-resolves that identity and reports its current scoped state without publishing.
+`task create` establishes the local task, README, manifest, scope, and branch
+identity. It does not publish a remote branch or create a pull request.
+`task status` resolves the current task and reports its scoped state without
+publishing.
 
-Continue using the same task, branch, and pull request while pursuing the same
-intention. Start a new set when work should be reviewed or merged independently.
-Do not share one active task between unrelated conversations, and do not place
-unrelated changes into the same pull request. A read-only conversation creates
-none of these objects because it has no repository change to publish.
+The same chat continues using the same task for its lifetime. Continue using
+the same branch and pull request when refining that same intention. Start a new
+task when work should be reviewed or merged independently. Unrelated chats must
+not share a task, branch, or pull request.
 
-A repository-infrastructure change follows the same one-task/one-branch/one-PR
-relationship. Its declared scope contains shared policy, entrypoints, CI, or
-other repository-wide mechanisms, and its pull request remains isolated from
-ordinary deliverable content. Infrastructure is a kind of task, not a bypass
-around task ownership.
+A repository-infrastructure change follows the same relationship. It is still
+one task with one branch and one pull request, but its explicitly declared
+scope contains shared policy, root entrypoints, CI, or other repository-wide
+mechanisms. Infrastructure is a kind of task, not a bypass around task
+ownership.
 
-`workspace-mgr` publishes the target branch but deliberately does not create,
-edit, approve, or merge a pull request through a hosting provider. The user or
-agent maintains the corresponding draft pull request through the repository's
-hosting workflow, and merging remains an explicit reviewer or maintainer action.
+The draft-pull-request relationship is the default review model. A repository
+may explicitly disable that hosting requirement; the conversation, task, and
+target branch remain one-to-one, and the effective repository instructions say
+whether a pull request is required.
 
-## Scope and placement answer different questions
+## Where task content lives
 
-Every retained path has two independent properties:
+Task scope answers **which conversation owns a path**. Storage placement answers
+**where the retained bytes live**. These are independent properties: putting an
+artifact in S3 does not remove it from the task, and putting it in Git does not
+broaden the task's scope.
 
-1. **Task scope** answers which reviewable intention owns the path.
-2. **Storage placement** answers where the retained bytes live: Git or S3.
+Every retained path has one storage placement:
 
-Putting content in S3 does not remove it from the task, and putting content in
-Git does not broaden the task's scope. The task manifest controls ownership;
-placement controls storage.
+- **Git** is appropriate when content should appear directly in repository
+  history, ordinary clones, and diffs.
+- **S3** is appropriate when content is bulky, binary, or naturally retrieved
+  as versioned data.
 
-Choose **Git** when content should be present directly in repository history,
-ordinary clones, and diffs. Choose **S3** when content is bulky, binary, or best
-retrieved as versioned data. Both are first-class choices. File size supplies
-an automatic default for new content, not an absolute rule: an explicit choice
-may put a large reviewable artifact in Git or a small data artifact in S3.
+Both are first-class choices. File size provides an automatic default for new
+content, not a prohibition. The user or agent may explicitly put a large
+reviewable artifact in Git or a small data artifact in S3 when intent matters
+more than size.
 
-Published placement is stable. A file does not silently move between Git and S3
-merely because its size changes. An explicit placement remains in force until
-it is reset. A directory placed in S3 is one recursive boundary whose
-descendants inherit that placement; overlapping placement boundaries are
-rejected so that every path has one owner and one answer.
+Published placement is stable. Content does not silently move between Git and
+S3 merely because its size changes. An explicit placement remains in force
+until it is reset. A directory placed in S3 is one recursive boundary whose
+descendants inherit that placement; overlapping boundaries are rejected so a
+path never has competing placement owners.
 
-Placement operations express local intent:
+Placement operations describe or change local intent:
 
-- `storage status` explains the effective placement and why it was selected.
+- `storage status` explains where a path is placed and why.
 - `storage set` records an explicit Git or S3 choice.
-- `storage reset` removes that explicit choice and returns to repository policy.
+- `storage reset` removes that choice and returns the path to repository policy.
 - `move` changes a path while preserving its placement.
-- `storage hydrate` reads exact S3 content into the working tree.
+- `storage hydrate` retrieves exact S3 content into the local workspace.
 
-None of those operations publishes a branch or uploads a new task state.
-Placement and publication are separate on purpose.
+None of these operations publishes a task. Placement and publication are
+separate so the agent can organize the proposed result before making it visible
+remotely.
 
-## Publication is the remote visibility boundary
+## From local work to review
 
-Files in the working tree and placement choices are proposed local state.
-`plan` explains the exact task scope, placement decisions, and Git changes that
-would be published. It may inspect remote state, but it does not upload task
-content, create a revision, or advance a remote branch.
+Files in the task directory and local placement choices are proposed task
+state. `plan` explains what the task would publish: its exact scope, placement
+decisions, and Git changes. It may inspect remote state, but it does not upload
+task content, create a revision, or advance a remote branch.
 
-`publish` is the only repository command that writes a task state to remotes.
-For S3-placed content, it uploads and verifies the exact object versions first.
-It then constructs a Git commit from only the declared task scopes, advances
-the task's target branch, and verifies the remote revision. The Git revision is
-the publication point for the combined state: a published branch must never
-refer to missing S3 content.
+`publish` is the remote visibility boundary. It is the only repository command
+that writes a task state to remotes. For S3-placed content, it uploads and
+verifies the exact object versions first. It then constructs a Git commit from
+only the task's declared scopes, advances the target branch, and verifies the
+remote revision. The Git revision is the publication point for the combined
+state: a published branch must never refer to missing S3 content.
 
-Publication makes the branch ready for review; it does not merge it. The draft
-pull request is the human-visible review surface for that branch. A final
-no-change plan, matching local and remote branch revisions, and current pull
-request metadata together establish that the task is fully synchronized.
+Publishing makes the target branch ready for review; it does not merge it. The
+agent or user maintains the corresponding draft pull request through the
+repository's hosting workflow. `workspace-mgr` does not create, edit, approve,
+or merge that pull request through a hosting-provider API. Merging remains an
+explicit user, reviewer, or maintainer decision.
 
-If Git publication fails after S3 upload, an unreferenced S3 object version may
-remain, but no remote Git revision should point to missing content. Retrying the
-same publication is safe. Automatic deletion of shared remote history is not
-part of normal repository management.
+A task is fully synchronized when its local and remote branch revisions match,
+its pull-request description reflects the same intention, and a final plan
+reports no remaining task changes.
 
-## A shared checkout is a coordination surface
+If Git publication fails after an S3 upload, an unreferenced S3 object version
+may remain, but no remote Git revision should point to missing content.
+Retrying the same publication is safe. Automatic deletion of shared remote
+history is outside normal workspace management.
 
-In the shared-checkout profile, the checkout stays on its shared branch while
-different tasks may have independent working-tree overlays. A task publishes
-to its target branch without checking that branch out and without staging
-unrelated paths in the shared Git index.
+## How multiple chats share the workspace
 
-This means an unrelated untracked or modified path can be valid state owned by
-another active task. Broad stash, clean, reset, or deletion operations would
-erase that ownership boundary and must not be used as routine synchronization.
+In the shared-checkout profile, the checkout remains on its shared branch while
+multiple chats may have independent task directories and working-tree overlays.
+A task publishes to its own branch without checking that branch out and without
+staging paths owned by other tasks in the shared Git index.
 
-After a task is merged, `refresh` safely advances the shared branch, preserves
-unrelated overlays, and materializes incoming Git and S3 content. Refresh is an
-inbound synchronization operation; it does not publish a task.
+An unrelated untracked or modified path may therefore be valid state owned by
+another active conversation. Broad stash, clean, reset, or deletion operations
+could erase another task's work and are not routine synchronization tools.
 
-## The lifecycle as one story
+After the user merges a task, `refresh` safely advances the shared branch,
+preserves unrelated overlays, and materializes incoming Git and S3 content.
+Refresh is inbound synchronization; it does not publish a task.
 
-The complete repository lifecycle is:
+## The workspace lifecycle
 
-1. `setup` provisions the CLI's private host runtime.
-2. `init` establishes tracked repository policy and the thin agent bootstrap.
-3. `config show` reports effective policy, while `doctor` validates the CLI,
-   repository, Git, and storage environment; neither changes repository state.
-4. `instructions` loads this model followed by the repository's effective rules.
-5. `task create` begins one writable, reviewable intention.
-6. Work is kept inside its declared scope, with retained content placed in Git
-   or S3.
-7. `plan` explains the proposed remote state without publishing it.
-8. `publish` verifies stored content and advances only the task branch.
-9. The matching draft pull request carries review; a reviewer or maintainer
+The complete story is:
+
+1. A repository owner uses `setup` and `init` to establish the managed
+   workspace and its tracked policy.
+2. The user starts a chat and describes the outcome they want.
+3. The agent loads `instructions` and decides whether the conversation is
+   read-only or needs a writable task.
+4. For writable work, `task create` gives the chat one durable workspace,
+   scope, branch identity, and eventual pull-request identity.
+5. The agent performs the requested work inside that task and keeps its README
+   aligned with the current purpose and outputs.
+6. Retained artifacts are placed in Git or S3 automatically or by an explicit
+   user or agent choice.
+7. `plan` explains the proposed reviewable state without publishing it.
+8. `publish` verifies stored content and advances only the task's target branch.
+9. The matching draft pull request carries review, and the user or maintainer
    decides when to merge it.
-10. `refresh` safely brings a merged result into the shared checkout.
+10. `refresh` brings the merged result into the shared workspace without
+    disturbing other active chats.
 
-The resulting boundary is deliberate: users and agents think in terms of
-repository policy, tasks, scope, Git/S3 placement, publication, review, and
-refresh. `workspace-mgr` owns the lower-level repository and storage mechanics
-needed to preserve those meanings.
+`config show` reports the effective repository policy, and `doctor` diagnoses
+the CLI, repository, Git, and storage environment without changing repository
+state.
+
+The intended division of responsibility is simple: the user asks for outcomes,
+the agent performs the work inside one task, and `workspace-mgr` preserves the
+workspace boundaries that make the result durable, reviewable, and safe to
+combine with other conversations.
