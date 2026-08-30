@@ -11,6 +11,7 @@ pub mod path;
 pub mod process;
 pub mod refresh;
 pub mod scaffold;
+pub mod storage;
 pub mod transaction;
 
 pub use error::{Error, Result};

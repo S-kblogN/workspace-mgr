@@ -1,67 +1,67 @@
 # Architecture and transaction guarantees
 
-## Boundaries
+## State boundaries
 
-`workspace-mgr` separates four kinds of state:
+`workspace-mgr` separates package defaults, tracked repository policy, scoped
+task state, and private runtime state. `.workspace-mgr.toml` contains public
+policy and non-secret locations. Task manifests contain only scope and branch
+state. Private indexes and locks live below the Git common directory.
 
-1. Package defaults are compiled into the released CLI.
-2. Repository policy lives in tracked `.workspace-mgr.toml`.
-3. A task manifest records only task-specific scope and branch state.
-4. Runtime indexes and locks live below the Git common directory and are never
-   staged.
+An explicit storage choice is recorded beside its path as workspace-mgr-owned
+metadata. This makes the choice reviewable and keeps independently active task
+scopes from contending on one central placement file. Users must not edit these
+sidecars or the generated S3 metadata directly.
 
-Repository configuration may name a publication remote and a non-secret storage
-URL, but the binary contains no repository URL, bucket name, or credential.
-Storage credentials remain in environment or platform identity mechanisms.
-`.workspace-mgr.toml` is authoritative; engine-specific configuration is a
-deterministic derived file owned and drift-checked by `workspace-mgr`.
+## Placement lifecycle
+
+Content has one public placement: Git or S3.
+
+- `storage status` explains the effective placement and its source.
+- `storage set` records an explicit local choice.
+- `storage reset` removes that choice and reapplies automatic policy.
+- `move` preserves placement while changing a path.
+- `storage hydrate` reads exact S3 content into the working tree.
+
+These commands do not publish. Automatic policy is evaluated during `plan` and
+`publish`; existing published content is not silently moved because its size
+changed.
 
 ## Scoped publication
 
 For a task publication, the CLI:
 
-1. Resolves and validates the declared task and additional scopes.
-2. Acquires task and managed-storage-boundary locks.
-3. Fetches the configured base and target branches.
-4. Reconciles and verifies in-scope managed-storage metadata.
-5. Builds a private Git index from the target branch, or the base branch when
-   the target does not yet exist.
-6. Stages only declared scopes and rejects gitlinks, unexpected large files,
-   whitespace errors, and unexplained storage-metadata deletion.
-7. Creates a commit with `git commit-tree`.
-8. Updates the unmounted local target ref with compare-and-swap semantics.
-9. Pushes an explicit commit-to-ref refspec and verifies the remote object ID.
+1. resolves the task and explicitly authorized scopes;
+2. fetches the configured base and target branches;
+3. evaluates placement and acquires task and storage-boundary locks;
+4. reconciles S3 metadata, uploads all live in-scope objects, and verifies them;
+5. builds a private Git index from the target branch, or the base branch when no
+   target exists;
+6. stages only declared scopes and rejects gitlinks, invalid placement, and
+   whitespace errors;
+7. creates a commit, updates the unmounted local target ref with compare-and-swap
+   semantics, pushes an explicit refspec, and verifies the remote object ID.
 
-The shared checkout's branch and working files are not switched by publication.
-Pull-request creation and metadata updates remain a repository-hosting concern;
-the generated instructions tell agents when a draft review is required, while
-the core transaction engine stays independent of a specific hosting provider.
+The Git commit is the publication point for the combined transaction. A later
+Git error may leave an unreferenced S3 object version, but a published Git
+revision must never reference missing S3 content. Publication never switches or
+rewrites the shared checkout's working files.
 
-## Managed-storage ordering
+## Private storage adapter
 
-The repository commit is the publication point for a combined metadata and
-storage transaction. When storage is enabled, dirty metadata is reconciled, all
-live in-scope objects are pushed, and the remote is verified before a repository
-commit can be published. A later publication error may leave an unreferenced
-remote object version, but the CLI must not publish a commit that references
-missing stored data.
+The S3 adapter currently uses DVC 3.67.1 internally. S3 remotes require exact
+object-version metadata and existence checks through an embedded verifier using
+the same exact DVC release. This is a maintainer compatibility boundary, not a
+public command or repository concept. A filesystem remote is retained only as
+an isolated-test adapter and uses remote-presence verification.
 
-The current private storage adapter is DVC 3.67.1. Standard remotes use its cloud
-status; object-versioned remotes require exact version metadata and existence
-checks. The Rust process invokes a small embedded adapter through a Python
-interpreter importing that same exact release. Pinning both surfaces protects
-the internal API boundary while preserving DVC's remote resolution and version
-semantics without embedding a provider-specific bucket implementation in the
-core CLI.
-When a boundary moves, path-bound cloud metadata from the old location is
-cleared before the push so DVC uploads the new object path and records its new
-version ID. Existing remote versions are retained.
+Moving an S3 boundary clears path-bound cloud metadata before upload so the new
+object path receives and records its own version ID. Existing remote versions
+are retained.
 
 ## Shared-checkout refresh
 
-Refresh requires the configured shared branch and a clean shared Git index. It
-fetches the remote branch, verifies a fast-forward, prefetches incoming stored
-revisions, compare-and-swap updates the local branch ref, resets only the index,
-then materializes changed storage metadata and outputs. Existing working-tree
-overlays are preserved. A failure after the ref update triggers rollback of the
-ref, index, storage metadata, and outputs created by that refresh.
+`refresh` requires the configured shared branch and a clean shared Git index. It
+verifies a fast-forward, prefetches incoming S3 revisions, compare-and-swap
+updates the local branch ref, resets only the index, and materializes changed
+content. Existing working-tree overlays are preserved. A failure after the ref
+update rolls back the ref, index, metadata, and outputs created by the refresh.

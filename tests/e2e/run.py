@@ -383,7 +383,7 @@ class Harness:
         rejected = self.wm(
             self.shared,
             "init",
-            "--storage-url",
+            "--s3-url",
             f"s3://{self.bucket}/dvc",
             expected=2,
         )
@@ -394,11 +394,10 @@ class Harness:
             "init",
             "--profile",
             "shared-checkout",
-            "--storage-url",
+            "--s3-url",
             f"s3://{self.bucket}/dvc",
-            "--storage-endpoint-url",
+            "--s3-endpoint-url",
             self.endpoint,
-            "--require-object-versioning",
             "--adopt",
         )
         dry = self.wm(self.shared, *common, "--dry-run")
@@ -420,7 +419,7 @@ class Harness:
         self.check("workspace-mgr instructions" in bootstrap, "thin AGENTS bootstrap installed")
         self.check(module == original_agents, "existing AGENTS content preserved as a module")
         self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
-        self.check("require_object_versioning = true" in config_text, "object-versioning policy enabled")
+        self.check("[storage.s3]" in config_text, "S3 placement is configured")
         self.check("version_aware = true" in dvc_config, "internal storage engine is version-aware")
         self.check(f"s3://{self.bucket}/dvc" in dvc_config, "internal storage URL selects test bucket")
         self.check(self.endpoint in dvc_config, "internal storage endpoint selects virtual S3")
@@ -449,9 +448,9 @@ class Harness:
         self.check(main_oid is not None, "initialized main exists on Git server")
 
         config = self.wm(self.shared, "config", "show")
-        self.check(config["git"]["remote"] == "origin", "config resolves Git remote")
-        self.check(config["storage"]["url"] == f"s3://{self.bucket}/dvc", "config resolves managed storage")
-        self.check(config["storage"]["require_object_versioning"] is True, "config requires exact object versions")
+        self.check(config["publication"]["remote"] == "origin", "config resolves publication remote")
+        self.check(config["storage"]["s3"]["url"] == f"s3://{self.bucket}/dvc", "config resolves S3 storage")
+        self.check(config["storage"]["default"] == "auto", "config defaults to automatic placement")
         self.check("dvc" not in config, "public config JSON hides the internal storage engine")
 
         for topic in ("all", "core", "task", "publish", "storage", "infrastructure"):
@@ -580,7 +579,7 @@ class Harness:
 
     def exercise_dvc(self, task_id: str, task: Path, branch: str) -> None:
         assert self.shared is not None
-        self.section("version-aware S3 track, update, failure atomicity, hydrate, move, and untrack")
+        self.section("Git/S3 placement, failure atomicity, hydrate, move, and reset")
         data = task / "data.bin"
         bundle = task / "bundle"
         bundle.mkdir()
@@ -593,30 +592,50 @@ class Harness:
         remote_before = self.remote_ref(branch)
         dry = self.wm(
             task,
-            "track",
+            "storage",
+            "set",
             "--dry-run",
-            "-m",
-            "Plan DVC boundaries",
             f"{task_id}/data.bin",
             f"{task_id}/bundle",
+            "--to",
+            "s3",
+            "--reason",
+            "Retained E2E binary data.",
         )
-        self.check(dry["status"] == "dry_run", "track dry-run succeeds")
-        self.check(dry["management"]["mode"] == "plan", "track dry-run reports management plan")
-        self.check(not task.joinpath("data.bin.dvc").exists(), "track dry-run creates no pointer")
-        self.check(self.remote_ref(branch) == remote_before, "track dry-run leaves Git remote unchanged")
-        self.check(self.list_s3_versions() == [], "track dry-run leaves S3 empty")
+        self.check(dry["status"] == "dry_run", "S3 placement dry-run succeeds")
+        self.check(dry["remote_writes"] is False, "placement dry-run reports no remote writes")
+        self.check(not task.joinpath("data.bin.dvc").exists(), "placement dry-run creates no metadata")
+        self.check(self.remote_ref(branch) == remote_before, "placement dry-run leaves Git remote unchanged")
+        self.check(self.list_s3_versions() == [], "placement dry-run leaves S3 empty")
 
-        tracked = self.wm(
+        placed = self.wm(
             task,
-            "track",
-            "-m",
-            "Track file and directory boundaries",
+            "storage",
+            "set",
             f"{task_id}/data.bin",
             f"{task_id}/bundle",
+            "--to",
+            "s3",
+            "--reason",
+            "Retained E2E binary data.",
         )
-        self.check(tracked["status"] == "pushed", "two DVC boundaries tracked atomically")
-        self.check(tracked["management"]["operation"] == "track", "track operation reported")
-        verification = tracked["storage"]["verification"]
+        self.check(placed["status"] == "updated", "two paths are placed in S3 locally")
+        self.check(placed["remote_writes"] is False, "S3 placement performs no remote writes")
+        self.check(self.remote_ref(branch) == remote_before, "placement leaves Git remote unchanged")
+        self.check(self.list_s3_versions() == [], "placement leaves S3 remote unchanged")
+        statuses = self.wm(task, "storage", "status")
+        self.check(
+            {item["path"] for item in statuses["placements"]}
+            == {f"{task_id}/data.bin", f"{task_id}/bundle"},
+            "storage status finds both explicit boundaries",
+        )
+        self.check(
+            all(item["target"] == "s3" and item["selected_by"] == "explicit" for item in statuses["placements"]),
+            "storage status explains explicit S3 placement",
+        )
+        tracked = self.wm(task, "publish", "-m", "Publish S3 file and directory")
+        self.check(tracked["status"] == "pushed", "two S3 boundaries publish atomically")
+        verification = tracked["storage"]["s3"]["verification"]
         self.check(verification["mode"] == "version-aware", "exact S3 version verification ran")
         self.check(len(verification["checked_objects"]) >= 3, "each payload object was exactly verified")
         data_pointer = task / "data.bin.dvc"
@@ -635,7 +654,7 @@ class Harness:
         bodies_v1 = self.s3_bodies()
         for payload in (v1, bundle_v1_a, bundle_v1_b):
             self.check(payload in bodies_v1, "S3 contains exact version-one payload", payload=payload.decode().strip())
-        self.check(self.wm(task, "plan")["status"] == "no_changes", "tracked state is clean")
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "published S3 state is clean")
 
         v2 = b"single-file version two\n"
         bundle_v2_a = b"bundle alpha version two\n"
@@ -648,7 +667,7 @@ class Harness:
         remote_before_plan = self.remote_ref(branch)
         planned = self.wm(task, "plan")
         self.check(planned["status"] == "dry_run", "dirty DVC outputs appear in plan")
-        self.check(set(planned["storage"]["dirty_files"]) == {f"{task_id}/data.bin.dvc", f"{task_id}/bundle.dvc"}, "plan finds both dirty storage boundaries")
+        self.check(set(planned["storage"]["s3"]["dirty_files"]) == {f"{task_id}/data.bin.dvc", f"{task_id}/bundle.dvc"}, "plan finds both dirty S3 boundaries")
         self.check(data_pointer.read_bytes() == pointer_before_plan, "plan does not rewrite DVC metadata")
         self.check(self.list_s3_versions() == s3_before_plan, "plan does not upload new S3 versions")
         self.check(self.remote_ref(branch) == remote_before_plan, "plan does not move Git branch")
@@ -672,7 +691,7 @@ class Harness:
 
         published_v2 = self.wm(task, "publish", "-m", "Publish DVC version two")
         self.check(published_v2["status"] == "pushed", "retry after S3 failure succeeds")
-        self.check(published_v2["storage"]["verification"]["mode"] == "version-aware", "retry verifies exact S3 versions")
+        self.check(published_v2["storage"]["s3"]["verification"]["mode"] == "version-aware", "retry verifies exact S3 versions")
         versions_v2 = self.list_s3_versions()
         self.check(len(versions_v2) > len(versions_v1), "S3 retains additional immutable versions")
         bodies_v2 = self.s3_bodies()
@@ -720,47 +739,60 @@ class Harness:
             shutil.rmtree(cache)
         if bundle.exists():
             shutil.rmtree(bundle)
-        dry_hydrate = self.wm(task, "hydrate", "--dry-run", f"{task_id}/data.bin.dvc")
+        dry_hydrate = self.wm(task, "storage", "hydrate", "--dry-run", f"{task_id}/data.bin")
         self.check(dry_hydrate["status"] == "dry_run", "hydrate dry-run reports work")
         self.check(not data.exists(), "hydrate dry-run does not materialize output")
-        hydrated_file = self.wm(task, "hydrate", f"{task_id}/data.bin.dvc")
+        hydrated_file = self.wm(task, "storage", "hydrate", f"{task_id}/data.bin")
         self.check(hydrated_file["status"] == "hydrated", "targeted hydrate succeeds from empty cache")
         self.check(data.read_bytes() == v3, "targeted hydrate restores exact S3 version")
         self.check(not bundle.exists(), "targeted hydrate does not materialize another boundary")
-        hydrated_all = self.wm(task, "hydrate")
+        hydrated_all = self.wm(task, "storage", "hydrate")
         self.check(hydrated_all["status"] == "hydrated", "scope-wide hydrate succeeds")
         self.check((bundle / "alpha.txt").read_bytes() == bundle_v3_a, "directory hydrate restores latest alpha")
         self.check((bundle / "gamma.txt").read_bytes() == bundle_v2_c, "directory hydrate preserves unchanged file")
 
         old_path = f"{task_id}/data.bin"
         new_path = f"{task_id}/moved.bin"
-        move_dry = self.wm(task, "move", "--dry-run", "-m", "Plan boundary move", old_path, new_path)
+        move_dry = self.wm(task, "move", "--dry-run", old_path, new_path)
         self.check(move_dry["status"] == "dry_run", "move dry-run succeeds")
         self.check(data.exists() and not task.joinpath("moved.bin").exists(), "move dry-run changes no files")
-        moved = self.wm(task, "move", "-m", "Move DVC boundary", old_path, new_path)
-        self.check(moved["status"] == "pushed", "DVC boundary move publishes")
+        versions_before_move = self.list_s3_versions()
+        remote_before_move = self.remote_ref(branch)
+        moved = self.wm(task, "move", old_path, new_path)
+        self.check(moved["status"] == "updated", "S3 boundary moves locally")
+        self.check(moved["remote_writes"] is False, "move reports no remote writes")
+        self.check(self.remote_ref(branch) == remote_before_move, "move leaves Git remote unchanged")
+        self.check(self.list_s3_versions() == versions_before_move, "move leaves S3 unchanged")
         moved_output = task / "moved.bin"
         moved_pointer = task / "moved.bin.dvc"
         self.check(not data.exists() and not data_pointer.exists(), "old DVC boundary is removed")
         self.check(moved_output.read_bytes() == v3 and moved_pointer.is_file(), "moved DVC boundary preserves payload")
+        moved_publish = self.wm(task, "publish", "-m", "Publish moved S3 boundary")
+        self.check(moved_publish["status"] == "pushed", "moved S3 boundary publishes")
         moved_oid = self.remote_ref(branch)
         assert moved_oid is not None
         self.check(self.remote_path_exists(moved_oid, f"{task_id}/moved.bin.dvc"), "moved pointer exists in remote Git tree")
         self.check(not self.remote_path_exists(moved_oid, f"{task_id}/data.bin.dvc"), "old pointer is absent from remote Git tree")
 
-        untrack_dry = self.wm(task, "untrack", "--dry-run", "-m", "Plan untrack", f"{task_id}/moved.bin.dvc")
-        self.check(untrack_dry["status"] == "dry_run", "untrack dry-run succeeds")
-        self.check(moved_pointer.is_file() and moved_output.is_file(), "untrack dry-run preserves boundary")
-        untracked = self.wm(task, "untrack", "-m", "Stop tracking moved boundary", f"{task_id}/moved.bin.dvc")
-        self.check(untracked["status"] == "pushed", "untrack publishes")
-        self.check(not moved_pointer.exists(), "untrack removes pointer")
-        self.check(moved_output.read_bytes() == v3, "untrack preserves output")
+        reset_dry = self.wm(task, "storage", "reset", "--dry-run", f"{task_id}/moved.bin")
+        self.check(reset_dry["status"] == "dry_run", "placement reset dry-run succeeds")
+        self.check(reset_dry["placements"][0]["target"] == "git", "automatic policy selects Git for small file")
+        self.check(moved_pointer.is_file() and moved_output.is_file(), "reset dry-run preserves boundary")
+        remote_before_reset = self.remote_ref(branch)
+        reset = self.wm(task, "storage", "reset", f"{task_id}/moved.bin")
+        self.check(reset["status"] == "updated", "reset returns path to automatic placement")
+        self.check(reset["remote_writes"] is False, "reset performs no remote writes")
+        self.check(self.remote_ref(branch) == remote_before_reset, "reset leaves Git remote unchanged")
+        self.check(not moved_pointer.exists(), "reset to Git removes S3 metadata locally")
+        self.check(moved_output.read_bytes() == v3, "reset preserves output")
+        reset_publish = self.wm(task, "publish", "-m", "Publish automatic Git placement")
+        self.check(reset_publish["status"] == "pushed", "Git placement publishes")
         untracked_oid = self.remote_ref(branch)
         assert untracked_oid is not None
-        self.check(self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin"), "untracked output becomes ordinary Git content")
-        self.check(not self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin.dvc"), "untracked pointer is absent from Git")
-        self.check(self.remote_path_exists(untracked_oid, f"{task_id}/bundle.dvc"), "other DVC boundary remains tracked")
-        self.check(self.wm(task, "plan")["status"] == "no_changes", "DVC lifecycle ends cleanly")
+        self.check(self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin"), "reset output becomes ordinary Git content")
+        self.check(not self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin.dvc"), "reset S3 metadata is absent from Git")
+        self.check(self.remote_path_exists(untracked_oid, f"{task_id}/bundle.dvc"), "other S3 boundary remains stored")
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "storage lifecycle ends cleanly")
 
     def refresh_and_cross_clone(self, task_id: str, task: Path, branch: str) -> None:
         assert self.shared is not None
@@ -803,65 +835,74 @@ class Harness:
         self.check((consumer_task / "moved.bin").read_bytes() == b"single-file version three\n", "fresh clone receives untracked Git payload")
         doctor = self.wm(consumer, "doctor")
         self.check(doctor["status"] == "ok", "fresh network clone passes doctor")
-        hydrated = self.wm(consumer_task, "hydrate")
+        hydrated = self.wm(consumer_task, "storage", "hydrate")
         self.check(hydrated["status"] == "hydrated", "fresh clone hydrates from MinIO")
         self.check((consumer_task / "bundle" / "alpha.txt").read_bytes() == b"bundle alpha version three\n", "cross-clone S3 hydration is exact")
 
-    def exercise_git_only(self) -> None:
+    def exercise_automatic_and_explicit_git(self) -> None:
         assert self.shared is not None
-        self.section("explicit Git-only exception and Git-only refresh")
-        task_id = "20260829-190000-git-only"
-        branch = "codex/git-only"
+        self.section("automatic S3 placement and explicit large-file Git override")
+        task_id = "20260829-190000-placement-policy"
+        branch = "codex/placement-policy"
         created = self.wm(
             self.shared,
             "task",
             "create",
-            "git-only",
+            "placement-policy",
             "--title",
-            "Git-only exception",
+            "Placement policy",
             "--purpose",
-            "Exercise explicit bypass metadata without touching DVC.",
+            "Exercise automatic S3 and explicit Git placement.",
             "--timestamp",
             "20260829-190000",
         )
         self.check(created["status"] == "created", "second task scaffold created")
         task = self.shared / task_id
-        (task / "result.txt").write_text("git-only result\n", encoding="utf-8")
-        rejected = self.wm(task, "publish", "-m", "Missing exception reason", "--git-only", expected=2)
-        self.check("--scope-note" in rejected["stderr"], "Git-only publish requires explicit reason")
-        self.check(self.remote_ref(branch) is None, "rejected Git-only publish has no remote branch")
-        published = self.wm(
+        explicit_git = task / "explicit-git.bin"
+        automatic_s3 = task / "automatic-s3.bin"
+        explicit_git.write_bytes(b"g" * 10_485_761)
+        automatic_s3.write_bytes(b"s" * 10_485_762)
+        remote_before = self.remote_ref(branch)
+        versions_before = self.list_s3_versions()
+        placed = self.wm(
             task,
-            "publish",
-            "-m",
-            "Publish explicit Git-only task",
-            "--git-only",
-            "--scope-note",
-            "The E2E scenario explicitly exercises the documented Git-only exception.",
+            "storage",
+            "set",
+            f"{task_id}/explicit-git.bin",
+            "--to",
+            "git",
+            "--reason",
+            "This E2E artifact must remain directly reviewable in Git.",
         )
-        self.check(published["status"] == "pushed", "authorized Git-only publish succeeds")
-        self.check(published["storage"]["mode"] == "git-only", "Git-only mode is reported")
-        merged_oid = self.merge_branch_to_main(branch)
-        rejected_refresh = self.wm(self.shared, "refresh", "--git-only", expected=2)
-        self.check("--scope-note" in rejected_refresh["stderr"], "Git-only refresh requires explicit reason")
-        refreshed = self.wm(
-            self.shared,
-            "refresh",
-            "--git-only",
-            "--scope-note",
-            "The E2E scenario explicitly exercises the documented Git-only refresh exception.",
-        )
-        self.check(refreshed["status"] == "updated", "authorized Git-only refresh succeeds")
-        self.check(refreshed["storage"]["mode"] == "git-only", "Git-only refresh mode is reported")
-        self.assert_shared_head(merged_oid)
-        plan = self.wm(
+        self.check(placed["status"] == "updated", "large file receives explicit Git placement")
+        self.check(placed["remote_writes"] is False, "explicit Git placement writes no remote")
+        self.check(self.remote_ref(branch) == remote_before, "placement leaves Git branch absent")
+        self.check(self.list_s3_versions() == versions_before, "placement leaves S3 unchanged")
+        status = self.wm(
             task,
-            "plan",
-            "--git-only",
-            "--scope-note",
-            "Verify the explicit Git-only task has no remaining changes.",
+            "storage",
+            "status",
+            f"{task_id}/explicit-git.bin",
         )
-        self.check(plan["status"] == "no_changes", "final Git-only plan is clean")
+        self.check(status["placements"][0]["target"] == "git", "status reports explicit Git")
+        plan = self.wm(task, "plan")
+        self.check(plan["status"] == "dry_run", "automatic S3 placement appears in plan")
+        self.check(
+            f"{task_id}/automatic-s3.bin"
+            in plan["storage"]["placement"]["would_place_in_s3"],
+            "plan routes the unplaced large file to S3",
+        )
+        self.check(not task.joinpath("automatic-s3.bin.dvc").exists(), "plan does not create S3 metadata")
+        self.check(self.list_s3_versions() == versions_before, "plan performs no S3 upload")
+        published = self.wm(task, "publish", "-m", "Publish automatic and explicit placement")
+        self.check(published["status"] == "pushed", "mixed Git and S3 placement publishes")
+        oid = self.remote_ref(branch)
+        assert oid is not None
+        self.check(self.remote_path_exists(oid, f"{task_id}/explicit-git.bin"), "explicit large file is stored in Git")
+        self.check(not self.remote_path_exists(oid, f"{task_id}/automatic-s3.bin"), "automatic S3 payload is absent from Git")
+        self.check(self.remote_path_exists(oid, f"{task_id}/automatic-s3.bin.dvc"), "automatic S3 metadata is stored in Git")
+        self.check(len(self.list_s3_versions()) > len(versions_before), "automatic placement uploads a versioned S3 object")
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "mixed placement ends cleanly")
 
     def close(self) -> None:
         if self.git_daemon is not None:
@@ -882,7 +923,7 @@ class Harness:
         task_id, task, branch = self.create_and_publish_task()
         self.exercise_dvc(task_id, task, branch)
         self.refresh_and_cross_clone(task_id, task, branch)
-        self.exercise_git_only()
+        self.exercise_automatic_and_explicit_git()
         summary = {
             "status": "passed",
             "assertions": self.assertions,

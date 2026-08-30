@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::Serialize;
 
-use crate::config::{CONFIG_NAME, Config, Profile, SCHEMA_VERSION};
+use crate::config::{CONFIG_NAME, Config, Profile, S3Config, SCHEMA_VERSION};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
@@ -16,9 +16,8 @@ use crate::process::run;
 pub struct InitOptions {
     pub repo: PathBuf,
     pub profile: Profile,
-    pub storage_url: Option<String>,
-    pub storage_endpoint_url: Option<String>,
-    pub require_object_versioning: bool,
+    pub s3_url: Option<String>,
+    pub s3_endpoint_url: Option<String>,
     pub adopt: bool,
     pub dry_run: bool,
 }
@@ -46,26 +45,15 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     let mut config = if existing_config {
         Config::load(&repo)?
     } else {
-        let mut config = Config::defaults(options.profile, options.storage_url.is_some());
+        let mut config = Config::defaults(options.profile);
         detect_git_defaults(&repo, &mut config)?;
         config
     };
-    if let Some(url) = &options.storage_url {
-        config.storage.enabled = true;
-        config.storage.url = Some(url.clone());
-        config
-            .storage
-            .endpoint_url
-            .clone_from(&options.storage_endpoint_url);
-        config.storage.require_object_versioning = options.require_object_versioning;
-        if !config
-            .agent
-            .modules
-            .iter()
-            .any(|module| module == "storage")
-        {
-            config.agent.modules.push("storage".to_owned());
-        }
+    if let Some(url) = &options.s3_url {
+        config.storage.s3 = Some(S3Config {
+            url: url.clone(),
+            endpoint_url: options.s3_endpoint_url.clone(),
+        });
     }
     config.validate()?;
 
@@ -131,9 +119,9 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         install_bootstrap = true;
     }
 
-    if config.storage.enabled {
+    if config.storage.s3_enabled() {
         dvc::require_runtime(&repo)?;
-        if config.storage.require_object_versioning {
+        if config.storage.requires_object_versioning() {
             dvc::require_version_adapter(&repo)?;
         }
         if !repo.root.join(".dvc").exists() {
@@ -149,7 +137,7 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         if let Some(rendered) = dvc::render_internal_config(&config)? {
             let internal_path = repo.root.join(".dvc/config");
             if fs::read_to_string(&internal_path).ok().as_deref() != Some(&rendered) {
-                let versioning = if config.storage.require_object_versioning {
+                let versioning = if config.storage.requires_object_versioning() {
                     " with exact object-version verification"
                 } else {
                     ""
@@ -201,11 +189,11 @@ fn detect_git_defaults(repo: &GitRepo, config: &mut Config) -> Result<()> {
         .filter(|line| !line.trim().is_empty())
         .collect();
     if remote_names.contains(&"origin") {
-        config.git.remote = "origin".to_owned();
+        config.publication.remote = "origin".to_owned();
     } else if let Some(remote) = remote_names.first() {
-        config.git.remote = (*remote).to_owned();
+        config.publication.remote = (*remote).to_owned();
     }
-    let remote_head = format!("refs/remotes/{}/HEAD", config.git.remote);
+    let remote_head = format!("refs/remotes/{}/HEAD", config.publication.remote);
     let symbolic = repo.run_unchecked(["symbolic-ref", "--quiet", "--short", &remote_head])?;
     let branch = if symbolic.success() {
         symbolic
@@ -217,8 +205,8 @@ fn detect_git_defaults(repo: &GitRepo, config: &mut Config) -> Result<()> {
         repo.current_branch()?
     };
     if let Some(branch) = branch {
-        config.git.base_branch.clone_from(&branch);
-        config.git.shared_checkout_branch = branch;
+        config.publication.base_branch.clone_from(&branch);
+        config.publication.shared_checkout_branch = branch;
     }
     Ok(())
 }
@@ -285,20 +273,21 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
     let branch = options
         .branch
         .clone()
-        .unwrap_or_else(|| format!("{}{}", config.git.branch_prefix, options.slug));
+        .unwrap_or_else(|| format!("{}{}", config.publication.branch_prefix, options.slug));
     repo.validate_branch(&branch)?;
     if repo
         .optional_oid(&format!("refs/heads/{branch}"))?
         .is_some()
         || repo
-            .remote_branch_oid(&config.git.remote, &branch)?
+            .remote_branch_oid(&config.publication.remote, &branch)?
             .is_some()
     {
         return Err(Error::message(format!(
             "task branch already exists: {branch}"
         )));
     }
-    let base_oid = repo.fetch_branch(&config.git.remote, &config.git.base_branch)?;
+    let base_oid =
+        repo.fetch_branch(&config.publication.remote, &config.publication.base_branch)?;
     let manifest = TaskManifest {
         schema_version: SCHEMA_VERSION,
         id: task_id.clone(),

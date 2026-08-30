@@ -1,14 +1,14 @@
 # Configuration reference
 
-The repository config is `.workspace-mgr.toml` in the Git root. All schemas use
-an integer `schema_version`; unknown schema versions are rejected.
+Repository policy lives in `.workspace-mgr.toml` at the Git root. Unknown fields
+and unsupported schema versions are rejected.
 
 ```toml
 schema_version = 1
 required_cli = ">=0.1.0-alpha.1,<0.2.0"
 profile = "shared-checkout"
 
-[git]
+[publication]
 remote = "origin"
 base_branch = "main"
 shared_checkout_branch = "main"
@@ -21,14 +21,13 @@ manifest_name = ".workspace-mgr-task.toml"
 require_readme = true
 draft_pull_request = true
 
-[large_files]
-threshold_bytes = 10485760
-
 [storage]
-enabled = true
+default = "auto"
+auto_s3_above_bytes = 10485760
+
+[storage.s3]
 url = "s3://example-bucket/workspace"
 endpoint_url = "https://s3.example.invalid"
-require_object_versioning = true
 
 [agent]
 modules = [
@@ -40,27 +39,35 @@ modules = [
 ]
 ```
 
-The repository config is the only source of truth for storage policy and its
-non-secret location. `workspace-mgr init` deterministically generates the
-lower-level compatibility configuration, and every storage operation refuses
-to run if that generated file drifts. Do not edit it or invoke the underlying
-storage engine directly; rerun `workspace-mgr init` after changing
-`.workspace-mgr.toml`.
+## Publication
 
-`workspace-mgr init --storage-url <url>` enables storage. Add
-`--storage-endpoint-url <url>` for an S3-compatible service and
-`--require-object-versioning` when the bucket's native object versions are part
-of the repository's durability contract. Embedded URL credentials are rejected.
-Authentication belongs in platform-standard environment or identity mechanisms;
-credentials are never written to tracked configuration.
+`publication` identifies where task branches are published and which branch a
+shared checkout must keep mounted. Repository URLs are discovered through the
+named Git remote; they are never compiled into the binary.
 
-The internal remote name, engine-specific versioning switch, and interpreter
-selection are intentionally absent from this schema. They belong to the
-`workspace-mgr` release and cannot vary by repository. Maintainers can override
-the version-verification interpreter with `WORKSPACE_MGR_STORAGE_PYTHON` for
-packaging and isolated tests; it is not a repository setting.
+## Storage
 
-New task manifests contain only task-specific state:
+`storage.default` is `auto`, `git`, or `s3`. In `auto`, an unplaced new file
+larger than `auto_s3_above_bytes` is placed in S3 and a smaller file is placed in
+Git. Published placement is sticky. An explicit per-path choice made with
+`storage set` overrides the default until `storage reset`.
+
+`[storage.s3]` enables S3. Any `s3://` URL has one fixed product contract:
+bucket object versioning is required and exact version IDs are verified before
+Git publication. There is no configuration switch that weakens this guarantee.
+`endpoint_url` supports S3-compatible services.
+
+Embedded URL credentials are rejected. Authentication belongs in ignored local
+configuration or platform-standard identity and environment mechanisms.
+
+`workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes this public
+configuration and deterministically generates the private engine configuration.
+Every S3 operation rejects drift in that derived file. Users and agents should
+edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
+
+## Tasks
+
+Task manifests contain task-specific state only:
 
 ```toml
 schema_version = 1
@@ -73,6 +80,6 @@ path = "docs/shared.md"
 reason = "The user explicitly requested this shared documentation change"
 ```
 
-`require_readme` is enforced before publication. `draft_pull_request` controls
-the generated review instructions; pull-request API calls are intentionally
-outside the provider-neutral transaction engine.
+`require_readme` is checked before publication. `draft_pull_request` affects the
+generated review instructions; provider-specific pull-request API calls remain
+outside the core transaction engine.

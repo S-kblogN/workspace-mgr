@@ -155,9 +155,10 @@ fn refresh_preserves_working_tree_overlays() {
 fn rejects_unmanaged_large_files_and_nested_gitlinks() {
     let fixture = managed_fixture();
     let config_path = fixture.shared.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path)
-        .unwrap()
-        .replace("threshold_bytes = 10485760", "threshold_bytes = 1024");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "auto_s3_above_bytes = 10485760",
+        "auto_s3_above_bytes = 1024",
+    );
     std::fs::write(&config_path, config).unwrap();
 
     workspace(
@@ -178,9 +179,26 @@ fn rejects_unmanaged_large_files_and_nested_gitlinks() {
     std::fs::write(task.join("large.bin"), vec![0_u8; 2048]).unwrap();
     let large = workspace_unchecked(&task, ["plan"]);
     assert_eq!(large.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&large.stderr).contains("larger than 1024 bytes"));
+    assert!(String::from_utf8_lossy(&large.stderr).contains("[storage.s3] is not configured"));
+
+    let explicitly_git = workspace(
+        &task,
+        [
+            "storage",
+            "set",
+            "20260829-170700-unsafe-artifacts/large.bin",
+            "--to",
+            "git",
+            "--reason",
+            "The user requires this artifact in Git.",
+        ],
+    );
+    assert_eq!(json(&explicitly_git)["remote_writes"], false);
+    let allowed = workspace(&task, ["plan"]);
+    assert_eq!(json(&allowed)["status"], "dry_run");
 
     std::fs::remove_file(task.join("large.bin")).unwrap();
+    std::fs::remove_file(task.join("large.bin.workspace-mgr-storage.toml")).unwrap();
     let nested = task.join("nested");
     command(&task, "git", ["init", nested.to_str().unwrap()]);
     configure_git(&nested);

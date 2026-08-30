@@ -3,7 +3,66 @@ mod common;
 use common::*;
 
 #[test]
-fn track_publish_and_hydrate_use_an_isolated_local_remote() {
+fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        [
+            "init",
+            "--profile",
+            "shared-checkout",
+            "--s3-url",
+            storage_remote.to_str().unwrap(),
+        ],
+    );
+    let config_path = fixture.seed.join(".workspace-mgr.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "auto_s3_above_bytes = 10485760",
+        "auto_s3_above_bytes = 1024",
+    );
+    std::fs::write(config_path, config).unwrap();
+    fixture.commit_seed("Initialize automatic storage policy");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "automatic-placement",
+            "--title",
+            "Automatic placement",
+            "--purpose",
+            "Test automatic S3 routing.",
+            "--timestamp",
+            "20260829-170450",
+        ],
+    );
+    let task_id = "20260829-170450-automatic-placement";
+    let task = fixture.shared.join(task_id);
+    std::fs::write(task.join("large.bin"), vec![7_u8; 2048]).unwrap();
+
+    let plan = workspace(&task, ["plan"]);
+    assert_eq!(json(&plan)["status"], "dry_run");
+    assert_eq!(
+        json(&plan)["storage"]["placement"]["would_place_in_s3"][0],
+        format!("{task_id}/large.bin")
+    );
+    assert!(!task.join("large.bin.dvc").exists());
+    assert!(!storage_remote.exists());
+
+    let published = workspace(&task, ["publish", "-m", "Publish automatic placement"]);
+    assert_eq!(json(&published)["status"], "pushed");
+    assert!(task.join("large.bin.dvc").is_file());
+    assert!(storage_remote.exists());
+}
+
+#[test]
+fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     if which::which("dvc").is_err() {
         eprintln!("skipping: dvc is unavailable");
         return;
@@ -16,7 +75,7 @@ fn track_publish_and_hydrate_use_an_isolated_local_remote() {
             "init",
             "--profile",
             "shared-checkout",
-            "--storage-url",
+            "--s3-url",
             dvc_remote.to_str().unwrap(),
         ],
     );
@@ -46,15 +105,21 @@ fn track_publish_and_hydrate_use_an_isolated_local_remote() {
     let data = task.join("data.bin");
     std::fs::write(&data, b"version one\n").unwrap();
 
-    let tracked = workspace(
+    let placed = workspace(
         &task,
         [
-            "track",
-            "-m",
-            "Track DVC data",
+            "storage",
+            "set",
             &format!("{task_name}/data.bin"),
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise explicit S3 placement.",
         ],
     );
+    assert_eq!(json(&placed)["status"], "updated");
+    assert_eq!(json(&placed)["remote_writes"], false);
+    let tracked = workspace(&task, ["publish", "-m", "Publish S3 data"]);
     assert_eq!(json(&tracked)["status"], "pushed");
     assert!(task.join("data.bin.dvc").is_file());
 
@@ -62,12 +127,12 @@ fn track_publish_and_hydrate_use_an_isolated_local_remote() {
     let published = workspace(&task, ["publish", "-m", "Update DVC data"]);
     assert_eq!(json(&published)["status"], "pushed");
     assert_eq!(
-        json(&published)["storage"]["dirty_files"][0],
+        json(&published)["storage"]["s3"]["dirty_files"][0],
         format!("{task_name}/data.bin.dvc")
     );
 
     std::fs::remove_file(&data).unwrap();
-    let hydrated = workspace(&task, ["hydrate"]);
+    let hydrated = workspace(&task, ["storage", "hydrate"]);
     assert_eq!(json(&hydrated)["status"], "hydrated");
     assert_eq!(std::fs::read(&data).unwrap(), b"version two\n");
 
@@ -76,26 +141,32 @@ fn track_publish_and_hydrate_use_an_isolated_local_remote() {
         &task,
         [
             "move",
-            "-m",
-            "Move DVC boundary",
             &format!("{task_name}/data.bin"),
             &format!("{task_name}/moved.bin"),
         ],
     );
-    assert_eq!(json(&move_report)["status"], "pushed");
+    assert_eq!(json(&move_report)["status"], "updated");
+    assert_eq!(json(&move_report)["remote_writes"], false);
+    let moved_publish = workspace(&task, ["publish", "-m", "Publish moved S3 data"]);
+    assert_eq!(json(&moved_publish)["status"], "pushed");
     assert!(moved.is_file());
     assert!(task.join("moved.bin.dvc").is_file());
 
-    let untrack_report = workspace(
+    let git_placement = workspace(
         &task,
         [
-            "untrack",
-            "-m",
-            "Untrack DVC boundary",
-            &format!("{task_name}/moved.bin.dvc"),
+            "storage",
+            "set",
+            &format!("{task_name}/moved.bin"),
+            "--to",
+            "git",
+            "--reason",
+            "Exercise explicit Git placement.",
         ],
     );
-    assert_eq!(json(&untrack_report)["status"], "pushed");
+    assert_eq!(json(&git_placement)["status"], "updated");
+    let git_publish = workspace(&task, ["publish", "-m", "Publish Git placement"]);
+    assert_eq!(json(&git_publish)["status"], "pushed");
     assert!(moved.is_file());
     assert!(!task.join("moved.bin.dvc").exists());
 }
@@ -114,7 +185,7 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
             "init",
             "--profile",
             "shared-checkout",
-            "--storage-url",
+            "--s3-url",
             dvc_remote.to_str().unwrap(),
         ],
     );
@@ -141,12 +212,16 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
     workspace(
         &task,
         [
-            "track",
-            "-m",
-            "Track data",
+            "storage",
+            "set",
             &format!("{task_name}/data.bin"),
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise missing output guard.",
         ],
     );
+    workspace(&task, ["publish", "-m", "Publish S3 data"]);
     std::fs::remove_file(&data).unwrap();
     let rejected = workspace_unchecked(&task, ["publish", "-m", "Delete output"]);
     assert_eq!(rejected.status.code(), Some(2));
@@ -163,7 +238,6 @@ fn object_version_adapter_and_engine_config_are_internal() {
         return;
     }
     let fixture = GitFixture::new();
-    let dvc_remote = fixture.root.join("dvc-remote");
     let fake_python = fixture.root.join("fake-python");
     std::fs::write(
         &fake_python,
@@ -178,9 +252,10 @@ fn object_version_adapter_and_engine_config_are_internal() {
             "init",
             "--profile",
             "shared-checkout",
-            "--storage-url",
-            dvc_remote.to_str().unwrap(),
-            "--require-object-versioning",
+            "--s3-url",
+            "s3://example.invalid/workspace",
+            "--s3-endpoint-url",
+            "https://s3.example.invalid",
         ])
         .current_dir(&fixture.seed)
         .env("WORKSPACE_MGR_FORMAT", "json")
@@ -189,7 +264,8 @@ fn object_version_adapter_and_engine_config_are_internal() {
         .unwrap();
     assert!(output.status.success());
     let public = std::fs::read_to_string(fixture.seed.join(".workspace-mgr.toml")).unwrap();
-    assert!(public.contains("require_object_versioning = true"));
+    assert!(public.contains("[storage.s3]"));
+    assert!(public.contains("url = \"s3://example.invalid/workspace\""));
     assert!(!public.contains("[dvc]"));
     assert!(!public.contains("require_version_aware"));
     assert!(!public.contains("python"));

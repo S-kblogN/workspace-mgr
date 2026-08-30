@@ -93,9 +93,9 @@ impl ResolvedTask {
             task_id,
             task_path,
             branch: one_line(&manifest.branch, "task branch")?,
-            remote: config.git.remote.clone(),
-            base_branch: config.git.base_branch.clone(),
-            shared_head: config.git.shared_checkout_branch.clone(),
+            remote: config.publication.remote.clone(),
+            base_branch: config.publication.base_branch.clone(),
+            shared_head: config.publication.shared_checkout_branch.clone(),
             additional_scopes,
         })
     }

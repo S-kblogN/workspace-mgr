@@ -13,6 +13,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::manifest::{AdditionalScope, ResolvedTask, one_line};
 use crate::path::{allowed, relative_to, repo_path, resolved_under};
+use crate::storage;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
@@ -20,9 +21,6 @@ const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 pub enum Operation {
     Plan,
     Publish,
-    Track,
-    Move,
-    Untrack,
 }
 
 impl Operation {
@@ -30,9 +28,6 @@ impl Operation {
         match self {
             Self::Plan => "plan",
             Self::Publish => "publish",
-            Self::Track => "track",
-            Self::Move => "move",
-            Self::Untrack => "untrack",
         }
     }
 
@@ -49,10 +44,8 @@ pub struct TransactionOptions {
     pub include: Vec<String>,
     pub scope_note: Option<String>,
     pub allow_non_shared_head: bool,
-    pub git_only: bool,
     pub dry_run: bool,
     pub operation: Operation,
-    pub management_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,8 +60,6 @@ pub struct TransactionReport {
     pub scopes: Vec<String>,
     pub changed_paths: Vec<String>,
     pub storage: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub management: Option<serde_json::Value>,
     pub ignored_entries: usize,
     pub tree_oid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,18 +99,6 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     validate_checkout(&repo, &task, options)?;
 
     let (scopes, authorizations) = resolve_scopes(&task, options)?;
-    let management_paths = validate_management_paths(&scopes, options)?;
-    if options.git_only && options.scope_note.is_none() {
-        return Err(Error::message(
-            "--git-only requires --scope-note explaining the exception",
-        ));
-    }
-    if options.git_only && !matches!(options.operation, Operation::Plan | Operation::Publish) {
-        return Err(Error::message(format!(
-            "{} cannot be combined with --git-only",
-            options.operation.name()
-        )));
-    }
     let dry_run = options.operation.dry_run(options.dry_run);
     let common_dir = repo.common_dir()?;
     let state_dir = state_dir(&common_dir, &task);
@@ -152,38 +131,30 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         )
     };
 
+    let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
     let initial_dvc = dvc::discover(&repo, &scopes)?;
     let mut lock_names = initial_dvc
         .iter()
         .map(|path| format!("pointer:{path}"))
-        .chain(management_paths.iter().map(|path| format!("output:{path}")))
+        .chain(
+            placement_preview
+                .would_place_in_s3
+                .iter()
+                .map(|path| format!("output:{path}")),
+        )
         .collect::<Vec<_>>();
     lock_names.sort();
     lock_names.dedup();
     let _dvc_locks = acquire_dvc_locks(&common_dir, &lock_names)?;
 
-    let management = if matches!(
-        options.operation,
-        Operation::Track | Operation::Move | Operation::Untrack
-    ) {
-        Some(dvc::management(
-            &repo,
-            &config,
-            options.operation.name(),
-            &management_paths,
-            dry_run,
-        )?)
+    let placement = if dry_run {
+        placement_preview
     } else {
-        None
+        storage::apply_automatic(&repo, &config, &scopes, &base_oid, false)?
     };
     let pointers = dvc::discover(&repo, &scopes)?;
-    let storage_report = if options.git_only {
-        serde_json::json!({"mode": "git-only", "files": pointers})
-    } else {
-        serde_json::to_value(dvc::reconcile(&repo, &config, &pointers, dry_run)?).map_err(
-            |error| Error::message(format!("failed to encode managed-storage report: {error}")),
-        )?
-    };
+    let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
+    let storage_report = serde_json::json!({"placement": placement, "s3": s3});
 
     let index = state_dir.join("index");
     if index.exists() {
@@ -205,23 +176,14 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             escaped.join(", ")
         )));
     }
-    let deleted_dvc: Vec<String> = paths
-        .iter()
-        .filter(|path| path.ends_with(".dvc") && !resolved_under(&repo.root, path).is_file())
-        .cloned()
-        .collect();
-    if !deleted_dvc.is_empty()
-        && options.operation != Operation::Untrack
-        && options.operation != Operation::Move
-    {
-        return Err(Error::message(format!(
-            "managed-storage metadata must be removed through untrack or move: {}",
-            deleted_dvc.join(", ")
-        )));
-    }
     check_gitlinks(&repo, &index, &paths)?;
-    let threshold = config.large_files.threshold_bytes;
-    check_large_files(&repo, &scopes, threshold)?;
+    check_large_files(
+        &repo,
+        &scopes,
+        &base_oid,
+        config.storage.auto_s3_above_bytes,
+        &placement.would_place_in_s3,
+    )?;
     repo.run_with_index(
         &index,
         ["diff", "--cached", "--check", &base_oid, "--"],
@@ -235,7 +197,8 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .trim()
         .to_owned();
     let storage_dirty = storage_report
-        .get("dirty_files")
+        .get("s3")
+        .and_then(|value| value.get("dirty_files"))
         .and_then(|value| value.as_array())
         .is_some_and(|files| !files.is_empty());
     let mut report = TransactionReport {
@@ -249,14 +212,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         scopes: scopes.clone(),
         changed_paths: paths.clone(),
         storage: storage_report,
-        management,
         ignored_entries,
         tree_oid: tree_oid.clone(),
         commit_oid: None,
         remote_oid: None,
         push: None,
     };
-    if paths.is_empty() && !storage_dirty && report.management.is_none() {
+    if paths.is_empty() && !storage_dirty {
         report.status = "no_changes".to_owned();
         return Ok(report);
     }
@@ -375,55 +337,6 @@ fn resolve_scopes(
     Ok((scopes, additional))
 }
 
-fn validate_management_paths(
-    scopes: &[String],
-    options: &TransactionOptions,
-) -> Result<Vec<String>> {
-    let expected = match options.operation {
-        Operation::Track => 1..=usize::MAX,
-        Operation::Move => 2..=2,
-        Operation::Untrack => 1..=usize::MAX,
-        _ => 0..=0,
-    };
-    if !expected.contains(&options.management_paths.len()) {
-        return Err(Error::message(format!(
-            "{} received an invalid number of paths",
-            options.operation.name()
-        )));
-    }
-    let paths = options
-        .management_paths
-        .iter()
-        .map(|path| repo_path(path, "managed-storage path"))
-        .collect::<Result<Vec<_>>>()?;
-    let outside: Vec<String> = paths
-        .iter()
-        .filter(|path| !allowed(path, scopes))
-        .cloned()
-        .collect();
-    if !outside.is_empty() {
-        return Err(Error::message(format!(
-            "{} paths escape the declared scope: {}",
-            options.operation.name(),
-            outside.join(", ")
-        )));
-    }
-    if options.operation == Operation::Untrack {
-        let invalid: Vec<String> = paths
-            .iter()
-            .filter(|path| !path.ends_with(".dvc"))
-            .cloned()
-            .collect();
-        if !invalid.is_empty() {
-            return Err(Error::message(format!(
-                "untrack requires standalone .dvc files: {}",
-                invalid.join(", ")
-            )));
-        }
-    }
-    Ok(paths)
-}
-
 fn state_dir(common_dir: &Path, task: &ResolvedTask) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(task.task_path.as_bytes());
@@ -517,7 +430,13 @@ fn check_gitlinks(repo: &GitRepo, index: &Path, paths: &[String]) -> Result<()> 
     Ok(())
 }
 
-fn check_large_files(repo: &GitRepo, scopes: &[String], threshold: u64) -> Result<()> {
+fn check_large_files(
+    repo: &GitRepo,
+    scopes: &[String],
+    base_oid: &str,
+    threshold: u64,
+    automatic_s3: &[String],
+) -> Result<()> {
     for scope in scopes {
         let root = resolved_under(&repo.root, scope);
         if !root.exists() || root.is_symlink() {
@@ -551,8 +470,19 @@ fn check_large_files(repo: &GitRepo, scopes: &[String], threshold: u64) -> Resul
                     "git check-ignore failed for {relative}"
                 )));
             }
+            if automatic_s3.contains(&relative) {
+                continue;
+            }
+            if storage::explicit_target(repo, &relative)? == Some(crate::config::StorageTarget::Git)
+            {
+                continue;
+            }
+            let object = format!("{base_oid}:{relative}");
+            if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
+                continue;
+            }
             return Err(Error::message(format!(
-                "retained file {relative:?} is larger than {threshold} bytes; move it into managed storage with `workspace-mgr track`"
+                "retained file {relative:?} is larger than {threshold} bytes and has no valid placement; run `workspace-mgr storage set {relative} --to git|s3 --reason <reason>`"
             )));
         }
     }

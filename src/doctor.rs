@@ -74,7 +74,7 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
         let head = repo
             .current_branch()?
             .unwrap_or_else(|| "detached".to_owned());
-        let expected = &config.git.shared_checkout_branch;
+        let expected = &config.publication.shared_checkout_branch;
         let branch_ok =
             config.profile != crate::config::Profile::SharedCheckout || head == *expected;
         checks.push(DoctorCheck {
@@ -92,18 +92,21 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
                 "publication author name or email is not configured".to_owned()
             },
         });
-        let remote = repo.run_unchecked(["remote", "get-url", &config.git.remote])?;
+        let remote = repo.run_unchecked(["remote", "get-url", &config.publication.remote])?;
         checks.push(DoctorCheck {
             name: "publication-remote".to_owned(),
             status: if remote.success() { "ok" } else { "error" }.to_owned(),
             detail: if remote.success() {
-                format!("configured remote {:?} exists", config.git.remote)
+                format!("configured remote {:?} exists", config.publication.remote)
             } else {
-                format!("configured remote {:?} does not exist", config.git.remote)
+                format!(
+                    "configured remote {:?} does not exist",
+                    config.publication.remote
+                )
             },
         });
 
-        if config.storage.enabled {
+        if config.storage.s3_enabled() {
             checks.push(match dvc::require_runtime(&repo) {
                 Ok(version) => DoctorCheck {
                     name: "managed-storage-runtime".to_owned(),
@@ -128,7 +131,7 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
                     detail: error.to_string(),
                 },
             });
-            if config.storage.require_object_versioning {
+            if config.storage.requires_object_versioning() {
                 checks.push(match dvc::require_version_adapter(&repo) {
                     Ok(adapter) => DoctorCheck {
                         name: "managed-storage-version-adapter".to_owned(),

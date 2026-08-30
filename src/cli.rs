@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::Profile;
+use crate::config::{Profile, StorageTarget};
 use crate::output::Format;
 
 #[derive(Debug, Parser)]
@@ -50,17 +50,11 @@ pub enum Command {
     /// Publish a scoped repository transaction.
     Publish(PublishCommandArgs),
 
-    /// Move one or more paths into managed storage and publish them.
-    Track(TrackArgs),
+    /// Inspect or change whether content is stored in Git or S3.
+    Storage(StorageArgs),
 
-    /// Move one managed-storage boundary and publish the result.
+    /// Move a path while preserving its storage placement.
     Move(MoveArgs),
-
-    /// Stop managing stored outputs without deleting their local content.
-    Untrack(UntrackArgs),
-
-    /// Fetch, materialize, and verify stored outputs in the current task scope.
-    Hydrate(HydrateArgs),
 
     /// Safely update a shared checkout and hydrate incoming stored data.
     Refresh(RefreshArgs),
@@ -80,17 +74,13 @@ pub struct InitArgs {
     #[arg(long, value_enum, default_value = "standard")]
     pub profile: Profile,
 
-    /// Enable managed storage at this non-secret URL.
+    /// Configure an S3 bucket at this non-secret URL.
     #[arg(long)]
-    pub storage_url: Option<String>,
+    pub s3_url: Option<String>,
 
     /// Optional S3-compatible API endpoint for managed storage.
-    #[arg(long, requires = "storage_url")]
-    pub storage_endpoint_url: Option<String>,
-
-    /// Require bucket object versioning and exact version verification.
-    #[arg(long, requires = "storage_url")]
-    pub require_object_versioning: bool,
+    #[arg(long, requires = "s3_url")]
+    pub s3_endpoint_url: Option<String>,
 
     #[arg(long)]
     pub adopt: bool,
@@ -186,9 +176,6 @@ pub struct PublishArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    #[arg(long)]
-    pub git_only: bool,
-
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 }
@@ -213,82 +200,93 @@ pub struct PublishCommandArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    #[arg(long)]
-    pub git_only: bool,
-
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct TrackArgs {
+pub struct StorageArgs {
+    #[command(subcommand)]
+    pub command: StorageCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StorageCommand {
+    /// Show the effective Git/S3 placement of paths in the task scope.
+    Status(StorageStatusArgs),
+    /// Explicitly place paths in Git or S3. This changes local desired state only.
+    Set(StorageSetArgs),
+    /// Remove an explicit choice and reapply the repository's automatic policy.
+    Reset(StorageResetArgs),
+    /// Materialize S3 content without publishing anything.
+    Hydrate(StorageHydrateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ScopedArgs {
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+
+    #[arg(long = "include")]
+    pub include: Vec<String>,
+
+    #[arg(long)]
+    pub scope_note: Option<String>,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StorageStatusArgs {
     #[command(flatten)]
-    pub publish: RequiredPublishArgs,
+    pub scoped: ScopedArgs,
+
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct StorageSetArgs {
+    #[command(flatten)]
+    pub scoped: ScopedArgs,
+
+    #[arg(required = true)]
+    pub paths: Vec<String>,
+
+    #[arg(long, value_enum)]
+    pub to: StorageTarget,
+
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Debug, Args)]
+pub struct StorageResetArgs {
+    #[command(flatten)]
+    pub scoped: ScopedArgs,
 
     #[arg(required = true)]
     pub paths: Vec<String>,
 }
 
 #[derive(Debug, Args)]
+pub struct StorageHydrateArgs {
+    #[command(flatten)]
+    pub scoped: ScopedArgs,
+
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct MoveArgs {
     #[command(flatten)]
-    pub publish: RequiredPublishArgs,
+    pub scoped: ScopedArgs,
 
     pub old_path: String,
     pub new_path: String,
-}
-
-#[derive(Debug, Args)]
-pub struct UntrackArgs {
-    #[command(flatten)]
-    pub publish: RequiredPublishArgs,
-
-    #[arg(required = true)]
-    pub targets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct RequiredPublishArgs {
-    #[arg(long)]
-    pub manifest: Option<PathBuf>,
-
-    #[arg(short = 'm', long)]
-    pub message: String,
-
-    #[arg(long = "include")]
-    pub include: Vec<String>,
-
-    #[arg(long)]
-    pub scope_note: Option<String>,
-
-    #[arg(long)]
-    pub allow_non_shared_head: bool,
-
-    #[arg(long)]
-    pub dry_run: bool,
-
-    #[arg(long, default_value = ".")]
-    pub repo: PathBuf,
-}
-
-#[derive(Debug, Args)]
-pub struct HydrateArgs {
-    #[arg(long)]
-    pub manifest: Option<PathBuf>,
-
-    #[arg(long = "include")]
-    pub include: Vec<String>,
-
-    #[arg(long)]
-    pub scope_note: Option<String>,
-
-    #[arg(long)]
-    pub dry_run: bool,
-
-    #[arg(long, default_value = ".")]
-    pub repo: PathBuf,
-
-    pub targets: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -304,10 +302,4 @@ pub struct RefreshArgs {
 
     #[arg(long)]
     pub dry_run: bool,
-
-    #[arg(long)]
-    pub git_only: bool,
-
-    #[arg(long)]
-    pub scope_note: Option<String>,
 }

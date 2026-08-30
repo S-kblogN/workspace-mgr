@@ -59,20 +59,17 @@ pub fn require_version_adapter(repo: &GitRepo) -> Result<String> {
 }
 
 pub fn render_internal_config(config: &Config) -> Result<Option<String>> {
-    if !config.storage.enabled {
+    let Some(s3) = &config.storage.s3 else {
         return Ok(None);
-    }
-    let url =
-        config.storage.url.as_deref().ok_or_else(|| {
-            Error::message("storage.url is required when managed storage is enabled")
-        })?;
+    };
+    let url = &s3.url;
     let mut rendered = format!(
         "[core]\n    remote = {INTERNAL_REMOTE}\n['remote \"{INTERNAL_REMOTE}\"']\n    url = {url}\n"
     );
-    if let Some(endpoint) = &config.storage.endpoint_url {
+    if let Some(endpoint) = &s3.endpoint_url {
         rendered.push_str(&format!("    endpointurl = {endpoint}\n"));
     }
-    if config.storage.require_object_versioning {
+    if config.storage.requires_object_versioning() {
         rendered.push_str("    version_aware = true\n");
     }
     Ok(Some(rendered))
@@ -115,14 +112,14 @@ pub fn validate_internal_config(repo: &GitRepo, config: &Config) -> Result<()> {
 }
 
 pub fn ensure_ready(repo: &GitRepo, config: &Config) -> Result<()> {
-    if !config.storage.enabled {
+    if !config.storage.s3_enabled() {
         return Err(Error::message(
             "managed storage is not enabled in .workspace-mgr.toml",
         ));
     }
     require_runtime(repo)?;
     validate_internal_config(repo, config)?;
-    if config.storage.require_object_versioning {
+    if config.storage.requires_object_versioning() {
         require_version_adapter(repo)?;
     }
     Ok(())
@@ -244,7 +241,7 @@ pub fn reconcile(
     pointers: &[String],
     dry_run: bool,
 ) -> Result<DvcReport> {
-    if config.storage.enabled || !pointers.is_empty() {
+    if config.storage.s3_enabled() || !pointers.is_empty() {
         ensure_ready(repo, config)?;
     }
     let outputs = output_paths(repo, pointers)?;
@@ -316,7 +313,7 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
     }
 
     ensure_ready(repo, config)?;
-    let exact = config.storage.require_object_versioning;
+    let exact = config.storage.requires_object_versioning();
     if exact {
         let python = storage_python();
         let serialized = serde_json::to_string(pointers).map_err(|error| {

@@ -53,7 +53,6 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
         sections.push(publication_section(config));
     }
     if (topic == "all" || topic == "storage")
-        && config.storage.enabled
         && config
             .agent
             .modules
@@ -119,7 +118,7 @@ fn core_section(config: &Config) -> String {
         Profile::Standard => "This repository uses the standard checkout profile. Work on an appropriate branch and preserve unrelated working-tree changes.".to_owned(),
         Profile::SharedCheckout => format!(
             "This repository uses a shared checkout. Keep the checkout on `{}` and publish task branches without switching it. Do not stash, clean, reset, or delete unrelated overlays.",
-            config.git.shared_checkout_branch
+            config.publication.shared_checkout_branch
         ),
     };
     format!(
@@ -130,7 +129,7 @@ fn core_section(config: &Config) -> String {
 fn task_section(config: &Config) -> String {
     format!(
         "## Task lifecycle\n\n- Create a new writable task with `workspace-mgr task create <slug> --title <title> --purpose <purpose>`.\n- Task directories follow `{}` and use branches prefixed with `{}`.\n- Reuse the same task for the full conversation or work item. Do not write into another active task without explicit authorization.\n- Keep the task README concise and current. It describes purpose and outputs, and includes a `## Directory map`; it is not a chronological log.\n- The task manifest is the authoritative task scope. Additional repository paths require a concise authorization reason.\n- Use `workspace-mgr task status` to inspect the resolved task before publishing.",
-        config.tasks.directory_pattern, config.git.branch_prefix
+        config.tasks.directory_pattern, config.publication.branch_prefix
     )
 }
 
@@ -147,19 +146,21 @@ fn publication_section(config: &Config) -> String {
     };
     format!(
         "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Keep every eligible task-owned file in scope. Ignore reproducible build output and external nested repositories using the narrowest applicable rule.\n- Never flatten a nested repository into the parent repository unless explicitly requested.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming publication is current.\n- {review_note}\n- `{}` is the configured base branch on remote `{}`.\n- {profile_note}",
-        config.git.base_branch, config.git.remote
+        config.publication.base_branch, config.publication.remote
     )
 }
 
 fn storage_section(config: &Config) -> String {
-    let version_note = if config.storage.require_object_versioning {
-        "The configured bucket must have object versioning enabled. Exact object version IDs, sizes, and available etags are verified before repository publication."
+    let s3_note = if config.storage.requires_object_versioning() {
+        "S3 is configured. The bucket must have object versioning enabled; exact object versions are verified before the Git revision is published."
+    } else if config.storage.s3_enabled() {
+        "An S3-compatible test or local storage adapter is configured; remote presence is verified before the Git revision is published."
     } else {
-        "Remote presence is verified before repository publication."
+        "S3 is not configured, so paths may only be placed in Git until repository configuration is updated."
     };
     format!(
-        "## Managed storage\n\n- Retained, non-ignored files larger than {} bytes must be moved into managed storage with `workspace-mgr track <path> -m <message>`.\n- After editing stored content, use the normal `workspace-mgr publish` command.\n- Use `workspace-mgr move`, `workspace-mgr untrack`, and `workspace-mgr hydrate` for the complete stored-data lifecycle. Do not hand-edit or directly delete storage metadata.\n- Storage credentials stay outside tracked repository configuration. Never print, copy, or commit credentials.\n- {version_note}\n- Never request permanent remote or cache garbage collection without explicit authorization for shared-data deletion.",
-        config.large_files.threshold_bytes
+        "## Storage placement\n\n- Every retained path is stored either directly in Git or as versioned content in S3. `workspace-mgr` owns the underlying mechanics; do not invoke lower-level storage tools.\n- Use `workspace-mgr storage status [<path> ...]` to inspect effective placement and whether it came from an explicit choice, existing history, or automatic policy.\n- Use `workspace-mgr storage set <path> --to git|s3 --reason <reason>` when placement must be explicit. This is valid in either direction regardless of file size.\n- Use `workspace-mgr storage reset <path>` to remove an explicit choice and reapply automatic policy. In automatic mode, previously published placement stays stable; new retained files above {} bytes go to S3 and smaller files go to Git.\n- Placement changes, resets, and `workspace-mgr move <old> <new>` update local desired state only. `workspace-mgr publish` is the only command that writes to Git or S3 remotes.\n- Use `workspace-mgr storage hydrate [<path> ...]` to materialize S3 content locally without publishing. Never hand-edit or directly delete workspace-mgr storage metadata.\n- Storage credentials stay outside tracked repository configuration. Never print, copy, or commit credentials.\n- {s3_note}\n- Never request permanent remote or cache garbage collection without explicit authorization for shared-data deletion.",
+        config.storage.auto_s3_above_bytes
     )
 }
 

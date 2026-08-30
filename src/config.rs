@@ -23,11 +23,9 @@ pub struct Config {
     pub schema_version: u32,
     pub required_cli: String,
     pub profile: Profile,
-    pub git: GitConfig,
+    pub publication: PublicationConfig,
     #[serde(default)]
     pub tasks: TaskConfig,
-    #[serde(default)]
-    pub large_files: LargeFileConfig,
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
@@ -36,7 +34,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GitConfig {
+pub struct PublicationConfig {
     pub remote: String,
     pub base_branch: String,
     pub shared_checkout_branch: String,
@@ -55,17 +53,33 @@ pub struct TaskConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct LargeFileConfig {
-    pub threshold_bytes: u64,
+pub struct StorageConfig {
+    pub default: StorageDefault,
+    pub auto_s3_above_bytes: u64,
+    pub s3: Option<S3Config>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct StorageConfig {
-    pub enabled: bool,
-    pub url: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Config {
+    pub url: String,
     pub endpoint_url: Option<String>,
-    pub require_object_versioning: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageDefault {
+    #[default]
+    Auto,
+    Git,
+    S3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageTarget {
+    Git,
+    S3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,14 +100,6 @@ impl Default for TaskConfig {
     }
 }
 
-impl Default for LargeFileConfig {
-    fn default() -> Self {
-        Self {
-            threshold_bytes: 10_485_760,
-        }
-    }
-}
-
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -101,37 +107,53 @@ impl Default for AgentConfig {
                 "scope".to_owned(),
                 "publication".to_owned(),
                 "artifact-hygiene".to_owned(),
+                "storage".to_owned(),
             ],
         }
     }
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            default: StorageDefault::Auto,
+            auto_s3_above_bytes: 10_485_760,
+            s3: None,
+        }
+    }
+}
+
+impl StorageConfig {
+    pub fn s3_enabled(&self) -> bool {
+        self.s3.is_some()
+    }
+
+    pub fn requires_object_versioning(&self) -> bool {
+        self.s3
+            .as_ref()
+            .is_some_and(|s3| s3.url.starts_with("s3://"))
+    }
+}
+
 impl Config {
-    pub fn defaults(profile: Profile, storage: bool) -> Self {
+    pub fn defaults(profile: Profile) -> Self {
         let shared = profile == Profile::SharedCheckout;
         let mut modules = AgentConfig::default().modules;
         if shared {
             modules.push("shared-checkout".to_owned());
         }
-        if storage {
-            modules.push("storage".to_owned());
-        }
         Self {
             schema_version: SCHEMA_VERSION,
             required_cli: ">=0.1.0-alpha.1,<0.2.0".to_owned(),
             profile,
-            git: GitConfig {
+            publication: PublicationConfig {
                 remote: "origin".to_owned(),
                 base_branch: "main".to_owned(),
                 shared_checkout_branch: "main".to_owned(),
                 branch_prefix: "codex/".to_owned(),
             },
             tasks: TaskConfig::default(),
-            large_files: LargeFileConfig::default(),
-            storage: StorageConfig {
-                enabled: storage,
-                ..StorageConfig::default()
-            },
+            storage: StorageConfig::default(),
             agent: AgentConfig { modules },
         }
     }
@@ -170,13 +192,13 @@ impl Config {
             Error::message(format!("invalid required_cli requirement: {error}"))
         })?;
         for (field, value) in [
-            ("git.remote", &self.git.remote),
-            ("git.base_branch", &self.git.base_branch),
+            ("publication.remote", &self.publication.remote),
+            ("publication.base_branch", &self.publication.base_branch),
             (
-                "git.shared_checkout_branch",
-                &self.git.shared_checkout_branch,
+                "publication.shared_checkout_branch",
+                &self.publication.shared_checkout_branch,
             ),
-            ("git.branch_prefix", &self.git.branch_prefix),
+            ("publication.branch_prefix", &self.publication.branch_prefix),
             ("tasks.directory_pattern", &self.tasks.directory_pattern),
             ("tasks.manifest_name", &self.tasks.manifest_name),
         ] {
@@ -196,29 +218,20 @@ impl Config {
                 "tasks.manifest_name must be a file name, not a path",
             ));
         }
-        if self.large_files.threshold_bytes == 0 {
+        if self.storage.auto_s3_above_bytes == 0 {
             return Err(Error::message(
-                "large_files.threshold_bytes must be positive",
+                "storage.auto_s3_above_bytes must be positive",
             ));
         }
-        if self.storage.enabled && self.storage.url.is_none() {
+        if self.storage.default == StorageDefault::S3 && self.storage.s3.is_none() {
             return Err(Error::message(
-                "storage.url is required when storage.enabled is true",
+                "storage.default = \"s3\" requires [storage.s3]",
             ));
         }
-        if !self.storage.enabled
-            && (self.storage.url.is_some()
-                || self.storage.endpoint_url.is_some()
-                || self.storage.require_object_versioning)
-        {
-            return Err(Error::message("storage settings require storage.enabled"));
-        }
-        for (field, value) in [
-            ("storage.url", self.storage.url.as_deref()),
-            ("storage.endpoint_url", self.storage.endpoint_url.as_deref()),
-        ] {
-            if let Some(value) = value {
-                validate_public_url(field, value)?;
+        if let Some(s3) = &self.storage.s3 {
+            validate_public_url("storage.s3.url", &s3.url)?;
+            if let Some(endpoint) = &s3.endpoint_url {
+                validate_public_url("storage.s3.endpoint_url", endpoint)?;
             }
         }
         let supported = [

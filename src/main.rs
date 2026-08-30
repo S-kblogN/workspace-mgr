@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use workspace_mgr::cli::{
-    Cli, Command, ConfigCommand, PublishArgs, PublishCommandArgs, RequiredPublishArgs, TaskCommand,
+    Cli, Command, ConfigCommand, PublishArgs, PublishCommandArgs, ScopedArgs, StorageCommand,
+    TaskCommand,
 };
 use workspace_mgr::config::Config;
-use workspace_mgr::dvc;
 use workspace_mgr::error::{Error, Result};
 use workspace_mgr::git::GitRepo;
 use workspace_mgr::instructions;
@@ -15,6 +15,7 @@ use workspace_mgr::output::{Format, print_human, print_json};
 use workspace_mgr::path::repo_path;
 use workspace_mgr::refresh::{RefreshOptions, execute as refresh};
 use workspace_mgr::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
+use workspace_mgr::storage;
 use workspace_mgr::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
@@ -31,9 +32,8 @@ fn run(cli: Cli) -> Result<()> {
             let report = init(&InitOptions {
                 repo: args.repo,
                 profile: args.profile,
-                storage_url: args.storage_url,
-                storage_endpoint_url: args.storage_endpoint_url,
-                require_object_versioning: args.require_object_versioning,
+                s3_url: args.s3_url,
+                s3_endpoint_url: args.s3_endpoint_url,
                 adopt: args.adopt,
                 dry_run: args.dry_run,
             })?;
@@ -95,31 +95,59 @@ fn run(cli: Cli) -> Result<()> {
                 cli.format,
             ),
         },
-        Command::Plan(args) => run_transaction(args, Operation::Plan, Vec::new(), cli.format),
+        Command::Plan(args) => run_transaction(args, Operation::Plan, cli.format),
         Command::Publish(args) => run_publish(args, cli.format),
-        Command::Track(args) => {
-            run_required_transaction(args.publish, Operation::Track, args.paths, cli.format)
-        }
-        Command::Move(args) => run_required_transaction(
-            args.publish,
-            Operation::Move,
-            vec![args.old_path, args.new_path],
-            cli.format,
-        ),
-        Command::Untrack(args) => {
-            run_required_transaction(args.publish, Operation::Untrack, args.targets, cli.format)
-        }
-        Command::Hydrate(args) => {
-            let repo = GitRepo::discover(&args.repo)?;
-            let config = Config::load(&repo)?;
-            let manifest_path = match args.manifest {
-                Some(path) => path,
-                None => ResolvedTask::discover(&repo, &config, &args.repo)?,
-            };
-            let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
-            let (scopes, _) = hydrate_scopes(&task, &args.include, args.scope_note.as_deref())?;
-            let report = dvc::hydrate(&repo, &config, &scopes, &args.targets, args.dry_run)?;
-            emit(&report, cli.format)
+        Command::Storage(args) => match args.command {
+            StorageCommand::Status(args) => {
+                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                emit(
+                    &storage::status(&repo, &config, &scopes, &args.paths)?,
+                    cli.format,
+                )
+            }
+            StorageCommand::Set(args) => {
+                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                emit(
+                    &storage::set(
+                        &repo,
+                        &config,
+                        &scopes,
+                        &args.paths,
+                        args.to,
+                        &args.reason,
+                        args.scoped.dry_run,
+                    )?,
+                    cli.format,
+                )
+            }
+            StorageCommand::Reset(args) => {
+                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                emit(
+                    &storage::reset(&repo, &config, &scopes, &args.paths, args.scoped.dry_run)?,
+                    cli.format,
+                )
+            }
+            StorageCommand::Hydrate(args) => {
+                let (repo, config, scopes) = scoped_context(&args.scoped)?;
+                emit(
+                    &storage::hydrate(&repo, &config, &scopes, &args.paths, args.scoped.dry_run)?,
+                    cli.format,
+                )
+            }
+        },
+        Command::Move(args) => {
+            let (repo, config, scopes) = scoped_context(&args.scoped)?;
+            emit(
+                &storage::move_path(
+                    &repo,
+                    &config,
+                    &scopes,
+                    &args.old_path,
+                    &args.new_path,
+                    args.scoped.dry_run,
+                )?,
+                cli.format,
+            )
         }
         Command::Refresh(args) => emit(
             &refresh(&RefreshOptions {
@@ -127,8 +155,6 @@ fn run(cli: Cli) -> Result<()> {
                 remote: args.remote,
                 branch: args.branch,
                 dry_run: args.dry_run,
-                git_only: args.git_only,
-                scope_note: args.scope_note,
             })?,
             cli.format,
         ),
@@ -144,21 +170,14 @@ fn run_publish(args: PublishCommandArgs, format: Format) -> Result<()> {
             scope_note: args.scope_note,
             allow_non_shared_head: args.allow_non_shared_head,
             dry_run: args.dry_run,
-            git_only: args.git_only,
             repo: args.repo,
         },
         Operation::Publish,
-        Vec::new(),
         format,
     )
 }
 
-fn run_transaction(
-    args: PublishArgs,
-    operation: Operation,
-    management_paths: Vec<String>,
-    format: Format,
-) -> Result<()> {
+fn run_transaction(args: PublishArgs, operation: Operation, format: Format) -> Result<()> {
     emit(
         &transact(&TransactionOptions {
             start: args.repo,
@@ -167,34 +186,9 @@ fn run_transaction(
             include: args.include,
             scope_note: args.scope_note,
             allow_non_shared_head: args.allow_non_shared_head,
-            git_only: args.git_only,
             dry_run: args.dry_run,
             operation,
-            management_paths,
         })?,
-        format,
-    )
-}
-
-fn run_required_transaction(
-    args: RequiredPublishArgs,
-    operation: Operation,
-    management_paths: Vec<String>,
-    format: Format,
-) -> Result<()> {
-    run_transaction(
-        PublishArgs {
-            manifest: args.manifest,
-            message: Some(args.message),
-            include: args.include,
-            scope_note: args.scope_note,
-            allow_non_shared_head: args.allow_non_shared_head,
-            dry_run: args.dry_run,
-            git_only: false,
-            repo: args.repo,
-        },
-        operation,
-        management_paths,
         format,
     )
 }
@@ -224,6 +218,18 @@ fn hydrate_scopes(
     scopes.sort();
     scopes.dedup();
     Ok((scopes, additional))
+}
+
+fn scoped_context(args: &ScopedArgs) -> Result<(GitRepo, Config, Vec<String>)> {
+    let repo = GitRepo::discover(&args.repo)?;
+    let config = Config::load(&repo)?;
+    let manifest_path = match &args.manifest {
+        Some(path) => path.clone(),
+        None => ResolvedTask::discover(&repo, &config, &args.repo)?,
+    };
+    let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
+    let (scopes, _) = hydrate_scopes(&task, &args.include, args.scope_note.as_deref())?;
+    Ok((repo, config, scopes))
 }
 
 fn emit<T: serde::Serialize>(value: &T, format: Format) -> Result<()> {

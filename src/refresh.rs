@@ -18,8 +18,6 @@ pub struct RefreshOptions {
     pub remote: Option<String>,
     pub branch: Option<String>,
     pub dry_run: bool,
-    pub git_only: bool,
-    pub scope_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,8 +31,6 @@ pub struct RefreshReport {
     pub incoming_paths: Vec<String>,
     pub working_changes_before: Vec<String>,
     pub working_changes_after: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope_note: Option<String>,
     pub storage: RefreshStorageReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -60,14 +56,11 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let remote = options
         .remote
         .clone()
-        .unwrap_or_else(|| config.git.remote.clone());
+        .unwrap_or_else(|| config.publication.remote.clone());
     let branch = options
         .branch
         .clone()
-        .unwrap_or_else(|| config.git.shared_checkout_branch.clone());
-    if options.git_only && options.scope_note.is_none() {
-        return Err(Error::message("refresh --git-only requires --scope-note"));
-    }
+        .unwrap_or_else(|| config.publication.shared_checkout_branch.clone());
     repo.validate_branch(&branch)?;
     let head = repo.current_branch()?;
     if head.as_deref() != Some(&branch) {
@@ -129,18 +122,8 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         incoming_paths,
         working_changes_before: working_before.clone(),
         working_changes_after: working_before,
-        scope_note: if options.git_only {
-            options.scope_note.clone()
-        } else {
-            None
-        },
         storage: RefreshStorageReport {
-            mode: if options.git_only {
-                "git-only"
-            } else {
-                "hydrate"
-            }
-            .to_owned(),
+            mode: "hydrate".to_owned(),
             changed_files: incoming_dvc.clone(),
             old_files: old_dvc.clone(),
             new_files: new_dvc.clone(),
@@ -154,7 +137,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         return Ok(report);
     }
 
-    let overlays = if incoming_dvc.is_empty() || options.git_only {
+    let overlays = if incoming_dvc.is_empty() {
         BTreeMap::new()
     } else {
         let overlays = capture_overlays(&repo, &old_oid, &new_oid, &incoming_dvc)?;
@@ -167,7 +150,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     }
 
     let mut outputs_absent_before = Vec::new();
-    if !incoming_dvc.is_empty() && !options.git_only {
+    if !incoming_dvc.is_empty() {
         let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_dvc)?;
         let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &new_dvc)?;
         let unsafe_outputs: Vec<String> = new_dvc
@@ -208,7 +191,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     ])?;
     let refreshed = (|| {
         repo.run(["read-tree", "--reset", &new_oid])?;
-        if !incoming_dvc.is_empty() && !options.git_only {
+        if !incoming_dvc.is_empty() {
             report.storage.materialized = materialize_metadata(&repo, &new_oid, &incoming_dvc)?;
             if !new_dvc.is_empty() {
                 let args = std::iter::once("checkout".to_owned())
@@ -244,7 +227,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     }
     report.status = "updated".to_owned();
     report.method = Some(
-        if !incoming_dvc.is_empty() && !options.git_only {
+        if !incoming_dvc.is_empty() {
             "prefetch managed storage, compare-and-swap the repository revision, then hydrate stored outputs"
         } else {
             "compare-and-swap ref update plus index-only read-tree"
