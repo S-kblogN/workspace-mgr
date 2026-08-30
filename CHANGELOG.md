@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1] - 2026-08-30
+
 ### Added
 
 - Initial standalone Rust CLI project.
@@ -25,6 +27,9 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - A networked end-to-end suite using versioned MinIO and `git daemon`, including
   configuration-drift repair and failure-ordering assertions.
 - Linux and macOS CI plus native packaging workflows.
+- A declarative release workflow that publishes each new `Cargo.toml` version
+  once, creates an immutable matching tag, and reconciles native GitHub Release
+  assets after the full CI and end-to-end gates pass.
 - Bidirectional Git/S3 placement transitions, ordinary Git refresh
   materialization, repository-wide operation locking, and tracked-input
   hardening.

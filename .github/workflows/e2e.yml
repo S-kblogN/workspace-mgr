@@ -2,9 +2,13 @@ name: End-to-end
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact Git revision to check
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -31,6 +35,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
         with:
