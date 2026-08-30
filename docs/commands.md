@@ -62,20 +62,23 @@ workspace-mgr init --dry-run
 
 ## `workspace-mgr instructions`
 
-Render the effective agent policy.
+Render the shared repository-management model and effective agent policy.
 
 ```text
-workspace-mgr instructions [all|core|task|publish|artifacts|storage|shared-checkout|infrastructure]
+workspace-mgr instructions [all|model|core|task|publish|artifacts|storage|shared-checkout|infrastructure]
   [--repo <path>]
 ```
 
-With no topic, `all` is used. The output includes a CLI version, schema version,
-topic, and policy hash. `core` is always available. Other topics require their
-corresponding `[agent].modules` entry; requesting a disabled topic is an error.
-Repository-specific additions are appended only to `all`.
+With no topic, `all` is used. It renders the canonical repository-management
+model first, then the effective operational rules. `model` returns only that
+shared conceptual document. The output includes a CLI version, schema version,
+topic, and policy hash. `core` and `model` are always available. Other topics
+require their corresponding `[agent].modules` entry; requesting a disabled
+topic is an error. Repository-specific additions are appended only to `all`.
 
 ```sh
 workspace-mgr instructions
+workspace-mgr instructions model
 workspace-mgr instructions storage
 workspace-mgr --format json instructions publish
 ```

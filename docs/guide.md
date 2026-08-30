@@ -5,29 +5,16 @@ coding agents. It creates the repository and task scaffolding, explains the
 effective repository policy, decides where retained content lives, and
 publishes a task without switching a shared checkout.
 
-The public model deliberately has only two storage locations: **Git** and
-**S3**. The implementation may use other programs internally, but users and
-agents should not configure or invoke those programs directly.
+Begin with the [repository management model](management-model.md). It explains
+the one-conversation/one-task/one-branch/one-PR relationship, separates task
+scope from Git/S3 placement, and defines publication and shared-checkout
+semantics before introducing commands. The same source document appears first
+in the default output of `workspace-mgr instructions`, so users and agents
+reason from one model rather than parallel summaries.
 
-## The mental model
-
-Five concepts describe the complete workflow.
-
-| Concept | Meaning | Main operations |
-| --- | --- | --- |
-| Repository policy | Tracked, non-secret defaults in `.workspace-mgr.toml` | `init`, `config show`, `doctor` |
-| Agent instructions | The effective operating rules generated from policy modules | `instructions` |
-| Task | One reviewable unit with a directory, manifest, README, and target branch | `task create`, `task status` |
-| Placement | Whether retained content is stored in Git or S3 | `storage status`, `set`, `reset`, `hydrate`, `move` |
-| Publication | One scoped, verified Git-and-S3 transaction | `plan`, `publish`, `refresh` |
-
-Installation has one separate host-level operation, `workspace-mgr setup`, which
-provisions the private execution runtime. It is not repository policy and does
-not add another repository-management concept.
-
-The task manifest defines the paths and branch involved in one transaction.
-Placement answers where content is stored. Publication is the only operation
-that makes the task visible on a remote.
+The sections below apply that model as an operational lifecycle. The public
+storage vocabulary deliberately contains only **Git** and **S3**; users and
+agents do not configure or invoke private execution engines directly.
 
 ## Repository lifecycle
 
@@ -78,16 +65,19 @@ workspace-mgr instructions --repo .
 ```
 
 `instructions` is intentionally different from `help`: help explains command
-syntax, while instructions renders the repository's actual operating policy.
-The output combines built-in policy modules, `.workspace-mgr.toml`, and the
-optional repository-specific module. Run `workspace-mgr doctor` before work if
-the installation or repository state may be inconsistent.
+syntax, while instructions first establishes the shared management model and
+then renders the repository's actual operating policy. The output combines the
+canonical model document, built-in policy modules, `.workspace-mgr.toml`, and
+the optional repository-specific module. Run `workspace-mgr doctor` before work
+if the installation or repository state may be inconsistent.
 
-The `[agent].modules` list controls which policy sections appear. The operating
-core is always included in the default `all` document and is not configurable;
-task scope, publication, artifact hygiene, storage, shared-checkout, and
-infrastructure rules are independent modules. Requesting a disabled topic is an
-error instead of silently returning incomplete policy.
+The default `all` document contains the model followed by all enabled rules.
+`instructions model` returns only the conceptual model. The `[agent].modules`
+list controls which operational sections appear; the operating core is always
+included in `all`, while task scope, publication, artifact hygiene, storage,
+shared-checkout, and infrastructure rules are independent modules. Requesting a
+disabled operational topic is an error instead of silently returning incomplete
+policy.
 
 ### 4. Create one task
 
@@ -181,7 +171,8 @@ the declared scopes, pushes an explicit target-branch ref, and verifies the
 remote object ID. It does not switch the checkout or stage files in the shared
 Git index.
 
-Creating and maintaining a pull request remains a repository-hosting action.
+Creating and maintaining the task's one draft pull request remains a
+repository-hosting action.
 `workspace-mgr` is provider-neutral: it publishes the branch transaction but
 does not call a GitHub or other hosting API. If repository policy asks for one
 draft pull request per task, the user or agent creates and updates it separately.

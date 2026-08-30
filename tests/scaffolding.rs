@@ -49,9 +49,24 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 
     let instructions = workspace(&fixture.shared, ["--format", "human", "instructions"]);
     let text = String::from_utf8(instructions.stdout).unwrap();
+    let model = text.find("# Repository management model").unwrap();
+    let rules = text.find("# Effective repository instructions").unwrap();
+    assert!(
+        model < rules,
+        "management model must precede operational rules"
+    );
+    assert!(text.contains("one writable conversation (chat) = one task"));
     assert!(text.contains("Effective repository instructions"));
     assert!(text.contains("shared checkout"));
     assert!(text.contains("policy="));
+
+    let model_only = workspace(
+        &fixture.shared,
+        ["--format", "human", "instructions", "model"],
+    );
+    let model_only = String::from_utf8(model_only.stdout).unwrap();
+    assert!(model_only.contains("# Repository management model"));
+    assert!(!model_only.contains("# Effective repository instructions"));
 
     let doctor = workspace(&fixture.shared, ["--format", "json", "doctor"]);
     assert_eq!(json(&doctor)["status"], "ok");
@@ -270,10 +285,10 @@ fn agent_modules_control_the_generated_policy() {
     let text = String::from_utf8(all.stdout).unwrap();
     assert!(text.contains("Operating model"));
     assert!(text.contains("Task lifecycle"));
-    assert!(!text.contains("Publication"));
-    assert!(!text.contains("Artifact hygiene"));
-    assert!(!text.contains("Storage placement"));
-    assert!(!text.contains("Shared checkout"));
+    assert!(!text.contains("\n## Publication\n"));
+    assert!(!text.contains("\n## Artifact hygiene\n"));
+    assert!(!text.contains("\n## Storage placement\n"));
+    assert!(!text.contains("\n## Shared checkout\n"));
 
     let disabled = workspace_unchecked(&fixture.shared, ["instructions", "publish"]);
     assert_eq!(disabled.status.code(), Some(2));

@@ -4,20 +4,31 @@ use workspace_mgr::cli::Cli;
 #[test]
 fn user_documentation_covers_the_complete_public_model() {
     let readme = include_str!("../README.md");
+    let model = include_str!("../docs/management-model.md");
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
 
+    assert!(readme.contains("docs/management-model.md"));
+    assert!(guide.contains("management-model.md"));
     assert!(readme.contains("docs/guide.md"));
     assert!(readme.contains("docs/commands.md"));
     for concept in [
-        "Repository policy",
-        "Agent instructions",
-        "Task",
-        "Placement",
+        "conversation",
+        "task",
+        "target branch",
+        "draft pull request",
+        "Task scope",
+        "Storage placement",
         "Publication",
+        "shared checkout",
     ] {
-        assert!(guide.contains(concept), "guide is missing {concept}");
+        assert!(model.contains(concept), "model is missing {concept}");
     }
+    assert!(model.contains(
+        "one writable conversation (chat) = one task = one target branch = one draft pull request"
+    ));
+    assert!(model.contains("Infrastructure is a kind of task"));
+    assert!(model.contains("Placement and publication are separate"));
     for command in [
         "setup",
         "init",
@@ -44,6 +55,7 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("does not call a GitHub or other hosting API"));
     assert!(guide.contains("S3 first, then Git"));
     assert!(guide.contains("Nested placement boundaries"));
+    assert!(!model.to_ascii_lowercase().contains("dvc"));
     assert!(!guide.to_ascii_lowercase().contains("dvc"));
     assert!(!commands.to_ascii_lowercase().contains("dvc"));
 }
@@ -71,6 +83,7 @@ fn documented_command_shapes_are_accepted_by_clap() {
             "--dry-run",
         ],
         &["instructions"],
+        &["instructions", "model"],
         &["instructions", "storage", "--repo", "/tmp/repository"],
         &["--format", "json", "instructions", "publish"],
         &["doctor", "--repo", "/tmp/repository"],

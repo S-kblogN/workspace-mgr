@@ -35,7 +35,7 @@ pub enum Command {
     /// Initialize or adopt repository policy and scaffolding.
     Init(InitArgs),
 
-    /// Print the effective repository instructions for an agent.
+    /// Print the shared management model and effective repository instructions.
     Instructions(InstructionsArgs),
 
     /// Diagnose dependencies, configuration, and repository state.
@@ -104,7 +104,7 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct InstructionsArgs {
-    /// Optional topic: core, task, publish, artifacts, storage, shared-checkout, or infrastructure.
+    /// Optional topic: model, core, task, publish, artifacts, storage, shared-checkout, or infrastructure.
     pub topic: Option<String>,
 
     #[arg(long, default_value = ".")]
