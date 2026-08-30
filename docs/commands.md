@@ -190,7 +190,7 @@ workspace-mgr storage set 20260829-180000-report/data \
 
 Remove an explicit choice and return paths to automatic policy. Published
 placement remains sticky: resetting a published S3 boundary keeps it in S3;
-use `storage set --to git` for an intentional migration.
+use `storage set --to git` for an intentional placement change.
 
 ```text
 workspace-mgr storage reset <path>...
