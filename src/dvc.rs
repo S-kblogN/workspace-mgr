@@ -174,25 +174,17 @@ pub fn remove_internal_config(repo: &GitRepo) -> Result<bool> {
 
 pub fn repository_pointers(repo: &GitRepo) -> Result<Vec<String>> {
     let mut found = BTreeSet::new();
-    for entry in WalkDir::new(&repo.root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !matches!(entry.file_name().to_str(), Some(".git" | ".dvc")))
-    {
-        let entry =
-            entry.map_err(|error| Error::message(format!("failed to walk repository: {error}")))?;
-        if entry.path().extension().and_then(|value| value.to_str()) == Some("dvc") {
-            if !entry.file_type().is_file() || entry.path().is_symlink() {
+    for path in repo.visible_paths(&[])? {
+        let absolute = resolved_under(&repo.root, &path);
+        if absolute.extension().and_then(|value| value.to_str()) == Some("dvc") {
+            let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err(Error::message(format!(
                     "managed-storage metadata must be a regular file: {}",
-                    entry.path().display()
+                    absolute.display()
                 )));
             }
-            found.insert(relative_to(
-                entry.path(),
-                &repo.root,
-                "managed-storage metadata",
-            )?);
+            found.insert(path);
         }
     }
     Ok(found.into_iter().collect())
@@ -303,48 +295,19 @@ struct PointerFile {
 
 pub fn discover(repo: &GitRepo, scopes: &[String]) -> Result<Vec<String>> {
     let mut found = BTreeSet::new();
-    for scope in scopes {
-        let root = resolved_under(&repo.root, scope);
-        if root.is_symlink() {
-            if root.extension().and_then(|value| value.to_str()) == Some("dvc") {
-                return Err(Error::message(format!(
-                    "managed-storage metadata may not be a symlink: {scope}"
-                )));
-            }
+    for path in repo.visible_paths(scopes)? {
+        let absolute = resolved_under(&repo.root, &path);
+        if absolute.extension().and_then(|value| value.to_str()) != Some("dvc") {
             continue;
         }
-        if root.is_file() {
-            if root.extension().and_then(|value| value.to_str()) == Some("dvc") {
-                found.insert(scope.clone());
-            }
-            continue;
+        let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(Error::message(format!(
+                "managed-storage metadata must be a regular file: {}",
+                absolute.display()
+            )));
         }
-        if !root.exists() || root.is_symlink() {
-            continue;
-        }
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| entry.file_name() != ".git")
-        {
-            let entry = entry.map_err(|error| {
-                Error::message(format!("failed to walk {}: {error}", root.display()))
-            })?;
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("dvc") {
-                continue;
-            }
-            if !entry.file_type().is_file() || entry.path().is_symlink() {
-                return Err(Error::message(format!(
-                    "managed-storage metadata must be a regular file: {}",
-                    entry.path().display()
-                )));
-            }
-            found.insert(relative_to(
-                entry.path(),
-                &repo.root,
-                "managed-storage metadata",
-            )?);
-        }
+        found.insert(path);
     }
     Ok(found.into_iter().collect())
 }

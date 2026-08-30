@@ -349,68 +349,41 @@ pub fn apply_automatic(
 ) -> Result<AutomaticPlacementReport> {
     let mut candidates = Vec::new();
     let mut decisions = Vec::new();
-    for scope in scopes {
-        let root = resolved_under(&repo.root, scope);
-        if !root.exists() || root.is_symlink() {
+    for path in repo.visible_paths(scopes)? {
+        let absolute = resolved_under(&repo.root, &path);
+        let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        let walker = if root.is_file() {
-            WalkDir::new(&root).max_depth(0)
-        } else {
-            WalkDir::new(&root)
-        };
-        for entry in walker
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| entry.file_name() != ".git")
-        {
-            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
-            if !entry.file_type().is_file() || entry.path().is_symlink() {
-                continue;
-            }
-            let path = relative_to(entry.path(), &repo.root, "storage candidate")?;
-            if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
-                continue;
-            }
-            let ignored = repo.run_unchecked(["check-ignore", "--quiet", "--", &path])?;
-            if ignored.code == 0 {
-                continue;
-            }
-            if ignored.code != 1 {
+        if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
+            continue;
+        }
+        if explicit_target(repo, &path)? == Some(StorageTarget::Git) {
+            continue;
+        }
+        let object = format!("{base_oid}:{path}");
+        if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
+            continue;
+        }
+        let size = metadata.len();
+        let target = size_fallback_target(size);
+        if size >= RECOMMENDED_S3_MINIMUM_BYTES {
+            decisions.push(placement_report(
+                repo,
+                &path,
+                &path,
+                target,
+                PlacementBasis::AutomaticSizeFallback,
+                None,
+            )?);
+        }
+        if target == StorageTarget::S3 {
+            if !config.s3_enabled() {
                 return Err(Error::message(format!(
-                    "git check-ignore failed for {path}"
+                    "automatic policy selected S3 for {path:?}, but [s3] is not configured; configure S3 or run `workspace-mgr storage set {path} --to git --reason <reason>`"
                 )));
             }
-            if explicit_target(repo, &path)? == Some(StorageTarget::Git) {
-                continue;
-            }
-            let object = format!("{base_oid}:{path}");
-            if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
-                continue;
-            }
-            let size = entry
-                .metadata()
-                .map_err(|error| Error::message(error.to_string()))?
-                .len();
-            let target = size_fallback_target(size);
-            if size >= RECOMMENDED_S3_MINIMUM_BYTES {
-                decisions.push(placement_report(
-                    repo,
-                    &path,
-                    &path,
-                    target,
-                    PlacementBasis::AutomaticSizeFallback,
-                    None,
-                )?);
-            }
-            if target == StorageTarget::S3 {
-                if !config.s3_enabled() {
-                    return Err(Error::message(format!(
-                        "automatic policy selected S3 for {path:?}, but [s3] is not configured; configure S3 or run `workspace-mgr storage set {path} --to git --reason <reason>`"
-                    )));
-                }
-                candidates.push(path);
-            }
+            candidates.push(path);
         }
     }
     candidates.sort();
@@ -820,64 +793,33 @@ fn resolve_status_paths(
             boundaries.insert(output);
         }
     }
-    for scope in scopes {
-        let root = resolved_under(&repo.root, scope);
-        if !root.exists() || root.is_symlink() {
-            continue;
-        }
-        for entry in WalkDir::new(&root).follow_links(false) {
-            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
-            if entry.file_type().is_file()
-                && entry.path().to_string_lossy().ends_with(PLACEMENT_SUFFIX)
-            {
-                let sidecar = relative_to(entry.path(), &repo.root, "placement metadata")?;
-                boundaries.insert(sidecar.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
-            }
+    let visible_paths = repo.visible_paths(scopes)?;
+    for path in &visible_paths {
+        let absolute = resolved_under(&repo.root, path);
+        if path.ends_with(PLACEMENT_SUFFIX)
+            && fs::symlink_metadata(&absolute)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            boundaries.insert(path.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
         }
     }
     found.extend(boundaries.iter().cloned());
-    for scope in scopes {
-        let root = resolved_under(&repo.root, scope);
-        if !root.exists() || root.is_symlink() {
+    for path in visible_paths {
+        let absolute = resolved_under(&repo.root, &path);
+        let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        let walker = if root.is_file() {
-            WalkDir::new(&root).max_depth(0)
-        } else {
-            WalkDir::new(&root)
-        };
-        for entry in walker
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| entry.file_name() != ".git")
-        {
-            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
-            if !entry.file_type().is_file() || entry.path().is_symlink() {
-                continue;
-            }
-            let path = relative_to(entry.path(), &repo.root, "storage status path")?;
-            if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
-                continue;
-            }
-            if boundaries
-                .iter()
-                .any(|boundary| path == *boundary || is_descendant(&path, boundary))
-            {
-                continue;
-            }
-            let ignored = repo.run_unchecked(["check-ignore", "--quiet", "--", &path])?;
-            match ignored.code {
-                0 => continue,
-                1 => {
-                    found.insert(path);
-                }
-                _ => {
-                    return Err(Error::message(
-                        "git check-ignore failed while listing storage status",
-                    ));
-                }
-            }
+        if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
+            continue;
         }
+        if boundaries
+            .iter()
+            .any(|boundary| path == *boundary || is_descendant(&path, boundary))
+        {
+            continue;
+        }
+        found.insert(path);
     }
     Ok(found.into_iter().collect())
 }
@@ -964,19 +906,13 @@ fn known_boundaries(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String
                 .unwrap_or_default(),
         );
     }
-    for scope in scopes {
-        let root = resolved_under(&repo.root, scope);
-        if !root.exists() || root.is_symlink() {
-            continue;
-        }
-        for entry in WalkDir::new(&root).follow_links(false) {
-            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
-            if entry.file_type().is_file()
-                && entry.path().to_string_lossy().ends_with(PLACEMENT_SUFFIX)
-            {
-                let sidecar = relative_to(entry.path(), &repo.root, "placement metadata")?;
-                boundaries.insert(sidecar.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
-            }
+    for path in repo.visible_paths(scopes)? {
+        let absolute = resolved_under(&repo.root, &path);
+        if path.ends_with(PLACEMENT_SUFFIX)
+            && fs::symlink_metadata(&absolute)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            boundaries.insert(path.trim_end_matches(PLACEMENT_SUFFIX).to_owned());
         }
     }
     Ok(boundaries)

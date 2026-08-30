@@ -274,6 +274,70 @@ fn explicit_git_directory_applies_recursively_and_status_lists_git_content() {
     assert!(String::from_utf8_lossy(&plan.stderr).contains("automatic policy selected S3"));
 }
 
+#[cfg(unix)]
+#[test]
+fn plan_prunes_ignored_directories_before_inspecting_their_contents() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "ignored-directories",
+            "--title",
+            "Ignored directories",
+            "--purpose",
+            "Verify ignored directory pruning.",
+            "--timestamp",
+            "20260829-170157",
+        ],
+    );
+    let task_id = "20260829-170157-ignored-directories";
+    let task = fixture.shared.join(task_id);
+    std::fs::write(task.join(".gitignore"), ".venv/\n.chat-sync-state/\n").unwrap();
+    let ignored = [task.join(".venv"), task.join(".chat-sync-state")];
+    for directory in &ignored {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::write(directory.join("sentinel"), "must not be inspected\n").unwrap();
+        let mut permissions = std::fs::metadata(directory).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(directory, permissions).unwrap();
+    }
+
+    let plan = workspace_unchecked(&task, ["plan"]);
+    let status = workspace_unchecked(&task, ["storage", "status"]);
+
+    for directory in &ignored {
+        let mut permissions = std::fs::metadata(directory).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(directory, permissions).unwrap();
+    }
+
+    assert!(
+        plan.status.success(),
+        "plan failed:\n{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    assert!(
+        status.status.success(),
+        "storage status failed:\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(json(&plan)["ignored_entries"].as_u64().unwrap() <= 2);
+    assert!(
+        json(&status)["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| {
+                let path = path.as_str().unwrap();
+                !path.contains("/.venv/") && !path.contains("/.chat-sync-state/")
+            })
+    );
+}
+
 #[test]
 fn additional_scope_requires_and_records_a_reason() {
     let fixture = managed_fixture();

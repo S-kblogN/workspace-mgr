@@ -99,6 +99,47 @@ impl GitRepo {
         run_with("git", full, &self.root, &env, input, check)
     }
 
+    pub fn visible_paths(&self, scopes: &[String]) -> Result<Vec<String>> {
+        let mut args = vec![
+            "ls-files".to_owned(),
+            "--cached".to_owned(),
+            "--others".to_owned(),
+            "--exclude-standard".to_owned(),
+            "-z".to_owned(),
+            "--".to_owned(),
+        ];
+        if scopes.is_empty() {
+            args.push(".".to_owned());
+        } else {
+            args.extend(scopes.iter().cloned());
+        }
+        let mut paths = Vec::new();
+        for path in self
+            .run(args)?
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+        {
+            match fs::symlink_metadata(self.root.join(path)) {
+                Ok(_) => paths.push(path.to_owned()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: self.root.join(path),
+                        source,
+                    });
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     pub fn common_dir(&self) -> Result<PathBuf> {
         let raw = self.run(["rev-parse", "--git-common-dir"])?.stdout;
         let path = PathBuf::from(raw.trim());

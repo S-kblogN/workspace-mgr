@@ -36,6 +36,9 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Fixed
 
+- Planning and storage-status discovery now ask Git for tracked and non-ignored
+  paths instead of recursively entering ignored directories; ignored-entry
+  reporting also stays at directory granularity.
 - Task manifests now enforce the product-owned task identity, branch mapping,
   required purpose metadata, and non-overlapping scopes on every load.
 - Distinct tasks can no longer claim the same remote branch after a concurrent

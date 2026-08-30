@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::dvc;
@@ -15,7 +14,7 @@ use crate::lock::RepositoryLock;
 use crate::manifest::{
     AdditionalScope, ResolvedTask, TaskKind, one_line, validate_additional_scopes,
 };
-use crate::path::{allowed, relative_to, repo_path, resolved_under};
+use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
     AUTO_S3_ABOVE_BYTES, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
     REVIEW_PULL_REQUEST,
@@ -649,54 +648,25 @@ fn check_large_files(
     threshold: u64,
     automatic_s3: &[String],
 ) -> Result<()> {
-    for scope in scopes {
-        let root = resolved_under(&repo.root, scope);
-        if !root.exists() || root.is_symlink() {
+    for relative in repo.visible_paths(scopes)? {
+        let absolute = resolved_under(&repo.root, &relative);
+        let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() <= threshold {
             continue;
         }
-        let walker = if root.is_file() {
-            WalkDir::new(&root).max_depth(0)
-        } else {
-            WalkDir::new(&root)
-        };
-        for entry in walker.follow_links(false) {
-            let entry = entry.map_err(|error| Error::message(format!("walk failed: {error}")))?;
-            if !entry.file_type().is_file() || entry.path().is_symlink() {
-                continue;
-            }
-            if entry
-                .metadata()
-                .map_err(|error| Error::message(error.to_string()))?
-                .len()
-                <= threshold
-            {
-                continue;
-            }
-            let relative = relative_to(entry.path(), &repo.root, "large file")?;
-            let ignored = repo.run_unchecked(["check-ignore", "--quiet", "--", &relative])?;
-            if ignored.code == 0 {
-                continue;
-            }
-            if ignored.code != 1 {
-                return Err(Error::message(format!(
-                    "git check-ignore failed for {relative}"
-                )));
-            }
-            if automatic_s3.contains(&relative) {
-                continue;
-            }
-            if storage::explicit_target(repo, &relative)? == Some(crate::config::StorageTarget::Git)
-            {
-                continue;
-            }
-            let object = format!("{base_oid}:{relative}");
-            if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
-                continue;
-            }
-            return Err(Error::message(format!(
-                "retained file {relative:?} is larger than {threshold} bytes and has no valid placement; run `workspace-mgr storage set {relative} --to git|s3 --reason <reason>`"
-            )));
+        if automatic_s3.contains(&relative) {
+            continue;
         }
+        if storage::explicit_target(repo, &relative)? == Some(crate::config::StorageTarget::Git) {
+            continue;
+        }
+        let object = format!("{base_oid}:{relative}");
+        if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
+            continue;
+        }
+        return Err(Error::message(format!(
+            "retained file {relative:?} is larger than {threshold} bytes and has no valid placement; run `workspace-mgr storage set {relative} --to git|s3 --reason <reason>`"
+        )));
     }
     Ok(())
 }
@@ -706,7 +676,7 @@ fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<usiz
         "status".to_owned(),
         "--ignored".to_owned(),
         "--short".to_owned(),
-        "--untracked-files=all".to_owned(),
+        "--untracked-files=normal".to_owned(),
         "--".to_owned(),
     ];
     args.extend(scopes.iter().cloned());
