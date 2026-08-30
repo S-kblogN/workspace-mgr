@@ -14,7 +14,8 @@ The [user guide](guide.md) explains how the commands form one workflow.
   path. `--manifest <path>` selects one explicitly.
 - `--include <path>` adds a one-invocation scope and requires a one-line
   `--scope-note <reason>`. Repeat `--include` for multiple paths.
-- `--dry-run` previews local mutation for commands that support it.
+- `--dry-run` previews local mutation for commands that support it. Task discard
+  also saves a private revision-bound confirmation plan.
 - Human output is concise YAML, except Markdown from `instructions` and TOML
   from `config show`. Use global `--format json` or set
   `WORKSPACE_MGR_FORMAT=json` for stable structured output.
@@ -151,6 +152,55 @@ workspace-mgr task status [--repo <path>] [--manifest <path>]
 
 This is a local read-only view. Use `plan` for the complete prospective
 publication state.
+
+## `workspace-mgr task discard`
+
+Permanently abandon one unmerged task after its pull request is closed or
+verified absent by the agent.
+
+```text
+workspace-mgr task discard (--dry-run | --confirm <task-id>)
+  [--repo <path>] [--manifest <path>]
+```
+
+Always run `--dry-run` first. It creates no repository-content or remote change,
+but writes a private `discard-plan.json` containing the observed task identity,
+local and remote task refs, and local and remote shared refs. Its structured
+report includes:
+
+- every working change in the deliverable scopes or infrastructure worktree;
+- the task directory or worktree to delete;
+- each additional deliverable scope to restore from the local shared branch;
+- whether the agent must close a pull request or verify that none exists;
+- current local or published managed S3 boundaries and recorded exact version
+  IDs, all marked `retained-not-purged`.
+
+After explicit user authorization, the agent verifies the task is unmerged,
+closes the matching pull request if it exists, and verifies that provider state.
+Run confirmation from the shared checkout and pass the manifest printed by the
+dry run, because the task workspace itself will be deleted:
+
+```sh
+workspace-mgr task discard --dry-run
+workspace-mgr task discard \
+  --manifest /absolute/path/to/.workspace-mgr-task.toml \
+  --confirm 20260830-120000-example
+```
+
+Confirmation requires the exact task ID and an unchanged private plan. It
+refuses changed refs, a branch with another task identity, a task already
+contained in the shared branch, an unmanaged infrastructure worktree, or an
+invocation whose current directory would be deleted. It deletes an existing
+remote task branch with `force-with-lease`, verifies absence, deletes local and
+remote-tracking refs, then removes the local workspace and private task state.
+Deliverable scopes are first moved into private quarantine; additional scopes
+and their shared-index entries are restored from the local shared branch. A
+remote failure restores quarantined paths and their prior index state.
+Infrastructure confirmation removes the entire managed worktree.
+
+The CLI is provider-neutral and cannot verify pull-request state itself; the
+report makes that agent responsibility explicit. Discard never permanently
+deletes versioned S3 objects or older remote-storage history.
 
 ## `workspace-mgr storage status`
 

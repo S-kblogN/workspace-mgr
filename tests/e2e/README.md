@@ -17,6 +17,8 @@ placement, aggregate boundary sizing, tiny-S3 warnings, the semantic review
 band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
 isolated infrastructure task scaffolding and scoped publication,
+deliverable and infrastructure task discard with branch/worktree cleanup while
+retaining versioned S3 objects,
 fixed policy with a minimal Git/S3-only public configuration,
 Git-to-S3 and S3-to-Git transitions, failure ordering, successful and rolled-back
 ordinary Git/S3 shared-checkout refresh, fresh-clone hydration, missing exact S3

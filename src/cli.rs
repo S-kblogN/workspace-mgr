@@ -130,6 +130,8 @@ pub enum TaskCommand {
     Create(TaskCreateArgs),
     /// Inspect the resolved task scope and working changes.
     Status(TaskStatusArgs),
+    /// Permanently discard an unmerged task after its pull request is closed.
+    Discard(TaskDiscardArgs),
 }
 
 #[derive(Debug, Args)]
@@ -170,6 +172,23 @@ pub struct TaskStatusArgs {
 
     #[arg(long)]
     pub manifest: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskDiscardArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+
+    /// Inspect the exact destructive scope and save a private confirmation plan.
+    #[arg(long, conflicts_with = "confirm")]
+    pub dry_run: bool,
+
+    /// Confirm the exact task ID after the agent closes or verifies absence of its PR.
+    #[arg(long, value_name = "TASK_ID", conflicts_with = "dry_run")]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]

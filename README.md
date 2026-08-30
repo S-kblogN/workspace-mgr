@@ -51,8 +51,10 @@ workspace-mgr publish -m "Publish the deliverable"
 
 `storage set`, `storage reset`, and `move` change local desired state only.
 `storage hydrate` reads from S3. `plan` is read-only. `publish` is the only
-command that writes to Git or S3 remotes, and it verifies S3 before publishing a
-Git revision.
+command that publishes repository content, and it verifies S3 before publishing
+a Git revision. If the user instead decides to retain none of the task, the
+agent closes its unmerged pull request and uses `task discard --dry-run` followed
+by `task discard --confirm <task-id>` to remove its branch and local workspace.
 
 ## Placement policy
 

@@ -55,6 +55,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "config show",
         "task create",
         "task status",
+        "task discard",
         "storage status",
         "storage set",
         "storage reset",
@@ -88,6 +89,9 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("Nested placement boundaries"));
     assert!(guide.contains("small-s3-boundary"));
     assert!(guide.contains("semantic-placement-review"));
+    assert!(guide.contains("retained-not-purged"));
+    assert!(commands.contains("force-with-lease"));
+    assert!(normalized_model.contains("explicit opposite endpoint"));
     assert!(commands.contains("payload_bytes"));
     for fact in ["[git]", "remote", "branch", "[s3]", "endpoint_url"] {
         assert!(

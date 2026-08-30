@@ -71,7 +71,10 @@ unrelated repository state.
 `task create` establishes the local task, README, manifest, scope, and branch
 identity. It does not publish a remote branch or create a pull request.
 `task status` resolves the current task and reports its scoped state without
-publishing.
+publishing. `task discard` is the explicit opposite endpoint: after the user
+decides that an unmerged task should not be retained and the agent closes or
+verifies absence of its pull request, it removes that task's branch and local
+workspace instead of publishing or merging it.
 
 The same chat continues using the same task for its lifetime. Continue using
 the same branch and pull request when refining that same intention. Start a new
@@ -167,7 +170,10 @@ the goal, scope, deliverables, validation, or known limitations materially
 change. It then verifies the base branch, head branch, review state, and that
 the pull-request head revision equals the revision reported by `publish`.
 Provider failures are blockers to full synchronization. The agent must not
-merge, enable auto-merge, approve, close, or mark the request ready.
+merge, enable auto-merge, approve, close, or mark the request ready without the
+user explicitly authorizing that exact transition. A user request to discard a
+specific unmerged task is exact authorization for the agent to close that
+task's pull request, verify it is closed, and then run confirmed task cleanup.
 
 A task is fully synchronized when its local and remote branch revisions match,
 its pull-request description reflects the same intention, and a final plan
@@ -177,6 +183,17 @@ If Git publication fails after an S3 upload, an unreferenced S3 object version
 may remain, but no remote Git revision should point to missing content.
 Retrying the same publication is safe. Automatic deletion of shared remote
 history is outside normal workspace management.
+
+Discard is deliberately a two-step destructive operation. Its dry run records
+the observed local task ref, remote task ref, and shared-branch revisions in
+private confirmation state and reports every local action plus the current S3
+version references. Confirmation from the shared checkout is accepted only for
+the exact task ID and unchanged revisions. The CLI then deletes the remote task
+branch with an exact lease, deletes the local task ref, removes the deliverable
+directory or infrastructure worktree, and restores any declared shared paths to
+the local shared-branch tree. A remote failure restores quarantined local state.
+Merged tasks are refused. Versioned S3 objects are reported as retained orphan
+candidates and are never permanently purged by discard.
 
 ## How multiple chats share the workspace
 
@@ -211,9 +228,11 @@ The complete story is:
 7. `plan` explains the proposed reviewable state without publishing it.
 8. `publish` verifies stored content and advances only the task's target branch.
 9. The matching draft pull request carries review, and the user or maintainer
-   decides when to merge it.
-10. `refresh` brings the merged result into the shared workspace without
-    disturbing other active chats.
+   decides whether to merge it or explicitly abandon the task.
+10. After merge, `refresh` brings the result into the shared workspace without
+    disturbing other active chats. After abandonment, the agent closes the
+    unmerged pull request and `task discard` removes the task workspace and
+    branch without purging retained S3 history.
 
 `config show` reports the repository's Git and S3 facts, and `doctor` diagnoses
 the CLI, repository, Git, and storage environment without changing repository

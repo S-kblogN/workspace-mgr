@@ -69,7 +69,8 @@ The following behavior is deliberately not configurable:
 - the agent creates and maintains the pull request title and living
   description;
 - the user or maintainer controls merge, ready, approval, close, and auto-merge
-  transitions;
+  transitions; after the user explicitly abandons an unmerged task, the agent
+  closes that task's pull request before confirmed `task discard` cleanup;
 - all instruction topics are always available, and Git/S3 are the only public
   storage concepts.
 

@@ -33,6 +33,10 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - A provider-neutral review policy and publication handoff that assigns
   pull-request creation, living metadata, verification, and merge authority
   while keeping hosting-provider API calls outside the CLI.
+- Transactional `task discard` for an explicitly abandoned, unmerged task,
+  including stale-plan and merged-task refusal, leased remote-branch deletion,
+  local quarantine and rollback, additional-scope restoration, infrastructure
+  worktree cleanup, and non-destructive S3 orphan reporting.
 
 ### Fixed
 

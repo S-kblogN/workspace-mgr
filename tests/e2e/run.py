@@ -946,6 +946,50 @@ class Harness:
             "published infrastructure worktree is clean",
         )
         self.check(self.wm(worktree, "plan")["status"] == "no_changes", "infrastructure plan ends clean")
+        versions_before_discard = self.list_s3_versions()
+        discard_preview = self.wm(worktree, "task", "discard", "--dry-run")
+        self.check(discard_preview["status"] == "dry_run", "infrastructure discard previews cleanup")
+        self.check(
+            discard_preview["review"]["provider_state_verified_by_cli"] is False
+            and "close" in discard_preview["review"]["required_before_confirm"],
+            "infrastructure discard hands PR closure to the agent",
+        )
+        self.check(
+            discard_preview["local_actions"][0]["action"] == "delete-worktree",
+            "infrastructure discard names the managed worktree deletion",
+        )
+        self.check(
+            any(item["boundary"] == "e2e-infra-assets/data.bin" for item in discard_preview["retained_s3"]),
+            "infrastructure discard reports retained S3 boundary versions",
+        )
+        discarded = self.wm(
+            self.shared,
+            "task",
+            "discard",
+            "--manifest",
+            str(created["manifest"]),
+            "--confirm",
+            "infra-e2e-policy",
+        )
+        self.check(discarded["status"] == "discarded", "infrastructure discard succeeds after review handoff")
+        self.check(
+            discarded.get("cleanup_warnings", []) == [],
+            "infrastructure discard completes without cleanup warnings",
+        )
+        self.check(not worktree.exists(), "infrastructure discard removes its worktree")
+        self.check(self.remote_ref(branch) is None, "infrastructure discard deletes its network branch")
+        local_branch = self.git(
+            self.shared,
+            "rev-parse",
+            "--verify",
+            branch,
+            expected=(0, 128),
+        )
+        self.check(local_branch.returncode == 128, "infrastructure discard deletes its local branch")
+        self.check(
+            self.list_s3_versions() == versions_before_discard,
+            "infrastructure discard does not purge versioned S3 content",
+        )
         self.assert_shared_head()
 
     def exercise_dvc(self, task_id: str, task: Path, branch: str) -> None:
@@ -1591,6 +1635,103 @@ class Harness:
         self.check(not automatic_s3.exists(), "failed exact-version hydrate leaves output absent")
         self.check(self.remote_ref(branch) == remote_before_loss, "missing S3 version leaves Git unchanged")
 
+    def discard_published_deliverable(self) -> None:
+        assert self.shared is not None
+        self.section("explicit abandonment and deliverable task discard")
+        task_id = "20260829-193000-discard-flow"
+        branch = "codex/discard-flow"
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "discard-flow",
+            "--title",
+            "Disposable E2E task",
+            "--purpose",
+            "Verify complete unmerged task abandonment.",
+            "--timestamp",
+            "20260829-193000",
+        )
+        task = Path(created["path"])
+        manifest = Path(created["manifest"])
+        payload = b"discarded task payload retained in versioned S3\n"
+        (task / "artifact.bin").write_bytes(payload)
+        self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/artifact.bin",
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise discard reporting without permanent S3 deletion.",
+        )
+        published = self.wm(task, "publish", "-m", "Publish disposable E2E task")
+        self.check(self.remote_ref(branch) == published["remote_oid"], "disposable task reaches network Git")
+        self.check(payload in self.s3_bodies(), "disposable task reaches versioned S3")
+        versions_before_discard = self.list_s3_versions()
+        shared_head = self.git(self.shared, "rev-parse", "main").stdout.strip()
+
+        preview = self.wm(task, "task", "discard", "--dry-run")
+        self.check(preview["status"] == "dry_run", "deliverable discard dry-run succeeds")
+        self.check(preview["remote_branch_oid"] == published["remote_oid"], "discard binds the published branch revision")
+        self.check(
+            preview["review"]["managed_by"] == "agent"
+            and "close" in preview["review"]["required_before_confirm"],
+            "discard requires the agent to close the unmerged PR",
+        )
+        self.check(
+            preview["local_actions"][0]["path"] == task_id
+            and preview["local_actions"][0]["action"] == "delete",
+            "discard reports the exact deliverable directory",
+        )
+        retained = next(
+            item
+            for item in preview["retained_s3"]
+            if item["boundary"] == f"{task_id}/artifact.bin"
+        )
+        self.check(
+            retained["version_ids"] and retained["disposition"] == "retained-not-purged",
+            "discard reports exact S3 retention without purging",
+        )
+        confirmation_plan = Path(preview["confirmation_plan"])
+        self.check(confirmation_plan.is_file(), "discard dry-run saves private confirmation state")
+
+        discarded = self.wm(
+            self.shared,
+            "task",
+            "discard",
+            "--manifest",
+            str(manifest),
+            "--confirm",
+            task_id,
+        )
+        self.check(discarded["status"] == "discarded", "confirmed deliverable discard succeeds")
+        self.check(
+            discarded.get("cleanup_warnings", []) == [],
+            "deliverable discard completes without cleanup warnings",
+        )
+        self.check(not task.exists(), "deliverable discard removes its local directory")
+        self.check(not confirmation_plan.exists(), "deliverable discard removes private task state")
+        self.check(self.remote_ref(branch) is None, "deliverable discard deletes its network branch")
+        local_branch = self.git(
+            self.shared,
+            "rev-parse",
+            "--verify",
+            branch,
+            expected=(0, 128),
+        )
+        self.check(local_branch.returncode == 128, "deliverable discard deletes its local branch")
+        self.check(
+            self.list_s3_versions() == versions_before_discard,
+            "deliverable discard preserves all versioned S3 objects",
+        )
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == shared_head,
+            "deliverable discard does not move the shared branch",
+        )
+        self.check((self.shared / "unrelated.txt").is_file(), "deliverable discard preserves another task overlay")
+
     def exercise_non_fast_forward_refresh_guard(self) -> None:
         assert self.shared is not None
         self.section("network non-fast-forward refresh guard")
@@ -1646,6 +1787,7 @@ class Harness:
         self.create_and_publish_infrastructure_task()
         self.refresh_and_cross_clone(task_id, task, branch)
         self.exercise_automatic_and_explicit_git()
+        self.discard_published_deliverable()
         self.exercise_non_fast_forward_refresh_guard()
         summary = {
             "status": "passed",

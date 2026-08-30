@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod cli;
 mod config;
+mod discard;
 mod doctor;
 mod dvc;
 mod error;
@@ -24,6 +25,7 @@ use crate::cli::{
     TaskCommand,
 };
 use crate::config::Config;
+use crate::discard::{TaskDiscardOptions, discard};
 use crate::error::{Error, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
@@ -116,6 +118,15 @@ fn run(cli: Cli) -> Result<()> {
             ),
             TaskCommand::Status(args) => emit(
                 &task_status(&args.repo, args.manifest.as_deref())?,
+                cli.format,
+            ),
+            TaskCommand::Discard(args) => emit(
+                &discard(&TaskDiscardOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
+                    dry_run: args.dry_run,
+                    confirm: args.confirm,
+                })?,
                 cli.format,
             ),
         },

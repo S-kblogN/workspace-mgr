@@ -141,7 +141,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     }
     let dry_run = options.operation.dry_run(options.dry_run);
     let common_dir = repo.common_dir()?;
-    let state_dir = state_dir(&common_dir, &task);
+    let state_dir = task_state_dir(&common_dir, &task);
     fs::create_dir_all(&state_dir).at(&state_dir)?;
     let _task_lock = LockGuard::acquire(
         &state_dir.join("transaction.lock"),
@@ -548,7 +548,7 @@ fn resolve_scopes(
     Ok((scopes, additional))
 }
 
-fn state_dir(common_dir: &Path, task: &ResolvedTask) -> PathBuf {
+pub(crate) fn task_state_dir(common_dir: &Path, task: &ResolvedTask) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(task.task_id.as_bytes());
     hasher.update(b"\0");
@@ -709,7 +709,7 @@ fn build_commit_message(
     lines.join("\n") + "\n"
 }
 
-fn validate_remote_task_identity(
+pub(crate) fn validate_remote_task_identity(
     repo: &GitRepo,
     task: &ResolvedTask,
     remote_oid: &str,

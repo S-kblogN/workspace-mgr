@@ -217,8 +217,9 @@ duplicate. It keeps the title and living description aligned with the goal,
 scope, deliverables, validation, and known limitations, then verifies the base,
 head, draft/open state, and head revision after every material publication.
 Hosting failures are reported immediately. The agent must not merge, enable
-auto-merge, approve, close, or mark
-the pull request ready.
+auto-merge, approve, close, or mark the pull request ready unless the user
+explicitly requests that exact transition. An explicit request to discard one
+unmerged task authorizes closing only that task's pull request before cleanup.
 
 Repository-wide policy, root entrypoints, CI, and shared storage mechanisms use
 `task create --kind infrastructure`. The command returns an isolated worktree
@@ -226,7 +227,48 @@ and stores task metadata privately rather than creating a timestamped task
 directory. Work and publication happen from that worktree and remain limited to
 the scopes declared at creation.
 
-### 8. Refresh after merge
+### 8. Discard an unmerged task instead of saving it
+
+If the user decides that a task should not be retained, first inspect the exact
+destructive scope:
+
+```sh
+workspace-mgr task discard --dry-run
+```
+
+The dry run fetches and records the local task ref, remote task ref, local
+shared ref, and remote shared ref in private confirmation state. It reports
+working changes, the directory or worktree to remove, additional scopes that
+will be restored from the local shared branch, the required pull-request
+transition, and any current versioned S3 references that will remain stored.
+It does not delete content or refs.
+
+After the user explicitly confirms abandonment, the agent verifies that the
+task is unmerged, closes its matching pull request when one exists, and verifies
+that provider transition. Confirmation must be run from the shared checkout so
+the invoking shell is not left inside the deleted workspace:
+
+```sh
+workspace-mgr task discard \
+  --manifest /absolute/path/to/.workspace-mgr-task.toml \
+  --confirm <exact-task-id>
+```
+
+For an infrastructure task, use the private manifest path reported by the dry
+run. Confirmation refuses a missing or stale dry run, a changed local or remote
+revision, a mismatched task ID, a merged task, an unexpected worktree, or a
+branch that does not belong to the task. It deletes the remote branch with an
+exact lease, deletes the local branch, removes the deliverable directory or
+infrastructure worktree, restores declared shared paths to the local shared
+branch, and clears private task state. Local deliverable content is quarantined
+until the remote deletion succeeds so a failure can restore it.
+
+Discard never permanently deletes S3 object versions. Its report lists current
+managed S3 boundaries and version candidates as `retained-not-purged`; older
+unreferenced versions may also remain. Permanent shared-storage garbage
+collection is a separate, explicitly authorized problem.
+
+### 9. Refresh after merge
 
 In a shared checkout, use:
 
@@ -270,14 +312,17 @@ configuration or platform-standard identity mechanisms.
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task status`, `storage status` | Read-only report | None | None |
+| `task discard --dry-run` | Saves private confirmation state | Git refs | None |
+| `task discard --confirm` | Removes an unmerged task workspace and local refs | Git ref verification | Deletes only the exact remote task branch |
 | `storage set`, `storage reset`, `move` | Changes local content/placement metadata | None | None |
 | `storage hydrate` | Materializes S3 content | S3 | None |
 | `plan` | Creates ignored/private preview state | Git refs and S3 bucket settings when configured | None |
 | `publish` | Updates private state and a local target ref | Git and S3 verification | S3 first, then Git |
 | `refresh` | Fast-forwards and materializes incoming content | Git and, when needed, S3 | None |
 
-`--dry-run` suppresses the normal local mutation of commands that support it.
-It never grants broader scope or bypasses safety checks.
+Most `--dry-run` forms suppress normal local mutation. `task discard --dry-run`
+also saves its private revision-bound confirmation plan; it changes no task
+content or remote. Dry-run never grants broader scope or bypasses safety checks.
 
 ## Transaction and failure boundary
 
