@@ -358,12 +358,79 @@ pub fn management(
         };
         args.extend(paths.iter().cloned());
         run("dvc", args, &repo.root)?;
+        if operation == "move" {
+            reset_moved_cloud_metadata(repo, &paths[1])?;
+        }
     }
     Ok(serde_json::json!({
         "operation": operation,
         "paths": paths,
         "mode": if dry_run { "plan" } else { "apply" },
     }))
+}
+
+fn reset_moved_cloud_metadata(repo: &GitRepo, output: &str) -> Result<()> {
+    let pointer = resolved_under(&repo.root, &format!("{output}.dvc"));
+    let raw = fs::read_to_string(&pointer).at(&pointer)?;
+    let mut document: serde_yaml::Value =
+        serde_yaml::from_str(&raw).map_err(|source| Error::Yaml {
+            path: pointer.clone(),
+            source,
+        })?;
+    let outs = document
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(serde_yaml::Value::String("outs".to_owned())))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| {
+            Error::message(format!(
+                "moved DVC metadata did not define outputs: {}",
+                pointer.display()
+            ))
+        })?;
+    let mut removed = false;
+    for out in outs {
+        removed |= remove_cloud_metadata(out);
+    }
+    if !removed {
+        return Ok(());
+    }
+    let rendered = serde_yaml::to_string(&document).map_err(|error| {
+        Error::message(format!(
+            "failed to render moved DVC metadata {}: {error}",
+            pointer.display()
+        ))
+    })?;
+    let parent = pointer
+        .parent()
+        .ok_or_else(|| Error::message("moved DVC pointer has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
+    use std::io::Write;
+    temporary.write_all(rendered.as_bytes()).at(&pointer)?;
+    temporary.flush().at(&pointer)?;
+    temporary.persist(&pointer).map_err(|error| Error::Io {
+        path: pointer,
+        source: error.error,
+    })?;
+    Ok(())
+}
+
+fn remove_cloud_metadata(value: &mut serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let removed = mapping
+                .remove(serde_yaml::Value::String("cloud".to_owned()))
+                .is_some();
+            mapping.values_mut().fold(removed, |changed, value| {
+                remove_cloud_metadata(value) || changed
+            })
+        }
+        serde_yaml::Value::Sequence(sequence) => {
+            sequence.iter_mut().fold(false, |changed, value| {
+                remove_cloud_metadata(value) || changed
+            })
+        }
+        _ => false,
+    }
 }
 
 pub fn prepare_revision(
@@ -456,5 +523,35 @@ trait EmptyFallback {
 impl EmptyFallback for str {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
         if self.is_empty() { fallback } else { self }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moved_pointer_drops_path_bound_cloud_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("task");
+        fs::create_dir(&task).unwrap();
+        let pointer = task.join("moved.dvc");
+        fs::write(
+            &pointer,
+            "outs:\n- md5: directory.dir\n  path: moved\n  cloud:\n    storage:\n      version_id: old-directory\n  files:\n  - relpath: alpha.txt\n    md5: alpha\n    cloud:\n      storage:\n        version_id: old-alpha\n",
+        )
+        .unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+
+        reset_moved_cloud_metadata(&repo, "task/moved").unwrap();
+
+        let content = fs::read_to_string(pointer).unwrap();
+        assert!(!content.contains("cloud:"));
+        assert!(!content.contains("version_id:"));
+        assert!(content.contains("md5: directory.dir"));
+        assert!(content.contains("relpath: alpha.txt"));
+        assert!(content.contains("path: moved"));
     }
 }

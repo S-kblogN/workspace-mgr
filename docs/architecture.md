@@ -48,6 +48,9 @@ require exact version metadata and existence checks. The Rust process invokes a
 small embedded adapter through a Python interpreter that can import the same
 DVC installation; this preserves DVC's remote resolution and version semantics
 without embedding a provider-specific bucket implementation in the core CLI.
+When a boundary moves, path-bound cloud metadata from the old location is
+cleared before the push so DVC uploads the new object path and records its new
+version ID. Existing remote versions are retained.
 
 ## Shared-checkout refresh
 
