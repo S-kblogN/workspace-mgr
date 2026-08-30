@@ -425,9 +425,11 @@ fn remove_cloud_metadata(value: &mut serde_yaml::Value) -> bool {
             })
         }
         serde_yaml::Value::Sequence(sequence) => {
-            sequence.iter_mut().fold(false, |changed, value| {
-                remove_cloud_metadata(value) || changed
-            })
+            let mut removed = false;
+            for value in sequence {
+                removed |= remove_cloud_metadata(value);
+            }
+            removed
         }
         _ => false,
     }
