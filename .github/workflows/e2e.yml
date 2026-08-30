@@ -44,7 +44,6 @@ jobs:
       - name: Check external commands
         run: |
           git --version
-          git lfs version
           dvc version
           docker version
       - name: Start versioned S3-compatible service

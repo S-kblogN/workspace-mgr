@@ -31,10 +31,9 @@ fn run(cli: Cli) -> Result<()> {
             let report = init(&InitOptions {
                 repo: args.repo,
                 profile: args.profile,
-                dvc: args.dvc,
-                dvc_remote: args.dvc_remote,
-                dvc_remote_url: args.dvc_remote_url,
-                version_aware: args.version_aware,
+                storage_url: args.storage_url,
+                storage_endpoint_url: args.storage_endpoint_url,
+                require_object_versioning: args.require_object_versioning,
                 adopt: args.adopt,
                 dry_run: args.dry_run,
             })?;

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,120 @@ use crate::path::{allowed, relative_to, repo_path, resolved_under};
 use crate::process::{run, run_unchecked};
 
 const VERSION_VERIFY_SCRIPT: &str = include_str!("../assets/dvc_version_verify.py");
+pub const REQUIRED_DVC_VERSION: &str = "3.67.1";
+pub const INTERNAL_REMOTE: &str = "workspace-mgr";
+pub const STORAGE_PYTHON_ENV: &str = "WORKSPACE_MGR_STORAGE_PYTHON";
+
+pub fn storage_python() -> String {
+    std::env::var(STORAGE_PYTHON_ENV).unwrap_or_else(|_| "python3".to_owned())
+}
+
+pub fn require_runtime(repo: &GitRepo) -> Result<String> {
+    let output = run_unchecked("dvc", ["--version"], &repo.root)?;
+    if !output.success() {
+        return Err(Error::message(
+            "managed-storage runtime is unavailable; install workspace-mgr with its required storage runtime",
+        ));
+    }
+    let actual = output.stdout.trim();
+    if actual != REQUIRED_DVC_VERSION {
+        return Err(Error::message(format!(
+            "managed-storage runtime version {actual:?} is incompatible; workspace-mgr requires exactly {REQUIRED_DVC_VERSION}"
+        )));
+    }
+    Ok(actual.to_owned())
+}
+
+pub fn require_version_adapter(repo: &GitRepo) -> Result<String> {
+    let python = storage_python();
+    let output = run_unchecked(
+        &python,
+        ["-c", "import dvc; print(dvc.__version__)"],
+        &repo.root,
+    )?;
+    if !output.success() {
+        return Err(Error::message(format!(
+            "managed-storage version adapter is unavailable through {python:?}"
+        )));
+    }
+    let actual = output.stdout.trim();
+    if actual != REQUIRED_DVC_VERSION {
+        return Err(Error::message(format!(
+            "managed-storage version adapter {actual:?} is incompatible; workspace-mgr requires exactly {REQUIRED_DVC_VERSION}"
+        )));
+    }
+    Ok(format!("{python} ({actual})"))
+}
+
+pub fn render_internal_config(config: &Config) -> Result<Option<String>> {
+    if !config.storage.enabled {
+        return Ok(None);
+    }
+    let url =
+        config.storage.url.as_deref().ok_or_else(|| {
+            Error::message("storage.url is required when managed storage is enabled")
+        })?;
+    let mut rendered = format!(
+        "[core]\n    remote = {INTERNAL_REMOTE}\n['remote \"{INTERNAL_REMOTE}\"']\n    url = {url}\n"
+    );
+    if let Some(endpoint) = &config.storage.endpoint_url {
+        rendered.push_str(&format!("    endpointurl = {endpoint}\n"));
+    }
+    if config.storage.require_object_versioning {
+        rendered.push_str("    version_aware = true\n");
+    }
+    Ok(Some(rendered))
+}
+
+pub fn write_internal_config(repo: &GitRepo, config: &Config) -> Result<bool> {
+    let Some(rendered) = render_internal_config(config)? else {
+        return Ok(false);
+    };
+    let path = repo.root.join(".dvc/config");
+    if fs::read_to_string(&path).ok().as_deref() == Some(&rendered) {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::message("managed-storage config path has no parent"))?;
+    fs::create_dir_all(parent).at(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
+    temporary.write_all(rendered.as_bytes()).at(&path)?;
+    temporary.flush().at(&path)?;
+    temporary.persist(&path).map_err(|error| Error::Io {
+        path,
+        source: error.error,
+    })?;
+    Ok(true)
+}
+
+pub fn validate_internal_config(repo: &GitRepo, config: &Config) -> Result<()> {
+    let Some(expected) = render_internal_config(config)? else {
+        return Ok(());
+    };
+    let path = repo.root.join(".dvc/config");
+    let actual = fs::read_to_string(&path).at(&path)?;
+    if actual != expected {
+        return Err(Error::message(
+            "managed-storage configuration drifted from .workspace-mgr.toml; run `workspace-mgr init` to regenerate internal scaffolding",
+        ));
+    }
+    Ok(())
+}
+
+pub fn ensure_ready(repo: &GitRepo, config: &Config) -> Result<()> {
+    if !config.storage.enabled {
+        return Err(Error::message(
+            "managed storage is not enabled in .workspace-mgr.toml",
+        ));
+    }
+    require_runtime(repo)?;
+    validate_internal_config(repo, config)?;
+    if config.storage.require_object_versioning {
+        require_version_adapter(repo)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DvcReport {
@@ -65,7 +180,11 @@ pub fn discover(repo: &GitRepo, scopes: &[String]) -> Result<Vec<String>> {
             {
                 continue;
             }
-            found.insert(relative_to(entry.path(), &repo.root, "DVC pointer")?);
+            found.insert(relative_to(
+                entry.path(),
+                &repo.root,
+                "managed-storage metadata",
+            )?);
         }
     }
     Ok(found.into_iter().collect())
@@ -82,7 +201,7 @@ pub fn output_paths(repo: &GitRepo, pointers: &[String]) -> Result<BTreeMap<Stri
         })?;
         if parsed.outs.is_empty() {
             return Err(Error::message(format!(
-                "DVC metadata did not define an output: {pointer}"
+                "managed-storage metadata did not define an output: {pointer}"
             )));
         }
         let parent = Path::new(pointer).parent().unwrap_or_else(|| Path::new(""));
@@ -93,7 +212,7 @@ pub fn output_paths(repo: &GitRepo, pointers: &[String]) -> Result<BTreeMap<Stri
             } else {
                 format!("{}/{}", crate::path::to_slash(parent), output.path)
             };
-            outputs.insert(repo_path(&raw, "DVC output")?);
+            outputs.insert(repo_path(&raw, "managed-storage output")?);
         }
         result.insert(pointer.clone(), outputs.into_iter().collect());
     }
@@ -104,7 +223,7 @@ pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
     let output = run_unchecked("dvc", ["status", "--json", pointer], &repo.root)?;
     if !output.success() {
         return Err(Error::message(format!(
-            "dvc status failed for {pointer}: {}",
+            "managed-storage status failed for {pointer}: {}",
             if output.stderr.trim().is_empty() {
                 output.stdout.trim()
             } else {
@@ -112,8 +231,11 @@ pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
             }
         )));
     }
-    serde_json::from_str(output.stdout.trim().if_empty("{}"))
-        .map_err(|error| Error::message(format!("dvc status returned invalid JSON: {error}")))
+    serde_json::from_str(output.stdout.trim().if_empty("{}")).map_err(|error| {
+        Error::message(format!(
+            "managed-storage status returned invalid data: {error}"
+        ))
+    })
 }
 
 pub fn reconcile(
@@ -122,6 +244,9 @@ pub fn reconcile(
     pointers: &[String],
     dry_run: bool,
 ) -> Result<DvcReport> {
+    if config.storage.enabled || !pointers.is_empty() {
+        ensure_ready(repo, config)?;
+    }
     let outputs = output_paths(repo, pointers)?;
     let mut dirty = Vec::new();
     for pointer in pointers {
@@ -142,7 +267,7 @@ pub fn reconcile(
         .collect();
     if !missing.is_empty() {
         return Err(Error::message(format!(
-            "DVC outputs are missing locally and will not be interpreted as deletions: {}; hydrate them before publishing",
+            "managed-storage outputs are missing locally and will not be interpreted as deletions: {}; hydrate them before publishing",
             missing.join(", ")
         )));
     }
@@ -185,18 +310,20 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
     let local = run_unchecked("dvc", local_args, &repo.root)?;
     if !local.success() {
         return Err(Error::message(format!(
-            "DVC metadata does not match local data for: {}",
+            "managed-storage metadata does not match local data for: {}",
             pointers.join(", ")
         )));
     }
 
-    let exact = config.dvc.require_version_aware;
+    ensure_ready(repo, config)?;
+    let exact = config.storage.require_object_versioning;
     if exact {
-        let python = config.dvc.python.as_str();
-        let serialized = serde_json::to_string(pointers)
-            .map_err(|error| Error::message(format!("failed to encode DVC files: {error}")))?;
+        let python = storage_python();
+        let serialized = serde_json::to_string(pointers).map_err(|error| {
+            Error::message(format!("failed to encode storage metadata files: {error}"))
+        })?;
         let output = run_unchecked(
-            python,
+            &python,
             [
                 "-c",
                 VERSION_VERIFY_SCRIPT,
@@ -207,7 +334,7 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
         )?;
         if !output.success() {
             return Err(Error::message(format!(
-                "failed to verify version-aware DVC content: {}",
+                "failed to verify versioned storage content: {}",
                 if output.stderr.trim().is_empty() {
                     output.stdout.trim()
                 } else {
@@ -229,11 +356,11 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
     let cloud = run_unchecked("dvc", cloud_args, &repo.root)?;
     if !cloud.success() {
         return Err(Error::message(format!(
-            "DVC content is missing from the configured remote for: {}",
+            "stored content is missing from the configured remote for: {}",
             pointers.join(", ")
         )));
     }
-    Ok(serde_json::json!({"mode": "dvc-cloud-status"}))
+    Ok(serde_json::json!({"mode": "remote-status"}))
 }
 
 pub fn hydrate(
@@ -243,6 +370,7 @@ pub fn hydrate(
     targets: &[String],
     dry_run: bool,
 ) -> Result<HydrateReport> {
+    ensure_ready(repo, config)?;
     let discovered = discover(repo, scopes)?;
     let pointers = if targets.is_empty() {
         discovered
@@ -256,7 +384,7 @@ pub fn hydrate(
         for target in &targets {
             if !target.ends_with(".dvc") {
                 return Err(Error::message(format!(
-                    "hydrate target is not a standalone DVC pointer: {target}"
+                    "hydrate target is not a managed-storage metadata file: {target}"
                 )));
             }
             if !allowed(target, scopes) {
@@ -273,11 +401,11 @@ pub fn hydrate(
         targets
     };
     let outputs = output_paths(repo, &pointers)?;
-    validate_worktree(repo, &pointers)?;
+    validate_worktree(repo, config, &pointers)?;
     let mut report = HydrateReport {
         status: if dry_run { "dry_run" } else { "pending" }.to_owned(),
         scopes: scopes.to_vec(),
-        dvc_files: pointers.clone(),
+        metadata_files: pointers.clone(),
         outputs,
         verification: None,
     };
@@ -305,13 +433,14 @@ pub fn hydrate(
 pub struct HydrateReport {
     pub status: String,
     pub scopes: Vec<String>,
-    pub dvc_files: Vec<String>,
+    pub metadata_files: Vec<String>,
     pub outputs: BTreeMap<String, Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification: Option<serde_json::Value>,
 }
 
-pub fn validate_worktree(repo: &GitRepo, pointers: &[String]) -> Result<()> {
+pub fn validate_worktree(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<()> {
+    ensure_ready(repo, config)?;
     let mut conflicts = Vec::new();
     for pointer in pointers {
         if !resolved_under(&repo.root, pointer).is_file() {
@@ -336,7 +465,7 @@ pub fn validate_worktree(repo: &GitRepo, pointers: &[String]) -> Result<()> {
     }
     if !conflicts.is_empty() {
         return Err(Error::message(format!(
-            "DVC metadata would overwrite locally changed outputs: {}; publish or preserve those changes first",
+            "managed-storage metadata would overwrite locally changed outputs: {}; publish or preserve those changes first",
             conflicts.join(", ")
         )));
     }
@@ -345,16 +474,22 @@ pub fn validate_worktree(repo: &GitRepo, pointers: &[String]) -> Result<()> {
 
 pub fn management(
     repo: &GitRepo,
+    config: &Config,
     operation: &str,
     paths: &[String],
     dry_run: bool,
 ) -> Result<serde_json::Value> {
+    ensure_ready(repo, config)?;
     if !dry_run {
         let mut args = match operation {
             "track" => vec!["add".to_owned()],
             "move" => vec!["move".to_owned()],
             "untrack" => vec!["remove".to_owned()],
-            other => return Err(Error::message(format!("unknown DVC operation {other}"))),
+            other => {
+                return Err(Error::message(format!(
+                    "unknown managed-storage operation {other}"
+                )));
+            }
         };
         args.extend(paths.iter().cloned());
         run("dvc", args, &repo.root)?;
@@ -383,7 +518,7 @@ fn reset_moved_cloud_metadata(repo: &GitRepo, output: &str) -> Result<()> {
         .and_then(serde_yaml::Value::as_sequence_mut)
         .ok_or_else(|| {
             Error::message(format!(
-                "moved DVC metadata did not define outputs: {}",
+                "moved storage metadata did not define outputs: {}",
                 pointer.display()
             ))
         })?;
@@ -396,13 +531,13 @@ fn reset_moved_cloud_metadata(repo: &GitRepo, output: &str) -> Result<()> {
     }
     let rendered = serde_yaml::to_string(&document).map_err(|error| {
         Error::message(format!(
-            "failed to render moved DVC metadata {}: {error}",
+            "failed to render moved storage metadata {}: {error}",
             pointer.display()
         ))
     })?;
     let parent = pointer
         .parent()
-        .ok_or_else(|| Error::message("moved DVC pointer has no parent"))?;
+        .ok_or_else(|| Error::message("moved storage metadata has no parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     use std::io::Write;
     temporary.write_all(rendered.as_bytes()).at(&pointer)?;
@@ -437,9 +572,11 @@ fn remove_cloud_metadata(value: &mut serde_yaml::Value) -> bool {
 
 pub fn prepare_revision(
     repo: &GitRepo,
+    config: &Config,
     oid: &str,
     pointers: &[String],
 ) -> Result<PreparedRevision> {
+    ensure_ready(repo, config)?;
     if pointers.is_empty() {
         return Ok(PreparedRevision {
             prepared_files: Vec::new(),

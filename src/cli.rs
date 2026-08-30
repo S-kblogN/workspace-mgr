@@ -9,7 +9,7 @@ use crate::output::Format;
 #[command(
     name = "workspace-mgr",
     version,
-    about = "Policy-driven workspace and Git/DVC transaction manager",
+    about = "Policy-driven repository workspace manager for coding agents",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -44,25 +44,25 @@ pub enum Command {
     /// Create or inspect task scaffolding.
     Task(TaskArgs),
 
-    /// Preview a scoped Git+DVC transaction without publishing.
+    /// Preview a scoped repository transaction without publishing.
     Plan(PublishArgs),
 
-    /// Publish a scoped Git+DVC transaction.
+    /// Publish a scoped repository transaction.
     Publish(PublishCommandArgs),
 
-    /// Declare one or more new DVC-managed boundaries and publish them.
+    /// Move one or more paths into managed storage and publish them.
     Track(TrackArgs),
 
-    /// Move one DVC-managed boundary and publish the result.
+    /// Move one managed-storage boundary and publish the result.
     Move(MoveArgs),
 
-    /// Stop tracking standalone DVC stages without deleting their outputs.
+    /// Stop managing stored outputs without deleting their local content.
     Untrack(UntrackArgs),
 
-    /// Fetch, materialize, and verify DVC outputs in the current task scope.
+    /// Fetch, materialize, and verify stored outputs in the current task scope.
     Hydrate(HydrateArgs),
 
-    /// Safely fast-forward a shared checkout and hydrate incoming DVC data.
+    /// Safely update a shared checkout and hydrate incoming stored data.
     Refresh(RefreshArgs),
 }
 
@@ -80,17 +80,17 @@ pub struct InitArgs {
     #[arg(long, value_enum, default_value = "standard")]
     pub profile: Profile,
 
+    /// Enable managed storage at this non-secret URL.
     #[arg(long)]
-    pub dvc: bool,
+    pub storage_url: Option<String>,
 
-    #[arg(long, requires = "dvc")]
-    pub dvc_remote: Option<String>,
+    /// Optional S3-compatible API endpoint for managed storage.
+    #[arg(long, requires = "storage_url")]
+    pub storage_endpoint_url: Option<String>,
 
-    #[arg(long, requires_all = ["dvc", "dvc_remote"])]
-    pub dvc_remote_url: Option<String>,
-
-    #[arg(long, requires = "dvc")]
-    pub version_aware: bool,
+    /// Require bucket object versioning and exact version verification.
+    #[arg(long, requires = "storage_url")]
+    pub require_object_versioning: bool,
 
     #[arg(long)]
     pub adopt: bool,
@@ -101,7 +101,7 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct InstructionsArgs {
-    /// Optional topic: core, task, publish, dvc, or infrastructure.
+    /// Optional topic: core, task, publish, storage, or infrastructure.
     pub topic: Option<String>,
 
     #[arg(long, default_value = ".")]

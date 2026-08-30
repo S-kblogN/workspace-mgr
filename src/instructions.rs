@@ -8,7 +8,7 @@ use crate::config::{Config, Profile};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 
-pub const BOOTSTRAP: &str = "# Repository instructions\n\nBefore doing any repository work, run:\n\n    workspace-mgr instructions --repo .\n\nFollow its output as the repository instructions for this session. If the command\nis unavailable or fails, stop and report the problem. Do not substitute raw Git\nor DVC mutation commands.\n";
+pub const BOOTSTRAP: &str = "# Repository instructions\n\nBefore doing any repository work, run:\n\n    workspace-mgr instructions --repo .\n\nFollow its output as the repository instructions for this session. If the command\nis unavailable or fails, stop and report the problem. Do not substitute lower-level\nversion-control or storage mutation commands.\n";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InstructionDocument {
@@ -21,7 +21,14 @@ pub struct InstructionDocument {
 
 pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<InstructionDocument> {
     let topic = topic.unwrap_or("all");
-    let valid_topics = ["all", "core", "task", "publish", "dvc", "infrastructure"];
+    let valid_topics = [
+        "all",
+        "core",
+        "task",
+        "publish",
+        "storage",
+        "infrastructure",
+    ];
     if !valid_topics.contains(&topic) {
         return Err(Error::message(format!(
             "unknown instruction topic {topic:?}; expected one of {}",
@@ -45,11 +52,15 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     if topic == "all" || topic == "publish" {
         sections.push(publication_section(config));
     }
-    if (topic == "all" || topic == "dvc")
-        && config.dvc.enabled
-        && config.agent.modules.iter().any(|module| module == "dvc")
+    if (topic == "all" || topic == "storage")
+        && config.storage.enabled
+        && config
+            .agent
+            .modules
+            .iter()
+            .any(|module| module == "storage")
     {
-        sections.push(dvc_section(config));
+        sections.push(storage_section(config));
     }
     if (topic == "all" || topic == "infrastructure")
         && config
@@ -112,7 +123,7 @@ fn core_section(config: &Config) -> String {
         ),
     };
     format!(
-        "## Operating model\n\n- Read-only requests do not require a task directory.\n- Requests that create or modify retained files use one declared task scope unless the user explicitly authorizes another workflow.\n- User authorization overrides repository defaults only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- Prefer `workspace-mgr` commands for managed Git and DVC mutations. Treat a refusal as a guard to investigate, not a reason to bypass it.\n- {checkout}\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
+        "## Operating model\n\n- Read-only requests do not require a task directory.\n- Requests that create or modify retained files use one declared task scope unless the user explicitly authorizes another workflow.\n- User authorization overrides repository defaults only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level tools.\n- {checkout}\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
     )
 }
 
@@ -135,30 +146,25 @@ fn publication_section(config: &Config) -> String {
         "Follow the repository hosting workflow when a review request is needed."
     };
     format!(
-        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may fetch Git metadata but does not create a commit, upload DVC data, or push a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret an ordinary shared-checkout `git status` as the complete task state; use the task-targeted plan.\n- Keep every eligible task-owned file in scope. Ignore reproducible build output and external nested Git checkouts using the narrowest applicable rule.\n- Never flatten a nested checkout into the parent repository or publish it as a gitlink unless explicitly requested.\n- Verify the reported local commit, remote object ID, and a final no-change plan before claiming publication is current.\n- {review_note}\n- `{}` is the configured base branch on remote `{}`.\n- {profile_note}",
+        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes to the configured target branch.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Keep every eligible task-owned file in scope. Ignore reproducible build output and external nested repositories using the narrowest applicable rule.\n- Never flatten a nested repository into the parent repository unless explicitly requested.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming publication is current.\n- {review_note}\n- `{}` is the configured base branch on remote `{}`.\n- {profile_note}",
         config.git.base_branch, config.git.remote
     )
 }
 
-fn dvc_section(config: &Config) -> String {
-    let remote = config
-        .dvc
-        .remote
-        .as_deref()
-        .unwrap_or("the DVC default remote");
-    let version_note = if config.dvc.require_version_aware {
-        "The selected remote must be version-aware; exact object version IDs, sizes, and available etags are verified before Git publication."
+fn storage_section(config: &Config) -> String {
+    let version_note = if config.storage.require_object_versioning {
+        "The configured bucket must have object versioning enabled. Exact object version IDs, sizes, and available etags are verified before repository publication."
     } else {
-        "Remote presence is verified through DVC before Git publication."
+        "Remote presence is verified before repository publication."
     };
     format!(
-        "## Large files and DVC\n\n- Retained, non-ignored files larger than {} bytes must be handled by the configured primary backend `{}` or fallback `{}`.\n- Declare a new DVC boundary with `workspace-mgr track <path> -m <message>`. After editing an existing DVC output, use the normal `publish` command; do not separately run `dvc commit` or `dvc push`.\n- Use `workspace-mgr move`, `workspace-mgr untrack`, and `workspace-mgr hydrate` for DVC lifecycle changes. Do not hand-edit or directly delete standalone `.dvc` pointers.\n- DVC credentials stay in local DVC configuration or the environment. Never print, copy, or commit credentials.\n- The configured DVC remote is `{remote}`. {version_note}\n- Never run remote or cache garbage collection without explicit authorization for permanent shared-data deletion.",
-        config.large_files.threshold_bytes, config.large_files.primary, config.large_files.fallback
+        "## Managed storage\n\n- Retained, non-ignored files larger than {} bytes must be moved into managed storage with `workspace-mgr track <path> -m <message>`.\n- After editing stored content, use the normal `workspace-mgr publish` command.\n- Use `workspace-mgr move`, `workspace-mgr untrack`, and `workspace-mgr hydrate` for the complete stored-data lifecycle. Do not hand-edit or directly delete storage metadata.\n- Storage credentials stay outside tracked repository configuration. Never print, copy, or commit credentials.\n- {version_note}\n- Never request permanent remote or cache garbage collection without explicit authorization for shared-data deletion.",
+        config.large_files.threshold_bytes
     )
 }
 
 fn infrastructure_section() -> String {
-    "## Repository infrastructure\n\n- Changes to shared policy, root entrypoints, CI, or repository-wide storage configuration are infrastructure changes rather than ordinary task deliverables.\n- Keep infrastructure changes isolated from task content and use a dedicated branch or worktree.\n- Infrastructure DVC tests use fresh temporary repositories and local filesystem remotes. They must not read user cloud credentials or contact a real storage service."
+    "## Repository infrastructure\n\n- Changes to shared policy, root entrypoints, CI, or repository-wide storage configuration are infrastructure changes rather than ordinary task deliverables.\n- Keep infrastructure changes isolated from task content and use a dedicated branch or worktree.\n- Infrastructure storage tests use fresh temporary repositories and local or mock remotes. They must not read user cloud credentials or contact a real storage service."
         .to_owned()
 }
 

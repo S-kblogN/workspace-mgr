@@ -105,7 +105,7 @@ fn adopt_preserves_existing_agents_as_a_module() {
 
 #[cfg(unix)]
 #[test]
-fn failed_dvc_setup_does_not_install_an_unusable_agents_bootstrap() {
+fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = GitFixture::new();
@@ -122,7 +122,7 @@ fn failed_dvc_setup_does_not_install_an_unusable_agents_bootstrap() {
     paths.extend(std::env::split_paths(&inherited_path));
     let path = std::env::join_paths(paths).unwrap();
     let output = std::process::Command::new(binary())
-        .args(["init", "--dvc"])
+        .args(["init", "--storage-url", "s3://example.invalid/workspace"])
         .current_dir(&fixture.shared)
         .env("PATH", path)
         .output()

@@ -5,10 +5,16 @@ Release artifacts are built and tested natively on:
 - Linux x86-64 and arm64;
 - macOS on Apple Silicon.
 
-Building from source requires Rust 1.85 or newer. Git is always required. The
-default large-file policy also checks for Git LFS. DVC workflows require DVC 3;
-CI is tested with DVC 3.67.1. Exact version-aware verification additionally
-requires the configured Python interpreter to import the same DVC installation.
+Building from source requires Rust 1.85 or newer. The current alpha distribution
+expects Git, Python, and the S3 extra for DVC to be provisioned by the
+installer. These are private execution engines: users and agents operate the
+repository through `workspace-mgr` only.
+
+The storage engine requirement is exact: both the `dvc` executable and the
+Python module imported by the version verifier must be DVC 3.67.1. A different
+patch release is rejected before a managed-storage transaction starts because
+the exact verifier intentionally uses DVC's Python remote APIs. CI installs
+`dvc[s3]==3.67.1` and tests this contract.
 
 Intel macOS and Windows are not supported release targets. The source contains
 portable path and symlink handling, but the end-to-end transaction suite does

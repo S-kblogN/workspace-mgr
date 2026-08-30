@@ -33,7 +33,6 @@ jobs:
       - name: Check external commands
         run: |
           git --version
-          git lfs version
           dvc version
       - name: Check formatting
         run: cargo fmt --check
@@ -82,7 +81,6 @@ jobs:
       - name: Check external commands
         run: |
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
-          git lfs version
           dvc version
       - name: Test
         run: cargo test --locked --all-features --no-fail-fast

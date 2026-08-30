@@ -3,9 +3,10 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::config::{CONFIG_NAME, Config};
+use crate::dvc;
 use crate::error::{Error, Result};
 use crate::git::GitRepo;
-use crate::process::{command_exists, run_unchecked};
+use crate::process::command_exists;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
@@ -31,7 +32,9 @@ impl DoctorReport {
 pub fn inspect(path: &Path) -> Result<DoctorReport> {
     let repo = GitRepo::discover(path)?;
     let mut checks = Vec::new();
-    checks.push(command_check("git", true));
+    let mut repository_runtime = command_check("git", true);
+    repository_runtime.name = "repository-runtime".to_owned();
+    checks.push(repository_runtime);
 
     let config_path = repo.root.join(CONFIG_NAME);
     let config = match Config::load(&repo) {
@@ -81,17 +84,17 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
         });
         let identity = repo.run_unchecked(["var", "GIT_AUTHOR_IDENT"])?;
         checks.push(DoctorCheck {
-            name: "git-author-identity".to_owned(),
+            name: "publication-identity".to_owned(),
             status: if identity.success() { "ok" } else { "error" }.to_owned(),
             detail: if identity.success() {
-                "Git author name and email are configured".to_owned()
+                "publication author name and email are configured".to_owned()
             } else {
-                "Git author name or email is not configured".to_owned()
+                "publication author name or email is not configured".to_owned()
             },
         });
         let remote = repo.run_unchecked(["remote", "get-url", &config.git.remote])?;
         checks.push(DoctorCheck {
-            name: "git-remote".to_owned(),
+            name: "publication-remote".to_owned(),
             status: if remote.success() { "ok" } else { "error" }.to_owned(),
             detail: if remote.success() {
                 format!("configured remote {:?} exists", config.git.remote)
@@ -100,80 +103,57 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
             },
         });
 
-        if config.large_files.fallback == "git-lfs" {
-            checks.push(command_check("git-lfs", true));
-        }
-        if config.dvc.enabled {
-            let dvc = command_check("dvc", true);
-            let dvc_ok = dvc.status == "ok";
-            checks.push(dvc);
-            let mut actual_remote = None;
-            if dvc_ok {
-                let output = run_unchecked("dvc", ["config", "core.remote"], &repo.root)?;
-                let actual = output.stdout.trim();
-                let expected = config.dvc.remote.as_deref();
-                let remote_ok = output.success()
-                    && !actual.is_empty()
-                    && expected.is_none_or(|value| value == actual);
-                checks.push(DoctorCheck {
-                    name: "dvc-default-remote".to_owned(),
-                    status: if remote_ok { "ok" } else { "error" }.to_owned(),
-                    detail: match (expected, actual.is_empty()) {
-                        (Some(expected), false) => {
-                            format!("configured {expected}, DVC default {actual}")
-                        }
-                        (Some(expected), true) => {
-                            format!("configured {expected}, but DVC has no default remote")
-                        }
-                        (None, false) => format!("DVC default {actual}"),
-                        (None, true) => "DVC has no default remote".to_owned(),
+        if config.storage.enabled {
+            checks.push(match dvc::require_runtime(&repo) {
+                Ok(version) => DoctorCheck {
+                    name: "managed-storage-runtime".to_owned(),
+                    status: "ok".to_owned(),
+                    detail: format!("internal engine {version}"),
+                },
+                Err(error) => DoctorCheck {
+                    name: "managed-storage-runtime".to_owned(),
+                    status: "error".to_owned(),
+                    detail: error.to_string(),
+                },
+            });
+            checks.push(match dvc::validate_internal_config(&repo, config) {
+                Ok(()) => DoctorCheck {
+                    name: "managed-storage-config".to_owned(),
+                    status: "ok".to_owned(),
+                    detail: "internal configuration matches .workspace-mgr.toml".to_owned(),
+                },
+                Err(error) => DoctorCheck {
+                    name: "managed-storage-config".to_owned(),
+                    status: "error".to_owned(),
+                    detail: error.to_string(),
+                },
+            });
+            if config.storage.require_object_versioning {
+                checks.push(match dvc::require_version_adapter(&repo) {
+                    Ok(adapter) => DoctorCheck {
+                        name: "managed-storage-version-adapter".to_owned(),
+                        status: "ok".to_owned(),
+                        detail: adapter,
+                    },
+                    Err(error) => DoctorCheck {
+                        name: "managed-storage-version-adapter".to_owned(),
+                        status: "error".to_owned(),
+                        detail: error.to_string(),
                     },
                 });
-                if !actual.is_empty() {
-                    actual_remote = Some(actual.to_owned());
-                }
-            }
-            if config.dvc.require_version_aware {
-                if let Some(remote) = actual_remote {
-                    let key = format!("remote.{remote}.version_aware");
-                    let output = run_unchecked("dvc", ["config", &key], &repo.root)?;
-                    let enabled =
-                        output.success() && output.stdout.trim().eq_ignore_ascii_case("true");
-                    checks.push(DoctorCheck {
-                        name: "dvc-version-aware".to_owned(),
-                        status: if enabled { "ok" } else { "error" }.to_owned(),
-                        detail: format!(
-                            "remote {remote} version_aware={}",
-                            if enabled { "true" } else { "false or unset" }
-                        ),
-                    });
-                }
-                let python = command_check(&config.dvc.python, true);
-                let python_ok = python.status == "ok";
-                checks.push(python);
-                if python_ok {
-                    let output = run_unchecked(
-                        &config.dvc.python,
-                        ["-c", "import dvc; print(dvc.__version__)"],
-                        &repo.root,
-                    )?;
-                    checks.push(DoctorCheck {
-                        name: "dvc-python-adapter".to_owned(),
-                        status: if output.success() { "ok" } else { "error" }.to_owned(),
-                        detail: if output.success() {
-                            format!("dvc {}", output.stdout.trim())
-                        } else {
-                            output.stderr.trim().to_owned()
-                        },
-                    });
-                }
+                checks.push(DoctorCheck {
+                    name: "managed-storage-object-versioning".to_owned(),
+                    status: "ok".to_owned(),
+                    detail: "required; exact object versions are verified on every publication"
+                        .to_owned(),
+                });
             }
             let local = repo.root.join(".dvc/config.local");
             if local.exists() {
                 let relative = ".dvc/config.local";
                 let ignored = repo.run_unchecked(["check-ignore", "--quiet", "--", relative])?;
                 checks.push(DoctorCheck {
-                    name: "dvc-local-config-ignore".to_owned(),
+                    name: "managed-storage-local-secrets".to_owned(),
                     status: if ignored.code == 0 { "ok" } else { "error" }.to_owned(),
                     detail: if ignored.code == 0 {
                         format!("{relative} is ignored")

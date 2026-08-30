@@ -66,12 +66,10 @@ pub struct TransactionReport {
     pub remote_base_oid: String,
     pub scopes: Vec<String>,
     pub changed_paths: Vec<String>,
-    pub dvc: serde_json::Value,
+    pub storage: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub management: Option<serde_json::Value>,
     pub ignored_entries: usize,
-    pub lfs_entries: usize,
-    pub large_lfs_files: Vec<String>,
     pub tree_oid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_oid: Option<String>,
@@ -170,6 +168,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     ) {
         Some(dvc::management(
             &repo,
+            &config,
             options.operation.name(),
             &management_paths,
             dry_run,
@@ -178,11 +177,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         None
     };
     let pointers = dvc::discover(&repo, &scopes)?;
-    let dvc_report = if options.git_only {
+    let storage_report = if options.git_only {
         serde_json::json!({"mode": "git-only", "files": pointers})
     } else {
-        serde_json::to_value(dvc::reconcile(&repo, &config, &pointers, dry_run)?)
-            .map_err(|error| Error::message(format!("failed to encode DVC report: {error}")))?
+        serde_json::to_value(dvc::reconcile(&repo, &config, &pointers, dry_run)?).map_err(
+            |error| Error::message(format!("failed to encode managed-storage report: {error}")),
+        )?
     };
 
     let index = state_dir.join("index");
@@ -215,13 +215,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         && options.operation != Operation::Move
     {
         return Err(Error::message(format!(
-            "standalone DVC pointers must be removed through untrack or move: {}",
+            "managed-storage metadata must be removed through untrack or move: {}",
             deleted_dvc.join(", ")
         )));
     }
     check_gitlinks(&repo, &index, &paths)?;
     let threshold = config.large_files.threshold_bytes;
-    let large_lfs_files = check_large_files(&repo, &index, &scopes, threshold)?;
+    check_large_files(&repo, &scopes, threshold)?;
     repo.run_with_index(
         &index,
         ["diff", "--cached", "--check", &base_oid, "--"],
@@ -229,18 +229,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         true,
     )?;
     let ignored_entries = count_ignored(&repo, &index, &scopes)?;
-    let lfs_entries = repo
-        .run_with_index(&index, ["lfs", "ls-files"], None, false)?
-        .stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
     let tree_oid = repo
         .run_with_index(&index, ["write-tree"], None, true)?
         .stdout
         .trim()
         .to_owned();
-    let dvc_dirty = dvc_report
+    let storage_dirty = storage_report
         .get("dirty_files")
         .and_then(|value| value.as_array())
         .is_some_and(|files| !files.is_empty());
@@ -254,17 +248,15 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         remote_base_oid,
         scopes: scopes.clone(),
         changed_paths: paths.clone(),
-        dvc: dvc_report,
+        storage: storage_report,
         management,
         ignored_entries,
-        lfs_entries,
-        large_lfs_files,
         tree_oid: tree_oid.clone(),
         commit_oid: None,
         remote_oid: None,
         push: None,
     };
-    if paths.is_empty() && !dvc_dirty && report.management.is_none() {
+    if paths.is_empty() && !storage_dirty && report.management.is_none() {
         report.status = "no_changes".to_owned();
         return Ok(report);
     }
@@ -402,7 +394,7 @@ fn validate_management_paths(
     let paths = options
         .management_paths
         .iter()
-        .map(|path| repo_path(path, "DVC management path"))
+        .map(|path| repo_path(path, "managed-storage path"))
         .collect::<Result<Vec<_>>>()?;
     let outside: Vec<String> = paths
         .iter()
@@ -472,7 +464,7 @@ fn acquire_dvc_locks(common_dir: &Path, names: &[String]) -> Result<Vec<LockGuar
     let lock_dir = common_dir.join("workspace-mgr/dvc-locks");
     let mut guards = vec![LockGuard::acquire(
         &lock_dir.join("transaction.lock"),
-        "another Git+DVC transaction is running",
+        "another repository transaction is running",
     )?];
     for name in names {
         let mut hasher = Sha256::new();
@@ -480,7 +472,7 @@ fn acquire_dvc_locks(common_dir: &Path, names: &[String]) -> Result<Vec<LockGuar
         let path = lock_dir.join(format!("{:x}.lock", hasher.finalize()));
         guards.push(LockGuard::acquire(
             &path,
-            &format!("another transaction is updating the same DVC boundary: {name}"),
+            &format!("another transaction is updating the same storage boundary: {name}"),
         )?);
     }
     Ok(guards)
@@ -525,13 +517,7 @@ fn check_gitlinks(repo: &GitRepo, index: &Path, paths: &[String]) -> Result<()> 
     Ok(())
 }
 
-fn check_large_files(
-    repo: &GitRepo,
-    index: &Path,
-    scopes: &[String],
-    threshold: u64,
-) -> Result<Vec<String>> {
-    let mut lfs_files = Vec::new();
+fn check_large_files(repo: &GitRepo, scopes: &[String], threshold: u64) -> Result<()> {
     for scope in scopes {
         let root = resolved_under(&repo.root, scope);
         if !root.exists() || root.is_symlink() {
@@ -565,19 +551,12 @@ fn check_large_files(
                     "git check-ignore failed for {relative}"
                 )));
             }
-            let attr =
-                repo.run_with_index(index, ["check-attr", "filter", "--", &relative], None, true)?;
-            if !attr.stdout.trim_end().ends_with(": lfs") {
-                return Err(Error::message(format!(
-                    "retained file {relative:?} is larger than {threshold} bytes but is not ignored, DVC-managed, or covered by Git LFS"
-                )));
-            }
-            lfs_files.push(relative);
+            return Err(Error::message(format!(
+                "retained file {relative:?} is larger than {threshold} bytes; move it into managed storage with `workspace-mgr track`"
+            )));
         }
     }
-    lfs_files.sort();
-    lfs_files.dedup();
-    Ok(lfs_files)
+    Ok(())
 }
 
 fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<usize> {

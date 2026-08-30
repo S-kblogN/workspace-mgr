@@ -360,22 +360,6 @@ class Harness:
         hook.chmod(0o755)
         return self.remote / "workspace-mgr-e2e-reject"
 
-    def configure_s3_remote(self, repo: Path) -> None:
-        self.run(
-            [
-                "dvc",
-                "remote",
-                "modify",
-                "--local",
-                "storage",
-                "endpointurl",
-                self.endpoint,
-            ],
-            cwd=repo,
-        )
-        ignored = self.git(repo, "check-ignore", "--quiet", ".dvc/config.local", expected=(0, 1))
-        self.check(ignored.returncode == 0, "DVC local endpoint config is ignored")
-
     def merge_branch_to_main(self, branch: str) -> str:
         assert self.seed is not None
         self.git(self.seed, "fetch", "origin", branch)
@@ -396,7 +380,13 @@ class Harness:
         assert self.shared is not None
         self.section("init, adoption, configuration, instructions, and doctor")
         original_agents = (self.shared / "AGENTS.md").read_text(encoding="utf-8")
-        rejected = self.wm(self.shared, "init", "--dvc", expected=2)
+        rejected = self.wm(
+            self.shared,
+            "init",
+            "--storage-url",
+            f"s3://{self.bucket}/dvc",
+            expected=2,
+        )
         self.check("--adopt" in rejected["stderr"], "init refuses unmanaged AGENTS.md")
         self.check(not (self.shared / ".dvc").exists(), "failed init is mutation-free")
 
@@ -404,12 +394,11 @@ class Harness:
             "init",
             "--profile",
             "shared-checkout",
-            "--dvc",
-            "--dvc-remote",
-            "storage",
-            "--dvc-remote-url",
+            "--storage-url",
             f"s3://{self.bucket}/dvc",
-            "--version-aware",
+            "--storage-endpoint-url",
+            self.endpoint,
+            "--require-object-versioning",
             "--adopt",
         )
         dry = self.wm(self.shared, *common, "--dry-run")
@@ -422,7 +411,6 @@ class Harness:
 
         initialized = self.wm(self.shared, *common)
         self.check(initialized["status"] == "initialized", "repository initialized")
-        self.configure_s3_remote(self.shared)
         config_text = (self.shared / ".workspace-mgr.toml").read_text(encoding="utf-8")
         dvc_config = (self.shared / ".dvc" / "config").read_text(encoding="utf-8")
         bootstrap = (self.shared / "AGENTS.md").read_text(encoding="utf-8")
@@ -432,15 +420,29 @@ class Harness:
         self.check("workspace-mgr instructions" in bootstrap, "thin AGENTS bootstrap installed")
         self.check(module == original_agents, "existing AGENTS content preserved as a module")
         self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
-        self.check("require_version_aware = true" in config_text, "version-aware policy enabled")
-        self.check("version_aware = true" in dvc_config, "DVC remote is version-aware")
-        self.check(f"s3://{self.bucket}/dvc" in dvc_config, "tracked DVC URL selects test bucket")
-        repeated = self.wm(self.shared, "init", "--dvc", "--adopt")
+        self.check("require_object_versioning = true" in config_text, "object-versioning policy enabled")
+        self.check("version_aware = true" in dvc_config, "internal storage engine is version-aware")
+        self.check(f"s3://{self.bucket}/dvc" in dvc_config, "internal storage URL selects test bucket")
+        self.check(self.endpoint in dvc_config, "internal storage endpoint selects virtual S3")
+        self.check("[dvc]" not in config_text.lower(), "public configuration does not expose a DVC section")
+        self.check("require_version_aware" not in config_text, "public configuration hides engine-specific versioning")
+        self.check("python" not in config_text.lower(), "public configuration does not expose its adapter")
+        repeated = self.wm(self.shared, "init", "--adopt")
         self.check(repeated["status"] == "no_changes", "init is idempotent")
+
+        (self.shared / ".dvc" / "config").write_text(dvc_config + "# drift\n", encoding="utf-8")
+        drifted = self.wm(self.shared, "doctor", expected=2)
+        self.check("configuration drifted" in drifted["stdout"], "doctor rejects internal storage drift")
+        repaired = self.wm(self.shared, "init", "--adopt")
+        self.check(repaired["status"] == "initialized", "init repairs internal storage drift")
+        self.check(
+            (self.shared / ".dvc" / "config").read_text(encoding="utf-8") == dvc_config,
+            "repair restores deterministic internal storage config",
+        )
 
         self.git(self.shared, "add", "-A")
         staged = self.git(self.shared, "diff", "--cached", "--name-only").stdout.splitlines()
-        self.check(".dvc/config.local" not in staged, "DVC credentials/endpoint state is not staged")
+        self.check(".dvc/config.local" not in staged, "local storage credentials are not staged")
         self.git(self.shared, "commit", "-m", "Initialize managed workspace")
         self.git(self.shared, "push", "origin", "main")
         main_oid = self.remote_ref("main")
@@ -448,10 +450,11 @@ class Harness:
 
         config = self.wm(self.shared, "config", "show")
         self.check(config["git"]["remote"] == "origin", "config resolves Git remote")
-        self.check(config["dvc"]["remote"] == "storage", "config resolves DVC remote")
-        self.check(config["dvc"]["require_version_aware"] is True, "config exposes exact verification")
+        self.check(config["storage"]["url"] == f"s3://{self.bucket}/dvc", "config resolves managed storage")
+        self.check(config["storage"]["require_object_versioning"] is True, "config requires exact object versions")
+        self.check("dvc" not in config, "public config JSON hides the internal storage engine")
 
-        for topic in ("all", "core", "task", "publish", "dvc", "infrastructure"):
+        for topic in ("all", "core", "task", "publish", "storage", "infrastructure"):
             document = self.wm(self.shared, "instructions", topic)
             self.check(document["topic"] == topic, "instruction topic renders", topic=topic)
             self.check(len(document["policy_hash"]) == 64, "instruction policy hash is complete", topic=topic)
@@ -613,7 +616,7 @@ class Harness:
         )
         self.check(tracked["status"] == "pushed", "two DVC boundaries tracked atomically")
         self.check(tracked["management"]["operation"] == "track", "track operation reported")
-        verification = tracked["dvc"]["verification"]
+        verification = tracked["storage"]["verification"]
         self.check(verification["mode"] == "version-aware", "exact S3 version verification ran")
         self.check(len(verification["checked_objects"]) >= 3, "each payload object was exactly verified")
         data_pointer = task / "data.bin.dvc"
@@ -645,7 +648,7 @@ class Harness:
         remote_before_plan = self.remote_ref(branch)
         planned = self.wm(task, "plan")
         self.check(planned["status"] == "dry_run", "dirty DVC outputs appear in plan")
-        self.check(set(planned["dvc"]["dirty_files"]) == {f"{task_id}/data.bin.dvc", f"{task_id}/bundle.dvc"}, "plan finds both dirty DVC boundaries")
+        self.check(set(planned["storage"]["dirty_files"]) == {f"{task_id}/data.bin.dvc", f"{task_id}/bundle.dvc"}, "plan finds both dirty storage boundaries")
         self.check(data_pointer.read_bytes() == pointer_before_plan, "plan does not rewrite DVC metadata")
         self.check(self.list_s3_versions() == s3_before_plan, "plan does not upload new S3 versions")
         self.check(self.remote_ref(branch) == remote_before_plan, "plan does not move Git branch")
@@ -669,7 +672,7 @@ class Harness:
 
         published_v2 = self.wm(task, "publish", "-m", "Publish DVC version two")
         self.check(published_v2["status"] == "pushed", "retry after S3 failure succeeds")
-        self.check(published_v2["dvc"]["verification"]["mode"] == "version-aware", "retry verifies exact S3 versions")
+        self.check(published_v2["storage"]["verification"]["mode"] == "version-aware", "retry verifies exact S3 versions")
         versions_v2 = self.list_s3_versions()
         self.check(len(versions_v2) > len(versions_v1), "S3 retains additional immutable versions")
         bodies_v2 = self.s3_bodies()
@@ -782,8 +785,8 @@ class Harness:
         refreshed = self.wm(self.shared, "refresh")
         self.check(refreshed["status"] == "updated", "refresh fast-forwards shared main")
         self.check(refreshed["new_oid"] == merged_oid, "refresh reports merged object ID")
-        self.check(refreshed["dvc"]["mode"] == "hydrate", "refresh uses DVC hydration path")
-        self.check(f"{task_id}/bundle.dvc" in refreshed["dvc"]["changed_files"], "refresh identifies incoming DVC metadata")
+        self.check(refreshed["storage"]["mode"] == "hydrate", "refresh uses managed-storage hydration")
+        self.check(f"{task_id}/bundle.dvc" in refreshed["storage"]["changed_files"], "refresh identifies incoming storage metadata")
         self.assert_shared_head(merged_oid)
         self.check((self.shared / "README.md").read_bytes() == overlay, "refresh preserves tracked overlay")
         self.check((self.shared / "unrelated.txt").read_bytes() == unrelated, "refresh preserves unrelated untracked overlay")
@@ -795,7 +798,6 @@ class Harness:
         consumer = self.root / "consumer"
         self.run(["git", "clone", self.remote_url, consumer], cwd=self.root)
         self.configure_git(consumer)
-        self.configure_s3_remote(consumer)
         consumer_task = consumer / task_id
         self.check(not (consumer_task / "bundle").exists(), "fresh clone has no DVC payload")
         self.check((consumer_task / "moved.bin").read_bytes() == b"single-file version three\n", "fresh clone receives untracked Git payload")
@@ -838,7 +840,7 @@ class Harness:
             "The E2E scenario explicitly exercises the documented Git-only exception.",
         )
         self.check(published["status"] == "pushed", "authorized Git-only publish succeeds")
-        self.check(published["dvc"]["mode"] == "git-only", "Git-only mode is reported")
+        self.check(published["storage"]["mode"] == "git-only", "Git-only mode is reported")
         merged_oid = self.merge_branch_to_main(branch)
         rejected_refresh = self.wm(self.shared, "refresh", "--git-only", expected=2)
         self.check("--scope-note" in rejected_refresh["stderr"], "Git-only refresh requires explicit reason")
@@ -850,7 +852,7 @@ class Harness:
             "The E2E scenario explicitly exercises the documented Git-only refresh exception.",
         )
         self.check(refreshed["status"] == "updated", "authorized Git-only refresh succeeds")
-        self.check(refreshed["dvc"]["mode"] == "git-only", "Git-only refresh mode is reported")
+        self.check(refreshed["storage"]["mode"] == "git-only", "Git-only refresh mode is reported")
         self.assert_shared_head(merged_oid)
         plan = self.wm(
             task,

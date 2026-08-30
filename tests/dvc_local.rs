@@ -10,24 +10,21 @@ fn track_publish_and_hydrate_use_an_isolated_local_remote() {
     }
     let fixture = GitFixture::new();
     let dvc_remote = fixture.root.join("dvc-remote");
-    command(&fixture.seed, "dvc", ["init"]);
-    command(
+    workspace(
         &fixture.seed,
-        "dvc",
         [
-            "remote",
-            "add",
-            "-d",
-            "storage",
+            "init",
+            "--profile",
+            "shared-checkout",
+            "--storage-url",
             dvc_remote.to_str().unwrap(),
         ],
     );
-    workspace(
-        &fixture.seed,
-        ["init", "--profile", "shared-checkout", "--dvc", "--adopt"],
-    );
     let config = std::fs::read_to_string(fixture.seed.join(".workspace-mgr.toml")).unwrap();
-    assert!(config.contains("remote = \"storage\""));
+    assert!(config.contains("[storage]"));
+    assert!(config.contains(&format!("url = {:?}", dvc_remote.to_str().unwrap())));
+    let internal = std::fs::read_to_string(fixture.seed.join(".dvc/config")).unwrap();
+    assert!(internal.contains("remote = workspace-mgr"));
     fixture.commit_seed("Initialize managed DVC repository");
     fixture.clone_shared();
     workspace(
@@ -65,7 +62,7 @@ fn track_publish_and_hydrate_use_an_isolated_local_remote() {
     let published = workspace(&task, ["publish", "-m", "Update DVC data"]);
     assert_eq!(json(&published)["status"], "pushed");
     assert_eq!(
-        json(&published)["dvc"]["dirty_files"][0],
+        json(&published)["storage"]["dirty_files"][0],
         format!("{task_name}/data.bin.dvc")
     );
 
@@ -111,21 +108,15 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
     }
     let fixture = GitFixture::new();
     let dvc_remote = fixture.root.join("dvc-remote");
-    command(&fixture.seed, "dvc", ["init"]);
-    command(
-        &fixture.seed,
-        "dvc",
-        [
-            "remote",
-            "add",
-            "-d",
-            "storage",
-            dvc_remote.to_str().unwrap(),
-        ],
-    );
     workspace(
         &fixture.seed,
-        ["init", "--profile", "shared-checkout", "--dvc", "--adopt"],
+        [
+            "init",
+            "--profile",
+            "shared-checkout",
+            "--storage-url",
+            dvc_remote.to_str().unwrap(),
+        ],
     );
     fixture.commit_seed("Initialize managed DVC repository");
     fixture.clone_shared();
@@ -164,7 +155,7 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
 
 #[cfg(unix)]
 #[test]
-fn version_aware_verifier_is_an_explicit_adapter() {
+fn object_version_adapter_and_engine_config_are_internal() {
     use std::os::unix::fs::PermissionsExt;
 
     if which::which("dvc").is_err() {
@@ -173,73 +164,36 @@ fn version_aware_verifier_is_an_explicit_adapter() {
     }
     let fixture = GitFixture::new();
     let dvc_remote = fixture.root.join("dvc-remote");
-    command(&fixture.seed, "dvc", ["init"]);
-    command(
-        &fixture.seed,
-        "dvc",
-        [
-            "remote",
-            "add",
-            "-d",
-            "storage",
-            dvc_remote.to_str().unwrap(),
-        ],
-    );
-    workspace(
-        &fixture.seed,
-        ["init", "--profile", "shared-checkout", "--dvc", "--adopt"],
-    );
     let fake_python = fixture.root.join("fake-python");
     std::fs::write(
         &fake_python,
-        "#!/bin/sh\nprintf '%s\\n' '{\"mode\":\"version-aware\",\"remote\":\"fake\",\"checked_objects\":[]}'\n",
+        "#!/bin/sh\ncase \"$2\" in\n  *'print(dvc.__version__)'*) printf '%s\\n' '3.67.1' ;;\n  *) printf '%s\\n' '{\"mode\":\"version-aware\",\"remote\":\"fake\",\"checked_objects\":[]}' ;;\nesac\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&fake_python).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_python, permissions).unwrap();
-    let config_path = fixture.seed.join(".workspace-mgr.toml");
-    let config = std::fs::read_to_string(&config_path).unwrap();
-    let config = config
-        .replace(
-            "require_version_aware = false",
-            "require_version_aware = true",
-        )
-        .replace(
-            "python = \"python3\"",
-            &format!("python = {:?}", fake_python.to_str().unwrap()),
-        );
-    std::fs::write(&config_path, config).unwrap();
-    fixture.commit_seed("Configure exact DVC verifier adapter");
-    fixture.clone_shared();
-    workspace(
-        &fixture.shared,
-        [
-            "task",
-            "create",
-            "version-aware",
-            "--title",
-            "Version aware",
-            "--purpose",
-            "Exercise the exact-verification adapter.",
-            "--timestamp",
-            "20260829-170600",
-        ],
-    );
-    let task_name = "20260829-170600-version-aware";
-    let task = fixture.shared.join(task_name);
-    std::fs::write(task.join("data.bin"), b"content\n").unwrap();
-    let output = workspace(
-        &task,
-        [
-            "track",
-            "-m",
-            "Track version-aware fixture",
-            &format!("{task_name}/data.bin"),
-        ],
-    );
-    assert_eq!(
-        json(&output)["dvc"]["verification"]["mode"],
-        "version-aware"
-    );
+    let output = std::process::Command::new(binary())
+        .args([
+            "init",
+            "--profile",
+            "shared-checkout",
+            "--storage-url",
+            dvc_remote.to_str().unwrap(),
+            "--require-object-versioning",
+        ])
+        .current_dir(&fixture.seed)
+        .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_STORAGE_PYTHON", &fake_python)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let public = std::fs::read_to_string(fixture.seed.join(".workspace-mgr.toml")).unwrap();
+    assert!(public.contains("require_object_versioning = true"));
+    assert!(!public.contains("[dvc]"));
+    assert!(!public.contains("require_version_aware"));
+    assert!(!public.contains("python"));
+    let internal = std::fs::read_to_string(fixture.seed.join(".dvc/config")).unwrap();
+    assert!(internal.contains("remote = workspace-mgr"));
+    assert!(internal.contains("version_aware = true"));
 }

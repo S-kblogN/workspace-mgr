@@ -23,14 +23,12 @@ draft_pull_request = true
 
 [large_files]
 threshold_bytes = 10485760
-primary = "dvc"
-fallback = "git-lfs"
 
-[dvc]
+[storage]
 enabled = true
-remote = "storage"
-require_version_aware = false
-python = "python3"
+url = "s3://example-bucket/workspace"
+endpoint_url = "https://s3.example.invalid"
+require_object_versioning = true
 
 [agent]
 modules = [
@@ -38,17 +36,29 @@ modules = [
   "shared-checkout",
   "publication",
   "artifact-hygiene",
-  "dvc",
+  "storage",
 ]
 ```
 
-The repository config expresses policy. The actual DVC URL remains in
-`.dvc/config`, and credentials remain in `.dvc/config.local` or environment
-variables.
+The repository config is the only source of truth for storage policy and its
+non-secret location. `workspace-mgr init` deterministically generates the
+lower-level compatibility configuration, and every storage operation refuses
+to run if that generated file drifts. Do not edit it or invoke the underlying
+storage engine directly; rerun `workspace-mgr init` after changing
+`.workspace-mgr.toml`.
 
-`init --dvc-remote <name> --dvc-remote-url <url>` writes a non-secret remote
-location to tracked DVC configuration. It rejects embedded URL credentials;
-authentication belongs in local DVC configuration or the environment.
+`workspace-mgr init --storage-url <url>` enables storage. Add
+`--storage-endpoint-url <url>` for an S3-compatible service and
+`--require-object-versioning` when the bucket's native object versions are part
+of the repository's durability contract. Embedded URL credentials are rejected.
+Authentication belongs in platform-standard environment or identity mechanisms;
+credentials are never written to tracked configuration.
+
+The internal remote name, engine-specific versioning switch, and interpreter
+selection are intentionally absent from this schema. They belong to the
+`workspace-mgr` release and cannot vary by repository. Maintainers can override
+the version-verification interpreter with `WORKSPACE_MGR_STORAGE_PYTHON` for
+packaging and isolated tests; it is not a repository setting.
 
 New task manifests contain only task-specific state:
 

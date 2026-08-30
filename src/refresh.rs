@@ -35,13 +35,13 @@ pub struct RefreshReport {
     pub working_changes_after: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_note: Option<String>,
-    pub dvc: RefreshDvcReport,
+    pub storage: RefreshStorageReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RefreshDvcReport {
+pub struct RefreshStorageReport {
     pub mode: String,
     pub changed_files: Vec<String>,
     pub old_files: Vec<String>,
@@ -134,7 +134,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         } else {
             None
         },
-        dvc: RefreshDvcReport {
+        storage: RefreshStorageReport {
             mode: if options.git_only {
                 "git-only"
             } else {
@@ -158,7 +158,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         BTreeMap::new()
     } else {
         let overlays = capture_overlays(&repo, &old_oid, &new_oid, &incoming_dvc)?;
-        dvc::validate_worktree(&repo, &incoming_dvc)?;
+        dvc::validate_worktree(&repo, &config, &incoming_dvc)?;
         overlays
     };
     if options.dry_run {
@@ -168,8 +168,8 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
 
     let mut outputs_absent_before = Vec::new();
     if !incoming_dvc.is_empty() && !options.git_only {
-        let old_prepared = dvc::prepare_revision(&repo, &old_oid, &old_dvc)?;
-        let new_prepared = dvc::prepare_revision(&repo, &new_oid, &new_dvc)?;
+        let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_dvc)?;
+        let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &new_dvc)?;
         let unsafe_outputs: Vec<String> = new_dvc
             .iter()
             .filter(|pointer| !resolved_under(&repo.root, pointer).is_file())
@@ -179,7 +179,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
             .collect();
         if !unsafe_outputs.is_empty() {
             return Err(Error::message(format!(
-                "incoming DVC outputs already exist without matching local metadata and will not be overwritten: {}",
+                "incoming stored outputs already exist without matching local metadata and will not be overwritten: {}",
                 unsafe_outputs.join(", ")
             )));
         }
@@ -189,8 +189,8 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
             .filter(|output| !resolved_under(&repo.root, output).exists())
             .cloned()
             .collect();
-        report.dvc.old_prepared = Some(old_prepared);
-        report.dvc.new_prepared = Some(new_prepared);
+        report.storage.old_prepared = Some(old_prepared);
+        report.storage.new_prepared = Some(new_prepared);
     }
 
     if repo.optional_oid(&local_ref)?.as_deref() != Some(&old_oid) {
@@ -209,7 +209,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let refreshed = (|| {
         repo.run(["read-tree", "--reset", &new_oid])?;
         if !incoming_dvc.is_empty() && !options.git_only {
-            report.dvc.materialized = materialize_metadata(&repo, &new_oid, &incoming_dvc)?;
+            report.storage.materialized = materialize_metadata(&repo, &new_oid, &incoming_dvc)?;
             if !new_dvc.is_empty() {
                 let args = std::iter::once("checkout".to_owned())
                     .chain(new_dvc.iter().cloned())
@@ -245,7 +245,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     report.status = "updated".to_owned();
     report.method = Some(
         if !incoming_dvc.is_empty() && !options.git_only {
-            "prefetch DVC, compare-and-swap Git ref, index-only read-tree, then hydrate DVC"
+            "prefetch managed storage, compare-and-swap the repository revision, then hydrate stored outputs"
         } else {
             "compare-and-swap ref update plus index-only read-tree"
         }
@@ -341,7 +341,7 @@ fn capture_overlays(
     }
     if !conflicts.is_empty() {
         return Err(Error::message(format!(
-            "incoming DVC metadata conflicts with active working overlays: {}",
+            "incoming storage metadata conflicts with active working overlays: {}",
             conflicts.join(", ")
         )));
     }
@@ -412,7 +412,7 @@ fn rollback(
         run("dvc", args, &repo.root)?;
     }
     for output in outputs_absent_before {
-        let normalized = repo_path(output, "rollback DVC output")?;
+        let normalized = repo_path(output, "rollback storage output")?;
         let candidate = resolved_under(&repo.root, &normalized);
         if candidate.is_symlink() || candidate.is_file() {
             fs::remove_file(&candidate).at(&candidate)?;

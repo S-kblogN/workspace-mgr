@@ -3,12 +3,12 @@ name = "workspace-mgr"
 version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
-description = "Policy-driven workspace and Git/DVC transaction manager for coding agents"
+description = "Policy-driven repository workspace manager for coding agents"
 license = "MIT"
 repository = "https://github.com/S-kblogN/workspace-mgr"
 homepage = "https://github.com/S-kblogN/workspace-mgr"
 readme = "README.md"
-keywords = ["agents", "git", "dvc", "workspace", "cli"]
+keywords = ["agents", "storage", "workspace", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/"]
 

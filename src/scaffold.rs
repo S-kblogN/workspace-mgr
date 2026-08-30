@@ -5,20 +5,20 @@ use chrono::Local;
 use serde::Serialize;
 
 use crate::config::{CONFIG_NAME, Config, Profile, SCHEMA_VERSION};
+use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::instructions::BOOTSTRAP;
 use crate::manifest::{TaskManifest, one_line};
-use crate::process::{run, run_unchecked};
+use crate::process::run;
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
     pub repo: PathBuf,
     pub profile: Profile,
-    pub dvc: bool,
-    pub dvc_remote: Option<String>,
-    pub dvc_remote_url: Option<String>,
-    pub version_aware: bool,
+    pub storage_url: Option<String>,
+    pub storage_endpoint_url: Option<String>,
+    pub require_object_versioning: bool,
     pub adopt: bool,
     pub dry_run: bool,
 }
@@ -41,30 +41,30 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     let repo = GitRepo::discover(&options.repo)?;
     let config_path = repo.root.join(CONFIG_NAME);
     let agents_path = repo.root.join("AGENTS.md");
-    if let Some(url) = &options.dvc_remote_url {
-        validate_public_remote_url(url)?;
-    }
     let mut actions = Vec::new();
     let existing_config = config_path.is_file();
     let mut config = if existing_config {
         Config::load(&repo)?
     } else {
-        let mut config = Config::defaults(options.profile, options.dvc);
+        let mut config = Config::defaults(options.profile, options.storage_url.is_some());
         detect_git_defaults(&repo, &mut config)?;
         config
     };
-    if options.dvc {
-        config.dvc.enabled = true;
-        if !existing_config || options.version_aware {
-            config.dvc.require_version_aware = options.version_aware;
-        }
-        if options.dvc_remote.is_some() {
-            config.dvc.remote.clone_from(&options.dvc_remote);
-        } else if config.dvc.remote.is_none() {
-            config.dvc.remote = detect_dvc_remote(&repo)?;
-        }
-        if !config.agent.modules.iter().any(|module| module == "dvc") {
-            config.agent.modules.push("dvc".to_owned());
+    if let Some(url) = &options.storage_url {
+        config.storage.enabled = true;
+        config.storage.url = Some(url.clone());
+        config
+            .storage
+            .endpoint_url
+            .clone_from(&options.storage_endpoint_url);
+        config.storage.require_object_versioning = options.require_object_versioning;
+        if !config
+            .agent
+            .modules
+            .iter()
+            .any(|module| module == "storage")
+        {
+            config.agent.modules.push("storage".to_owned());
         }
     }
     config.validate()?;
@@ -131,63 +131,38 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         install_bootstrap = true;
     }
 
-    if options.dvc {
+    if config.storage.enabled {
+        dvc::require_runtime(&repo)?;
+        if config.storage.require_object_versioning {
+            dvc::require_version_adapter(&repo)?;
+        }
         if !repo.root.join(".dvc").exists() {
             actions.push(InitAction {
                 action: "run".to_owned(),
                 path: ".dvc/".to_owned(),
-                detail: "dvc init".to_owned(),
+                detail: "initialize the internal managed-storage engine".to_owned(),
             });
             if !options.dry_run {
                 run("dvc", ["init"], &repo.root)?;
             }
         }
-        match (&options.dvc_remote, &options.dvc_remote_url) {
-            (Some(name), Some(url)) => {
+        if let Some(rendered) = dvc::render_internal_config(&config)? {
+            let internal_path = repo.root.join(".dvc/config");
+            if fs::read_to_string(&internal_path).ok().as_deref() != Some(&rendered) {
+                let versioning = if config.storage.require_object_versioning {
+                    " with exact object-version verification"
+                } else {
+                    ""
+                };
                 actions.push(InitAction {
                     action: "configure".to_owned(),
                     path: ".dvc/config".to_owned(),
-                    detail: format!("set default DVC remote {name:?}"),
+                    detail: format!("generate internal managed-storage configuration{versioning}"),
                 });
-                if !options.dry_run {
-                    run("dvc", ["remote", "add", "-d", "-f", name, url], &repo.root)?;
-                }
-            }
-            (Some(name), None) => {
-                actions.push(InitAction {
-                    action: "configure".to_owned(),
-                    path: ".dvc/config".to_owned(),
-                    detail: format!("select existing DVC remote {name:?} as default"),
-                });
-                if !options.dry_run {
-                    run("dvc", ["remote", "default", name], &repo.root)?;
-                }
-            }
-            (None, Some(_)) => {
-                return Err(Error::message("--dvc-remote-url requires --dvc-remote"));
-            }
-            _ => {}
-        }
-        if options.version_aware {
-            let remote = config.dvc.remote.as_deref().ok_or_else(|| {
-                Error::message(
-                    "--version-aware requires an existing default DVC remote or --dvc-remote",
-                )
-            })?;
-            actions.push(InitAction {
-                action: "configure".to_owned(),
-                path: ".dvc/config".to_owned(),
-                detail: format!("require exact version-aware verification for {remote:?}"),
-            });
-            if !options.dry_run {
-                run(
-                    "dvc",
-                    ["remote", "modify", remote, "version_aware", "true"],
-                    &repo.root,
-                )?;
             }
         }
         if !options.dry_run {
+            dvc::write_internal_config(&repo, &config)?;
             ensure_line(&repo.root.join(".dvc/.gitignore"), "/config.local")?;
         }
     }
@@ -219,23 +194,6 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
     })
 }
 
-fn validate_public_remote_url(url: &str) -> Result<()> {
-    if url.trim().is_empty() || url.contains(['\n', '\r']) {
-        return Err(Error::message(
-            "DVC remote URL must be a non-empty single-line value",
-        ));
-    }
-    if let Some((_, authority_and_path)) = url.split_once("://") {
-        let authority = authority_and_path.split('/').next().unwrap_or_default();
-        if authority.contains('@') {
-            return Err(Error::message(
-                "DVC remote URL must not contain embedded credentials; use local DVC configuration or environment credentials",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn detect_git_defaults(repo: &GitRepo, config: &mut Config) -> Result<()> {
     let remotes = repo.run(["remote"])?.stdout;
     let remote_names: Vec<&str> = remotes
@@ -263,17 +221,6 @@ fn detect_git_defaults(repo: &GitRepo, config: &mut Config) -> Result<()> {
         config.git.shared_checkout_branch = branch;
     }
     Ok(())
-}
-
-fn detect_dvc_remote(repo: &GitRepo) -> Result<Option<String>> {
-    if !repo.root.join(".dvc").exists() {
-        return Ok(None);
-    }
-    let output = run_unchecked("dvc", ["config", "core.remote"], &repo.root)?;
-    if !output.success() || output.stdout.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(output.stdout.trim().to_owned()))
 }
 
 #[derive(Debug, Clone)]

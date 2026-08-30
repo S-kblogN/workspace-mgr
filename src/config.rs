@@ -29,7 +29,7 @@ pub struct Config {
     #[serde(default)]
     pub large_files: LargeFileConfig,
     #[serde(default)]
-    pub dvc: DvcConfig,
+    pub storage: StorageConfig,
     #[serde(default)]
     pub agent: AgentConfig,
 }
@@ -57,17 +57,15 @@ pub struct TaskConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct LargeFileConfig {
     pub threshold_bytes: u64,
-    pub primary: String,
-    pub fallback: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct DvcConfig {
+pub struct StorageConfig {
     pub enabled: bool,
-    pub remote: Option<String>,
-    pub require_version_aware: bool,
-    pub python: String,
+    pub url: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub require_object_versioning: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,19 +90,6 @@ impl Default for LargeFileConfig {
     fn default() -> Self {
         Self {
             threshold_bytes: 10_485_760,
-            primary: "dvc".to_owned(),
-            fallback: "git-lfs".to_owned(),
-        }
-    }
-}
-
-impl Default for DvcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            remote: None,
-            require_version_aware: false,
-            python: "python3".to_owned(),
         }
     }
 }
@@ -122,14 +107,14 @@ impl Default for AgentConfig {
 }
 
 impl Config {
-    pub fn defaults(profile: Profile, dvc: bool) -> Self {
+    pub fn defaults(profile: Profile, storage: bool) -> Self {
         let shared = profile == Profile::SharedCheckout;
         let mut modules = AgentConfig::default().modules;
         if shared {
             modules.push("shared-checkout".to_owned());
         }
-        if dvc {
-            modules.push("dvc".to_owned());
+        if storage {
+            modules.push("storage".to_owned());
         }
         Self {
             schema_version: SCHEMA_VERSION,
@@ -143,9 +128,9 @@ impl Config {
             },
             tasks: TaskConfig::default(),
             large_files: LargeFileConfig::default(),
-            dvc: DvcConfig {
-                enabled: dvc,
-                ..DvcConfig::default()
+            storage: StorageConfig {
+                enabled: storage,
+                ..StorageConfig::default()
             },
             agent: AgentConfig { modules },
         }
@@ -216,35 +201,32 @@ impl Config {
                 "large_files.threshold_bytes must be positive",
             ));
         }
-        for (field, value) in [
-            ("large_files.primary", self.large_files.primary.as_str()),
-            ("large_files.fallback", self.large_files.fallback.as_str()),
-            ("dvc.python", self.dvc.python.as_str()),
-        ] {
-            if value.trim().is_empty() || value.contains('\n') {
-                return Err(Error::message(format!(
-                    "{field} must be a non-empty single-line string"
-                )));
-            }
-        }
-        if let Some(remote) = &self.dvc.remote {
-            if remote.trim().is_empty() || remote.contains('\n') {
-                return Err(Error::message(
-                    "dvc.remote must be a non-empty single-line string when set",
-                ));
-            }
-        }
-        if self.dvc.require_version_aware && !self.dvc.enabled {
+        if self.storage.enabled && self.storage.url.is_none() {
             return Err(Error::message(
-                "dvc.require_version_aware requires dvc.enabled",
+                "storage.url is required when storage.enabled is true",
             ));
+        }
+        if !self.storage.enabled
+            && (self.storage.url.is_some()
+                || self.storage.endpoint_url.is_some()
+                || self.storage.require_object_versioning)
+        {
+            return Err(Error::message("storage settings require storage.enabled"));
+        }
+        for (field, value) in [
+            ("storage.url", self.storage.url.as_deref()),
+            ("storage.endpoint_url", self.storage.endpoint_url.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_public_url(field, value)?;
+            }
         }
         let supported = [
             "scope",
             "shared-checkout",
             "publication",
             "artifact-hygiene",
-            "dvc",
+            "storage",
             "infrastructure",
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -270,4 +252,21 @@ impl Config {
         })?;
         Ok(requirement.matches(&version))
     }
+}
+
+fn validate_public_url(field: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.contains(['\n', '\r']) {
+        return Err(Error::message(format!(
+            "{field} must be a non-empty single-line value"
+        )));
+    }
+    if let Some((_, authority_and_path)) = value.split_once("://") {
+        let authority = authority_and_path.split('/').next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err(Error::message(format!(
+                "{field} must not contain embedded credentials; use environment credentials or ignored local configuration"
+            )));
+        }
+    }
+    Ok(())
 }
