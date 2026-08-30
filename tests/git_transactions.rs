@@ -60,6 +60,55 @@ fn publishes_only_the_task_scope_without_switching_main() {
 }
 
 #[test]
+fn published_git_placement_stays_stable_when_a_file_grows() {
+    let fixture = managed_fixture();
+    let config_path = fixture.shared.join(".workspace-mgr.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap().replace(
+        "auto_s3_above_bytes = 10485760",
+        "auto_s3_above_bytes = 1024",
+    );
+    std::fs::write(config_path, config).unwrap();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "sticky-git",
+            "--title",
+            "Sticky Git",
+            "--purpose",
+            "Verify published placement remains stable.",
+            "--timestamp",
+            "20260829-170150",
+        ],
+    );
+    let task_id = "20260829-170150-sticky-git";
+    let task = fixture.shared.join(task_id);
+    let retained = task.join("retained.bin");
+    std::fs::write(&retained, vec![1_u8; 512]).unwrap();
+    workspace(&task, ["publish", "-m", "Publish small Git file"]);
+
+    std::fs::write(&retained, vec![2_u8; 2048]).unwrap();
+    let status = workspace(
+        &task,
+        ["storage", "status", &format!("{task_id}/retained.bin")],
+    );
+    assert_eq!(json(&status)["placements"][0]["target"], "git");
+    assert_eq!(
+        json(&status)["placements"][0]["selected_by"],
+        "published-history"
+    );
+    let plan = workspace(&task, ["plan"]);
+    assert_eq!(json(&plan)["status"], "dry_run");
+    assert!(
+        json(&plan)["storage"]["placement"]["would_place_in_s3"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn additional_scope_requires_and_records_a_reason() {
     let fixture = managed_fixture();
     workspace(

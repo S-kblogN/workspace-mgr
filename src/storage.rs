@@ -398,6 +398,15 @@ fn placement_status(repo: &GitRepo, config: &Config, path: &str) -> Result<Place
             reason: None,
         });
     }
+    let history = repo.run_unchecked(["log", "--all", "--format=%H", "-n", "1", "--", path])?;
+    if history.success() && !history.stdout.trim().is_empty() {
+        return Ok(PlacementStatus {
+            path: path.to_owned(),
+            target: StorageTarget::Git,
+            selected_by: "published-history".to_owned(),
+            reason: None,
+        });
+    }
     Ok(PlacementStatus {
         path: path.to_owned(),
         target: automatic_target(repo, config, path)?,
