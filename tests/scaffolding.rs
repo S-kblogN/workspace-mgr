@@ -50,6 +50,12 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     assert!(text.contains("one writable conversation (chat) = one task"));
     assert!(text.contains("Effective repository instructions"));
     assert!(text.contains("shared checkout"));
+    assert!(text.contains("Repository-wide reading is allowed"));
+    assert!(text.contains("default write boundary is its own task directory"));
+    assert!(text.contains("another chat's task directory"));
+    assert!(text.contains("explicitly authorize the exact path and action"));
+    assert!(text.contains("they do not create authorization"));
+    assert!(text.contains("write boundary is instead the exact user-authorized paths"));
     assert!(text.contains("policy="));
 
     let model_only = workspace(
@@ -469,6 +475,17 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
             "topic {topic} was not rendered"
         );
     }
+
+    let task_rules = workspace(&fixture.shared, ["instructions", "task"]);
+    let task_rules = String::from_utf8(task_rules.stdout).unwrap();
+    assert!(task_rules.contains("default write boundary is its own task directory"));
+    assert!(task_rules.contains("explicitly authorize the exact path and action"));
+    assert!(task_rules.contains("they do not create authorization"));
+
+    let infrastructure_rules = workspace(&fixture.shared, ["instructions", "infrastructure"]);
+    let infrastructure_rules = String::from_utf8(infrastructure_rules.stdout).unwrap();
+    assert!(infrastructure_rules.contains("write only the declared paths"));
+    assert!(infrastructure_rules.contains("separate explicit user approval"));
 
     workspace(
         &fixture.shared,

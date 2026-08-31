@@ -31,6 +31,21 @@ fn user_documentation_covers_the_complete_public_model() {
         "one writable conversation (chat) = one task = one target branch = one draft pull request"
     ));
     assert!(normalized_model.contains("Infrastructure is a kind of task"));
+    for ownership_rule in [
+        "Reading and ownership are separate",
+        "Reading a path does not transfer ownership or authorize mutation",
+        "task directory is the default write boundary",
+        "another chat's task directory",
+        "explicit user authorization for the exact path and action",
+        "does not manufacture approval",
+        "manifest scopes are its write boundary",
+        "Untracked does not mean unowned",
+    ] {
+        assert!(
+            normalized_model.contains(ownership_rule),
+            "model is missing ownership rule {ownership_rule:?}"
+        );
+    }
     assert!(normalized_model.contains("same management strategy"));
     assert!(normalized_model.contains("the user asks for outcomes"));
     assert!(normalized_model.contains("None of these operations publishes a task"));
