@@ -20,6 +20,12 @@ The [user guide](guide.md) explains how the commands form one workflow.
   from `config show`. Use global `--format json` or set
   `WORKSPACE_MGR_FORMAT=json` for stable structured output.
 - Errors exit with status 2 and start with `workspace-mgr:`.
+- Every invocation performs a best-effort cached update check. A newer
+  applicable release produces exactly one `workspace-mgr: update available`
+  line on stderr; stdout, structured output, and command exit status are
+  unchanged. The CLI never updates itself. Agents report the versions and ask
+  the user before updating, then run `workspace-mgr setup`; scaffold changes are
+  reconciled with `workspace-mgr init` in an infrastructure task.
 
 ## `workspace-mgr setup`
 
@@ -59,7 +65,10 @@ ignore files. Before the first successful initialization, an existing
 `AGENTS.md` or private internal-storage scaffold is instead an atomic collision
 that the caller must move or remove explicitly. `init` refuses to change the S3
 location while retained S3 boundaries exist. It never contacts or writes a
-remote.
+remote. The generated `AGENTS.md` includes an approval-gated crates.io install
+command for the exact scaffold-generating CLI version, followed by `setup` and
+an instructions retry, so a new machine can bootstrap without inventing a
+lower-level workflow.
 
 ```sh
 workspace-mgr init

@@ -29,6 +29,23 @@ pull-request ownership, and merge authority are compiled product policy. They
 are intentionally absent from repository configuration so different
 repositories cannot drift into different management strategies.
 
+## Update observation boundary
+
+Update discovery is advisory and user-scoped, not repository configuration.
+Before parsing any command, the executable reads a small cache in the user's
+cache directory. A successful crates.io result is reused for six hours and a
+failed attempt for one hour. Refresh uses a nonblocking process lock, a 750 ms
+request deadline, a 1 MiB response limit, and an atomic cache replacement. Lock
+contention, unavailable cache storage, malformed responses, and all network
+failures are ignored.
+
+The cache records only timestamps and the newest non-yanked stable and overall
+versions. Stable installations compare against the stable entry; prerelease
+installations compare against the overall entry using semantic-version
+precedence. A newer candidate emits one stderr line per invocation. The update
+checker never writes stdout, changes the requested command's status, downloads
+an executable, mutates a repository, or changes product policy.
+
 An explicit storage choice is recorded beside its path as workspace-mgr-owned
 metadata. This makes the choice reviewable and keeps independently active task
 scopes from contending on one central placement file. Users must not edit these

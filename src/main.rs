@@ -20,6 +20,7 @@ mod runtime;
 mod scaffold;
 mod storage;
 mod transaction;
+mod update;
 
 use crate::cli::{
     Cli, Command, ConfigCommand, PlanArgs, PublishCommandArgs, ScopedArgs, StorageCommand,
@@ -39,6 +40,7 @@ use crate::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
 use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
+    update::check_and_warn();
     let cli = Cli::parse();
     if let Err(error) = run(cli) {
         eprintln!("workspace-mgr: {error}");

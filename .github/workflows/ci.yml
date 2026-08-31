@@ -72,6 +72,8 @@ jobs:
       - name: Package native archive
         run: sh scripts/package-native.sh x86_64-unknown-linux-gnu
       - name: Exercise native installer
+        env:
+          WORKSPACE_MGR_UPDATE_CHECK_DISABLE: "1"
         run: |
           install_root="$(mktemp -d)"
           archive="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"

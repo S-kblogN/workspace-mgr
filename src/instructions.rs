@@ -13,7 +13,23 @@ use crate::policy::{
     TASK_BRANCH_PREFIX, TASK_DIRECTORY_PATTERN,
 };
 
-pub const BOOTSTRAP: &str = "# Repository instructions\n\nBefore doing any repository work, run:\n\n    workspace-mgr instructions --repo .\n\nFollow its output as the repository instructions for this session. If the command\nis unavailable or fails, stop and report the problem. Do not substitute lower-level\nversion-control or storage mutation commands.\n";
+pub const BOOTSTRAP: &str = concat!(
+    "# Repository instructions\n\n",
+    "Before doing any repository work, run:\n\n",
+    "    workspace-mgr instructions --repo .\n\n",
+    "Follow its output as the repository instructions for this session. If\n",
+    "`workspace-mgr` is unavailable, stop repository work, tell the user, and ask\n",
+    "permission to install the exact CLI version that generated this scaffold from\n",
+    "crates.io:\n\n",
+    "    cargo install --locked workspace-mgr --version ",
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "    workspace-mgr setup\n\n",
+    "After installation, retry `workspace-mgr instructions --repo .`. If installation\n",
+    "is not approved, installation fails, or the instructions command still fails,\n",
+    "stop and report the problem. Do not substitute lower-level version-control or\n",
+    "storage mutation commands.\n",
+);
 pub const MANAGEMENT_MODEL: &str = include_str!("../docs/management-model.md");
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,7 +144,7 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
 }
 
 fn core_section() -> String {
-    "## Operating model\n\n- Read-only requests do not require a task directory.\n- User authorization can make a narrow exception to the fixed workspace policy only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-content mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level Git or storage tools. Repository-hosting review metadata remains the agent's responsibility; merge-state transitions remain the user's responsibility.\n- `workspace-mgr init` is the deterministic scaffold reconciliation and upgrade operation. Product-owned files are identified by the initialized repository and fixed path, never by their old contents. Do not hand-edit them; after a CLI update or scaffold-drift report, reconcile them in an infrastructure task so the resulting repository-wide diff is reviewed.\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
+    "## Operating model\n\n- Read-only requests do not require a task directory.\n- User authorization can make a narrow exception to the fixed workspace policy only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-content mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level Git or storage tools. Repository-hosting review metadata remains the agent's responsibility; merge-state transitions remain the user's responsibility.\n- If any invocation reports `workspace-mgr: update available`, tell the user the current and available versions and ask before updating. Never update the CLI without explicit approval. After an approved update, run `workspace-mgr setup`.\n- `workspace-mgr init` is the deterministic scaffold reconciliation and upgrade operation. Product-owned files are identified by the initialized repository and fixed path, never by their old contents. Do not hand-edit them; after a CLI update or scaffold-drift report, reconcile them in an infrastructure task so the resulting repository-wide diff is reviewed.\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent."
         .to_owned()
 }
 

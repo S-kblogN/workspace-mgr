@@ -64,6 +64,7 @@ class Harness:
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_TERMINAL_PROMPT": "0",
                 "DVC_NO_ANALYTICS": "true",
+                "WORKSPACE_MGR_UPDATE_CHECK_DISABLE": "1",
                 "AWS_EC2_METADATA_DISABLED": "true",
                 "AWS_MAX_ATTEMPTS": "1",
                 "AWS_ACCESS_KEY_ID": self.access_key,
