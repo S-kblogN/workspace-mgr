@@ -12,7 +12,7 @@ const DISABLE_ENV: &str = "WORKSPACE_MGR_UPDATE_CHECK_DISABLE";
 fn update_notice_is_cached_and_never_contaminates_stdout() {
     let temp = tempfile::tempdir().unwrap();
     let cache = temp.path().join("update-check.json");
-    let latest = "999.0.0-alpha.1";
+    let latest = "999.0.0";
     let body = format!(r#"{{"versions":[{{"num":"{latest}","yanked":false}}]}}"#);
     let (url, server) = serve_once(200, body);
 

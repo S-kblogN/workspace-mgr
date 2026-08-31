@@ -5,13 +5,16 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
-## [0.1.0-alpha.2] - 2026-08-30
+## [0.1.0] - 2026-08-30
 
 ### Added
 
 - Advisory update discovery on every invocation, with six-hour successful
   caching, one-hour silent failure caching, stable/prerelease channel-aware
   selection, agent-directed stderr notices, and no automatic mutation.
+- Managed `AGENTS.md` bootstrap instructions for approval-gated installation of
+  the exact scaffold-generating CLI version from crates.io, runtime setup, and
+  instructions retry.
 - Isolated update-check tests covering cache reuse, failure isolation, registry
   filtering, concurrency, timeouts, and structured-output separation.
 

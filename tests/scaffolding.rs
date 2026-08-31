@@ -372,6 +372,13 @@ fn first_init_treats_reserved_paths_as_collisions_without_inspecting_content() {
     workspace(&fixture.shared, ["init"]);
     let agents_path = fixture.shared.join("AGENTS.md");
     let canonical = std::fs::read_to_string(&agents_path).unwrap();
+    assert!(canonical.contains("install the exact CLI version"));
+    assert!(canonical.contains(&format!(
+        "cargo install --locked workspace-mgr --version {}",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(canonical.contains("workspace-mgr setup"));
+    assert!(canonical.contains("retry `workspace-mgr instructions --repo .`"));
     std::fs::remove_file(fixture.shared.join(".workspace-mgr.toml")).unwrap();
 
     let rejected = workspace_unchecked(&fixture.shared, ["init"]);

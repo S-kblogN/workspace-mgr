@@ -65,7 +65,10 @@ ignore files. Before the first successful initialization, an existing
 `AGENTS.md` or private internal-storage scaffold is instead an atomic collision
 that the caller must move or remove explicitly. `init` refuses to change the S3
 location while retained S3 boundaries exist. It never contacts or writes a
-remote.
+remote. The generated `AGENTS.md` includes an approval-gated crates.io install
+command for the exact scaffold-generating CLI version, followed by `setup` and
+an instructions retry, so a new machine can bootstrap without inventing a
+lower-level workflow.
 
 ```sh
 workspace-mgr init
