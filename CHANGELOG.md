@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-30
+
 ### Changed
 
 - Deliverable task creation now hands agents an explicit requirement to publish
