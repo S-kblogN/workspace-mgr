@@ -229,13 +229,16 @@ jobs:
           PRERELEASE: ${{ steps.published.outputs.prerelease }}
         run: |
           if [ "${RELEASE_EXISTS}" = "true" ]; then
-            gh release upload "${RELEASE_TAG}" dist/* --clobber
+            gh release upload "${RELEASE_TAG}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
           else
             prerelease_flag=""
             if [ "${PRERELEASE}" = "true" ]; then
               prerelease_flag="--prerelease"
             fi
             gh release create "${RELEASE_TAG}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --title "workspace-mgr ${RELEASE_VERSION}" \
               --notes-file release-notes.md \
