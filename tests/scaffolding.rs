@@ -86,6 +86,15 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     let payload = json(&created);
     assert_eq!(payload["status"], "created");
     assert_eq!(payload["task_id"], "20260829-170000-sample-task");
+    assert_eq!(payload["review"]["pull_request"], "required");
+    assert_eq!(
+        payload["review"]["creation_timing"],
+        "immediate-after-scaffold-publication"
+    );
+    assert_eq!(
+        payload["review"]["synchronization_cadence"],
+        "before-every-turn-end"
+    );
     let task = fixture.shared.join("20260829-170000-sample-task");
     assert!(task.join("README.md").is_file());
     assert!(task.join(".workspace-mgr-task.toml").is_file());
@@ -125,6 +134,14 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
     assert_eq!(created["kind"], "infrastructure");
     assert_eq!(created["task_id"], "infra-shared-policy");
     assert_eq!(created["branch"], "codex/infra-shared-policy");
+    assert_eq!(
+        created["review"]["creation_timing"],
+        "after-first-scoped-publication"
+    );
+    assert_eq!(
+        created["review"]["synchronization_cadence"],
+        "before-every-turn-end"
+    );
     let worktree = std::path::PathBuf::from(created["path"].as_str().unwrap());
     let manifest = std::path::PathBuf::from(created["manifest"].as_str().unwrap());
     assert!(worktree.is_dir());
