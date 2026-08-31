@@ -71,7 +71,13 @@ unrelated repository state.
 `task create` establishes the local task, README, manifest, scope, and branch
 identity. It does not publish a remote branch or create a pull request.
 `task status` resolves the current task and reports its scoped state without
-publishing. `task discard` is the explicit opposite endpoint: after the user
+publishing. `task rename` changes the current human-readable slug when the
+conversation's topic evolves. For a deliverable it moves the complete task
+directory, including Git and S3 placement metadata, while preserving the
+immutable task ID and target branch. The next normal publication removes the
+old remote tree and publishes the new path. For infrastructure it updates the
+current slug in private task metadata while its identity-owned worktree remains
+stable. `task discard` is the explicit opposite endpoint: after the user
 decides that an unmerged task should not be retained and the agent closes or
 verifies absence of its pull request, it removes that task's branch and local
 workspace instead of publishing or merging it.
@@ -80,6 +86,12 @@ The same chat continues using the same task for its lifetime. Continue using
 the same branch and pull request when refining that same intention. Start a new
 task when work should be reviewed or merged independently. Unrelated chats must
 not share a task, branch, or pull request.
+
+The current slug is a mutable topic label; the task ID and target branch are
+stable publication identities. This distinction preserves the one-PR contract:
+renaming an open pull request's head branch can close that request on hosting
+providers. After a task rename, the agent reuses the existing pull request and
+updates its title and living description instead of replacing it.
 
 A repository-infrastructure change follows the same relationship. It is still
 one task with one branch and one pull request, but `task create --kind
@@ -222,7 +234,8 @@ The complete story is:
 4. For writable work, `task create` gives the chat one durable workspace,
    scope, branch identity, and eventual pull-request identity.
 5. The agent performs the requested work inside that task and keeps its README
-   aligned with the current purpose and outputs.
+   aligned with the current purpose and outputs. If the topic changes, `task
+   rename` updates its current slug without replacing its branch or review.
 6. Retained artifacts are placed in Git or S3 automatically or by an explicit
    user or agent choice.
 7. `plan` explains the proposed reviewable state without publishing it.

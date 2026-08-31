@@ -726,7 +726,18 @@ pub fn management(
 }
 
 fn reset_moved_cloud_metadata(repo: &GitRepo, output: &str) -> Result<()> {
-    let pointer = resolved_under(&repo.root, &format!("{output}.dvc"));
+    reset_moved_pointer_cloud_metadata(repo, &format!("{output}.dvc")).map(|_| ())
+}
+
+pub(crate) fn reset_moved_pointer_cloud_metadata(repo: &GitRepo, pointer: &str) -> Result<bool> {
+    let pointer = repo_path(pointer, "moved managed-storage metadata")?;
+    if !pointer.ends_with(".dvc") {
+        return Err(Error::message(format!(
+            "moved managed-storage metadata must end in .dvc: {pointer}"
+        )));
+    }
+    reject_symlink_traversal(&repo.root, &pointer, "moved managed-storage metadata")?;
+    let pointer = resolved_under(&repo.root, &pointer);
     let raw = fs::read_to_string(&pointer).at(&pointer)?;
     let mut document: serde_yaml::Value =
         serde_yaml::from_str(&raw).map_err(|source| Error::Yaml {
@@ -748,7 +759,7 @@ fn reset_moved_cloud_metadata(repo: &GitRepo, output: &str) -> Result<()> {
         removed |= remove_cloud_metadata(out);
     }
     if !removed {
-        return Ok(());
+        return Ok(false);
     }
     let rendered = serde_yaml::to_string(&document).map_err(|error| {
         Error::message(format!(
@@ -767,7 +778,7 @@ fn reset_moved_cloud_metadata(repo: &GitRepo, output: &str) -> Result<()> {
         path: pointer,
         source: error.error,
     })?;
-    Ok(())
+    Ok(true)
 }
 
 fn remove_cloud_metadata(value: &mut serde_yaml::Value) -> bool {

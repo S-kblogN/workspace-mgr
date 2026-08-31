@@ -88,9 +88,10 @@ not alternate repository strategies.
 Task manifests contain task-specific state rather than repository policy:
 
 ```toml
-schema_version = 1
+schema_version = 2
 kind = "deliverable"
 id = "20260829-170000-example"
+slug = "example"
 path = "20260829-170000-example"
 branch = "codex/example"
 title = "Example"
@@ -106,10 +107,16 @@ requires at least one `additional_scopes` entry. It is stored in private
 worktree Git state rather than committed to the repository. The manifest schema
 version describes serialized task state; it is not a strategy selector.
 
-Every field shown above except `additional_scopes` is required. A deliverable
-ID and path must be exactly `YYYYMMDD-HHMMSS-<slug>` and its branch must be
-`codex/<slug>`. An infrastructure ID must be `infra-<slug>` and its branch must
-be `codex/infra-<slug>`. Slugs are lowercase ASCII kebab case. Declared scopes
-must be distinct and non-overlapping. These constraints are validated whenever
-a manifest is loaded, so hand-editing task state cannot select another
+Every field shown above except `additional_scopes` is required. The ID is the
+immutable creation identity: a deliverable uses
+`YYYYMMDD-HHMMSS-<original-slug>` and an infrastructure task uses
+`infra-<original-slug>`. The branch is derived from that immutable identity and
+does not change. `slug` is the current lowercase ASCII kebab-case topic label.
+A deliverable path uses the ID's original timestamp plus the current slug, so
+`task rename` can move it without replacing the task or review branch. An
+infrastructure task has no `path`; its private worktree remains keyed by the
+stable ID. Declared scopes must be distinct and non-overlapping. Schema 1
+manifests are still readable with their original slug and are upgraded to
+schema 2 by `task rename`. These constraints are validated whenever a manifest
+is loaded, so hand-editing task state cannot select another
 repository-management strategy.

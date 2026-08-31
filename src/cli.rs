@@ -45,7 +45,7 @@ pub enum Command {
     /// Inspect repository configuration.
     Config(ConfigArgs),
 
-    /// Create or inspect task scaffolding.
+    /// Manage task scaffolding and lifecycle.
     Task(TaskArgs),
 
     /// Preview a scoped repository transaction without publishing.
@@ -128,10 +128,26 @@ pub struct TaskArgs {
 pub enum TaskCommand {
     /// Create a deliverable workspace or isolated infrastructure worktree.
     Create(TaskCreateArgs),
+    /// Change a task's current slug while preserving its identity and review branch.
+    Rename(TaskRenameArgs),
     /// Inspect the resolved task scope and working changes.
     Status(TaskStatusArgs),
     /// Permanently discard an unmerged task after its pull request is closed.
     Discard(TaskDiscardArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskRenameArgs {
+    pub new_slug: String,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -395,6 +411,14 @@ mod tests {
                 "The user requested this infrastructure change",
             ],
             &["task", "status", "--manifest", "task/manifest.toml"],
+            &[
+                "task",
+                "rename",
+                "current-topic",
+                "--manifest",
+                "task/manifest.toml",
+                "--dry-run",
+            ],
             &["storage", "status"],
             &[
                 "storage",

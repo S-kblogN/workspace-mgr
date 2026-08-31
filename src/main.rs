@@ -19,6 +19,7 @@ mod refresh;
 mod runtime;
 mod scaffold;
 mod storage;
+mod task_rename;
 mod transaction;
 mod update;
 
@@ -37,6 +38,7 @@ use crate::path::repo_path;
 use crate::refresh::{RefreshOptions, execute as refresh};
 use crate::runtime::{SetupOptions, setup};
 use crate::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
+use crate::task_rename::{TaskRenameOptions, rename as rename_task};
 use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
@@ -115,6 +117,15 @@ fn run(cli: Cli) -> Result<()> {
                     scopes: args.scopes,
                     scope_note: args.scope_note,
                     timestamp: args.timestamp,
+                    dry_run: args.dry_run,
+                })?,
+                cli.format,
+            ),
+            TaskCommand::Rename(args) => emit(
+                &rename_task(&TaskRenameOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
+                    new_slug: args.new_slug,
                     dry_run: args.dry_run,
                 })?,
                 cli.format,

@@ -143,6 +143,23 @@ For shared repository mechanisms, use `--kind infrastructure` with explicit
 worktree reported by `task create`; it discovers the private infrastructure
 manifest automatically and creates no timestamped task directory.
 
+If the conversation's topic changes, keep the same task and rename its current
+slug:
+
+```sh
+workspace-mgr task rename updated-model-comparison --dry-run
+workspace-mgr task rename updated-model-comparison
+```
+
+For a deliverable this moves the complete timestamped task directory and
+rewrites its manifest. The immutable task ID and original target branch remain
+stable so the same draft pull request continues to represent the chat. The
+command writes no remote; the next ordinary `plan` shows both the published old
+path and current path, and `publish` removes the old Git tree after preserving
+Git/S3 placement history. The agent then updates the existing pull request's
+title and description. An infrastructure rename updates its private current
+slug while its identity-owned worktree remains in place.
+
 ### 5. Choose where retained content lives
 
 First decide whether content should be retained at all. Ignore safely
@@ -354,6 +371,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `instructions`, `config show` | Read-only checks/output | None | None |
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
+| `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks and collisions | None |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
 | `task discard --confirm` | Removes an unmerged task workspace and local refs | Git ref verification | Deletes only the exact remote task branch |

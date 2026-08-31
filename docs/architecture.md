@@ -5,7 +5,9 @@
 `workspace-mgr` separates fixed product policy, tracked repository facts,
 scoped task state, and private runtime state. `.workspace-mgr.toml` contains
 only non-secret Git and optional S3 locations. Task manifests contain identity, purpose,
-scope, and branch state. Deliverable manifests are tracked inside their task
+current slug, scope, and branch state. The task ID and review branch are
+immutable; the slug and deliverable path may change together. Deliverable
+manifests are tracked inside their task
 directories; infrastructure manifests and isolated worktrees live below the
 Git common directory. Private indexes and locks also live there. All
 mutating repository, placement, publication, hydration, and refresh operations
@@ -80,6 +82,20 @@ S3 below 1 MiB remains valid but reports an efficiency warning based on the
 aggregate materialized boundary size.
 
 ## Scoped publication
+
+`task rename` is a local identity-preserving transition. It moves an ordinary
+task directory as one filesystem unit and atomically rewrites manifest schema
+2, or rewrites only private metadata for infrastructure. Existing schema 1
+manifests remain readable and are upgraded by rename. The immutable task ID
+keeps private state and commit ownership stable, while the unchanged target
+branch preserves the existing pull request. When a published deliverable path
+differs from the current path, publication finds the prior manifest by stable
+task ID, treats that old tree as a temporary cleanup scope, maps published
+placement history to the new path, and removes the old tree in the same commit.
+Version-aware S3 object IDs are path-bound, so local rename removes their old
+path bindings from moved pointers. The next publish creates and verifies new
+object versions at the new path before publishing Git; old versions remain
+retained.
 
 For a task publication, the CLI:
 

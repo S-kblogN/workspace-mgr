@@ -533,6 +533,7 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         schema_version: TASK_SCHEMA_VERSION,
         kind: options.kind,
         id: task_id.clone(),
+        slug: options.slug.clone(),
         path: (options.kind == TaskKind::Deliverable).then(|| task_id.clone()),
         branch: branch.clone(),
         title: title.clone(),

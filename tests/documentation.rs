@@ -54,6 +54,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "doctor",
         "config show",
         "task create",
+        "task rename",
         "task status",
         "task discard",
         "storage status",
@@ -92,6 +93,8 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("retained-not-purged"));
     assert!(commands.contains("force-with-lease"));
     assert!(normalized_model.contains("explicit opposite endpoint"));
+    assert!(normalized_model.contains("current slug is a mutable topic label"));
+    assert!(commands.contains("head branch can close"));
     assert!(commands.contains("payload_bytes"));
     for fact in ["[git]", "remote", "branch", "[s3]", "endpoint_url"] {
         assert!(
@@ -123,6 +126,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "Shared-checkout refresh",
         "Refresh ancestry",
         "Pull-request ownership",
+        "Task slug rename",
     ] {
         assert!(
             e2e_coverage.contains(boundary),
