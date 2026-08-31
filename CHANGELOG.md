@@ -5,6 +5,17 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-30
+
+### Changed
+
+- Effective agent instructions now separate repository-wide read access from
+  write ownership: deliverable tasks require explicit user approval for exact
+  paths and actions outside their own directory, while infrastructure tasks
+  write only their exact user-authorized manifest scopes.
+- Additional-scope arguments are documented as an audit record of existing
+  user authorization, never as a way for an agent to create authorization.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added

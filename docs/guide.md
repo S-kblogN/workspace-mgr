@@ -134,14 +134,24 @@ create a remote branch or a pull request.
 
 Run task commands from inside the task directory so the manifest is discovered
 automatically. Use `--manifest <path>` when working elsewhere. The task
-directory is the default scope. A manifest may declare durable additional
-scopes, while `--include <path> --scope-note <reason>` authorizes an additional
-scope for one invocation.
+directory is the default write boundary. The agent may read anywhere in the
+repository for context, but reading does not authorize mutation. Before the
+agent creates, edits, moves, or deletes anything outside its task directory,
+the user's request must explicitly authorize the exact path and action. This
+includes shared root paths and another chat's task directory. If the request
+does not, the agent asks and waits before writing.
+
+A manifest may declare durable additional scopes, while `--include <path>
+--scope-note <reason>` records a user-authorized additional scope for one
+invocation. Neither mechanism creates authorization by itself.
 
 For shared repository mechanisms, use `--kind infrastructure` with explicit
 `--scope` paths and a `--scope-note`. Run subsequent commands from the isolated
 worktree reported by `task create`; it discovers the private infrastructure
-manifest automatically and creates no timestamped task directory.
+manifest automatically and creates no timestamped task directory. Because
+there is no deliverable task directory, the exact user-authorized manifest
+scopes are the infrastructure task's write boundary. Reading outside them is
+allowed for context; writing outside them is not.
 
 If the conversation's topic changes, keep the same task and rename its current
 slug:

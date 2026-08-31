@@ -62,11 +62,24 @@ target branch. An infrastructure task instead has an isolated worktree and a
 private manifest because its content belongs at shared repository paths rather
 than inside a timestamped deliverable directory.
 
-The task directory is the default ownership boundary. If the user asks the
-agent to change a shared path elsewhere in the repository, the agent records
-that additional scope and the reason it was authorized. This makes the user's
-request auditable without turning a narrow task into permission to modify
-unrelated repository state.
+Reading and ownership are separate. Any chat may inspect any repository path
+when useful for context, including another chat's task directory. Reading a
+path does not transfer ownership or authorize mutation.
+
+For a deliverable task, its task directory is the default write boundary. The
+agent must have explicit user authorization for the exact path and action
+before it creates, edits, moves, or deletes anything outside that directory,
+including a shared root path or another chat's task directory. If the current
+request does not provide that authorization, the agent asks and waits before
+writing. An additional-scope declaration records the approval and its reason;
+it does not manufacture approval.
+
+An infrastructure task is the structural exception to the task-directory
+boundary because it has no deliverable directory. Its exact, user-authorized
+manifest scopes are its write boundary. It may read elsewhere for context, but
+it does not gain permission to mutate undeclared shared paths or another task's
+directory. This makes the user's request auditable without turning
+infrastructure work into permission to modify unrelated repository state.
 
 `task create` establishes the local task, README, manifest, scope, and branch
 identity. It does not publish a remote branch or create a pull request.
@@ -217,6 +230,8 @@ staging paths owned by other tasks in the shared Git index.
 An unrelated untracked or modified path may therefore be valid state owned by
 another active conversation. Broad stash, clean, reset, or deletion operations
 could erase another task's work and are not routine synchronization tools.
+Agents may read that state for context, but must not mutate it without explicit
+user approval for the exact path and action. Untracked does not mean unowned.
 
 After the user merges a task, `refresh` safely advances the shared branch,
 preserves unrelated overlays, and materializes incoming Git and S3 content.

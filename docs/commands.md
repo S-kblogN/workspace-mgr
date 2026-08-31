@@ -12,8 +12,9 @@ The [user guide](guide.md) explains how the commands form one workflow.
   the current directory.
 - Task-scoped commands discover `.workspace-mgr-task.toml` from the starting
   path. `--manifest <path>` selects one explicitly.
-- `--include <path>` adds a one-invocation scope and requires a one-line
-  `--scope-note <reason>`. Repeat `--include` for multiple paths.
+- `--include <path>` records a user-authorized one-invocation scope and requires
+  a one-line `--scope-note <reason>`. It does not create authorization. Repeat
+  `--include` for multiple paths.
 - `--dry-run` previews local mutation for commands that support it. Task discard
   also saves a private revision-bound confirmation plan.
 - Human output is concise YAML, except Markdown from `instructions` and TOML
