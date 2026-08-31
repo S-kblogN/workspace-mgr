@@ -20,6 +20,12 @@ The [user guide](guide.md) explains how the commands form one workflow.
   from `config show`. Use global `--format json` or set
   `WORKSPACE_MGR_FORMAT=json` for stable structured output.
 - Errors exit with status 2 and start with `workspace-mgr:`.
+- Every invocation performs a best-effort cached update check. A newer
+  applicable release produces exactly one `workspace-mgr: update available`
+  line on stderr; stdout, structured output, and command exit status are
+  unchanged. The CLI never updates itself. Agents report the versions and ask
+  the user before updating, then run `workspace-mgr setup`; scaffold changes are
+  reconciled with `workspace-mgr init` in an infrastructure task.
 
 ## `workspace-mgr setup`
 

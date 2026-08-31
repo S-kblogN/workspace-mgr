@@ -225,6 +225,7 @@ fn setup_installs_and_reuses_a_verified_private_runtime() {
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
         .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
         .output()
         .unwrap();
@@ -250,6 +251,7 @@ fn setup_installs_and_reuses_a_verified_private_runtime() {
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
         .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
         .output()
         .unwrap();
@@ -289,6 +291,7 @@ fn failed_runtime_install_restores_the_previous_directory() {
     let failed = std::process::Command::new(binary())
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
         .output()
         .unwrap();
@@ -354,6 +357,7 @@ fn concurrent_runtime_install_is_rejected_before_provisioning() {
     let blocked = std::process::Command::new(binary())
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .output()
         .unwrap();
     assert_eq!(blocked.status.code(), Some(2));
@@ -532,6 +536,7 @@ fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {
     let output = std::process::Command::new(binary())
         .args(["init", "--s3-url", "s3://example.invalid/workspace"])
         .current_dir(&fixture.shared)
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .output()
         .unwrap();
@@ -560,6 +565,7 @@ fn partially_failing_storage_initialization_rolls_back_all_scaffolding() {
     let output = std::process::Command::new(binary())
         .args(["init", "--s3-url", storage.to_str().unwrap()])
         .current_dir(&fixture.shared)
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .output()
         .unwrap();

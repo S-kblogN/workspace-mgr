@@ -111,7 +111,8 @@ where
     command
         .args(args)
         .current_dir(cwd)
-        .env("WORKSPACE_MGR_FORMAT", "json");
+        .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1");
     inject_test_storage_engine(&mut command);
     let output = command.output().expect("run command");
     if !output.status.success() {
@@ -145,15 +146,16 @@ where
     command
         .args(args)
         .current_dir(cwd)
-        .env("WORKSPACE_MGR_FORMAT", "json");
+        .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1");
     inject_test_storage_engine(&mut command);
     command.output().expect("run workspace-mgr")
 }
 
-fn inject_test_storage_engine(command: &mut Command) {
+fn inject_test_storage_engine(_command: &mut Command) {
     #[cfg(feature = "test-storage")]
     if let Ok(program) = which::which("dvc") {
-        command.env("WORKSPACE_MGR_STORAGE_DVC", program);
+        _command.env("WORKSPACE_MGR_STORAGE_DVC", program);
     }
 }
 

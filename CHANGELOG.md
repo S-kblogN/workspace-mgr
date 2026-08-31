@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-08-30
+
+### Added
+
+- Advisory update discovery on every invocation, with six-hour successful
+  caching, one-hour silent failure caching, stable/prerelease channel-aware
+  selection, agent-directed stderr notices, and no automatic mutation.
+- Isolated update-check tests covering cache reuse, failure isolation, registry
+  filtering, concurrency, timeouts, and structured-output separation.
+
 ## [0.1.0-alpha.1] - 2026-08-30
 
 ### Added

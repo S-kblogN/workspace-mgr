@@ -34,6 +34,25 @@ and actions without changing the host. A custom `--runtime-dir` must be absent
 or already carry workspace-mgr's private ownership marker; setup never replaces
 an arbitrary existing directory.
 
+Every invocation also checks the local update cache. A successful registry
+check remains fresh for six hours; a failed check is silent and is retried after
+one hour. The network request has a short timeout, never changes the command's
+exit status, and never writes to stdout. If a newer applicable release is
+known, each invocation writes one line to stderr asking the agent to notify the
+user. Stable installations consider only stable releases; prerelease
+installations follow the newest non-yanked release, including prereleases.
+
+The CLI never updates itself. The agent reports the current and available
+versions and asks for approval. After an approved update, run:
+
+```sh
+workspace-mgr setup
+```
+
+If the release changes managed repository scaffolding, create an infrastructure
+task covering the affected product-owned paths and run `workspace-mgr init`
+from its isolated worktree. Review and publish that generated diff normally.
+
 ### 2. Initialize a repository
 
 Run `init` once from the Git repository:
@@ -315,6 +334,10 @@ revision. Credentials never belong in `.workspace-mgr.toml`; use ignored local
 configuration or platform-standard identity mechanisms.
 
 ## Side effects by command
+
+In addition to the command-specific effects below, every invocation may read
+the crates.io release record when its local update cache is stale. This
+best-effort check is bounded, failure-silent, and never performs a remote write.
 
 | Command | Local effect | Remote reads | Remote writes |
 | --- | --- | --- | --- |

@@ -440,6 +440,7 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
         ])
         .current_dir(&task)
         .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .env("FAKE_DVC_COUNTER", &counter)
         .output()
@@ -507,6 +508,7 @@ fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
         .args(["publish", "-m", "This automatic placement must fail"])
         .current_dir(&task)
         .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .output()
         .unwrap();
@@ -597,6 +599,7 @@ fn object_version_adapter_and_engine_config_are_internal() {
         ])
         .current_dir(&fixture.seed)
         .env("WORKSPACE_MGR_FORMAT", "json")
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", which::which("dvc").unwrap())
         .env("WORKSPACE_MGR_STORAGE_PYTHON", &fake_python)
         .output()

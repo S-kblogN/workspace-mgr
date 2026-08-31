@@ -104,7 +104,7 @@ its exact private storage runtime in an isolated user data directory. Set
 For a source installation:
 
 ```sh
-cargo install --locked workspace-mgr --version 0.1.0-alpha.1
+cargo install --locked workspace-mgr --version 0.1.0-alpha.2
 workspace-mgr setup
 workspace-mgr --help
 ```
@@ -113,6 +113,14 @@ workspace-mgr --help
 storage engine, and verifies both its executable and Python module. Users and
 agents never invoke that engine directly. The exact compatibility contract is in
 [docs/platform-support.md](docs/platform-support.md).
+
+Every CLI invocation consults a local update cache. At most once every six
+hours, it asks crates.io for newer non-yanked versions; a failed request is
+silently retried after one hour. When an applicable version is available, the
+CLI writes one agent-directed notice to stderr without changing command output
+or exit status. It never updates itself. The agent reports the versions and asks
+the user before updating, then runs `workspace-mgr setup`; managed repository
+scaffolding is reconciled with `workspace-mgr init` in an infrastructure task.
 
 Configuration is documented in
 [docs/configuration.md](docs/configuration.md), transaction guarantees in
