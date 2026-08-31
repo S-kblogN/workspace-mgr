@@ -15,7 +15,11 @@ use crate::manifest::{
     build_task_branch, build_task_id, one_line, validate_additional_scopes,
 };
 use crate::path::{reject_symlink_traversal, repo_path};
-use crate::policy::TASK_MANIFEST_NAME;
+use crate::policy::{
+    REVIEW_DELIVERABLE_CREATION_TIMING, REVIEW_INFRASTRUCTURE_CREATION_TIMING,
+    REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST,
+    REVIEW_SYNC_CADENCE, TASK_MANIFEST_NAME,
+};
 
 const STORAGE_GITIGNORE: &str = "/config.local\n/tmp\n/cache\n";
 const STORAGE_IGNORE: &str =
@@ -455,6 +459,17 @@ pub struct TaskCreateReport {
     pub branch: String,
     pub base_oid: String,
     pub files: Vec<String>,
+    pub review: TaskCreateReviewHandoff,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskCreateReviewHandoff {
+    pub pull_request: &'static str,
+    pub initial_state: &'static str,
+    pub managed_by: &'static str,
+    pub merge_authority: &'static str,
+    pub creation_timing: &'static str,
+    pub synchronization_cadence: &'static str,
 }
 
 pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
@@ -608,6 +623,17 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         branch,
         base_oid,
         files,
+        review: TaskCreateReviewHandoff {
+            pull_request: REVIEW_PULL_REQUEST,
+            initial_state: REVIEW_INITIAL_STATE,
+            managed_by: REVIEW_MANAGED_BY,
+            merge_authority: REVIEW_MERGE_AUTHORITY,
+            creation_timing: match options.kind {
+                TaskKind::Deliverable => REVIEW_DELIVERABLE_CREATION_TIMING,
+                TaskKind::Infrastructure => REVIEW_INFRASTRUCTURE_CREATION_TIMING,
+            },
+            synchronization_cadence: REVIEW_SYNC_CADENCE,
+        },
     })
 }
 

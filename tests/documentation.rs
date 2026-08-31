@@ -86,13 +86,16 @@ fn user_documentation_covers_the_complete_public_model() {
             "command reference is missing {command}"
         );
     }
-    assert!(guide.contains("remote branch or a pull request"));
+    assert!(guide.contains("itself create a remote branch or call a hosting provider"));
     assert!(guide.contains("does not call a GitHub or other hosting API"));
     for responsibility in [
+        "immediately follows creation",
         "create exactly one",
         "never create a duplicate",
         "living description",
         "head revision",
+        "Before ending every turn",
+        "does not need to request",
         "must not merge",
         "enable auto-merge",
     ] {
@@ -102,6 +105,7 @@ fn user_documentation_covers_the_complete_public_model() {
         );
     }
     assert!(guide.contains("S3 first, then Git"));
+    assert!(guide.contains("Before every writable-task turn ends"));
     assert!(guide.contains("Nested placement boundaries"));
     assert!(guide.contains("small-s3-boundary"));
     assert!(guide.contains("semantic-placement-review"));
