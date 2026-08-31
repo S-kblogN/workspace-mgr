@@ -101,24 +101,28 @@ storage mutation commands.
 
 ## Installation
 
-Download the native archive for Linux x86-64/arm64 or Apple Silicon macOS,
-extract it, and run:
-
-```sh
-./install.sh
-```
-
-The installer copies the CLI to `${HOME}/.local/bin` by default and provisions
-its exact private storage runtime in an isolated user data directory. Set
-`WORKSPACE_MGR_PREFIX` to choose another executable prefix.
-
-For a source installation:
+Install the latest stable release from crates.io, then provision its private
+storage runtime:
 
 ```sh
 cargo install --locked workspace-mgr
 workspace-mgr setup
 workspace-mgr --help
 ```
+
+Building the crates.io package requires Rust 1.85 or newer. To install without
+a Rust toolchain, download a prebuilt native archive for Linux x86-64/arm64 or
+Apple Silicon macOS from the
+[latest GitHub release](https://github.com/S-kblogN/workspace-mgr/releases/latest),
+extract it, and run:
+
+```sh
+./install.sh
+```
+
+The native installer provisions the runtime and copies the CLI to
+`${HOME}/.local/bin` by default. Set `WORKSPACE_MGR_PREFIX` to choose another
+executable prefix.
 
 `setup` checks Git, creates a private Python environment, installs the pinned
 storage engine, and verifies both its executable and Python module. Users and
