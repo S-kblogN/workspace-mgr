@@ -42,6 +42,7 @@ workspace-mgr task create shared-policy --kind infrastructure \
 Inside a task:
 
 ```sh
+workspace-mgr task rename more-accurate-topic
 workspace-mgr storage status
 workspace-mgr storage set path/to/data --to s3 --reason "Retained dataset"
 workspace-mgr storage set path/to/report.pdf --to git --reason "Review in Git"
@@ -49,7 +50,11 @@ workspace-mgr plan
 workspace-mgr publish -m "Publish the deliverable"
 ```
 
-`storage set`, `storage reset`, and `move` change local desired state only.
+When a conversation's topic changes, `task rename <new-slug>` moves the complete
+deliverable directory and updates task metadata while preserving the immutable
+task ID, target branch, and existing pull request. The next ordinary `publish`
+removes the previously published path and publishes the new one. `storage set`,
+`storage reset`, and `move` change local desired state only.
 `storage hydrate` reads from S3. `plan` is read-only. `publish` is the only
 command that publishes repository content, and it verifies S3 before publishing
 a Git revision. If the user instead decides to retain none of the task, the

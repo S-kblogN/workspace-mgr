@@ -11,7 +11,8 @@ use crate::path::repo_path;
 use crate::policy::{TASK_BRANCH_PREFIX, TASK_MANIFEST_NAME};
 
 pub const INFRASTRUCTURE_MANIFEST_NAME: &str = "workspace-mgr/task.toml";
-pub const TASK_SCHEMA_VERSION: u32 = 1;
+pub const TASK_SCHEMA_VERSION: u32 = 2;
+const LEGACY_TASK_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -26,6 +27,8 @@ pub struct TaskManifest {
     pub schema_version: u32,
     pub kind: TaskKind,
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub branch: String,
@@ -47,6 +50,7 @@ pub struct ResolvedTask {
     pub manifest_path: PathBuf,
     pub kind: TaskKind,
     pub task_id: String,
+    pub slug: String,
     pub task_path: Option<String>,
     pub branch: String,
     pub title: String,
@@ -75,13 +79,32 @@ impl ResolvedTask {
             path: absolute.clone(),
             source,
         })?;
-        if manifest.schema_version != TASK_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            LEGACY_TASK_SCHEMA_VERSION | TASK_SCHEMA_VERSION
+        ) {
             return Err(Error::message(format!(
-                "unsupported task schema {}, expected {}",
-                manifest.schema_version, TASK_SCHEMA_VERSION
+                "unsupported task schema {}, expected {} or {}",
+                manifest.schema_version, LEGACY_TASK_SCHEMA_VERSION, TASK_SCHEMA_VERSION
             )));
         }
         let task_id = one_line(&manifest.id, "task id")?;
+        let identity = parse_task_identity(manifest.kind, &task_id)?;
+        let slug = match manifest.schema_version {
+            LEGACY_TASK_SCHEMA_VERSION => {
+                if !manifest.slug.is_empty() {
+                    return Err(Error::message(
+                        "task schema 1 must not declare the schema 2 slug field",
+                    ));
+                }
+                identity.original_slug.clone()
+            }
+            TASK_SCHEMA_VERSION => {
+                validate_task_slug(&manifest.slug)?;
+                manifest.slug.clone()
+            }
+            _ => unreachable!(),
+        };
         let task_path = match manifest.kind {
             TaskKind::Deliverable => {
                 let raw_path = manifest
@@ -94,9 +117,10 @@ impl ResolvedTask {
                         "task path must be a directory directly below the repository root",
                     ));
                 }
-                if task_id != task_path {
+                let expected_path = build_task_path(&identity, &slug);
+                if task_path != expected_path {
                     return Err(Error::message(format!(
-                        "task id must match task path {task_path:?}; got {task_id:?}"
+                        "deliverable task path must be {expected_path:?} for slug {slug:?}; got {task_path:?}"
                     )));
                 }
                 let expected = repo.root.join(&task_path).join(TASK_MANIFEST_NAME);
@@ -134,7 +158,7 @@ impl ResolvedTask {
             ));
         }
         let branch = one_line(&manifest.branch, "task branch")?;
-        let expected_branch = expected_task_branch(manifest.kind, &task_id)?;
+        let expected_branch = build_task_branch(manifest.kind, &identity.original_slug)?;
         if branch != expected_branch {
             return Err(Error::message(format!(
                 "task branch must be {expected_branch:?} for task {task_id:?}; got {branch:?}"
@@ -146,6 +170,7 @@ impl ResolvedTask {
             manifest_path: absolute,
             kind: manifest.kind,
             task_id,
+            slug,
             task_path,
             branch,
             title,
@@ -207,6 +232,58 @@ impl ResolvedTask {
             )
             .collect()
     }
+}
+
+pub(crate) fn published_task_paths(
+    repo: &GitRepo,
+    oid: &str,
+    task: &ResolvedTask,
+) -> Result<Vec<String>> {
+    if task.kind != TaskKind::Deliverable {
+        return Ok(Vec::new());
+    }
+    let listed = repo.run(["ls-tree", "-r", "-z", "--name-only", oid, "--"])?;
+    let suffix = format!("/{TASK_MANIFEST_NAME}");
+    let mut matches = Vec::new();
+    for manifest_path in listed
+        .stdout
+        .split('\0')
+        .filter(|path| path.ends_with(&suffix))
+    {
+        let raw = repo
+            .run(["show", &format!("{oid}:{manifest_path}")])?
+            .stdout;
+        let manifest: TaskManifest = toml::from_str(&raw).map_err(|error| {
+            Error::message(format!(
+                "failed to inspect published task manifest {manifest_path:?}: {error}"
+            ))
+        })?;
+        if manifest.id != task.task_id {
+            continue;
+        }
+        if manifest.kind != TaskKind::Deliverable {
+            return Err(Error::message(format!(
+                "published manifest {manifest_path:?} has the task ID but the wrong task kind"
+            )));
+        }
+        let declared = manifest
+            .path
+            .as_deref()
+            .ok_or_else(|| Error::message("published deliverable manifest has no task path"))?;
+        let path = repo_path(declared, "published task path")?;
+        let containing = manifest_path
+            .strip_suffix(&suffix)
+            .ok_or_else(|| Error::message("published task manifest has an invalid path"))?;
+        if path != containing {
+            return Err(Error::message(format!(
+                "published task manifest path mismatch: declared {path:?}, stored under {containing:?}"
+            )));
+        }
+        matches.push(path);
+    }
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
 }
 
 pub fn validate_additional_scopes(
@@ -305,8 +382,14 @@ pub fn build_task_branch(kind: TaskKind, slug: &str) -> Result<String> {
     })
 }
 
-fn expected_task_branch(kind: TaskKind, task_id: &str) -> Result<String> {
-    let slug = match kind {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIdentity {
+    pub timestamp: Option<String>,
+    pub original_slug: String,
+}
+
+pub fn parse_task_identity(kind: TaskKind, task_id: &str) -> Result<TaskIdentity> {
+    let (timestamp, slug) = match kind {
         TaskKind::Deliverable => {
             let timestamp = task_id.get(..15).ok_or_else(|| {
                 Error::message(
@@ -319,17 +402,50 @@ fn expected_task_branch(kind: TaskKind, task_id: &str) -> Result<String> {
                 ));
             }
             validate_task_timestamp(timestamp)?;
-            task_id.get(16..).ok_or_else(|| {
+            let slug = task_id.get(16..).ok_or_else(|| {
                 Error::message(
                     "deliverable task id must use YYYYMMDD-HHMMSS-<lowercase-kebab-slug>",
                 )
-            })?
+            })?;
+            (Some(timestamp.to_owned()), slug)
         }
-        TaskKind::Infrastructure => task_id.strip_prefix("infra-").ok_or_else(|| {
-            Error::message("infrastructure task id must use infra-<lowercase-kebab-slug>")
-        })?,
+        TaskKind::Infrastructure => (
+            None,
+            task_id.strip_prefix("infra-").ok_or_else(|| {
+                Error::message("infrastructure task id must use infra-<lowercase-kebab-slug>")
+            })?,
+        ),
     };
-    build_task_branch(kind, slug)
+    validate_task_slug(slug)?;
+    Ok(TaskIdentity {
+        timestamp,
+        original_slug: slug.to_owned(),
+    })
+}
+
+pub fn build_task_path(identity: &TaskIdentity, slug: &str) -> String {
+    match &identity.timestamp {
+        Some(timestamp) => format!("{timestamp}-{slug}"),
+        None => format!("infra-{slug}"),
+    }
+}
+
+pub(crate) fn published_history_path(
+    path: &str,
+    current_task_path: Option<&str>,
+    published_task_path: Option<&str>,
+) -> String {
+    let (Some(current_root), Some(published_root)) = (current_task_path, published_task_path)
+    else {
+        return path.to_owned();
+    };
+    if path == current_root {
+        return published_root.to_owned();
+    }
+    match path.strip_prefix(&format!("{current_root}/")) {
+        Some(relative) => format!("{published_root}/{relative}"),
+        None => path.to_owned(),
+    }
 }
 
 pub fn one_line(value: &str, field: &str) -> Result<String> {
@@ -348,21 +464,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_task_identities_determine_their_branches() {
+    fn fixed_task_identities_determine_their_branches_and_mutable_paths() {
+        let deliverable =
+            parse_task_identity(TaskKind::Deliverable, "20260829-170000-sample-task").unwrap();
         assert_eq!(
-            expected_task_branch(TaskKind::Deliverable, "20260829-170000-sample-task").unwrap(),
+            build_task_branch(TaskKind::Deliverable, &deliverable.original_slug).unwrap(),
             "codex/sample-task"
         );
         assert_eq!(
-            expected_task_branch(TaskKind::Infrastructure, "infra-shared-policy").unwrap(),
+            build_task_path(&deliverable, "renamed-task"),
+            "20260829-170000-renamed-task"
+        );
+        let infrastructure =
+            parse_task_identity(TaskKind::Infrastructure, "infra-shared-policy").unwrap();
+        assert_eq!(
+            build_task_branch(TaskKind::Infrastructure, &infrastructure.original_slug).unwrap(),
             "codex/infra-shared-policy"
         );
-        assert!(expected_task_branch(TaskKind::Deliverable, "sample-task").is_err());
-        assert!(
-            expected_task_branch(TaskKind::Deliverable, "20261329-170000-sample-task").is_err()
+        assert!(parse_task_identity(TaskKind::Deliverable, "sample-task").is_err());
+        assert!(parse_task_identity(TaskKind::Deliverable, "20261329-170000-sample-task").is_err());
+        assert!(parse_task_identity(TaskKind::Deliverable, "20260829-17000-sample-task").is_err());
+        assert!(parse_task_identity(TaskKind::Infrastructure, "shared-policy").is_err());
+        assert_eq!(
+            published_history_path(
+                "20260829-170000-renamed-task/output.bin",
+                Some("20260829-170000-renamed-task"),
+                Some("20260829-170000-sample-task"),
+            ),
+            "20260829-170000-sample-task/output.bin"
         );
-        assert!(expected_task_branch(TaskKind::Deliverable, "20260829-17000-sample-task").is_err());
-        assert!(expected_task_branch(TaskKind::Infrastructure, "shared-policy").is_err());
     }
 
     #[test]

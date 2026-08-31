@@ -13,7 +13,8 @@ lifecycle against two local network services:
 
 The scenario covers private-runtime setup, initialization,
 instructions, diagnostics, task creation, storage status, explicit Git and S3
-placement, aggregate boundary sizing, tiny-S3 warnings, the semantic review
+placement, published task slug rename with stable branch/PR identity and exact
+S3 hydration, aggregate boundary sizing, tiny-S3 warnings, the semantic review
 band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
 content-independent first-init collisions and whole-file scaffold reconciliation,

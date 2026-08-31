@@ -5,6 +5,21 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-30
+
+### Added
+
+- `workspace-mgr task rename <new-slug>` changes a task's current topic label,
+  moves a deliverable workspace as one unit, preserves its immutable task and
+  review-branch identity, and lets the next publication remove the old Git tree
+  without losing published Git or S3 placement history.
+
+### Changed
+
+- Task manifest schema 2 records the mutable current slug separately from the
+  immutable task ID. Schema 1 manifests remain readable and are upgraded when
+  renamed.
+
 ## [0.1.1] - 2026-08-30
 
 ### Fixed

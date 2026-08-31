@@ -10,7 +10,7 @@ use crate::config::{Config, StorageTarget};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
-use crate::manifest::{ResolvedTask, one_line};
+use crate::manifest::{ResolvedTask, one_line, published_history_path, published_task_paths};
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
 use crate::policy::{AUTO_S3_ABOVE_BYTES, RECOMMENDED_S3_MINIMUM_BYTES, TASK_MANIFEST_NAME};
 
@@ -90,10 +90,10 @@ pub fn status(
     paths: &[String],
 ) -> Result<StorageOperationReport> {
     let paths = resolve_status_paths(repo, scopes, paths)?;
-    let history_oid = task_history_oid(repo, config, scopes)?;
+    let history = task_history(repo, config, scopes)?;
     let placements = paths
         .iter()
-        .map(|path| placement_status(repo, config, path, history_oid.as_deref()))
+        .map(|path| placement_status(repo, config, path, history.as_ref()))
         .collect::<Result<Vec<_>>>()?;
     Ok(StorageOperationReport {
         status: "ok".to_owned(),
@@ -174,12 +174,12 @@ pub fn reset(
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
     validate_boundary_targets(repo, scopes, &paths)?;
-    let history_oid = task_history_oid(repo, config, scopes)?;
+    let history = task_history(repo, config, scopes)?;
     let desired = paths
         .iter()
         .map(|path| {
             let (target, basis) =
-                automatic_target_after_reset(repo, config, path, history_oid.as_deref())?;
+                automatic_target_after_reset(repo, config, path, history.as_ref())?;
             Ok((path.clone(), target, basis))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -260,8 +260,8 @@ pub fn move_path(
             "move may not cross an existing directory placement boundary; move the boundary itself or reset it first",
         ));
     }
-    let history_oid = task_history_oid(repo, config, scopes)?;
-    let before = placement_status(repo, config, &old_path, history_oid.as_deref())?;
+    let history = task_history(repo, config, scopes)?;
+    let before = placement_status(repo, config, &old_path, history.as_ref())?;
     if !dry_run {
         let snapshot = MetadataSnapshot::capture(repo, &[old_path.clone(), new_path.clone()])?;
         let result = (|| {
@@ -347,6 +347,7 @@ pub fn apply_automatic(
     base_oid: &str,
     dry_run: bool,
 ) -> Result<AutomaticPlacementReport> {
+    let history = history_for_oid(repo, config, scopes, base_oid)?;
     let mut candidates = Vec::new();
     let mut decisions = Vec::new();
     for path in repo.visible_paths(scopes)? {
@@ -361,7 +362,7 @@ pub fn apply_automatic(
         if explicit_target(repo, &path)? == Some(StorageTarget::Git) {
             continue;
         }
-        let object = format!("{base_oid}:{path}");
+        let object = format!("{base_oid}:{}", history.object_path(&path));
         if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
             continue;
         }
@@ -394,7 +395,7 @@ pub fn apply_automatic(
             return Err(rollback_error(error, snapshot.restore()));
         }
     }
-    for decision in warning_relevant_boundaries(repo, config, scopes, base_oid)? {
+    for decision in warning_relevant_boundaries(repo, config, scopes, &history)? {
         if !decisions
             .iter()
             .any(|current| current.path == decision.path && current.basis == decision.basis)
@@ -475,17 +476,22 @@ fn automatic_target_after_reset(
     repo: &GitRepo,
     config: &Config,
     path: &str,
-    history_oid: Option<&str>,
+    history: Option<&HistoryContext>,
 ) -> Result<(StorageTarget, PlacementBasis)> {
-    if let Some(oid) = history_oid {
+    if let Some(history) = history {
+        let history_path = history.object_path(path);
         if repo
-            .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}.dvc")])?
+            .run_unchecked([
+                "cat-file",
+                "-e",
+                &format!("{}:{history_path}.dvc", history.oid),
+            ])?
             .success()
         {
             return Ok((StorageTarget::S3, PlacementBasis::PublishedHistory));
         }
         if repo
-            .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}")])?
+            .run_unchecked(["cat-file", "-e", &format!("{}:{history_path}", history.oid)])?
             .success()
         {
             return Ok((StorageTarget::Git, PlacementBasis::PublishedHistory));
@@ -501,7 +507,7 @@ fn placement_status(
     repo: &GitRepo,
     config: &Config,
     path: &str,
-    history_oid: Option<&str>,
+    history: Option<&HistoryContext>,
 ) -> Result<PlacementStatus> {
     if let Some(placement) = read_placement(repo, path)? {
         return placement_report(
@@ -513,9 +519,14 @@ fn placement_status(
             Some(placement.reason),
         );
     }
-    if let Some(oid) = history_oid {
+    if let Some(history) = history {
+        let history_path = history.object_path(path);
         if repo
-            .run_unchecked(["cat-file", "-e", &format!("{oid}:{path}.dvc")])?
+            .run_unchecked([
+                "cat-file",
+                "-e",
+                &format!("{}:{history_path}.dvc", history.oid),
+            ])?
             .success()
         {
             return placement_report(
@@ -548,15 +559,21 @@ fn placement_status(
             boundary.reason,
         );
     }
-    let published_in_git = if let Some(oid) = history_oid {
-        repo.run_unchecked(["cat-file", "-e", &format!("{oid}:{path}")])?
-            .success()
+    let published_in_git = if let Some(history) = history {
+        repo.run_unchecked([
+            "cat-file",
+            "-e",
+            &format!("{}:{}", history.oid, history.object_path(path)),
+        ])?
+        .success()
     } else {
         false
     };
     if published_in_git {
-        let published_as_directory = history_oid
-            .map(|oid| published_object_is_directory(repo, oid, path))
+        let published_as_directory = history
+            .map(|history| {
+                published_object_is_directory(repo, &history.oid, &history.object_path(path))
+            })
             .transpose()?
             .unwrap_or(false);
         if resolved_under(&repo.root, path).is_dir() || published_as_directory {
@@ -710,11 +727,11 @@ fn warning_relevant_boundaries(
     repo: &GitRepo,
     config: &Config,
     scopes: &[String],
-    base_oid: &str,
+    history: &HistoryContext,
 ) -> Result<Vec<PlacementStatus>> {
     known_boundaries(repo, scopes)?
         .into_iter()
-        .map(|path| placement_status(repo, config, &path, Some(base_oid)))
+        .map(|path| placement_status(repo, config, &path, Some(history)))
         .filter_map(|status| match status {
             Ok(status) if !status.warnings.is_empty() => Some(Ok(status)),
             Ok(_) => None,
@@ -723,7 +740,28 @@ fn warning_relevant_boundaries(
         .collect()
 }
 
-fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Result<Option<String>> {
+#[derive(Debug, Clone)]
+struct HistoryContext {
+    oid: String,
+    current_task_path: Option<String>,
+    published_task_path: Option<String>,
+}
+
+impl HistoryContext {
+    fn object_path(&self, current: &str) -> String {
+        published_history_path(
+            current,
+            self.current_task_path.as_deref(),
+            self.published_task_path.as_deref(),
+        )
+    }
+}
+
+fn task_history(
+    repo: &GitRepo,
+    config: &Config,
+    scopes: &[String],
+) -> Result<Option<HistoryContext>> {
     let task_manifest = scopes.iter().find(|scope| {
         resolved_under(&repo.root, &format!("{scope}/{TASK_MANIFEST_NAME}")).is_file()
     });
@@ -741,10 +779,54 @@ fn task_history_oid(repo: &GitRepo, config: &Config, scopes: &[String]) -> Resul
         format!("refs/heads/{}", task.base_branch),
     ] {
         if let Some(oid) = repo.optional_oid(&reference)? {
-            return Ok(Some(oid));
+            return history_context(repo, &task, &oid).map(Some);
         }
     }
     Ok(None)
+}
+
+fn history_for_oid(
+    repo: &GitRepo,
+    config: &Config,
+    scopes: &[String],
+    oid: &str,
+) -> Result<HistoryContext> {
+    let task_manifest = scopes.iter().find(|scope| {
+        resolved_under(&repo.root, &format!("{scope}/{TASK_MANIFEST_NAME}")).is_file()
+    });
+    let task = match task_manifest {
+        Some(task_path) => ResolvedTask::load(
+            repo,
+            config,
+            &resolved_under(&repo.root, &format!("{task_path}/{TASK_MANIFEST_NAME}")),
+        )?,
+        None => match ResolvedTask::discover(repo, &repo.root) {
+            Ok(path) => ResolvedTask::load(repo, config, &path)?,
+            Err(_) => {
+                return Ok(HistoryContext {
+                    oid: oid.to_owned(),
+                    current_task_path: None,
+                    published_task_path: None,
+                });
+            }
+        },
+    };
+    history_context(repo, &task, oid)
+}
+
+fn history_context(repo: &GitRepo, task: &ResolvedTask, oid: &str) -> Result<HistoryContext> {
+    let paths = published_task_paths(repo, oid, task)?;
+    if paths.len() > 1 {
+        return Err(Error::message(format!(
+            "published history contains multiple paths for task {:?}",
+            task.task_id
+        )));
+    }
+    Ok(HistoryContext {
+        oid: oid.to_owned(),
+        current_task_path: task.task_path.clone(),
+        published_task_path: paths.into_iter().next(),
+    })
 }
 
 fn validate_targets(

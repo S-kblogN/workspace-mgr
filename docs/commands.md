@@ -155,10 +155,51 @@ workspace-mgr task create shared-policy --kind infrastructure \
   --scope-note "The user requested this infrastructure change"
 ```
 
+## `workspace-mgr task rename`
+
+Change the current human-readable slug without replacing the task, target
+branch, or pull request.
+
+```text
+workspace-mgr task rename <new-slug>
+  [--repo <path>] [--manifest <path>] [--dry-run]
+```
+
+The new slug uses the same lowercase ASCII kebab-case validation as creation.
+For a deliverable, the command preserves the timestamp and moves the entire
+task directory from `<timestamp>-<old-slug>` to
+`<timestamp>-<new-slug>`. Its README, retained content, S3 pointers, placement
+sidecars, and manifest move together. The manifest is atomically rewritten with
+schema 2 and records the new current slug and path. Infrastructure tasks keep
+their identity-owned private worktree path and update only the private current
+slug metadata.
+
+The task ID and target branch are immutable. Keeping the branch stable lets the
+agent reuse the one existing draft pull request; renaming an open pull request's
+head branch can close it on hosting providers. The report tells the agent to
+update that pull request's title and description after publication.
+
+Rename fetches the shared and task refs to reject merged tasks, changed remote
+identity, published destination collisions, local destination collisions, and
+staged source/destination changes. It writes no Git or S3 remote. On a published
+deliverable, the next normal `plan` includes the published old path as an
+identity-derived cleanup scope, preserves published Git/S3 placement at the new
+path, and `publish` deletes the old tree while advancing the same branch.
+Because version-aware S3 IDs are bound to object paths, rename clears those old
+bindings from moved pointers; publish creates and verifies new object versions
+at the new path while retaining the old versions.
+
+```sh
+workspace-mgr task rename current-research-question --dry-run
+workspace-mgr task rename current-research-question
+workspace-mgr plan
+workspace-mgr publish -m "Rename the task for its current topic"
+```
+
 ## `workspace-mgr task status`
 
-Show the resolved task identity, manifest, branch, remote, base branch, scopes,
-and current working changes inside those scopes.
+Show the immutable task identity, current slug, manifest, branch, remote, base
+branch, scopes, and current working changes inside those scopes.
 
 ```text
 workspace-mgr task status [--repo <path>] [--manifest <path>]

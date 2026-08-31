@@ -13,7 +13,7 @@ use crate::manifest::{INFRASTRUCTURE_MANIFEST_NAME, ResolvedTask, TaskKind};
 use crate::path::{repo_path, resolved_under};
 use crate::transaction::{task_state_dir, validate_remote_task_identity};
 
-const DISCARD_PLAN_SCHEMA: u32 = 1;
+const DISCARD_PLAN_SCHEMA: u32 = 2;
 const DISCARD_PLAN_NAME: &str = "discard-plan.json";
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
@@ -83,6 +83,8 @@ struct DiscardPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DiscardSnapshot {
     task_id: String,
+    slug: String,
+    task_path: Option<String>,
     branch: String,
     local_branch_oid: Option<String>,
     remote_branch_oid: Option<String>,
@@ -259,6 +261,8 @@ fn snapshot(repo: &GitRepo, task: &ResolvedTask) -> Result<DiscardSnapshot> {
     }
     Ok(DiscardSnapshot {
         task_id: task.task_id.clone(),
+        slug: task.slug.clone(),
+        task_path: task.task_path.clone(),
         branch: task.branch.clone(),
         local_branch_oid: repo.optional_oid(&format!("refs/heads/{}", task.branch))?,
         remote_branch_oid,

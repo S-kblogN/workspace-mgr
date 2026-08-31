@@ -495,6 +495,10 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
             "task branch must be",
         ),
         (original.replace("kind = \"deliverable\"\n", ""), "kind"),
+        (
+            original.replace("slug = \"fixed-branch\"\n", ""),
+            "lowercase kebab",
+        ),
         (original.replace("title = \"Fixed branch\"\n", ""), "title"),
         (
             original.replace(

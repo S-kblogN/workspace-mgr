@@ -1464,6 +1464,171 @@ class Harness:
         self.check(self.remote_path_exists(untracked_oid, f"{task_id}/bundle.dvc"), "other S3 boundary remains stored")
         self.check(self.wm(task, "plan")["status"] == "no_changes", "storage lifecycle ends cleanly")
 
+    def rename_published_task(self) -> None:
+        assert self.shared is not None
+        self.section("published task slug rename with versioned S3 content")
+        task_id = "20260829-185000-initial-topic"
+        renamed_id = "20260829-185000-current-topic"
+        branch = "codex/initial-topic"
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "initial-topic",
+            "--title",
+            "Rename lifecycle",
+            "--purpose",
+            "Verify a published task can follow the conversation topic.",
+            "--timestamp",
+            "20260829-185000",
+        )
+        task = Path(created["path"])
+        payload = b"published payload preserved across task rename\n"
+        artifact = task / "artifact.bin"
+        artifact.write_bytes(payload)
+        self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/artifact.bin",
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise S3 identity migration during a task rename.",
+        )
+        first = self.wm(task, "publish", "-m", "Publish the initial task topic")
+        first_oid = first["remote_oid"]
+        self.check(
+            self.remote_path_exists(first_oid, f"{task_id}/artifact.bin.dvc"),
+            "initial published tree contains the S3 pointer",
+        )
+        reset = self.wm(
+            task,
+            "storage",
+            "reset",
+            f"{task_id}/artifact.bin",
+        )
+        self.check(
+            reset["placements"][0]["target"] == "s3"
+            and reset["placements"][0]["basis"] == "published-history",
+            "reset removes the explicit choice and inherits published S3 placement",
+        )
+        versions_before = self.list_s3_versions()
+        remote_before = self.remote_ref(branch)
+
+        preview = self.wm(task, "task", "rename", "current-topic", "--dry-run")
+        self.check(
+            preview["status"] == "dry_run"
+            and preview["task_id"] == task_id
+            and preview["branch"] == branch
+            and preview["review"]["head_branch_unchanged"] is True,
+            "rename preview preserves stable task and review identity",
+        )
+        self.check(task.is_dir(), "rename preview leaves the old task directory present")
+        self.check(
+            self.remote_ref(branch) == remote_before,
+            "rename preview leaves the network branch unchanged",
+        )
+        self.check(
+            self.list_s3_versions() == versions_before,
+            "rename preview leaves versioned S3 unchanged",
+        )
+
+        renamed = self.wm(task, "task", "rename", "current-topic")
+        renamed_task = self.shared / renamed_id
+        self.check(
+            renamed["status"] == "renamed"
+            and renamed["task_id"] == task_id
+            and renamed["branch"] == branch
+            and renamed["remote_writes"] is False,
+            "rename changes the mutable slug but not task or branch identity",
+        )
+        self.check(
+            not task.exists()
+            and renamed_task.is_dir()
+            and (renamed_task / "artifact.bin").read_bytes() == payload
+            and (renamed_task / "artifact.bin.dvc").is_file(),
+            "rename moves the complete local task including S3 metadata and output",
+        )
+        self.check(
+            self.remote_ref(branch) == remote_before,
+            "local rename leaves the network branch unchanged",
+        )
+        self.check(
+            self.list_s3_versions() == versions_before,
+            "local rename leaves versioned S3 unchanged",
+        )
+        status = self.wm(
+            renamed_task,
+            "storage",
+            "status",
+            f"{renamed_id}/artifact.bin",
+        )
+        self.check(
+            status["placements"][0]["target"] == "s3"
+            and status["placements"][0]["basis"] == "published-history",
+            "renamed content retains its published S3 placement",
+        )
+        plan = self.wm(renamed_task, "plan")
+        self.check(
+            plan["status"] == "dry_run"
+            and set(plan["scopes"]) == {task_id, renamed_id},
+            "rename plan owns both the published old path and current path",
+        )
+        self.check(
+            f"{task_id}/artifact.bin.dvc" in plan["changed_paths"]
+            and f"{renamed_id}/artifact.bin.dvc" in plan["changed_paths"],
+            "rename plan records old-pointer deletion and new-pointer addition",
+        )
+        self.check(
+            self.remote_ref(branch) == remote_before
+            and self.list_s3_versions() == versions_before,
+            "rename plan performs no Git or S3 remote writes",
+        )
+
+        published = self.wm(
+            renamed_task,
+            "publish",
+            "-m",
+            "Publish the renamed task topic",
+        )
+        renamed_oid = published["remote_oid"]
+        self.check(
+            self.remote_ref(branch) == renamed_oid,
+            "renamed task advances the same network branch",
+        )
+        self.check(
+            not self.remote_path_exists(renamed_oid, task_id)
+            and self.remote_path_exists(
+                renamed_oid, f"{renamed_id}/artifact.bin.dvc"
+            ),
+            "renamed publication removes the old tree and publishes the new tree",
+        )
+        self.check(
+            self.wm(renamed_task, "task", "status")["slug"] == "current-topic",
+            "task status reports the current slug separately from stable identity",
+        )
+        self.check(
+            self.wm(renamed_task, "plan")["status"] == "no_changes",
+            "renamed publication ends in a clean task state",
+        )
+
+        cache = self.shared / ".dvc" / "cache"
+        if cache.exists():
+            shutil.rmtree(cache)
+        (renamed_task / "artifact.bin").unlink()
+        hydrated = self.wm(
+            renamed_task,
+            "storage",
+            "hydrate",
+            f"{renamed_id}/artifact.bin",
+        )
+        self.check(
+            hydrated["status"] == "hydrated"
+            and (renamed_task / "artifact.bin").read_bytes() == payload,
+            "renamed S3 boundary hydrates its exact published payload",
+        )
+
     def refresh_and_cross_clone(self, task_id: str, task: Path, branch: str) -> None:
         assert self.shared is not None
         self.section("shared-checkout refresh and independent clone hydration")
@@ -1898,6 +2063,7 @@ class Harness:
         self.initialize_workspace()
         task_id, task, branch = self.create_and_publish_task()
         self.exercise_dvc(task_id, task, branch)
+        self.rename_published_task()
         self.create_and_publish_infrastructure_task()
         self.refresh_and_cross_clone(task_id, task, branch)
         self.exercise_automatic_and_explicit_git()

@@ -13,7 +13,8 @@ use crate::git::GitRepo;
 use crate::hex::encode_lower;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    AdditionalScope, ResolvedTask, TaskKind, one_line, validate_additional_scopes,
+    AdditionalScope, ResolvedTask, TaskKind, one_line, published_history_path,
+    published_task_paths, validate_additional_scopes,
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
@@ -118,7 +119,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     if task.kind == TaskKind::Deliverable {
         repo.ensure_branch_not_checked_out(&task.branch)?;
     }
-    let (scopes, authorizations) = resolve_scopes(&task, options)?;
+    let (mut scopes, authorizations) = resolve_scopes(&task, options)?;
     validate_checkout(&repo, &task, &scopes, options)?;
     let message = match options.operation {
         Operation::Plan => None,
@@ -154,6 +155,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
 
     let remote_base_oid = repo.fetch_branch(&task.remote, &task.base_branch)?;
     let remote_target_oid = repo.remote_branch_oid(&task.remote, &task.branch)?;
+    let has_remote_target = remote_target_oid.is_some();
     let (base_ref, base_oid) = if let Some(remote_target_oid) = remote_target_oid {
         let fetched = repo.fetch_branch(&task.remote, &task.branch)?;
         if fetched != remote_target_oid {
@@ -172,6 +174,31 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             remote_base_oid.clone(),
         )
     };
+    let mut published_task_path = None;
+    if task.kind == TaskKind::Deliverable && has_remote_target {
+        let published_paths = published_task_paths(&repo, &base_oid, &task)?;
+        if published_paths.len() != 1 {
+            return Err(Error::message(format!(
+                "published deliverable branch must contain exactly one manifest for task {:?}; found {}",
+                task.task_id,
+                published_paths.len()
+            )));
+        }
+        published_task_path = published_paths.first().cloned();
+        for retired in published_paths {
+            if task.task_path.as_deref() == Some(&retired) {
+                continue;
+            }
+            if local_path_exists(&resolved_under(&repo.root, &retired))? {
+                return Err(Error::message(format!(
+                    "previously published task path {retired:?} reappeared locally after rename; move or remove the conflicting path before publication"
+                )));
+            }
+            scopes.push(retired);
+        }
+        scopes.sort();
+        scopes.dedup();
+    }
 
     let initial_dvc = dvc::discover(&repo, &scopes)?;
     let initial_outputs = dvc::output_paths(&repo, &initial_dvc)?;
@@ -192,8 +219,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &base_oid,
         &scopes,
         &preview_paths,
-        AUTO_S3_ABOVE_BYTES,
-        &preview_automatic_s3,
+        &PrivateIndexPolicy {
+            task: &task,
+            published_task_path: published_task_path.as_deref(),
+            large_file_threshold: AUTO_S3_ABOVE_BYTES,
+            automatic_s3: &preview_automatic_s3,
+        },
     )?;
     let mut lock_names = initial_dvc
         .iter()
@@ -236,8 +267,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             &base_oid,
             &scopes,
             &preflight_paths,
-            AUTO_S3_ABOVE_BYTES,
-            &automatic_s3,
+            &PrivateIndexPolicy {
+                task: &task,
+                published_task_path: published_task_path.as_deref(),
+                large_file_threshold: AUTO_S3_ABOVE_BYTES,
+                automatic_s3: &automatic_s3,
+            },
         )?;
     }
     let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
@@ -258,8 +293,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &base_oid,
         &scopes,
         &paths,
-        AUTO_S3_ABOVE_BYTES,
-        &automatic_s3,
+        &PrivateIndexPolicy {
+            task: &task,
+            published_task_path: published_task_path.as_deref(),
+            large_file_threshold: AUTO_S3_ABOVE_BYTES,
+            automatic_s3: &automatic_s3,
+        },
     )?;
     let ignored_entries = count_ignored(&repo, &index, &scopes)?;
     let tree_oid = repo
@@ -366,14 +405,31 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     Ok(report)
 }
 
+fn local_path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+struct PrivateIndexPolicy<'a> {
+    task: &'a ResolvedTask,
+    published_task_path: Option<&'a str>,
+    large_file_threshold: u64,
+    automatic_s3: &'a [String],
+}
+
 fn validate_private_index(
     repo: &GitRepo,
     index: &Path,
     base_oid: &str,
     scopes: &[String],
     paths: &[String],
-    large_file_threshold: u64,
-    automatic_s3: &[String],
+    policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     let escaped: Vec<String> = paths
         .iter()
@@ -387,7 +443,7 @@ fn validate_private_index(
         )));
     }
     check_gitlinks(repo, index, paths)?;
-    check_large_files(repo, scopes, base_oid, large_file_threshold, automatic_s3)?;
+    check_large_files(repo, scopes, base_oid, policy)?;
     repo.run_with_index(
         index,
         ["diff", "--cached", "--check", base_oid, "--"],
@@ -677,27 +733,35 @@ fn check_large_files(
     repo: &GitRepo,
     scopes: &[String],
     base_oid: &str,
-    threshold: u64,
-    automatic_s3: &[String],
+    policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     for relative in repo.visible_paths(scopes)? {
         let absolute = resolved_under(&repo.root, &relative);
         let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() <= threshold {
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() <= policy.large_file_threshold
+        {
             continue;
         }
-        if automatic_s3.contains(&relative) {
+        if policy.automatic_s3.contains(&relative) {
             continue;
         }
         if storage::explicit_target(repo, &relative)? == Some(crate::config::StorageTarget::Git) {
             continue;
         }
-        let object = format!("{base_oid}:{relative}");
+        let history_path = published_history_path(
+            &relative,
+            policy.task.task_path.as_deref(),
+            policy.published_task_path,
+        );
+        let object = format!("{base_oid}:{history_path}");
         if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
             continue;
         }
         return Err(Error::message(format!(
-            "retained file {relative:?} is larger than {threshold} bytes and has no valid placement; run `workspace-mgr storage set {relative} --to git|s3 --reason <reason>`"
+            "retained file {relative:?} is larger than {} bytes and has no valid placement; run `workspace-mgr storage set {relative} --to git|s3 --reason <reason>`",
+            policy.large_file_threshold
         )));
     }
     Ok(())
@@ -786,6 +850,7 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
     Ok(TaskStatus {
         kind: task.kind,
         task_id: task.task_id,
+        slug: task.slug,
         title: task.title,
         purpose: task.purpose,
         manifest: task.manifest_path.display().to_string(),
@@ -801,6 +866,7 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
 pub struct TaskStatus {
     pub kind: TaskKind,
     pub task_id: String,
+    pub slug: String,
     pub title: String,
     pub purpose: String,
     pub manifest: String,
