@@ -13,23 +13,7 @@ use crate::policy::{
     TASK_BRANCH_PREFIX, TASK_DIRECTORY_PATTERN,
 };
 
-pub const BOOTSTRAP: &str = concat!(
-    "# Repository instructions\n\n",
-    "Before doing any repository work, run:\n\n",
-    "    workspace-mgr instructions --repo .\n\n",
-    "Follow its output as the repository instructions for this session. If\n",
-    "`workspace-mgr` is unavailable, stop repository work, tell the user, and ask\n",
-    "permission to install the exact CLI version that generated this scaffold from\n",
-    "crates.io:\n\n",
-    "    cargo install --locked workspace-mgr --version ",
-    env!("CARGO_PKG_VERSION"),
-    "\n",
-    "    workspace-mgr setup\n\n",
-    "After installation, retry `workspace-mgr instructions --repo .`. If installation\n",
-    "is not approved, installation fails, or the instructions command still fails,\n",
-    "stop and report the problem. Do not substitute lower-level version-control or\n",
-    "storage mutation commands.\n",
-);
+pub const BOOTSTRAP: &str = "# Repository instructions\n\nBefore doing any repository work, run:\n\n    workspace-mgr instructions --repo .\n\nFollow its output as the repository instructions for this session. If\n`workspace-mgr` is unavailable, stop repository work, tell the user, and ask\npermission to install the latest stable release from crates.io:\n\n    cargo install --locked workspace-mgr\n    workspace-mgr setup\n\nAfter installation, retry `workspace-mgr instructions --repo .`. If installation\nis not approved, installation fails, or the instructions command still fails,\nstop and report the problem. Do not substitute lower-level version-control or\nstorage mutation commands.\n";
 pub const MANAGEMENT_MODEL: &str = include_str!("../docs/management-model.md");
 
 #[derive(Debug, Clone, Serialize)]

@@ -5,6 +5,13 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-30
+
+### Fixed
+
+- Managed `AGENTS.md` now installs the latest stable crates.io release instead
+  of pinning the CLI version that generated the scaffold.
+
 ## [0.1.0] - 2026-08-30
 
 ### Added

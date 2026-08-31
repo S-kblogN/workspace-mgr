@@ -100,12 +100,12 @@ workspace-mgr instructions --repo .
 ```
 
 If the command is unavailable, the same scaffold tells the agent to stop
-repository work, inform the user, and ask permission to install the exact CLI
-version that generated the scaffold from crates.io. After approval it runs the
-embedded `cargo install --locked workspace-mgr --version <version>` command,
-then `workspace-mgr setup`, and retries `workspace-mgr instructions --repo .`.
-An unapproved or failed installation remains a blocker; the agent does not
-substitute lower-level repository or storage commands.
+repository work, inform the user, and ask permission to install the latest
+stable release from crates.io. After approval it runs `cargo install --locked
+workspace-mgr`, then `workspace-mgr setup`, and retries `workspace-mgr
+instructions --repo .`. An unapproved or failed installation remains a
+blocker; the agent does not substitute lower-level repository or storage
+commands.
 
 `instructions` is intentionally different from `help`: help explains command
 syntax, while instructions first establishes the shared workspace model and

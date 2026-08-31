@@ -89,8 +89,8 @@ current versions; their ownership comes from the initialized repository and
 reserved path, never from matching old file content.
 
 The scaffold also contains a recovery path for a machine without the CLI. The
-agent asks the user before installing the exact scaffold-generating version
-from crates.io with `cargo install --locked`, runs `workspace-mgr setup`, and
+agent asks the user before installing the latest stable release from crates.io
+with `cargo install --locked workspace-mgr`, runs `workspace-mgr setup`, and
 then retries the instructions command. It never falls back to raw repository or
 storage mutation commands.
 
@@ -110,7 +110,7 @@ its exact private storage runtime in an isolated user data directory. Set
 For a source installation:
 
 ```sh
-cargo install --locked workspace-mgr --version 0.1.0
+cargo install --locked workspace-mgr
 workspace-mgr setup
 workspace-mgr --help
 ```
