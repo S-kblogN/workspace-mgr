@@ -633,7 +633,8 @@ class Harness:
         )
         self.check(
             "The agent owns pull-request operations" in all_instructions["markdown"]
-            and "must not merge" in all_instructions["markdown"],
+            and "must not merge" in all_instructions["markdown"]
+            and "Before ending every turn" in all_instructions["markdown"],
             "instructions fix agent PR ownership and user merge authority",
         )
         self.check(
@@ -718,6 +719,11 @@ class Harness:
         task = self.shared / task_id
         self.check(created["status"] == "created", "task scaffold created")
         self.check(created["branch"] == branch, "task branch follows fixed codex prefix")
+        self.check(
+            created["review"]["creation_timing"] == "immediate-after-scaffold-publication"
+            and created["review"]["synchronization_cadence"] == "before-every-turn-end",
+            "deliverable creation reports immediate review and turn-end synchronization",
+        )
         self.check(task.joinpath("README.md").is_file(), "task README created")
         self.check(task.joinpath(".workspace-mgr-task.toml").is_file(), "task manifest created")
         readme_before_collision = task.joinpath("README.md").read_bytes()
@@ -932,6 +938,11 @@ class Harness:
         )
         worktree = Path(created["path"])
         self.check(created["kind"] == "infrastructure", "infrastructure kind is explicit")
+        self.check(
+            created["review"]["creation_timing"] == "after-first-scoped-publication"
+            and created["review"]["synchronization_cadence"] == "before-every-turn-end",
+            "infrastructure creation reports first-publication review and turn-end synchronization",
+        )
         self.check(worktree.is_dir(), "infrastructure worktree exists")
         self.check(Path(created["manifest"]).is_file(), "infrastructure manifest is private state")
         self.check(

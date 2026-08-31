@@ -34,6 +34,8 @@ workspace-mgr instructions
 workspace-mgr task create example-task \
   --title "Example task" \
   --purpose "Produce one reviewable deliverable"
+workspace-mgr plan
+workspace-mgr publish -m "Create the task review"
 workspace-mgr task create shared-policy --kind infrastructure \
   --title "Shared policy" --purpose "Update repository policy" \
   --scope AGENTS.md --scope-note "The user requested this shared change"
@@ -49,6 +51,13 @@ workspace-mgr storage set path/to/report.pdf --to git --reason "Review in Git"
 workspace-mgr plan
 workspace-mgr publish -m "Publish the deliverable"
 ```
+
+Immediately after creating a deliverable task, the agent publishes its initial
+scaffold and creates the one matching draft pull request. Before every later
+turn ends, it automatically publishes all safe retained in-scope changes,
+updates the draft pull request, and verifies that the local task, remote branch,
+and pull-request head agree. This synchronization does not require a separate
+user request.
 
 When a conversation's topic changes, `task rename <new-slug>` moves the complete
 deliverable directory and updates task metadata while preserving the immutable

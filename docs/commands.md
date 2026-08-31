@@ -144,6 +144,15 @@ manifest is private worktree state and every scope is explicit. Both kinds
 fetch the configured base branch, reject an existing directory or local/remote
 branch, and publish nothing.
 
+The report contains a structured `review` handoff. Deliverable creation reports
+`creation_timing: immediate-after-scaffold-publication`; the agent must
+immediately plan and publish the initial scaffold, then create and verify the
+one draft pull request. Infrastructure creation reports
+`creation_timing: after-first-scoped-publication`. Both report
+`synchronization_cadence: before-every-turn-end`, requiring the agent to
+reconcile the task, remote branch, and pull request automatically before each
+writable-task turn ends.
+
 ```sh
 workspace-mgr task create training-report \
   --title "Training report" \

@@ -5,6 +5,14 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Deliverable task creation now hands agents an explicit requirement to publish
+  the initial scaffold and create its draft pull request immediately.
+- Effective instructions now require automatic publication and pull-request
+  reconciliation before every writable-task turn ends, with blockers reported
+  as exact unsynchronized state.
+
 ## [0.2.1] - 2026-08-30
 
 ### Changed

@@ -72,7 +72,9 @@ The following behavior is deliberately not configurable:
   fixed below-1 MiB Git preference, 1–10 MiB review band, and above-10 MiB S3
   fallback; published or explicitly selected placement stays sticky;
 - the agent creates and maintains the pull request title and living
-  description;
+  description, creates the draft pull request immediately after a deliverable
+  task's initial scaffold publication, and automatically reconciles the local
+  task, remote branch, and pull request before every writable-task turn ends;
 - the user or maintainer controls merge, ready, approval, close, and auto-merge
   transitions; after the user explicitly abandons an unmerged task, the agent
   closes that task's pull request before confirmed `task discard` cleanup;

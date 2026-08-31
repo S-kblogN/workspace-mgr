@@ -130,7 +130,10 @@ workspace-mgr task create model-report \
 
 This fetches the configured base branch, then creates a timestamped directory,
 a concise README, a task manifest, and a local target-branch ref. It does not
-create a remote branch or a pull request.
+itself create a remote branch or call a hosting provider. Immediately after the
+command succeeds, the agent runs `plan`, publishes the initial scaffold, and
+creates and verifies the matching draft pull request before substantial task
+work. That checkpoint is automatic and does not require another user prompt.
 
 Run task commands from inside the task directory so the manifest is discovered
 automatically. Use `--manifest <path>` when working elsewhere. The task
@@ -277,11 +280,21 @@ Git index.
 Creating and maintaining the task's one draft pull request remains a
 repository-hosting action.
 `workspace-mgr` is provider-neutral: it publishes the branch transaction but
-does not call a GitHub or other hosting API. The agent finds the request by head
-branch, reuses it or creates exactly one draft pull request, and never creates a
-duplicate. It keeps the title and living description aligned with the goal,
-scope, deliverables, validation, and known limitations, then verifies the base,
-head, draft/open state, and head revision after every material publication.
+does not call a GitHub or other hosting API. Immediately after publishing a new
+deliverable task's scaffold, the agent finds the request by head branch, reuses
+it or creates exactly one draft pull request, and never creates a duplicate. An
+infrastructure task does this after its first safe scoped publication. The agent
+keeps the title and living description aligned with the goal, scope,
+deliverables, validation, and known limitations, then verifies the base, head,
+draft/open state, and head revision after every material publication.
+
+Before every writable-task turn ends, the agent automatically runs a
+task-targeted plan, publishes all safe retained in-scope changes even if the
+work remains in progress, updates and verifies the draft pull request, and
+finishes with a no-change plan. If there is nothing to publish, it still verifies
+that the local task revision, remote branch, and pull-request head agree. A
+publication or provider blocker is reported with the exact unsynchronized state;
+the user never has to ask for routine turn-end synchronization.
 Hosting failures are reported immediately. The agent must not merge, enable
 auto-merge, approve, close, or mark the pull request ready unless the user
 explicitly requests that exact transition. An explicit request to discard one

@@ -83,6 +83,10 @@ infrastructure work into permission to modify unrelated repository state.
 
 `task create` establishes the local task, README, manifest, scope, and branch
 identity. It does not publish a remote branch or create a pull request.
+For a deliverable task, the agent immediately follows creation with an initial
+plan and publication of that scaffold, then creates and verifies the draft pull
+request before substantial task work. This is one automatic task-creation
+checkpoint, not an extra action the user must remember to request.
 `task status` resolves the current task and reports its scoped state without
 publishing. `task rename` changes the current human-readable slug when the
 conversation's topic evolves. For a deliverable it moves the complete task
@@ -188,12 +192,15 @@ workflow. `workspace-mgr` does not create, edit, approve, or merge that pull
 request through a hosting-provider API. Merging remains an explicit authorized
 action.
 
-The agent must query by head branch after the first successful publish, reuse
-an existing open pull request or create exactly one, and never create a
-duplicate. It owns the title and living description and updates them whenever
-the goal, scope, deliverables, validation, or known limitations materially
-change. It then verifies the base branch, head branch, review state, and that
-the pull-request head revision equals the revision reported by `publish`.
+Immediately after the initial scaffold publication, the agent must query by
+head branch, reuse an existing open pull request or create exactly one draft
+pull request, and never create a duplicate. Infrastructure tasks do this after
+their first safe scoped publication because their creation has no repository
+content to publish. The agent owns the title and living description and updates
+them whenever the goal, scope, deliverables, validation, or known limitations
+materially change. It then verifies the base branch, head branch, review state,
+and that the pull-request head revision equals the revision reported by
+`publish`.
 Provider failures are blockers to full synchronization. The agent must not
 merge, enable auto-merge, approve, close, or mark the request ready without the
 user explicitly authorizing that exact transition. A user request to discard a
@@ -203,6 +210,16 @@ task's pull request, verify it is closed, and then run confirmed task cleanup.
 A task is fully synchronized when its local and remote branch revisions match,
 its pull-request description reflects the same intention, and a final plan
 reports no remaining task changes.
+
+Before ending every turn in a writable task, the agent automatically reconciles
+that state. It plans the task, publishes all safe retained in-scope changes even
+when the deliverable is still work in progress, updates and verifies the draft
+pull request, and finishes with a no-change plan. A turn with no publishable
+change still verifies that the local task revision, remote branch, and
+pull-request head already match. The user does not need to request this
+turn-ending synchronization. If publication or provider verification is
+blocked, the agent reports the exact unsynchronized state rather than claiming
+the task is current.
 
 If Git publication fails after an S3 upload, an unreferenced S3 object version
 may remain, but no remote Git revision should point to missing content.
@@ -247,14 +264,18 @@ The complete story is:
 3. The agent loads `instructions` and decides whether the conversation is
    read-only or needs a writable task.
 4. For writable work, `task create` gives the chat one durable workspace,
-   scope, branch identity, and eventual pull-request identity.
-5. The agent performs the requested work inside that task and keeps its README
+   scope, branch identity, and pull-request identity.
+5. For a deliverable task, the agent immediately publishes the initial scaffold
+   and creates the matching draft pull request. Infrastructure creates it after
+   the first safe scoped publication.
+6. The agent performs the requested work inside that task and keeps its README
    aligned with the current purpose and outputs. If the topic changes, `task
    rename` updates its current slug without replacing its branch or review.
-6. Retained artifacts are placed in Git or S3 automatically or by an explicit
+7. Retained artifacts are placed in Git or S3 automatically or by an explicit
    user or agent choice.
-7. `plan` explains the proposed reviewable state without publishing it.
-8. `publish` verifies stored content and advances only the task's target branch.
+8. At every turn end, `plan` explains the proposed reviewable state, `publish`
+   advances the task branch when needed, and the agent updates and verifies the
+   matching draft pull request.
 9. The matching draft pull request carries review, and the user or maintainer
    decides whether to merge it or explicitly abandon the task.
 10. After merge, `refresh` brings the result into the shared workspace without
