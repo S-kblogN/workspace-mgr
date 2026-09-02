@@ -21,6 +21,7 @@ use crate::policy::{
     AUTO_S3_ABOVE_BYTES, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
     REVIEW_PULL_REQUEST,
 };
+use crate::s3_purge;
 use crate::storage;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -276,7 +277,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         )?;
     }
     let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
-    let storage_report = serde_json::json!({"placement": placement, "s3": s3});
+    let storage_report = serde_json::json!({
+        "placement": placement,
+        "s3": s3,
+        "purge": s3_purge::preview(&repo)?,
+    });
 
     let index = state_dir.join("index");
     if index.exists() {
@@ -339,7 +344,20 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         push: None,
     };
     if paths.is_empty() && !storage_dirty && !placement_pending {
-        report.status = "no_changes".to_owned();
+        if dry_run {
+            report.status = "no_changes".to_owned();
+        } else {
+            let purge = s3_purge::purge_pending(&repo, &config, &task.remote)?;
+            report.status = if purge.deleted.is_empty() {
+                "no_changes"
+            } else {
+                "s3_purged"
+            }
+            .to_owned();
+            report.storage["purge"] = serde_json::to_value(purge).map_err(|error| {
+                Error::message(format!("failed to encode S3 purge report: {error}"))
+            })?;
+        }
         return Ok(report);
     }
     if dry_run {
@@ -368,6 +386,9 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .stdout
         .trim()
         .to_owned();
+    let purge_candidates =
+        s3_purge::candidates_between(&repo, &config, &base_oid, &commit_oid, &scopes)?;
+    s3_purge::queue(&repo, &purge_candidates)?;
     let local_ref = format!("refs/heads/{}", task.branch);
     let old_local_oid = repo.optional_oid(&local_ref)?;
     repo.run([
@@ -398,6 +419,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &format!("refs/remotes/{}/{}", task.remote, task.branch),
         &commit_oid,
     ])?;
+    let mut purge = s3_purge::purge_pending(&repo, &config, &task.remote)?;
+    purge.queued = purge_candidates;
+    report.storage["purge"] = serde_json::to_value(purge)
+        .map_err(|error| Error::message(format!("failed to encode S3 purge report: {error}")))?;
     report.status = "pushed".to_owned();
     report.commit_oid = Some(commit_oid);
     report.remote_oid = Some(observed);

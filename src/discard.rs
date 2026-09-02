@@ -1,16 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::manifest::{INFRASTRUCTURE_MANIFEST_NAME, ResolvedTask, TaskKind};
 use crate::path::{repo_path, resolved_under};
+use crate::s3_purge::{self, ObjectVersion, PurgeReport};
 use crate::transaction::{task_state_dir, validate_remote_task_identity};
 
 const DISCARD_PLAN_SCHEMA: u32 = 2;
@@ -41,7 +40,7 @@ pub struct TaskDiscardReport {
     pub working_changes: Vec<String>,
     pub local_actions: Vec<LocalDiscardAction>,
     pub review: DiscardReview,
-    pub retained_s3: Vec<RetainedS3Boundary>,
+    pub s3_purge: PurgeReport,
     pub remote_writes: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmation_plan: Option<String>,
@@ -66,14 +65,6 @@ pub struct DiscardReview {
     pub provider_state_verified_by_cli: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct RetainedS3Boundary {
-    pub boundary: String,
-    pub sources: Vec<String>,
-    pub version_ids: Vec<String>,
-    pub disposition: &'static str,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DiscardPlan {
     schema_version: u32,
@@ -96,12 +87,14 @@ struct DiscardSnapshot {
 struct DiscardContext {
     task_repo: GitRepo,
     admin_repo: GitRepo,
+    config: Config,
     task: ResolvedTask,
     state_dir: PathBuf,
     snapshot: DiscardSnapshot,
     working_changes: Vec<String>,
     local_actions: Vec<LocalDiscardAction>,
-    retained_s3: Vec<RetainedS3Boundary>,
+    purge_candidates: Vec<ObjectVersion>,
+    purge_report: PurgeReport,
 }
 
 pub fn discard(options: &TaskDiscardOptions) -> Result<TaskDiscardReport> {
@@ -117,7 +110,7 @@ pub fn discard(options: &TaskDiscardOptions) -> Result<TaskDiscardReport> {
         None => ResolvedTask::discover(&task_repo, &options.start)?,
     };
     let task = ResolvedTask::load(&task_repo, &config, &manifest)?;
-    let mut context = build_context(task_repo, task)?;
+    let mut context = build_context(task_repo, task, config)?;
     let plan_path = context.state_dir.join(DISCARD_PLAN_NAME);
 
     if options.dry_run {
@@ -155,10 +148,24 @@ pub fn discard(options: &TaskDiscardOptions) -> Result<TaskDiscardReport> {
         )));
     }
 
-    let cleanup_warnings = match context.task.kind {
+    s3_purge::queue(&context.admin_repo, &context.purge_candidates)?;
+    let mut cleanup_warnings = match context.task.kind {
         TaskKind::Deliverable => discard_deliverable(&mut context)?,
         TaskKind::Infrastructure => discard_infrastructure(&mut context)?,
     };
+    match s3_purge::purge_pending(&context.admin_repo, &context.config, &context.task.remote) {
+        Ok(mut purge) => {
+            purge.queued = context.purge_candidates.clone();
+            context.purge_report = purge;
+        }
+        Err(error) => {
+            cleanup_warnings.push(format!(
+                "task was discarded, but permanent S3 deletion remains pending: {error}"
+            ));
+            context.purge_report = s3_purge::preview(&context.admin_repo)?;
+            context.purge_report.queued = context.purge_candidates.clone();
+        }
+    }
     Ok(report(&context, "discarded", None, cleanup_warnings))
 }
 
@@ -174,7 +181,7 @@ fn validate_mode(options: &TaskDiscardOptions) -> Result<()> {
     }
 }
 
-fn build_context(task_repo: GitRepo, task: ResolvedTask) -> Result<DiscardContext> {
+fn build_context(task_repo: GitRepo, task: ResolvedTask, config: Config) -> Result<DiscardContext> {
     task_repo.validate_branch(&task.branch)?;
     task_repo.validate_remote_name(&task.remote)?;
     let admin_repo = administrative_repo(&task_repo, &task)?;
@@ -184,16 +191,32 @@ fn build_context(task_repo: GitRepo, task: ResolvedTask) -> Result<DiscardContex
     reject_merged_task(&admin_repo, &task, &snapshot)?;
     let working_changes = working_changes(&task_repo, &task)?;
     let local_actions = local_actions(&task_repo, &task, &snapshot.local_base_oid)?;
-    let retained_s3 = retained_s3(&task_repo, &admin_repo, &task, &snapshot)?;
+    let mut purge_candidates =
+        s3_purge::candidates_for_worktree(&task_repo, &config, &task.scopes())?;
+    if let Some(oid) = &snapshot.remote_branch_oid {
+        purge_candidates.extend(s3_purge::candidates_for_revision(
+            &admin_repo,
+            &config,
+            oid,
+            &task.scopes(),
+        )?);
+    }
+    purge_candidates.sort();
+    purge_candidates.dedup();
+    let mut purge_report = s3_purge::preview(&admin_repo)?;
+    purge_report.status = "planned".to_owned();
+    purge_report.queued = purge_candidates.clone();
     Ok(DiscardContext {
         task_repo,
         admin_repo,
+        config,
         task,
         state_dir,
         snapshot,
         working_changes,
         local_actions,
-        retained_s3,
+        purge_candidates,
+        purge_report,
     })
 }
 
@@ -362,90 +385,6 @@ fn local_actions(
     Ok(actions)
 }
 
-fn retained_s3(
-    task_repo: &GitRepo,
-    admin_repo: &GitRepo,
-    task: &ResolvedTask,
-    state: &DiscardSnapshot,
-) -> Result<Vec<RetainedS3Boundary>> {
-    let scopes = task.scopes();
-    let mut records: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
-    for pointer in dvc::discover(task_repo, &scopes)? {
-        let raw = fs::read_to_string(resolved_under(&task_repo.root, &pointer))
-            .at(resolved_under(&task_repo.root, &pointer))?;
-        add_s3_record(&mut records, &pointer, "local", &raw)?;
-    }
-    if let Some(oid) = &state.remote_branch_oid {
-        let mut args = vec![
-            "ls-tree".to_owned(),
-            "-r".to_owned(),
-            "-z".to_owned(),
-            "--name-only".to_owned(),
-            oid.clone(),
-            "--".to_owned(),
-        ];
-        args.extend(scopes);
-        for pointer in admin_repo
-            .run(args)?
-            .stdout
-            .split('\0')
-            .filter(|path| path.ends_with(".dvc"))
-        {
-            let raw = admin_repo
-                .run(["show", &format!("{oid}:{pointer}")])?
-                .stdout;
-            add_s3_record(&mut records, pointer, "remote-branch", &raw)?;
-        }
-    }
-    Ok(records
-        .into_iter()
-        .map(|(pointer, (sources, versions))| RetainedS3Boundary {
-            boundary: pointer.trim_end_matches(".dvc").to_owned(),
-            sources: sources.into_iter().collect(),
-            version_ids: versions.into_iter().collect(),
-            disposition: "retained-not-purged",
-        })
-        .collect())
-}
-
-fn add_s3_record(
-    records: &mut BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
-    pointer: &str,
-    source: &str,
-    raw: &str,
-) -> Result<()> {
-    let parsed: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|error| {
-        Error::message(format!(
-            "failed to inspect managed-storage versions in {pointer}: {error}"
-        ))
-    })?;
-    let entry = records.entry(pointer.to_owned()).or_default();
-    entry.0.insert(source.to_owned());
-    collect_version_ids(&parsed, &mut entry.1);
-    Ok(())
-}
-
-fn collect_version_ids(value: &serde_yaml::Value, found: &mut BTreeSet<String>) {
-    match value {
-        serde_yaml::Value::Mapping(mapping) => {
-            for (key, value) in mapping {
-                if key.as_str() == Some("version_id") {
-                    if let Some(version) = value.as_str() {
-                        found.insert(version.to_owned());
-                    }
-                }
-                collect_version_ids(value, found);
-            }
-        }
-        serde_yaml::Value::Sequence(values) => {
-            for value in values {
-                collect_version_ids(value, found);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn report(
     context: &DiscardContext,
     status: &str,
@@ -477,8 +416,10 @@ fn report(
             must_be_unmerged: true,
             provider_state_verified_by_cli: false,
         },
-        retained_s3: context.retained_s3.clone(),
-        remote_writes: status == "discarded" && context.snapshot.remote_branch_oid.is_some(),
+        s3_purge: context.purge_report.clone(),
+        remote_writes: status == "discarded"
+            && (context.snapshot.remote_branch_oid.is_some()
+                || !context.purge_report.deleted.is_empty()),
         confirmation_plan: confirmation_plan.map(|path| path.display().to_string()),
         cleanup_warnings,
     }

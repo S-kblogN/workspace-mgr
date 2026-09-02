@@ -48,6 +48,7 @@ workspace-mgr task rename more-accurate-topic
 workspace-mgr storage status
 workspace-mgr storage set path/to/data --to s3 --reason "Retained dataset"
 workspace-mgr storage set path/to/report.pdf --to git --reason "Review in Git"
+workspace-mgr remove path/to/obsolete-data
 workspace-mgr plan
 workspace-mgr publish -m "Publish the deliverable"
 ```
@@ -63,10 +64,13 @@ When a conversation's topic changes, `task rename <new-slug>` moves the complete
 deliverable directory and updates task metadata while preserving the immutable
 task ID, target branch, and existing pull request. The next ordinary `publish`
 removes the previously published path and publishes the new one. `storage set`,
-`storage reset`, and `move` change local desired state only.
+`storage reset`, `move`, and `remove` change local desired state only.
 `storage hydrate` reads from S3. `plan` is read-only. `publish` is the only
 command that publishes repository content, and it verifies S3 before publishing
-a Git revision. If the user instead decides to retain none of the task, the
+a Git revision. It then permanently deletes every S3 version at object paths
+removed by delete, move, rename, or S3-to-Git placement; current remote branches
+and tags defer deletion until the last live reference disappears. If the user
+instead decides to retain none of the task, the
 agent closes its unmerged pull request and uses `task discard --dry-run` followed
 by `task discard --confirm <task-id>` to remove its branch and local workspace.
 
@@ -86,8 +90,10 @@ warning. Existing published placement stays stable when size changes, and
 `storage reset` returns a path to published history or the fallback.
 
 Directories may be placed in S3 as one logical boundary whose aggregate payload
-size is reported. `move` preserves a path's placement. `storage hydrate`
-materializes S3 content without publishing.
+size is reported. `move` preserves a path's placement, and `remove` explicitly
+deletes a file or boundary without confusing an unhydrated S3 output for an
+intentional deletion. `storage hydrate` materializes S3 content without
+publishing.
 
 ## Agent instructions
 

@@ -15,6 +15,7 @@ use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, res
 use crate::process::{CommandOutput, run as run_process, run_unchecked as run_process_unchecked};
 
 const VERSION_VERIFY_SCRIPT: &str = include_str!("../assets/dvc_version_verify.py");
+const VERSION_PURGE_SCRIPT: &str = include_str!("../assets/dvc_version_purge.py");
 const INTERNAL_CONFIG_HEADER: &str =
     "# Managed by workspace-mgr. Edit .workspace-mgr.toml and rerun workspace-mgr init.\n";
 pub const REQUIRED_DVC_VERSION: &str = "3.67.1";
@@ -470,6 +471,42 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
         )));
     }
     Ok(serde_json::json!({"mode": "remote-status"}))
+}
+
+pub fn version_purge_adapter(
+    repo: &GitRepo,
+    operation: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let python = storage_python();
+    let serialized = serde_json::to_string(payload).map_err(|error| {
+        Error::message(format!(
+            "failed to encode managed-storage purge request: {error}"
+        ))
+    })?;
+    let output = run_process_unchecked(
+        &python,
+        [
+            "-c",
+            VERSION_PURGE_SCRIPT,
+            &repo.root.to_string_lossy(),
+            operation,
+            &serialized,
+        ],
+        &repo.root,
+    )
+    .map_err(private_engine_error)?;
+    if !output.success() {
+        return Err(Error::message(format!(
+            "managed-storage permanent deletion failed: {}",
+            private_detail(&output)
+        )));
+    }
+    serde_json::from_str(output.stdout.trim()).map_err(|error| {
+        Error::message(format!(
+            "managed-storage purge adapter returned invalid JSON: {error}"
+        ))
+    })
 }
 
 pub fn hydrate(

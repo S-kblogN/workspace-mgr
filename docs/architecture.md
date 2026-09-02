@@ -94,8 +94,8 @@ task ID, treats that old tree as a temporary cleanup scope, maps published
 placement history to the new path, and removes the old tree in the same commit.
 Version-aware S3 object IDs are path-bound, so local rename removes their old
 path bindings from moved pointers. The next publish creates and verifies new
-object versions at the new path before publishing Git; old versions remain
-retained.
+object versions at the new path before publishing Git, then permanently deletes
+every version at the old path unless a current remote branch or tag protects it.
 
 For a task publication, the CLI:
 
@@ -109,7 +109,9 @@ For a task publication, the CLI:
 7. stages only declared scopes and rejects gitlinks, invalid placement, and
    whitespace errors;
 8. creates a commit with its task identity, updates the local target ref with compare-and-swap
-   semantics, pushes an explicit refspec, and verifies the remote object ID.
+   semantics, pushes an explicit refspec, and verifies the remote object ID;
+9. permanently deletes all versions at obsolete S3 object paths, deferring paths
+   still referenced by a current remote branch or tag.
 
 Deliverable target refs remain unmounted, so publication never changes the
 shared checkout. An infrastructure target ref is mounted only in its dedicated
@@ -131,8 +133,10 @@ the `test-storage` feature for isolated tests and uses remote-presence
 verification. Release builds reject it in the public S3 schema.
 
 Moving an S3 boundary clears path-bound cloud metadata before upload so the new
-object path receives and records its own version ID. Existing remote versions
-are retained.
+object path receives and records its own version ID. After Git publication,
+every version at the old object path is permanently deleted unless protected by
+a current remote branch or tag. This deliberately makes older Git revisions
+that used the removed path non-hydratable.
 
 ## Shared-checkout refresh
 

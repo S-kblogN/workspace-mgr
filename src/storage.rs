@@ -304,6 +304,69 @@ pub fn move_path(
     })
 }
 
+pub fn remove_paths(
+    repo: &GitRepo,
+    config: &Config,
+    scopes: &[String],
+    paths: &[String],
+    dry_run: bool,
+) -> Result<StorageOperationReport> {
+    let paths = validate_targets(repo, scopes, paths, true)?;
+    for (index, path) in paths.iter().enumerate() {
+        if scopes.iter().any(|scope| scope == path) {
+            return Err(Error::message(format!(
+                "remove may not delete an entire task scope {path:?}; use `workspace-mgr task discard` for an unmerged task"
+            )));
+        }
+        if paths
+            .iter()
+            .skip(index + 1)
+            .any(|other| is_descendant(path, other) || is_descendant(other, path))
+        {
+            return Err(Error::message(
+                "one remove operation may not target nested paths",
+            ));
+        }
+    }
+    let history = task_history(repo, config, scopes)?;
+    let placements = paths
+        .iter()
+        .map(|path| placement_status(repo, config, path, history.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+    if !dry_run {
+        for path in &paths {
+            let pointer = pointer_path(repo, path);
+            if pointer.is_file() {
+                dvc::management(
+                    repo,
+                    config,
+                    "untrack",
+                    &[relative_to(&pointer, &repo.root, "storage metadata")?],
+                    false,
+                )?;
+            }
+            let sidecar = sidecar_path(repo, path);
+            if sidecar.is_file() {
+                fs::remove_file(&sidecar).at(&sidecar)?;
+            }
+            let target = resolved_under(&repo.root, path);
+            let metadata = fs::symlink_metadata(&target).at(&target)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(&target).at(&target)?;
+            } else {
+                fs::remove_file(&target).at(&target)?;
+            }
+        }
+    }
+    Ok(StorageOperationReport {
+        status: if dry_run { "dry_run" } else { "updated" }.to_owned(),
+        operation: "remove".to_owned(),
+        paths,
+        placements,
+        remote_writes: false,
+    })
+}
+
 pub fn hydrate(
     repo: &GitRepo,
     config: &Config,

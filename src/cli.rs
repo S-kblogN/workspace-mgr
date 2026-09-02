@@ -60,6 +60,9 @@ pub enum Command {
     /// Move a path while preserving its storage placement.
     Move(MoveArgs),
 
+    /// Delete a path and permanently purge obsolete S3 versions after publication.
+    Remove(RemoveArgs),
+
     /// Safely update a shared checkout and hydrate incoming stored data.
     Refresh(RefreshArgs),
 }
@@ -344,6 +347,18 @@ pub struct MoveArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RemoveArgs {
+    #[command(flatten)]
+    pub scoped: ScopedArgs,
+
+    #[arg(required = true)]
+    pub paths: Vec<String>,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct RefreshArgs {
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
@@ -450,6 +465,7 @@ mod tests {
             &["storage", "reset", "task/data"],
             &["storage", "hydrate", "task/data/example.csv"],
             &["move", "task/old.bin", "task/new.bin", "--dry-run"],
+            &["remove", "task/obsolete.bin", "--dry-run"],
             &[
                 "plan",
                 "--include",

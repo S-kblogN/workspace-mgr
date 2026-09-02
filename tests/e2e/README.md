@@ -20,10 +20,11 @@ configuration drift and repair, disabled-versioning refusal before upload,
 content-independent first-init collisions and whole-file scaffold reconciliation,
 isolated infrastructure task scaffolding, scoped publication, and stable
 publication of a deleted infrastructure file scope,
-deliverable and infrastructure task discard with branch/worktree cleanup while
-retaining versioned S3 objects,
+deliverable and infrastructure task discard with branch/worktree cleanup and
+permanent unreferenced S3-path deletion,
 fixed policy with a minimal Git/S3-only public configuration,
-Git-to-S3 and S3-to-Git transitions, failure ordering, successful and rolled-back
+Git-to-S3 and S3-to-Git transitions, explicit remove, delete/move/rename purge,
+failure ordering, successful and rolled-back
 ordinary Git/S3 shared-checkout refresh, fresh-clone hydration, missing exact S3
 versions, cross-process locks, alternate checkouts, and network non-fast-forwards.
 It checks that placement commands never write either remote, that S3 object

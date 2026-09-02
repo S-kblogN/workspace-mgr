@@ -223,8 +223,10 @@ the task is current.
 
 If Git publication fails after an S3 upload, an unreferenced S3 object version
 may remain, but no remote Git revision should point to missing content.
-Retrying the same publication is safe. Automatic deletion of shared remote
-history is outside normal workspace management.
+Retrying the same publication is safe. After Git publication succeeds, the CLI
+permanently deletes every version at S3 object paths removed by deletion, move,
+rename, or S3-to-Git placement. A current remote branch or tag defers deletion
+until a later publish, refresh, or discard observes that the reference is gone.
 
 Discard is deliberately a two-step destructive operation. Its dry run records
 the observed local task ref, remote task ref, and shared-branch revisions in
@@ -234,8 +236,9 @@ the exact task ID and unchanged revisions. The CLI then deletes the remote task
 branch with an exact lease, deletes the local task ref, removes the deliverable
 directory or infrastructure worktree, and restores any declared shared paths to
 the local shared-branch tree. A remote failure restores quarantined local state.
-Merged tasks are refused. Versioned S3 objects are reported as retained orphan
-candidates and are never permanently purged by discard.
+Merged tasks are refused. Versioned S3 object paths are queued before branch
+deletion, then permanently purged when no current remote branch or tag protects
+them.
 
 ## How multiple chats share the workspace
 
@@ -281,7 +284,7 @@ The complete story is:
 10. After merge, `refresh` brings the result into the shared workspace without
     disturbing other active chats. After abandonment, the agent closes the
     unmerged pull request and `task discard` removes the task workspace and
-    branch without purging retained S3 history.
+    branch, permanently purging its unreferenced S3 object paths.
 
 `config show` reports the repository's Git and S3 facts, and `doctor` diagnoses
 the CLI, repository, Git, and storage environment without changing repository
