@@ -402,7 +402,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `storage set`, `storage reset`, `move`, `remove` | Changes local content/placement metadata | None | None |
 | `storage hydrate` | Materializes S3 content | S3 | None |
 | `plan` | Creates ignored/private preview state | Git refs and S3 bucket settings when configured | None |
-| `publish` | Updates private state and a local target ref | Git and S3 verification | Upload S3, publish Git, then purge obsolete S3 paths |
+| `publish` | Updates private state and a local target ref | Git and S3 verification | S3 first, then Git, then purge obsolete S3 paths |
 | `refresh` | Fast-forwards, materializes incoming content, and retries pending purge | Git and, when needed, S3 | Deletes pending unreferenced S3 paths |
 
 Most `--dry-run` forms suppress normal local mutation. `task discard --dry-run`

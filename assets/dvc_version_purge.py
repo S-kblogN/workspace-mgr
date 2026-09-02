@@ -34,7 +34,11 @@ def objects_at(revision, pointers):
                             f"managed-storage output in {pointer!r} must be pushable and inside the repository"
                         )
                     _, base_parts = out.index_key
-                    if out.isdir():
+                    # `out.isdir()` inspects the current worktree, so it becomes
+                    # false when DVC opens a historical Git revision whose
+                    # stored output is intentionally absent from Git. The
+                    # pointer hash is the revision-stable source of truth.
+                    if out.hash_info and out.hash_info.isdir:
                         if out.files is None:
                             raise RuntimeError(
                                 f"managed-storage directory metadata is incomplete: {pointer}"
