@@ -1057,7 +1057,7 @@ class Harness:
             self.wm(worktree, "plan")["status"] == "no_changes",
             "missing published infrastructure scope remains a clean plan",
         )
-        versions_before_discard = self.list_s3_versions()
+        infra_discarded_key = self.s3_version_for_body(infra_payload)["key"]
         discard_preview = self.wm(worktree, "task", "discard", "--dry-run")
         self.check(discard_preview["status"] == "dry_run", "infrastructure discard previews cleanup")
         self.check(
@@ -1070,8 +1070,11 @@ class Harness:
             "infrastructure discard names the managed worktree deletion",
         )
         self.check(
-            any(item["boundary"] == "e2e-infra-assets/data.bin" for item in discard_preview["retained_s3"]),
-            "infrastructure discard reports retained S3 boundary versions",
+            any(
+                item["object"] == "e2e-infra-assets/data.bin"
+                for item in discard_preview["s3_purge"]["queued"]
+            ),
+            "infrastructure discard reports S3 paths queued for permanent deletion",
         )
         discarded = self.wm(
             self.shared,
@@ -1098,8 +1101,9 @@ class Harness:
         )
         self.check(local_branch.returncode == 128, "infrastructure discard deletes its local branch")
         self.check(
-            self.list_s3_versions() == versions_before_discard,
-            "infrastructure discard does not purge versioned S3 content",
+            all(item["key"] != infra_discarded_key for item in self.list_s3_versions())
+            and discarded["s3_purge"]["status"] == "deleted",
+            "infrastructure discard permanently purges unreferenced versioned S3 content",
         )
         self.assert_shared_head()
 
@@ -1234,6 +1238,7 @@ class Harness:
         versions_v1 = self.list_s3_versions()
         self.check(len(versions_v1) >= 3, "MinIO contains DVC payload versions")
         self.check(all(item["version_id"] not in ("", "null") for item in versions_v1), "all S3 objects have version IDs")
+        beta_key = self.s3_version_for_body(bundle_v1_b)["key"]
         config_before_relocation = (self.shared / ".workspace-mgr.toml").read_bytes()
         internal_before_repair = (self.shared / ".dvc" / "config").read_bytes()
         damaged_internal = b"# damaged generated configuration with live pointers\n"
@@ -1341,6 +1346,10 @@ class Harness:
         self.check(published_v2["storage"]["s3"]["verification"]["mode"] == "version-aware", "retry verifies exact S3 versions")
         versions_v2 = self.list_s3_versions()
         self.check(len(versions_v2) > len(versions_v1), "S3 retains additional immutable versions")
+        self.check(
+            all(item["key"] != beta_key for item in versions_v2),
+            "publishing a directory deletion permanently removes every S3 version at the deleted child path",
+        )
         bodies_v2 = self.s3_bodies()
         for payload in (v2, bundle_v2_a, bundle_v2_c):
             self.check(payload in bodies_v2, "S3 contains exact version-two payload", payload=payload.decode().strip())
@@ -1424,6 +1433,7 @@ class Harness:
         self.check(move_dry["status"] == "dry_run", "move dry-run succeeds")
         self.check(data.exists() and not task.joinpath("moved.bin").exists(), "move dry-run changes no files")
         versions_before_move = self.list_s3_versions()
+        old_data_key = self.s3_version_for_body(v3)["key"]
         remote_before_move = self.remote_ref(branch)
         moved = self.wm(task, "move", old_path, new_path)
         self.check(moved["status"] == "updated", "S3 boundary moves locally")
@@ -1440,6 +1450,10 @@ class Harness:
         assert moved_oid is not None
         self.check(self.remote_path_exists(moved_oid, f"{task_id}/moved.bin.dvc"), "moved pointer exists in remote Git tree")
         self.check(not self.remote_path_exists(moved_oid, f"{task_id}/data.bin.dvc"), "old pointer is absent from remote Git tree")
+        self.check(
+            all(item["key"] != old_data_key for item in self.list_s3_versions()),
+            "publishing a move permanently removes every S3 version at the old path",
+        )
 
         reset_dry = self.wm(task, "storage", "reset", "--dry-run", f"{task_id}/moved.bin")
         self.check(reset_dry["status"] == "dry_run", "placement reset dry-run succeeds")
@@ -1454,6 +1468,7 @@ class Harness:
         self.check(moved_output.read_bytes() == v3, "reset preserves output")
         reset_status = self.wm(task, "storage", "status", f"{task_id}/moved.bin")
         self.check(reset_status["placements"][0]["target"] == "s3", "status keeps the published S3 placement")
+        moved_key = self.s3_version_for_body(v3)["key"]
         to_git = self.wm(
             task,
             "storage",
@@ -1472,6 +1487,10 @@ class Harness:
         assert untracked_oid is not None
         self.check(self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin"), "reset output becomes ordinary Git content")
         self.check(not self.remote_path_exists(untracked_oid, f"{task_id}/moved.bin.dvc"), "reset S3 metadata is absent from Git")
+        self.check(
+            all(item["key"] != moved_key for item in self.list_s3_versions()),
+            "publishing an S3-to-Git transition permanently removes every S3 version at the old object path",
+        )
         self.check(self.remote_path_exists(untracked_oid, f"{task_id}/bundle.dvc"), "other S3 boundary remains stored")
         self.check(self.wm(task, "plan")["status"] == "no_changes", "storage lifecycle ends cleanly")
 
@@ -1509,6 +1528,7 @@ class Harness:
         )
         first = self.wm(task, "publish", "-m", "Publish the initial task topic")
         first_oid = first["remote_oid"]
+        old_artifact_key = self.s3_version_for_body(payload)["key"]
         self.check(
             self.remote_path_exists(first_oid, f"{task_id}/artifact.bin.dvc"),
             "initial published tree contains the S3 pointer",
@@ -1616,6 +1636,10 @@ class Harness:
             "renamed publication removes the old tree and publishes the new tree",
         )
         self.check(
+            all(item["key"] != old_artifact_key for item in self.list_s3_versions()),
+            "renamed publication permanently removes every S3 version at the old task path",
+        )
+        self.check(
             self.wm(renamed_task, "task", "status")["slug"] == "current-topic",
             "task status reports the current slug separately from stable identity",
         )
@@ -1638,6 +1662,30 @@ class Harness:
             hydrated["status"] == "hydrated"
             and (renamed_task / "artifact.bin").read_bytes() == payload,
             "renamed S3 boundary hydrates its exact published payload",
+        )
+        renamed_artifact_key = self.s3_version_for_body(payload)["key"]
+        removed = self.wm(
+            renamed_task,
+            "remove",
+            f"{renamed_id}/artifact.bin",
+        )
+        self.check(
+            removed["status"] == "updated"
+            and removed["remote_writes"] is False
+            and not (renamed_task / "artifact.bin").exists()
+            and not (renamed_task / "artifact.bin.dvc").exists(),
+            "explicit remove deletes a complete S3 boundary locally without touching remotes",
+        )
+        removed_publish = self.wm(
+            renamed_task,
+            "publish",
+            "-m",
+            "Publish permanent artifact deletion",
+        )
+        self.check(removed_publish["status"] == "pushed", "explicit S3 deletion publishes")
+        self.check(
+            all(item["key"] != renamed_artifact_key for item in self.list_s3_versions()),
+            "publishing remove permanently deletes every S3 version at the removed path",
         )
 
     def refresh_and_cross_clone(self, task_id: str, task: Path, branch: str) -> None:
@@ -1954,12 +2002,12 @@ class Harness:
             "--to",
             "s3",
             "--reason",
-            "Exercise discard reporting without permanent S3 deletion.",
+            "Exercise discard reporting with permanent S3 deletion.",
         )
         published = self.wm(task, "publish", "-m", "Publish disposable E2E task")
         self.check(self.remote_ref(branch) == published["remote_oid"], "disposable task reaches network Git")
         self.check(payload in self.s3_bodies(), "disposable task reaches versioned S3")
-        versions_before_discard = self.list_s3_versions()
+        discarded_key = self.s3_version_for_body(payload)["key"]
         shared_head = self.git(self.shared, "rev-parse", "main").stdout.strip()
 
         preview = self.wm(task, "task", "discard", "--dry-run")
@@ -1975,14 +2023,13 @@ class Harness:
             and preview["local_actions"][0]["action"] == "delete",
             "discard reports the exact deliverable directory",
         )
-        retained = next(
-            item
-            for item in preview["retained_s3"]
-            if item["boundary"] == f"{task_id}/artifact.bin"
-        )
         self.check(
-            retained["version_ids"] and retained["disposition"] == "retained-not-purged",
-            "discard reports exact S3 retention without purging",
+            preview["s3_purge"]["status"] == "planned"
+            and any(
+                item["object"] == f"{task_id}/artifact.bin"
+                for item in preview["s3_purge"]["queued"]
+            ),
+            "discard reports exact S3 paths queued for permanent deletion",
         )
         confirmation_plan = Path(preview["confirmation_plan"])
         self.check(confirmation_plan.is_file(), "discard dry-run saves private confirmation state")
@@ -2013,8 +2060,9 @@ class Harness:
         )
         self.check(local_branch.returncode == 128, "deliverable discard deletes its local branch")
         self.check(
-            self.list_s3_versions() == versions_before_discard,
-            "deliverable discard preserves all versioned S3 objects",
+            all(item["key"] != discarded_key for item in self.list_s3_versions())
+            and discarded["s3_purge"]["status"] == "deleted",
+            "deliverable discard permanently removes every S3 version owned only by its branch",
         )
         self.check(
             self.git(self.shared, "rev-parse", "main").stdout.strip() == shared_head,

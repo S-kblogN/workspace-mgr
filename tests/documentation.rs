@@ -77,6 +77,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "storage reset",
         "storage hydrate",
         "move",
+        "remove",
         "plan",
         "publish",
         "refresh",
@@ -106,10 +107,11 @@ fn user_documentation_covers_the_complete_public_model() {
     }
     assert!(guide.contains("S3 first, then Git"));
     assert!(guide.contains("Before every writable-task turn ends"));
+    assert!(guide.contains("Upload S3, publish Git, then purge obsolete S3 paths"));
     assert!(guide.contains("Nested placement boundaries"));
     assert!(guide.contains("small-s3-boundary"));
     assert!(guide.contains("semantic-placement-review"));
-    assert!(guide.contains("retained-not-purged"));
+    assert!(guide.contains("permanently deletes every version"));
     assert!(commands.contains("force-with-lease"));
     assert!(normalized_model.contains("explicit opposite endpoint"));
     assert!(normalized_model.contains("current slug is a mutable topic label"));

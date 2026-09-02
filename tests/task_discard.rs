@@ -265,7 +265,7 @@ fn published_deliverable_discard_deletes_branches_and_restores_additional_scopes
 }
 
 #[test]
-fn discard_reports_but_does_not_purge_versioned_s3_boundaries() {
+fn discard_reports_the_s3_purge_plan() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
     workspace(&fixture.shared, ["init"]);
@@ -277,10 +277,7 @@ fn discard_reports_but_does_not_purge_versioned_s3_boundaries() {
     )
     .unwrap();
     let preview = workspace(&task, ["task", "discard", "--dry-run"]);
-    let retained = &json(&preview)["retained_s3"][0];
-    assert_eq!(retained["boundary"], format!("{task_id}/artifact.bin"));
-    assert_eq!(retained["version_ids"][0], "exact-version-1");
-    assert_eq!(retained["disposition"], "retained-not-purged");
+    assert_eq!(json(&preview)["s3_purge"]["status"], "planned");
 
     workspace(
         &fixture.shared,

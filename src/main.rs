@@ -17,6 +17,7 @@ mod policy;
 mod process;
 mod refresh;
 mod runtime;
+mod s3_purge;
 mod scaffold;
 mod storage;
 mod task_rename;
@@ -195,6 +196,13 @@ fn run(cli: Cli) -> Result<()> {
                     &args.new_path,
                     args.dry_run,
                 )?,
+                cli.format,
+            )
+        }
+        Command::Remove(args) => {
+            let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
+            emit(
+                &storage::remove_paths(&repo, &config, &scopes, &args.paths, args.dry_run)?,
                 cli.format,
             )
         }

@@ -20,6 +20,7 @@ use crate::policy::{
     REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST,
     REVIEW_SYNC_CADENCE, TASK_MANIFEST_NAME,
 };
+use crate::s3_purge;
 
 const STORAGE_GITIGNORE: &str = "/config.local\n/tmp\n/cache\n";
 const STORAGE_IGNORE: &str =
@@ -159,11 +160,17 @@ pub fn init(options: &InitOptions) -> Result<InitReport> {
         detect_git_defaults(&repo, &mut config)?;
         config
     };
+    let previous_s3 = config.s3.clone();
     if let Some(url) = &options.s3_url {
         config.s3 = Some(S3Config {
             url: url.clone(),
             endpoint_url: options.s3_endpoint_url.clone(),
         });
+    }
+    if previous_s3 != config.s3 && s3_purge::has_pending(&repo)? {
+        return Err(Error::message(
+            "cannot change the managed S3 location while permanent deletions remain pending; run `workspace-mgr refresh` or `workspace-mgr publish` first",
+        ));
     }
     config.validate()?;
     repo.validate_remote_name(&config.git.remote)?;

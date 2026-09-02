@@ -10,6 +10,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::path::{reject_symlink_traversal, repo_path, resolved_under};
+use crate::s3_purge::{self, PurgeReport};
 
 #[derive(Debug, Clone)]
 pub struct RefreshOptions {
@@ -46,6 +47,7 @@ pub struct RefreshStorageReport {
     pub new_prepared: Option<PreparedRevision>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub materialized: Vec<String>,
+    pub purge: PurgeReport,
 }
 
 pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
@@ -104,6 +106,11 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let old_dvc = existing_at(&repo, &old_oid, &incoming_dvc)?;
     let new_dvc = existing_at(&repo, &new_oid, &incoming_dvc)?;
     let working_before = working_changes(&repo)?;
+    let purge_candidates = if old_oid == new_oid {
+        Vec::new()
+    } else {
+        s3_purge::candidates_between(&repo, &config, &old_oid, &new_oid, &[])?
+    };
     let mut report = RefreshReport {
         status: if old_oid == new_oid {
             "no_changes"
@@ -128,10 +135,18 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
             old_prepared: None,
             new_prepared: None,
             materialized: Vec::new(),
+            purge: s3_purge::preview(&repo)?,
         },
         method: None,
     };
+    report.storage.purge.queued = purge_candidates.clone();
     if old_oid == new_oid {
+        if !options.dry_run {
+            report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
+            if !report.storage.purge.deleted.is_empty() {
+                report.status = "s3_purged".to_owned();
+            }
+        }
         return Ok(report);
     }
 
@@ -146,6 +161,8 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         report.status = "dry_run".to_owned();
         return Ok(report);
     }
+
+    s3_purge::queue(&repo, &purge_candidates)?;
 
     let mut outputs_absent_before = Vec::new();
     if !incoming_dvc.is_empty() {
@@ -239,6 +256,8 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         .to_owned(),
     );
     report.working_changes_after = working_changes(&repo)?;
+    report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
+    report.storage.purge.queued = purge_candidates;
     Ok(report)
 }
 

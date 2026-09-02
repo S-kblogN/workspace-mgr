@@ -342,10 +342,11 @@ infrastructure worktree, restores declared shared paths to the local shared
 branch, and clears private task state. Local deliverable content is quarantined
 until the remote deletion succeeds so a failure can restore it.
 
-Discard never permanently deletes S3 object versions. Its report lists current
-managed S3 boundaries and version candidates as `retained-not-purged`; older
-unreferenced versions may also remain. Permanent shared-storage garbage
-collection is a separate, explicitly authorized problem.
+Discard queues the task's managed S3 object paths before deleting its branch,
+then permanently deletes every version at paths no current remote branch or tag
+still references. Its report distinguishes deleted paths from protected pending
+paths. A later publish, refresh, or discard retries protected paths after their
+last current reference disappears.
 
 ### 9. Refresh after merge
 
@@ -397,12 +398,12 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks and collisions | None |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
-| `task discard --confirm` | Removes an unmerged task workspace and local refs | Git ref verification | Deletes only the exact remote task branch |
-| `storage set`, `storage reset`, `move` | Changes local content/placement metadata | None | None |
+| `task discard --confirm` | Removes an unmerged task workspace and local refs | Git and S3 reference verification | Deletes the exact remote task branch, then purges unreferenced S3 paths |
+| `storage set`, `storage reset`, `move`, `remove` | Changes local content/placement metadata | None | None |
 | `storage hydrate` | Materializes S3 content | S3 | None |
 | `plan` | Creates ignored/private preview state | Git refs and S3 bucket settings when configured | None |
-| `publish` | Updates private state and a local target ref | Git and S3 verification | S3 first, then Git |
-| `refresh` | Fast-forwards and materializes incoming content | Git and, when needed, S3 | None |
+| `publish` | Updates private state and a local target ref | Git and S3 verification | Upload S3, publish Git, then purge obsolete S3 paths |
+| `refresh` | Fast-forwards, materializes incoming content, and retries pending purge | Git and, when needed, S3 | Deletes pending unreferenced S3 paths |
 
 Most `--dry-run` forms suppress normal local mutation. `task discard --dry-run`
 also saves its private revision-bound confirmation plan; it changes no task
@@ -414,8 +415,10 @@ The Git commit is the publication point for a combined Git-and-S3 transaction.
 A Git revision is never intentionally published before all content it references
 is present and verified in S3. If a later Git operation fails, an unreferenced
 S3 object version may remain, but the remote Git branch must not point to
-missing content. Retrying `publish` is safe; automatic cleanup of shared remote
-versions is deliberately outside the product boundary.
+missing content. Retrying `publish` is safe. Once Git publication succeeds,
+object paths removed by a delete, move, rename, or S3-to-Git transition are
+permanently purged, including all older versions at those paths. Current remote
+branches and tags defer deletion until the last live reference disappears.
 
 All repository paths accepted by task, storage, plan, and publish operations are
 repository-relative and must remain inside the resolved scopes. A refusal is a

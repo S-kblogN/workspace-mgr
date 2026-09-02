@@ -197,7 +197,8 @@ identity-derived cleanup scope, preserves published Git/S3 placement at the new
 path, and `publish` deletes the old tree while advancing the same branch.
 Because version-aware S3 IDs are bound to object paths, rename clears those old
 bindings from moved pointers; publish creates and verifies new object versions
-at the new path while retaining the old versions.
+at the new path, publishes Git, then permanently deletes every version at the
+old path unless another current remote branch or tag still references it.
 
 ```sh
 workspace-mgr task rename current-research-question --dry-run
@@ -237,8 +238,8 @@ report includes:
 - the task directory or worktree to delete;
 - each additional deliverable scope to restore from the local shared branch;
 - whether the agent must close a pull request or verify that none exists;
-- current local or published managed S3 boundaries and recorded exact version
-  IDs, all marked `retained-not-purged`.
+- current local or published managed S3 object paths and recorded exact version
+  IDs queued for permanent deletion after the branch is removed.
 
 After explicit user authorization, the agent verifies the task is unmerged,
 closes the matching pull request if it exists, and verifies that provider state.
@@ -264,8 +265,11 @@ remote failure restores quarantined paths and their prior index state.
 Infrastructure confirmation removes the entire managed worktree.
 
 The CLI is provider-neutral and cannot verify pull-request state itself; the
-report makes that agent responsibility explicit. Discard never permanently
-deletes versioned S3 objects or older remote-storage history.
+report makes that agent responsibility explicit. Before branch deletion,
+discard queues every versioned S3 object path owned by the task. After the Git
+branch is removed, it permanently deletes every version of paths that no
+current remote branch or tag still references. Protected paths remain pending
+and are retried by a later publish, refresh, or discard.
 
 ## `workspace-mgr storage status`
 
@@ -369,8 +373,28 @@ Both paths must remain inside the resolved scopes, the source must exist, and
 the destination must not. A move may stay within a containing directory
 boundary or move the boundary itself; it may not cross into or out of another
 directory boundary. The command changes local desired state only. A later
-`publish` writes the new S3 object path when applicable and retains earlier
-remote versions.
+`publish` writes and verifies the new S3 object path, publishes the Git revision,
+then permanently deletes every version of the old path unless another current
+remote branch or tag still references it.
+
+## `workspace-mgr remove`
+
+Delete ordinary Git content, a complete S3 boundary, or a descendant inside an
+S3 directory boundary without interpreting an unhydrated output as deletion.
+
+```text
+workspace-mgr remove <path>...
+  [--manifest <path>]
+  [--include <path> --scope-note <reason>]
+  [--repo <path>] [--dry-run]
+```
+
+The command changes local desired state only and refuses to remove an entire
+task scope; use confirmed task discard for that. A later `publish` first makes
+the deletion authoritative in Git, then permanently deletes every S3 version
+at object paths removed by the operation. Current remote branches and tags are
+reference guards, so protected objects remain in private pending state until a
+later `publish`, `refresh`, or discard can delete them safely.
 
 ## `workspace-mgr plan`
 
