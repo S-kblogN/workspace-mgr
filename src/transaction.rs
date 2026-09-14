@@ -201,6 +201,15 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         scopes.dedup();
     }
 
+    let local_only = storage::local_boundaries(&repo, &scopes)?;
+    for boundary in &local_only {
+        let pointer = format!("{boundary}.dvc");
+        if local_path_exists(&resolved_under(&repo.root, &pointer))? {
+            return Err(Error::message(format!(
+                "managed-storage metadata {pointer:?} conflicts with local-only content {boundary:?}; run `workspace-mgr untrack {boundary}` again to reconcile local retention, or run `workspace-mgr storage set {boundary} --to git|s3 --reason <reason>` to restore tracking explicitly"
+            )));
+        }
+    }
     let initial_dvc = dvc::discover(&repo, &scopes)?;
     let initial_outputs = dvc::output_paths(&repo, &initial_dvc)?;
     let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
@@ -210,9 +219,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         fs::remove_file(&preview_index).at(&preview_index)?;
     }
     repo.run_with_index(&preview_index, ["read-tree", &base_oid], None, true)?;
+    remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
     stage_scopes(&repo, &preview_index, &scopes)?;
     remove_stored_outputs_from_index(&repo, &preview_index, &initial_outputs)?;
     remove_output_paths_from_index(&repo, &preview_index, preview_automatic_s3.iter())?;
+    remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
     let preview_paths = changed_paths(&repo, &preview_index, &base_oid)?;
     validate_private_index(
         &repo,
@@ -259,8 +270,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             fs::remove_file(&preflight_index).at(&preflight_index)?;
         }
         repo.run_with_index(&preflight_index, ["read-tree", &base_oid], None, true)?;
+        remove_output_paths_from_index(&repo, &preflight_index, local_only.iter())?;
         stage_scopes(&repo, &preflight_index, &scopes)?;
         remove_stored_outputs_from_index(&repo, &preflight_index, &preflight_outputs)?;
+        remove_output_paths_from_index(&repo, &preflight_index, local_only.iter())?;
         let preflight_paths = changed_paths(&repo, &preflight_index, &base_oid)?;
         validate_private_index(
             &repo,
@@ -277,10 +290,32 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         )?;
     }
     let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
+    let mut purge_preview = s3_purge::preview(&repo)?;
+    if !local_only.is_empty() {
+        let retired_pointers = local_only
+            .iter()
+            .map(|path| {
+                format!(
+                    "{}.dvc",
+                    published_history_path(
+                        path,
+                        task.task_path.as_deref(),
+                        published_task_path.as_deref(),
+                    )
+                )
+            })
+            .collect::<Vec<_>>();
+        purge_preview.queued =
+            s3_purge::candidates_for_revision(&repo, &config, &base_oid, &retired_pointers)?;
+        if !purge_preview.queued.is_empty() {
+            purge_preview.status = "pending_publication".to_owned();
+        }
+    }
     let storage_report = serde_json::json!({
         "placement": placement,
+        "local_only": local_only,
         "s3": s3,
-        "purge": s3_purge::preview(&repo)?,
+        "purge": purge_preview,
     });
 
     let index = state_dir.join("index");
@@ -288,9 +323,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         fs::remove_file(&index).at(&index)?;
     }
     repo.run_with_index(&index, ["read-tree", &base_oid], None, true)?;
+    remove_output_paths_from_index(&repo, &index, local_only.iter())?;
     stage_scopes(&repo, &index, &scopes)?;
     remove_stored_outputs_from_index(&repo, &index, &s3.outputs)?;
     remove_output_paths_from_index(&repo, &index, automatic_s3.iter())?;
+    remove_output_paths_from_index(&repo, &index, local_only.iter())?;
     let paths = changed_paths(&repo, &index, &base_oid)?;
     validate_private_index(
         &repo,
@@ -481,6 +518,9 @@ fn validate_private_index(
 fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
     let mut present = Vec::new();
     for scope in scopes {
+        if storage::is_local(repo, scope)? {
+            continue;
+        }
         let exists = match fs::symlink_metadata(resolved_under(&repo.root, scope)) {
             Ok(_) => true,
             Err(error)
@@ -530,7 +570,8 @@ fn remove_output_paths_from_index<'a>(
 ) -> Result<()> {
     let mut tracked = BTreeSet::new();
     for output in outputs {
-        let listed = repo.run_with_index(index, ["ls-files", "-z", "--", output], None, true)?;
+        let literal = format!(":(literal){output}");
+        let listed = repo.run_with_index(index, ["ls-files", "-z", "--", &literal], None, true)?;
         tracked.extend(
             listed
                 .stdout
@@ -761,6 +802,9 @@ fn check_large_files(
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     for relative in repo.visible_paths(scopes)? {
+        if storage::is_local(repo, &relative)? {
+            continue;
+        }
         let absolute = resolved_under(&repo.root, &relative);
         let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
         if !metadata.is_file()

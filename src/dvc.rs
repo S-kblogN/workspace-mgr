@@ -277,8 +277,17 @@ struct PointerFile {
 pub fn discover(repo: &GitRepo, scopes: &[String]) -> Result<Vec<String>> {
     let mut found = BTreeSet::new();
     for path in repo.visible_paths(scopes)? {
+        if crate::storage::is_local(repo, &path)? {
+            continue;
+        }
         let absolute = resolved_under(&repo.root, &path);
         if absolute.extension().and_then(|value| value.to_str()) != Some("dvc") {
+            continue;
+        }
+        let boundary = path
+            .strip_suffix(".dvc")
+            .expect("the metadata extension was checked above");
+        if crate::storage::is_local(repo, boundary)? {
             continue;
         }
         let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;

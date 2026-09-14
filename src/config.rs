@@ -37,6 +37,8 @@ pub struct S3Config {
 pub enum StorageTarget {
     Git,
     S3,
+    #[value(skip)]
+    Local,
 }
 
 impl Default for GitConfig {

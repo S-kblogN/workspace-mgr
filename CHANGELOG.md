@@ -5,6 +5,15 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `workspace-mgr untrack <path>...` keeps local bytes, adds managed ignore rules,
+  and records durable local-only placement. Publication removes payloads from
+  Git and queues obsolete S3 versions for reference-protected permanent cleanup.
+- Local-only placement is reported by storage status and plan, survives
+  publication and post-merge refresh, and can be explicitly restored to Git or
+  S3 with `storage set`.
+
 ## [0.2.2] - 2026-08-30
 
 ### Changed

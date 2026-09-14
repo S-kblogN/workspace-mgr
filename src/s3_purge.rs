@@ -209,7 +209,7 @@ fn pointers_at(repo: &GitRepo, revision: &str, scopes: &[String]) -> Result<Vec<
     if scopes.is_empty() {
         args.push(".".to_owned());
     } else {
-        args.extend(scopes.iter().cloned());
+        args.extend(scopes.iter().map(|scope| format!(":(literal){scope}")));
     }
     let mut pointers = repo
         .run(args)?

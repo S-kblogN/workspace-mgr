@@ -135,11 +135,16 @@ Every retained path has one storage placement:
 - **S3 is the artifact and data plane.** It is appropriate when content is
   consumed as an exact object, changes atomically, or should be hydrated on
   demand.
+- **Local-only content stays on the current machine.** `untrack` preserves its
+  bytes and records an explicit `local` placement plus a managed ignore rule.
+  Git retains these small control records but excludes the payload; S3 content
+  is cleaned after publication when no remote branch or tag still references
+  it. New clones do not receive the payload.
 
 The agent understands why content exists, so it makes the semantic choice when
 that intent is clear and records the reason with `storage set`. The CLI does not
-guess from filename extensions. A user may explicitly choose either location
-at any size, and that instruction takes priority.
+guess from filename extensions. A user's explicit placement instruction takes
+priority at any size.
 
 Size is a fallback for new content whose semantics have not been selected. A
 new boundary below 1 MiB strongly defaults to Git. From 1 through 10 MiB, Git
@@ -165,6 +170,10 @@ Placement operations describe or change local intent:
   reason, payload size/file count, and any structured warning.
 - `storage set` records an explicit Git or S3 choice.
 - `storage reset` removes that choice and returns the path to fixed policy.
+- `untrack` explicitly keeps a file or complete boundary local only. Repeated
+  publication does not track it again, and post-merge `refresh` preserves any
+  existing local bytes. Re-track it with `storage set --to git|s3`; a local-only
+  choice cannot be cleared with `storage reset`.
 - `move` changes a path while preserving its placement.
 - `storage hydrate` retrieves exact S3 content into the local workspace.
 
@@ -225,7 +234,7 @@ If Git publication fails after an S3 upload, an unreferenced S3 object version
 may remain, but no remote Git revision should point to missing content.
 Retrying the same publication is safe. After Git publication succeeds, the CLI
 permanently deletes every version at S3 object paths removed by deletion, move,
-rename, or S3-to-Git placement. A current remote branch or tag defers deletion
+rename, untrack, or S3-to-Git placement. A current remote branch or tag defers deletion
 until a later publish, refresh, or discard observes that the reference is gone.
 
 Discard is deliberately a two-step destructive operation. Its dry run records
@@ -275,7 +284,7 @@ The complete story is:
    aligned with the current purpose and outputs. If the topic changes, `task
    rename` updates its current slug without replacing its branch or review.
 7. Retained artifacts are placed in Git or S3 automatically or by an explicit
-   user or agent choice.
+   user or agent choice. An explicit `untrack` choice keeps content local only.
 8. At every turn end, `plan` explains the proposed reviewable state, `publish`
    advances the task branch when needed, and the agent updates and verifies the
    matching draft pull request.

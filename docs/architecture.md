@@ -61,7 +61,7 @@ scope.
 
 ## Placement lifecycle
 
-Content has one public placement: Git or S3.
+Content has one placement: Git, S3, or explicit local-only state.
 
 - Git represents collaboration/control-plane history; S3 represents
   artifact/data-plane object history. An explicit choice and reason carry the
@@ -73,6 +73,18 @@ Content has one public placement: Git or S3.
 - `storage reset` removes that choice and reapplies automatic policy.
 - `move` preserves placement while changing a path.
 - `storage hydrate` reads exact S3 content into the working tree.
+- `untrack` records `target = "local"` in the existing placement sidecar and
+  maintains a literal anchored rule in the parent `.gitignore`. It removes S3
+  pointers while preserving the payload. The sidecar is the durable intent;
+  ignore rules alone cannot remove already tracked Git files.
+
+Local boundaries are excluded from automatic placement and explicitly removed
+from every private publication index. Only their sidecars and ignore rules are
+published. S3 cleanup reuses the reference-protected purge transaction.
+`refresh` reads incoming and pending local placement to keep payload bytes
+through merged Git deletions, without requiring retired S3 data to be fetched.
+An explicit `storage set --to git|s3` resumes tracking and removes only the
+managed ignore rule; reset does not implicitly resume tracking.
 
 These commands do not publish. Automatic policy is evaluated during `plan` and
 `publish`; existing published content is not silently moved because its size

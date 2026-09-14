@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use crate::policy::{AUTO_S3_ABOVE_BYTES, RECOMMENDED_S3_MINIMUM_BYTES, TASK_MANI
 
 pub const PLACEMENT_SUFFIX: &str = ".workspace-mgr-storage.toml";
 const PLACEMENT_SCHEMA: u32 = 1;
+const LOCAL_REASON: &str = "Keep payload only in this checkout";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,8 +114,23 @@ pub fn set(
     reason: &str,
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
+    if target == StorageTarget::Local {
+        return Err(Error::message(
+            "use `workspace-mgr untrack <path>` to keep content local only",
+        ));
+    }
     let paths = validate_targets(repo, scopes, paths, true)?;
     validate_boundary_targets(repo, scopes, &paths)?;
+    let local = paths
+        .iter()
+        .filter_map(|path| match is_local(repo, path) {
+            Ok(true) => Some(Ok(path.clone())),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_local_metadata_scope(repo, scopes, &local)?;
+    validate_retrack_ignores(repo, &local)?;
     let reason = one_line(reason, "storage placement reason")?;
     if target == StorageTarget::S3 && !config.s3_enabled() {
         return Err(Error::message(
@@ -130,6 +146,9 @@ pub fn set(
         let snapshot = MetadataSnapshot::capture(repo, &paths)?;
         let result = (|| {
             for path in &paths {
+                if local.contains(path) {
+                    update_local_ignore(repo, path, false)?;
+                }
                 apply_target(repo, config, path, target)?;
                 write_placement(repo, path, target, &reason)?;
             }
@@ -165,6 +184,120 @@ pub fn set(
     })
 }
 
+/// Keep payload bytes in this checkout while retiring Git and S3 publication.
+pub fn untrack(
+    repo: &GitRepo,
+    config: &Config,
+    scopes: &[String],
+    paths: &[String],
+    dry_run: bool,
+) -> Result<StorageOperationReport> {
+    let paths = validate_targets(repo, scopes, paths, false)?;
+    if paths.is_empty() {
+        return Err(Error::message(
+            "untrack requires at least one file or complete storage boundary",
+        ));
+    }
+    validate_boundary_targets(repo, scopes, &paths)?;
+    validate_local_metadata_scope(repo, scopes, &paths)?;
+    let mut already_local = BTreeSet::new();
+    for path in &paths {
+        reject_control_path(repo, path)?;
+        let absolute = resolved_under(&repo.root, path);
+        let existing = read_placement(repo, path)?;
+        if existing
+            .as_ref()
+            .is_some_and(|value| value.target == StorageTarget::Local)
+        {
+            already_local.insert(path.clone());
+            continue;
+        }
+        if !absolute.exists() {
+            return Err(Error::message(format!(
+                "cannot untrack {path:?} without a local payload; run `workspace-mgr storage hydrate {path}` first if it is stored in S3"
+            )));
+        }
+        if absolute.is_dir() && existing.is_none() && !pointer_path(repo, path).is_file() {
+            return Err(Error::message(format!(
+                "directory {path:?} is not a complete storage boundary; select an existing boundary or first run `workspace-mgr storage set {path} --to git --reason <reason>`"
+            )));
+        }
+        for file in payload_paths(repo, path)? {
+            // Ignore files inside a complete boundary are part of its payload;
+            // the boundary's owned rule lives outside it, in its parent.
+            if Path::new(&file)
+                .file_name()
+                .is_some_and(|name| name == ".gitignore")
+                && file != *path
+            {
+                continue;
+            }
+            reject_control_path(repo, &file)?;
+        }
+    }
+    // Capture and validate metadata even in dry-run, so previews catch unsafe paths.
+    let snapshot = MetadataSnapshot::capture(repo, &paths)?;
+    let mut replacements = BTreeMap::new();
+    for path in &paths {
+        let ignore = local_ignore_path(path)?;
+        let original = replacements
+            .entry(ignore.clone())
+            .or_insert(read_ignore(repo, &ignore)?);
+        *original = with_local_ignore(original, path, true)?;
+    }
+    let metadata_paths = paths
+        .iter()
+        .map(|path| format!("{path}{PLACEMENT_SUFFIX}"))
+        .chain(replacements.keys().cloned())
+        .collect::<Vec<_>>();
+    validate_unignored(repo, &metadata_paths, &replacements, "local-only metadata")?;
+    if !dry_run {
+        let result = (|| {
+            for path in &paths {
+                apply_target(repo, config, path, StorageTarget::Local)?;
+                update_local_ignore(repo, path, true)?;
+                write_placement(repo, path, StorageTarget::Local, LOCAL_REASON)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(rollback_error(error, snapshot.restore()));
+        }
+    }
+    let placements = paths
+        .iter()
+        .map(|path| {
+            if already_local.contains(path) {
+                return Ok(PlacementStatus {
+                    path: path.clone(),
+                    boundary: path.clone(),
+                    target: StorageTarget::Local,
+                    basis: PlacementBasis::Explicit,
+                    payload_bytes: None,
+                    payload_files: None,
+                    reason: Some(LOCAL_REASON.to_owned()),
+                    warnings: Vec::new(),
+                });
+            }
+            placement_report(
+                repo,
+                path,
+                path,
+                StorageTarget::Local,
+                PlacementBasis::Explicit,
+                Some(LOCAL_REASON.to_owned()),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(StorageOperationReport {
+        status: if dry_run { "dry_run" } else { "updated" }.to_owned(),
+        operation: "untrack".to_owned(),
+        paths,
+        placements,
+        remote_writes: false,
+    })
+}
+
 pub fn reset(
     repo: &GitRepo,
     config: &Config,
@@ -174,6 +307,13 @@ pub fn reset(
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
     validate_boundary_targets(repo, scopes, &paths)?;
+    for path in &paths {
+        if is_local(repo, path)? {
+            return Err(Error::message(format!(
+                "cannot reset local-only content {path:?} automatically; run `workspace-mgr storage set {path} --to git|s3 --reason <reason>` to resume tracking explicitly"
+            )));
+        }
+    }
     let history = task_history(repo, config, scopes)?;
     let desired = paths
         .iter()
@@ -253,6 +393,16 @@ pub fn move_path(
     }
     let old_container = inherited_boundary(repo, &old_path)?;
     let new_container = inherited_boundary(repo, &new_path)?;
+    if is_local(repo, &old_path)?
+        || is_local(repo, &new_path)?
+        || local_boundaries(repo, scopes)?
+            .iter()
+            .any(|path| is_descendant(path, &old_path))
+    {
+        return Err(Error::message(
+            "move of or within local-only content is not supported; explicitly restore tracking with `workspace-mgr storage set <boundary> --to git|s3 --reason <reason>` first",
+        ));
+    }
     if old_container.as_ref().map(|boundary| &boundary.path)
         != new_container.as_ref().map(|boundary| &boundary.path)
     {
@@ -312,6 +462,17 @@ pub fn remove_paths(
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
     let paths = validate_targets(repo, scopes, paths, true)?;
+    let local = local_boundaries(repo, scopes)?;
+    for path in &paths {
+        if local
+            .iter()
+            .any(|boundary| is_descendant(boundary, path) || is_descendant(path, boundary))
+        {
+            return Err(Error::message(format!(
+                "remove {path:?} intersects a local-only boundary; remove the complete local-only boundary instead"
+            )));
+        }
+    }
     for (index, path) in paths.iter().enumerate() {
         if scopes.iter().any(|scope| scope == path) {
             return Err(Error::message(format!(
@@ -335,6 +496,10 @@ pub fn remove_paths(
         .collect::<Result<Vec<_>>>()?;
     if !dry_run {
         for path in &paths {
+            if local.contains(path) {
+                validate_local_metadata_scope(repo, scopes, std::slice::from_ref(path))?;
+                update_local_ignore(repo, path, false)?;
+            }
             let pointer = pointer_path(repo, path);
             if pointer.is_file() {
                 dvc::management(
@@ -414,6 +579,9 @@ pub fn apply_automatic(
     let mut candidates = Vec::new();
     let mut decisions = Vec::new();
     for path in repo.visible_paths(scopes)? {
+        if is_local(repo, &path)? {
+            continue;
+        }
         let absolute = resolved_under(&repo.root, &path);
         let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -422,7 +590,10 @@ pub fn apply_automatic(
         if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
             continue;
         }
-        if explicit_target(repo, &path)? == Some(StorageTarget::Git) {
+        if matches!(
+            explicit_target(repo, &path)?,
+            Some(StorageTarget::Git | StorageTarget::Local)
+        ) {
             continue;
         }
         let object = format!("{base_oid}:{}", history.object_path(&path));
@@ -492,10 +663,68 @@ pub fn explicit_target(repo: &GitRepo, path: &str) -> Result<Option<StorageTarge
     Ok(inherited_boundary(repo, path)?.and_then(|boundary| boundary.explicit_target))
 }
 
+pub fn is_local(repo: &GitRepo, path: &str) -> Result<bool> {
+    Ok(explicit_target(repo, path)? == Some(StorageTarget::Local))
+}
+
+pub fn local_boundaries(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String>> {
+    let mut result = BTreeSet::new();
+    for path in repo.visible_paths(scopes)? {
+        if let Some(boundary) = path.strip_suffix(PLACEMENT_SUFFIX) {
+            if read_placement(repo, boundary)?
+                .is_some_and(|value| value.target == StorageTarget::Local)
+            {
+                result.insert(boundary.to_owned());
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub fn local_boundaries_at(repo: &GitRepo, oid: &str) -> Result<BTreeSet<String>> {
+    let mut result = BTreeSet::new();
+    for entry in repo
+        .run(["ls-tree", "-r", "-z", oid])?
+        .stdout
+        .split('\0')
+        .filter(|value| !value.is_empty())
+    {
+        let Some((header, path)) = entry.split_once('\t') else {
+            return Err(Error::message(
+                "invalid Git tree while reading local-only boundaries",
+            ));
+        };
+        let Some(boundary) = path.strip_suffix(PLACEMENT_SUFFIX) else {
+            continue;
+        };
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || !matches!(fields[0], "100644" | "100755") || fields[1] != "blob" {
+            return Err(Error::message(format!(
+                "storage placement metadata is not a regular file: {path}"
+            )));
+        }
+        let object = fields[2];
+        let raw = repo.run(["cat-file", "blob", object])?.stdout;
+        let placement: PlacementFile = toml::from_str(&raw).map_err(|source| Error::Toml {
+            path: repo.root.join(path),
+            source,
+        })?;
+        if placement.schema_version != PLACEMENT_SCHEMA {
+            return Err(Error::message(format!(
+                "unsupported placement metadata schema in {path}"
+            )));
+        }
+        if placement.target == StorageTarget::Local {
+            result.insert(repo_path(boundary, "local-only boundary")?);
+        }
+    }
+    Ok(result)
+}
+
 fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarget) -> Result<()> {
     let pointer = pointer_path(repo, path);
     match target {
-        StorageTarget::Git if pointer.is_file() => {
+        StorageTarget::Git | StorageTarget::Local if pointer.is_file() => {
             dvc::management(
                 repo,
                 config,
@@ -794,7 +1023,12 @@ fn warning_relevant_boundaries(
 ) -> Result<Vec<PlacementStatus>> {
     known_boundaries(repo, scopes)?
         .into_iter()
-        .map(|path| placement_status(repo, config, &path, Some(history)))
+        .filter_map(|path| match is_local(repo, &path) {
+            Ok(true) => None,
+            Ok(false) => Some(Ok(path)),
+            Err(error) => Some(Err(error)),
+        })
+        .map(|path| path.and_then(|path| placement_status(repo, config, &path, Some(history))))
         .filter_map(|status| match status {
             Ok(status) if !status.warnings.is_empty() => Some(Ok(status)),
             Ok(_) => None,
@@ -1098,6 +1332,260 @@ fn read_placement(repo: &GitRepo, path: &str) -> Result<Option<PlacementFile>> {
         )));
     }
     Ok(Some(placement))
+}
+
+fn reject_control_path(repo: &GitRepo, path: &str) -> Result<()> {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let task_readme = name == "README.md"
+        && Path::new(path)
+            .parent()
+            .is_some_and(|parent| repo.root.join(parent).join(TASK_MANIFEST_NAME).is_file());
+    if name == ".gitignore"
+        || task_readme
+        || name == TASK_MANIFEST_NAME
+        || name == crate::config::CONFIG_NAME
+        || name.ends_with(PLACEMENT_SUFFIX)
+        || name.ends_with(".dvc")
+        || path.split('/').any(|part| part == ".git" || part == ".dvc")
+    {
+        return Err(Error::message(format!(
+            "untrack may not hide task or storage control metadata: {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn local_ignore_path(path: &str) -> Result<String> {
+    let parent = Path::new(path)
+        .parent()
+        .ok_or_else(|| Error::message("local-only path has no parent"))?;
+    Ok(crate::path::to_slash(&parent.join(".gitignore")))
+}
+
+fn validate_local_metadata_scope(
+    repo: &GitRepo,
+    scopes: &[String],
+    paths: &[String],
+) -> Result<()> {
+    for path in paths {
+        if scopes.iter().any(|scope| scope == path) && resolved_under(&repo.root, path).is_dir() {
+            return Err(Error::message(format!(
+                "untrack may not hide an entire declared scope: {path}"
+            )));
+        }
+        for metadata in [
+            format!("{path}{PLACEMENT_SUFFIX}"),
+            format!("{path}.dvc"),
+            local_ignore_path(path)?,
+        ] {
+            if !allowed(&metadata, scopes) {
+                return Err(Error::message(format!(
+                    "local-only metadata {metadata:?} escapes the declared scope; include its parent directory in the task scope first"
+                )));
+            }
+            reject_symlink_traversal(&repo.root, &metadata, "local-only metadata")?;
+        }
+    }
+    Ok(())
+}
+
+fn read_ignore(repo: &GitRepo, path: &str) -> Result<Vec<u8>> {
+    reject_symlink_traversal(&repo.root, path, "Git ignore file")?;
+    let absolute = resolved_under(&repo.root, path);
+    match fs::read(&absolute) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(Error::Io {
+            path: absolute,
+            source,
+        }),
+    }
+}
+
+fn with_local_ignore(contents: &[u8], path: &str, add: bool) -> Result<Vec<u8>> {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::message("local-only path must have a UTF-8 file name"))?;
+    let key = crate::hex::encode_lower(name.as_bytes());
+    let begin = format!("# workspace-mgr local begin {key}");
+    let end = format!("# workspace-mgr local end {key}");
+    let mut pattern = String::from("/");
+    for character in name.chars() {
+        if matches!(character, '\\' | '*' | '?' | '[' | ']' | '!' | '#' | ' ') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    let block = format!("\n{begin}\n{pattern}\n{end}\n");
+    let mut result = contents.to_vec();
+    if let Some(start) = result
+        .windows(block.len())
+        .position(|part| part == block.as_bytes())
+    {
+        if add {
+            return Ok(result);
+        }
+        result.drain(start..start + block.len());
+        return Ok(result);
+    }
+    if result
+        .windows(begin.len())
+        .any(|part| part == begin.as_bytes())
+        || result.windows(end.len()).any(|part| part == end.as_bytes())
+    {
+        return Err(Error::message(format!(
+            "managed local-only ignore rule for {path:?} was edited; restore its original block before changing tracking"
+        )));
+    }
+    if add {
+        result.extend_from_slice(block.as_bytes());
+    }
+    Ok(result)
+}
+
+fn update_local_ignore(repo: &GitRepo, path: &str, add: bool) -> Result<()> {
+    let ignore = local_ignore_path(path)?;
+    let original = read_ignore(repo, &ignore)?;
+    let updated = with_local_ignore(&original, path, add)?;
+    if updated != original {
+        atomic_write_bytes(&resolved_under(&repo.root, &ignore), &updated)?;
+    }
+    Ok(())
+}
+
+fn payload_paths(repo: &GitRepo, path: &str) -> Result<Vec<String>> {
+    let root = resolved_under(&repo.root, path);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for entry in WalkDir::new(&root).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            Error::message(format!("cannot inspect local-only payload: {error}"))
+        })?;
+        if entry.file_type().is_symlink()
+            || !(entry.file_type().is_file() || entry.file_type().is_dir())
+        {
+            return Err(Error::message(format!(
+                "local-only payload must contain regular files and directories: {}",
+                entry.path().display()
+            )));
+        }
+        if entry.file_type().is_file() {
+            result.push(relative_to(entry.path(), &repo.root, "local-only payload")?);
+        }
+    }
+    Ok(result)
+}
+
+fn validate_retrack_ignores(repo: &GitRepo, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut replacements = BTreeMap::new();
+    let mut probes = Vec::new();
+    for path in paths {
+        let ignore = local_ignore_path(path)?;
+        let contents = replacements
+            .entry(ignore.clone())
+            .or_insert(read_ignore(repo, &ignore)?);
+        *contents = with_local_ignore(contents, path, false)?;
+        probes.push(path.clone());
+        probes.extend(payload_paths(repo, path)?);
+    }
+    validate_unignored(
+        repo,
+        &probes,
+        &replacements,
+        "content being restored to tracking",
+    )
+}
+
+/// Ask Git to evaluate the resulting rules without modifying the real checkout,
+/// including global excludes and .git/info/exclude from this repository.
+fn validate_unignored(
+    repo: &GitRepo,
+    probes: &[String],
+    replacements: &BTreeMap<String, Vec<u8>>,
+    description: &str,
+) -> Result<()> {
+    let shadow = tempfile::tempdir().map_err(|source| Error::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let mut ignores = BTreeSet::new();
+    for path in probes {
+        let mut directory = Path::new(path).parent();
+        while let Some(parent) = directory {
+            ignores.insert(crate::path::to_slash(&parent.join(".gitignore")));
+            directory = parent.parent();
+        }
+        let absolute = resolved_under(shadow.path(), path);
+        if resolved_under(&repo.root, path).is_dir() {
+            fs::create_dir_all(&absolute).at(&absolute)?;
+        } else {
+            if let Some(parent) = absolute.parent() {
+                fs::create_dir_all(parent).at(parent)?;
+            }
+            fs::write(&absolute, []).at(&absolute)?;
+        }
+    }
+    for ignore in ignores {
+        let contents = match replacements.get(&ignore) {
+            Some(contents) => contents.clone(),
+            None => read_ignore(repo, &ignore)?,
+        };
+        if !contents.is_empty() {
+            atomic_write_bytes(&resolved_under(shadow.path(), &ignore), &contents)?;
+        }
+    }
+    let mut input = probes.join("\0");
+    input.push('\0');
+    let git_dir = repo.git_dir()?;
+    let git_dir = git_dir.canonicalize().at(&git_dir)?;
+    let mut args = vec![
+        "--git-dir".to_owned(),
+        git_dir.to_string_lossy().into_owned(),
+        "--work-tree".to_owned(),
+        shadow.path().to_string_lossy().into_owned(),
+    ];
+    let excludes = repo.run_unchecked(["config", "--path", "--get", "core.excludesFile"])?;
+    if excludes.success() && !excludes.stdout.trim().is_empty() {
+        let configured = Path::new(excludes.stdout.trim());
+        let absolute = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            repo.root.join(configured)
+        };
+        args.extend([
+            "-c".to_owned(),
+            format!("core.excludesFile={}", absolute.display()),
+        ]);
+    }
+    args.extend(["check-ignore", "--no-index", "-z", "--stdin"].map(str::to_owned));
+    let output = crate::process::run_with(
+        "git",
+        args,
+        shadow.path(),
+        &BTreeMap::new(),
+        Some(&input),
+        false,
+    )?;
+    match output.code {
+        0 => Err(Error::message(format!(
+            "{description} is still excluded by user Git ignore rules: {}; adjust those rules explicitly before retrying",
+            output.stdout.trim_end_matches('\0').replace('\0', ", ")
+        ))),
+        1 => Ok(()),
+        _ => Err(Error::message(format!(
+            "cannot validate Git ignore rules: {}",
+            output.stderr.trim()
+        ))),
+    }
 }
 
 fn write_placement(repo: &GitRepo, path: &str, target: StorageTarget, reason: &str) -> Result<()> {

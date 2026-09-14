@@ -206,6 +206,13 @@ fn run(cli: Cli) -> Result<()> {
                 cli.format,
             )
         }
+        Command::Untrack(args) => {
+            let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
+            emit(
+                &storage::untrack(&repo, &config, &scopes, &args.paths, args.dry_run)?,
+                cli.format,
+            )
+        }
         Command::Refresh(args) => emit(
             &refresh(&RefreshOptions {
                 repo: args.repo,
