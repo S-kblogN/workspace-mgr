@@ -367,6 +367,7 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
 
     // A restored old pointer must not publish newer local-only bytes under
     // conflicting metadata. Both previews and publication refuse it first.
+    let retained_ignores = std::fs::read(task.join(".gitignore")).unwrap();
     std::fs::write(task.join("data.bin.dvc"), &published_pointer).unwrap();
     for args in [
         vec!["plan"],
@@ -389,6 +390,10 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
     workspace(&task, ["untrack", &path]);
     assert!(!task.join("data.bin.dvc").exists());
     assert_eq!(
+        std::fs::read(task.join(".gitignore")).unwrap(),
+        retained_ignores
+    );
+    assert_eq!(
         std::fs::read(task.join("data.bin")).unwrap(),
         b"new local-only content\n"
     );
@@ -402,7 +407,10 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
         "no_changes"
     );
 
-    workspace(
+    // The alternative recovery API must rebuild both metadata and the DVC
+    // ignore rule from the current local payload before publication.
+    std::fs::write(task.join("data.bin.dvc"), &published_pointer).unwrap();
+    let retracked = json(&workspace(
         &task,
         [
             "storage",
@@ -413,7 +421,14 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
             "--reason",
             "Share the local payload again.",
         ],
+    ));
+    assert_eq!(retracked["remote_writes"], false);
+    assert_eq!(remote_snapshot(&remote), remote_before);
+    assert_ne!(
+        std::fs::read(task.join("data.bin.dvc")).unwrap(),
+        published_pointer
     );
+    git(&fixture.shared, ["check-ignore", "--no-index", "--", &path]);
     let restored = json(&workspace(&task, ["publish", "-m", "Restore S3 tracking"]));
     let restored_oid = restored["commit_oid"].as_str().unwrap();
     assert!(tree_contains(

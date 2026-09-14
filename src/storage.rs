@@ -148,6 +148,9 @@ pub fn set(
             for path in &paths {
                 if local.contains(path) {
                     update_local_ignore(repo, path, false)?;
+                    // A restored old pointer must not bypass creation of fresh
+                    // storage metadata and DVC ignore rules when re-tracking.
+                    apply_target(repo, config, path, StorageTarget::Git)?;
                 }
                 apply_target(repo, config, path, target)?;
                 write_placement(repo, path, target, &reason)?;
@@ -254,7 +257,19 @@ pub fn untrack(
     if !dry_run {
         let result = (|| {
             for path in &paths {
+                let retained_ignore = if is_local(repo, path)? && pointer_path(repo, path).is_file()
+                {
+                    let ignore = local_ignore_path(path)?;
+                    Some((ignore.clone(), read_ignore(repo, &ignore)?))
+                } else {
+                    None
+                };
                 apply_target(repo, config, path, StorageTarget::Local)?;
+                if let Some((ignore, contents)) = retained_ignore {
+                    // DVC remove may strip its former output pattern from our
+                    // managed block. Once local, these rules belong to us.
+                    atomic_write_bytes(&resolved_under(&repo.root, &ignore), &contents)?;
+                }
                 update_local_ignore(repo, path, true)?;
                 write_placement(repo, path, StorageTarget::Local, LOCAL_REASON)?;
             }
