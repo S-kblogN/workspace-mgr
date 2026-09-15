@@ -5,14 +5,39 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-14
+
 ### Added
 
+- `workspace-mgr remove <path>...` explicitly deletes a file or complete storage
+  boundary and schedules obsolete S3 content for permanent cleanup after
+  publication.
 - `workspace-mgr untrack <path>...` keeps local bytes, adds managed ignore rules,
   and records durable local-only placement. Publication removes payloads from
   Git and queues obsolete S3 versions for reference-protected permanent cleanup.
 - Local-only placement is reported by storage status and plan, survives
   publication and post-merge refresh, and can be explicitly restored to Git or
   S3 with `storage set`.
+
+### Changed
+
+- Deletions, moves, task renames, S3-to-Git transitions, untracking, and task
+  discard permanently purge all versions and delete markers at retired S3
+  object paths. Current
+  remote branches and tags protect referenced content; pending cleanup is
+  retried by publication, refresh, or discard after those references disappear.
+  Git history is retained, but old revisions cannot hydrate purged S3 content.
+
+### Fixed
+
+- Refresh preserves local-only payloads after merged Git deletions and S3
+  retirement, including local edits and cases where old remote data or caches
+  are unavailable. Failed refresh rolls back metadata without replacing the
+  retained bytes.
+- Conflicting stale S3 pointers are rejected before publication and can be
+  reconciled through `untrack` or explicit re-tracking without damaging owned
+  ignore rules.
+- Updated rustls to 0.23.45 to address RUSTSEC-2026-0285.
 
 ## [0.2.2] - 2026-08-30
 
