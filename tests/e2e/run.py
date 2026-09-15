@@ -1851,6 +1851,179 @@ class Harness:
         self.check((consumer_task / "bundle" / "alpha.txt").read_bytes() == b"bundle alpha version three\n", "cross-clone S3 hydration is exact")
         self.check((consumer_task / "notes.txt").read_text(encoding="utf-8") == "task-only content\n", "cross-clone hydration restores Git-to-S3 content")
 
+    def exercise_untrack(self) -> None:
+        assert self.shared is not None
+        self.section("local retention, remote reference protection, and permanent S3 purge")
+        task_id = "20260914-120000-local-retention"
+        branch = "codex/local-retention"
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "local-retention",
+            "--title",
+            "Local retention",
+            "--purpose",
+            "Preserve local files while retiring their Git and S3 copies.",
+            "--timestamp",
+            "20260914-120000",
+        )
+        task = Path(created["path"])
+        git_path = f"{task_id}/retained.txt"
+        s3_path = f"{task_id}/retained.bin"
+        git_payload = task / "retained.txt"
+        s3_payload = task / "retained.bin"
+        git_bytes = b"Git content retained locally\n"
+        s3_v1 = b"S3 content retained locally, version one\n"
+        s3_v2 = b"S3 content retained locally, version two\n"
+        git_payload.write_bytes(git_bytes)
+        s3_payload.write_bytes(s3_v1)
+        self.wm(
+            task,
+            "storage",
+            "set",
+            s3_path,
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise retirement of versioned S3 content.",
+        )
+        self.wm(task, "publish", "-m", "Publish retained content version one")
+        s3_key = self.s3_version_for_body(s3_v1)["key"]
+        s3_payload.write_bytes(s3_v2)
+        second = self.wm(task, "publish", "-m", "Publish retained content version two")
+        latest_version = self.s3_version_for_body(s3_v2)
+        self.check(
+            latest_version["key"] == s3_key,
+            "both retained S3 versions share one object path",
+        )
+        self.merge_branch_to_main(branch)
+        self.wm(self.shared, "refresh")
+        tag = "untrack-retention-guard"
+        self.git(self.shared, "push", "origin", f"{second['remote_oid']}:refs/tags/{tag}")
+
+        versions_before = self.list_s3_versions()
+        index_path = self.shared / ".git" / "index"
+        index_before = index_path.read_bytes()
+        ignore_before = (task / ".gitignore").read_bytes()
+        s3_placement = task / "retained.bin.workspace-mgr-storage.toml"
+        placement_before = s3_placement.read_bytes()
+        dry = self.wm(task, "untrack", git_path, s3_path, "--dry-run")
+        self.check(dry["status"] == "dry_run", "untrack dry-run reports local retention")
+        self.check(
+            (task / ".gitignore").read_bytes() == ignore_before
+            and s3_placement.read_bytes() == placement_before
+            and not (task / "retained.txt.workspace-mgr-storage.toml").exists()
+            and (task / "retained.bin.dvc").is_file(),
+            "untrack dry-run preserves all local tracking metadata",
+        )
+        untracked = self.wm(task, "untrack", git_path, s3_path)
+        self.check(
+            untracked["remote_writes"] is False
+            and all(item["target"] == "local" for item in untracked["placements"]),
+            "untrack records explicit local placement without remote writes",
+        )
+        self.check(
+            git_payload.read_bytes() == git_bytes and s3_payload.read_bytes() == s3_v2,
+            "untrack retains both Git and S3 payload bytes",
+        )
+        self.check(not (task / "retained.bin.dvc").exists(), "untrack removes the S3 pointer")
+        self.check(
+            self.list_s3_versions() == versions_before
+            and self.remote_ref(branch) == second["remote_oid"],
+            "untrack changes neither S3 versions nor the published Git branch",
+        )
+        plan = self.wm(task, "plan")
+        self.check(
+            {git_path, s3_path}.issubset(set(plan["storage"]["local_only"]))
+            and git_path in plan["changed_paths"]
+            and f"{s3_path}.dvc" in plan["changed_paths"],
+            "plan exposes retained local boundaries and Git deletion records",
+        )
+        self.check(
+            plan["storage"]["purge"]["status"] == "pending_publication"
+            and any(
+                item["pointer"] == f"{s3_path}.dvc"
+                and f"dvc/{item['object']}" == s3_key
+                and item["version_id"] == latest_version["version_id"]
+                for item in plan["storage"]["purge"]["queued"]
+            )
+            and self.list_s3_versions() == versions_before,
+            "plan previews the exact retired S3 object and version without deleting it",
+        )
+        published = self.wm(task, "publish", "-m", "Keep Git and S3 content local only")
+        published_oid = published["remote_oid"]
+        self.check(
+            all(
+                not self.remote_path_exists(published_oid, path)
+                for path in (git_path, s3_path, f"{s3_path}.dvc")
+            )
+            and all(
+                self.remote_path_exists(published_oid, f"{path}.workspace-mgr-storage.toml")
+                for path in (git_path, s3_path)
+            ),
+            "published tree retains placement intent and removes payloads and S3 pointer",
+        )
+        self.check(
+            published["storage"]["purge"]["status"] == "protected"
+            and published["storage"]["purge"]["pending"]
+            and self.list_s3_versions() == versions_before,
+            "live main and tag references keep every retired S3 version pending",
+        )
+        self.check(index_path.read_bytes() == index_before, "untrack and publish preserve the shared index")
+        local_s3_bytes = b"edited local-only S3 content after publication\n"
+        s3_payload.write_bytes(local_s3_bytes)
+        self.check(self.wm(task, "plan")["status"] == "no_changes", "editing retained content creates no publication change")
+        repeated = self.wm(task, "publish", "-m", "Retry protected local-retention cleanup")
+        self.check(
+            repeated["status"] == "no_changes"
+            and repeated["storage"]["purge"]["pending"]
+            and self.list_s3_versions() == versions_before,
+            "repeat publication neither uploads local content nor loses protected cleanup",
+        )
+
+        merged_oid = self.merge_branch_to_main(branch)
+        refreshed = self.wm(self.shared, "refresh")
+        self.check(
+            refreshed["status"] == "updated" and refreshed["new_oid"] == merged_oid,
+            "refresh materializes the merged local-retention transition",
+        )
+        self.check(
+            git_payload.read_bytes() == git_bytes
+            and s3_payload.read_bytes() == local_s3_bytes,
+            "merge and refresh preserve both clean Git bytes and edited S3 bytes locally",
+        )
+        self.check(
+            refreshed["storage"]["purge"]["status"] == "protected"
+            and refreshed["storage"]["purge"]["pending"]
+            and self.list_s3_versions() == versions_before,
+            "the remote tag independently protects retired S3 versions after main is merged",
+        )
+        self.git(self.shared, "push", "origin", f":refs/tags/{tag}")
+        cleaned = self.wm(self.shared, "refresh")
+        self.check(
+            cleaned["status"] == "s3_purged"
+            and cleaned["storage"]["purge"]["status"] == "deleted"
+            and cleaned["storage"]["purge"]["pending"] == [],
+            "refresh retries and completes cleanup after the last remote reference disappears",
+        )
+        remaining = self.s3.list_object_versions(Bucket=self.bucket, Prefix=s3_key)
+        self.check(
+            not remaining.get("Versions") and not remaining.get("DeleteMarkers"),
+            "cleanup permanently removes every old S3 version and delete marker",
+        )
+        self.check(
+            git_payload.read_bytes() == git_bytes
+            and s3_payload.read_bytes() == local_s3_bytes,
+            "permanent remote cleanup leaves local payload bytes intact",
+        )
+        self.check(
+            self.wm(task, "plan")["status"] == "no_changes"
+            and self.wm(self.shared, "refresh")["status"] == "no_changes",
+            "completed local-retention lifecycle is idempotent",
+        )
+        self.assert_shared_head(merged_oid)
+
     def exercise_automatic_and_explicit_git(self) -> None:
         assert self.shared is not None
         self.section("automatic S3 placement and explicit large-file Git override")
@@ -2125,6 +2298,7 @@ class Harness:
         self.rename_published_task()
         self.create_and_publish_infrastructure_task()
         self.refresh_and_cross_clone(task_id, task, branch)
+        self.exercise_untrack()
         self.exercise_automatic_and_explicit_git()
         self.discard_published_deliverable()
         self.exercise_non_fast_forward_refresh_guard()

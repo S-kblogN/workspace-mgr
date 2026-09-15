@@ -273,7 +273,7 @@ and are retried by a later publish, refresh, or discard.
 
 ## `workspace-mgr storage status`
 
-Explain effective Git/S3 placement.
+Explain effective Git/S3 placement or explicit local-only state.
 
 ```text
 workspace-mgr storage status [<path> ...]
@@ -302,6 +302,10 @@ workspace-mgr storage status 20260829-180000-report/results/model.bin
 
 Record an explicit Git or S3 placement.
 
+For a local-only path, this explicitly resumes tracking and removes only the
+ignore rule owned by `untrack`. User-authored ignore rules are preserved; if
+they still prevent tracking, resolve the reported conflict first.
+
 ```text
 workspace-mgr storage set <path>... --to git|s3 --reason <reason>
   [--manifest <path>]
@@ -329,6 +333,8 @@ workspace-mgr storage set 20260829-180000-report/data \
 Remove an explicit choice and return paths to automatic policy. Published
 placement remains sticky: resetting a published S3 boundary keeps it in S3;
 use `storage set --to git` for an intentional placement change.
+Local-only paths refuse reset: use an explicit `storage set --to git|s3` to
+resume tracking.
 
 ```text
 workspace-mgr storage reset <path>...
@@ -395,6 +401,58 @@ the deletion authoritative in Git, then permanently deletes every S3 version
 at object paths removed by the operation. Current remote branches and tags are
 reference guards, so protected objects remain in private pending state until a
 later `publish`, `refresh`, or discard can delete them safely.
+
+## `workspace-mgr untrack`
+
+Keep content locally, add a managed ignore rule, and remove its payload from
+Git and S3 on the next publication.
+
+```text
+workspace-mgr untrack <path>...
+  [--manifest <path>]
+  [--include <path> --scope-note <reason>]
+  [--repo <path>] [--dry-run]
+```
+
+The command preserves local bytes, writes a placement sidecar with `target =
+"local"`, adds an anchored literal rule to the parent `.gitignore`, and removes
+any S3 pointer for the boundary. The sidecar and ignore rule remain in Git;
+the payload does not. It writes no remote and does not modify the shared Git
+index. Repeating it is safe and does not duplicate ignore rules. `--dry-run`
+previews the change without modifying local files or metadata.
+
+The first conversion requires materialized content. If the S3 output is absent,
+run `storage hydrate <path>` first. Local-only placement remains valid on a new
+clone where the payload has never existed. A directory is one recursive local
+boundary. An ordinary directory must first be selected as a boundary with
+`storage set <directory> --to git --reason <reason>`. Nested placement
+boundaries, task control files, and entire task
+scopes cannot be untracked; operate on a complete existing boundary or first
+reorganize its placement. The payload, sidecar, and parent `.gitignore` must
+all be inside the authorized scopes.
+
+`plan` reports `storage.local_only`, the Git changes, and retired S3 versions
+in `storage.purge.queued`. `publish` first publishes the Git deletion, then
+permanently cleans obsolete S3 object versions. Current remote branches and
+tags can defer cleanup; for example, `main` protects the previous S3 content
+until the deletion is merged. A later `publish` or `refresh` retries pending
+cleanup. Git history is not rewritten.
+
+After merge, `refresh` retains existing local-only bytes. Automatic placement,
+publication, and hydration do not upload or recreate them. Resume tracking with
+`storage set <path> --to git|s3 --reason <reason>`; `storage reset` deliberately
+refuses to resume tracking implicitly.
+
+`move` currently refuses local-only boundaries and their descendants; resume
+tracking before using managed moves. `remove` can delete a complete local-only
+boundary, including its owned ignore rule.
+
+```sh
+workspace-mgr untrack 20260829-180000-report/data.bin --dry-run
+workspace-mgr untrack 20260829-180000-report/data.bin
+workspace-mgr plan
+workspace-mgr publish -m "Keep data.bin local only"
+```
 
 ## `workspace-mgr plan`
 

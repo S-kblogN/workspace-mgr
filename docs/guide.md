@@ -227,6 +227,33 @@ choice allows its files to be evaluated independently during planning and
 publication. A published S3 directory remains one sticky S3 boundary until an
 explicit `storage set --to git` moves it.
 
+To retain existing bytes only on this machine, use `untrack`:
+
+```sh
+workspace-mgr untrack task/path/data.bin --dry-run
+workspace-mgr untrack task/path/data.bin
+workspace-mgr plan
+workspace-mgr publish -m "Keep data.bin local only"
+```
+
+This records `target = "local"` and an exact managed `.gitignore` rule while
+preserving the payload. Publication removes the payload from Git and queues
+obsolete S3 versions for permanent cleanup. References from other remote
+branches or tags defer cleanup until they disappear. Git history is retained.
+After merge, `refresh` keeps the local copy, and future publication does not
+upload it again. A new clone receives the placement record and ignore rule,
+but no payload. Hydrate absent S3 content before the initial untrack operation.
+
+Operate on a standalone file or complete directory boundary; untracking a
+child of an existing storage boundary is refused. To resume tracking, use
+`storage set <path> --to git|s3 --reason <reason>`. This removes only the tool's
+ignore rule; conflicting user rules are reported and preserved. Local-only
+paths refuse `storage reset` so a reset cannot accidentally upload private
+local content.
+
+For an ordinary directory without a placement boundary, first select it with
+`storage set <directory> --to git --reason <reason>`, then untrack that boundary.
+
 ### 6. Inspect and materialize placement
 
 ```sh
@@ -235,8 +262,8 @@ workspace-mgr storage status task/path/dataset/example.csv
 workspace-mgr storage hydrate task/path/dataset
 ```
 
-With no paths, `storage status` lists ordinary Git content plus explicit or
-published S3 boundaries in the resolved task scopes. A directory boundary is
+With no paths, `storage status` lists ordinary Git content plus explicit,
+local-only, or published S3 boundaries in the resolved task scopes. A directory boundary is
 shown once rather than once per descendant. For a selected path,
 `basis` explains the result:
 
@@ -399,7 +426,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
 | `task discard --confirm` | Removes an unmerged task workspace and local refs | Git and S3 reference verification | Deletes the exact remote task branch, then purges unreferenced S3 paths |
-| `storage set`, `storage reset`, `move`, `remove` | Changes local content/placement metadata | None | None |
+| `storage set`, `storage reset`, `move`, `remove`, `untrack` | Changes local content/placement metadata | None | None |
 | `storage hydrate` | Materializes S3 content | S3 | None |
 | `plan` | Creates ignored/private preview state | Git refs and S3 bucket settings when configured | None |
 | `publish` | Updates private state and a local target ref | Git and S3 verification | S3 first, then Git, then purge obsolete S3 paths |
@@ -416,7 +443,7 @@ A Git revision is never intentionally published before all content it references
 is present and verified in S3. If a later Git operation fails, an unreferenced
 S3 object version may remain, but the remote Git branch must not point to
 missing content. Retrying `publish` is safe. Once Git publication succeeds,
-object paths removed by a delete, move, rename, or S3-to-Git transition are
+object paths removed by a delete, move, rename, untrack, or S3-to-Git transition are
 permanently purged, including all older versions at those paths. Current remote
 branches and tags defer deletion until the last live reference disappears.
 

@@ -11,6 +11,11 @@ The public model has two storage locations:
 - **S3** stores content as versioned objects while Git records the small metadata
   needed to reproduce that exact state.
 
+Content can also be explicitly kept **local only** with `untrack`: its bytes
+stay in the working tree, while a small placement record and managed
+`.gitignore` rule prevent future publication. New clones do not receive those
+bytes.
+
 Users and agents choose between those concepts; the lower-level engines remain
 implementation details.
 
@@ -49,6 +54,7 @@ workspace-mgr storage status
 workspace-mgr storage set path/to/data --to s3 --reason "Retained dataset"
 workspace-mgr storage set path/to/report.pdf --to git --reason "Review in Git"
 workspace-mgr remove path/to/obsolete-data
+workspace-mgr untrack path/to/local-data
 workspace-mgr plan
 workspace-mgr publish -m "Publish the deliverable"
 ```
@@ -64,11 +70,11 @@ When a conversation's topic changes, `task rename <new-slug>` moves the complete
 deliverable directory and updates task metadata while preserving the immutable
 task ID, target branch, and existing pull request. The next ordinary `publish`
 removes the previously published path and publishes the new one. `storage set`,
-`storage reset`, `move`, and `remove` change local desired state only.
+`storage reset`, `move`, `remove`, and `untrack` change local desired state only.
 `storage hydrate` reads from S3. `plan` is read-only. `publish` is the only
 command that publishes repository content, and it verifies S3 before publishing
 a Git revision. It then permanently deletes every S3 version at object paths
-removed by delete, move, rename, or S3-to-Git placement; current remote branches
+removed by delete, move, rename, untrack, or S3-to-Git placement; current remote branches
 and tags defer deletion until the last live reference disappears. If the user
 instead decides to retain none of the task, the
 agent closes its unmerged pull request and uses `task discard --dry-run` followed
@@ -94,6 +100,13 @@ size is reported. `move` preserves a path's placement, and `remove` explicitly
 deletes a file or boundary without confusing an unhydrated S3 output for an
 intentional deletion. `storage hydrate` materializes S3 content without
 publishing.
+
+`untrack` keeps a materialized file or complete storage boundary locally and
+adds an exact ignore rule. After publication, its payload is absent from the
+task's Git tree and obsolete S3 versions are queued for permanent cleanup.
+`refresh` preserves the local copy after the change is merged. Use
+`storage set <path> --to git|s3 --reason <reason>` to track it again; `storage
+reset` does not undo a local-only choice. Git commit history remains available.
 
 ## Agent instructions
 

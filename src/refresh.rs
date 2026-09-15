@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,7 @@ use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::path::{reject_symlink_traversal, repo_path, resolved_under};
 use crate::s3_purge::{self, PurgeReport};
+use crate::storage;
 
 #[derive(Debug, Clone)]
 pub struct RefreshOptions {
@@ -48,6 +49,11 @@ pub struct RefreshStorageReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub materialized: Vec<String>,
     pub purge: PurgeReport,
+}
+
+struct StorageOverlay {
+    contents: Option<String>,
+    checkout_output: bool,
 }
 
 pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
@@ -102,9 +108,43 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         .filter(|path| !path.ends_with(".dvc"))
         .cloned()
         .collect();
+    let old_local_boundaries = storage::local_boundaries_at(&repo, &old_oid)?;
+    let mut local_boundaries = storage::local_boundaries_at(&repo, &new_oid)?;
+    // A pending local choice must survive an unrelated upstream publication.
+    // A published local choice may be explicitly replaced upstream; normal
+    // overlay checks still preserve any existing payload when that happens.
+    local_boundaries.extend(
+        storage::local_boundaries(&repo, &[])?
+            .difference(&old_local_boundaries)
+            .cloned(),
+    );
+    let incoming_git: Vec<String> = incoming_git
+        .into_iter()
+        .filter(|path| !overlaps_local_boundary(path, &local_boundaries))
+        .collect();
     let materialized_git_paths = safe_git_materialization_paths(&repo, &old_oid, &incoming_git)?;
     let old_dvc = existing_at(&repo, &old_oid, &incoming_dvc)?;
     let new_dvc = existing_at(&repo, &new_oid, &incoming_dvc)?;
+    let retired_local_pointers: BTreeSet<String> = incoming_dvc
+        .iter()
+        .filter(|pointer| {
+            !new_dvc.contains(pointer)
+                && pointer
+                    .strip_suffix(".dvc")
+                    .is_some_and(|path| overlaps_local_boundary(path, &local_boundaries))
+        })
+        .cloned()
+        .collect();
+    for pointer in &new_dvc {
+        if pointer
+            .strip_suffix(".dvc")
+            .is_some_and(|path| overlaps_local_boundary(path, &local_boundaries))
+        {
+            return Err(Error::message(format!(
+                "incoming storage metadata {pointer:?} conflicts with a local-only placement; resolve that placement before refreshing"
+            )));
+        }
+    }
     let working_before = working_changes(&repo)?;
     let purge_candidates = if old_oid == new_oid {
         Vec::new()
@@ -153,8 +193,21 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let overlays = if incoming_dvc.is_empty() {
         BTreeMap::new()
     } else {
-        let overlays = capture_overlays(&repo, &old_oid, &new_oid, &incoming_dvc)?;
-        dvc::validate_worktree(&repo, &config, &incoming_dvc)?;
+        let overlays = capture_overlays(
+            &repo,
+            &old_oid,
+            &new_oid,
+            &incoming_dvc,
+            &retired_local_pointers,
+        )?;
+        let updated_pointers: Vec<String> = incoming_dvc
+            .iter()
+            .filter(|pointer| !retired_local_pointers.contains(*pointer))
+            .cloned()
+            .collect();
+        if !updated_pointers.is_empty() {
+            dvc::validate_worktree(&repo, &config, &updated_pointers)?;
+        }
         overlays
     };
     if options.dry_run {
@@ -166,7 +219,15 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
 
     let mut outputs_absent_before = Vec::new();
     if !incoming_dvc.is_empty() {
-        let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_dvc)?;
+        // Retiring a local-only boundary changes its metadata, never its
+        // payload. Its old remote versions may already have been purged, and
+        // neither refresh nor rollback needs them to retain the local bytes.
+        let old_checkout_pointers: Vec<String> = old_dvc
+            .iter()
+            .filter(|pointer| !retired_local_pointers.contains(*pointer))
+            .cloned()
+            .collect();
+        let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_checkout_pointers)?;
         let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &new_dvc)?;
         for output in new_prepared.outputs.values().flatten() {
             reject_symlink_traversal(&repo.root, output, "incoming managed-storage output")?;
@@ -334,7 +395,8 @@ fn capture_overlays(
     old: &str,
     new: &str,
     paths: &[String],
-) -> Result<BTreeMap<String, Option<String>>> {
+    retired_local_pointers: &BTreeSet<String>,
+) -> Result<BTreeMap<String, StorageOverlay>> {
     let mut conflicts = Vec::new();
     let mut overlays = BTreeMap::new();
     for path in paths {
@@ -343,8 +405,14 @@ fn capture_overlays(
         let old_content = file_at(repo, old, path)?;
         let new_content = file_at(repo, new, path)?;
         if !candidate.exists() {
-            overlays.insert(path.clone(), None);
-            if old_content.is_some() {
+            overlays.insert(
+                path.clone(),
+                StorageOverlay {
+                    contents: None,
+                    checkout_output: false,
+                },
+            );
+            if old_content.is_some() && !retired_local_pointers.contains(path) {
                 conflicts.push(path.clone());
             }
             continue;
@@ -354,7 +422,13 @@ fn capture_overlays(
             continue;
         }
         let current = fs::read_to_string(&candidate).at(&candidate)?;
-        overlays.insert(path.clone(), Some(current.clone()));
+        overlays.insert(
+            path.clone(),
+            StorageOverlay {
+                contents: Some(current.clone()),
+                checkout_output: !retired_local_pointers.contains(path),
+            },
+        );
         if Some(&current) != old_content.as_ref() && Some(&current) != new_content.as_ref() {
             conflicts.push(path.clone());
         }
@@ -397,7 +471,7 @@ fn rollback(
     old_oid: &str,
     new_oid: &str,
     materialized_git_paths: &[String],
-    overlays: &BTreeMap<String, Option<String>>,
+    overlays: &BTreeMap<String, StorageOverlay>,
     outputs_absent_before: &[String],
 ) -> Result<()> {
     repo.run([
@@ -411,16 +485,18 @@ fn rollback(
     repo.run(["read-tree", "--reset", old_oid])?;
     materialize_git_paths(repo, old_oid, materialized_git_paths)?;
     let mut restored = Vec::new();
-    for (path, content) in overlays {
+    for (path, overlay) in overlays {
         reject_symlink_traversal(&repo.root, path, "rollback managed-storage metadata")?;
         let candidate = resolved_under(&repo.root, path);
-        match content {
+        match &overlay.contents {
             Some(content) => {
                 if let Some(parent) = candidate.parent() {
                     fs::create_dir_all(parent).at(parent)?;
                 }
                 fs::write(&candidate, content).at(&candidate)?;
-                restored.push(path.clone());
+                if overlay.checkout_output {
+                    restored.push(path.clone());
+                }
             }
             None => {
                 if candidate.exists() {
@@ -447,6 +523,18 @@ fn rollback(
         }
     }
     Ok(())
+}
+
+fn overlaps_local_boundary(path: &str, boundaries: &BTreeSet<String>) -> bool {
+    boundaries.iter().any(|boundary| {
+        path == boundary
+            || path
+                .strip_prefix(boundary)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            || boundary
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
 
 fn safe_git_materialization_paths(

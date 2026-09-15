@@ -78,6 +78,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "storage hydrate",
         "move",
         "remove",
+        "untrack",
         "plan",
         "publish",
         "refresh",

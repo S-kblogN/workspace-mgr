@@ -63,6 +63,9 @@ pub enum Command {
     /// Delete a path and permanently purge obsolete S3 versions after publication.
     Remove(RemoveArgs),
 
+    /// Keep content locally, ignore it, and remove it from Git/S3 after publication.
+    Untrack(UntrackArgs),
+
     /// Safely update a shared checkout and hydrate incoming stored data.
     Refresh(RefreshArgs),
 }
@@ -359,6 +362,18 @@ pub struct RemoveArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct UntrackArgs {
+    #[command(flatten)]
+    pub scoped: ScopedArgs,
+
+    #[arg(required = true)]
+    pub paths: Vec<String>,
+
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct RefreshArgs {
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
@@ -466,6 +481,7 @@ mod tests {
             &["storage", "hydrate", "task/data/example.csv"],
             &["move", "task/old.bin", "task/new.bin", "--dry-run"],
             &["remove", "task/obsolete.bin", "--dry-run"],
+            &["untrack", "task/local.bin", "--dry-run"],
             &[
                 "plan",
                 "--include",
