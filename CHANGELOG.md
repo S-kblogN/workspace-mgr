@@ -5,6 +5,17 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Repository paths keep backslashes as ordinary file-name characters instead of
+  rewriting them to `/`, so storage metadata, user-typed paths, and Git paths
+  compare exactly.
+- A file above 10 MiB whose path contains a backslash no longer breaks every
+  later `plan` and `publish`. Automatic and explicit S3 placement refuse such a
+  path before the storage engine writes metadata it cannot address, and
+  metadata left by earlier releases is reported with a `workspace-mgr move`
+  recovery hint.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

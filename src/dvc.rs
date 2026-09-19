@@ -342,6 +342,29 @@ pub fn output_paths(repo: &GitRepo, pointers: &[String]) -> Result<BTreeMap<Stri
     Ok(result)
 }
 
+/// The storage engine rewrites every `\` in a command target to `/`, even on
+/// Unix, so a boundary whose repository path contains one could be created but
+/// never addressed again.
+pub fn require_addressable(path: &str, field: &str, remedy: &str) -> Result<()> {
+    if path.contains('\\') {
+        return Err(Error::message(format!(
+            "{field} {path:?} contains a backslash, which the storage engine reads as a path separator; {remedy}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn require_addressable_metadata(pointers: &[String]) -> Result<()> {
+    for pointer in pointers {
+        require_addressable(
+            pointer,
+            "managed-storage metadata",
+            "rename its output to a path without backslashes with `workspace-mgr move`",
+        )?;
+    }
+    Ok(())
+}
+
 pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
     let output = inspect_engine(&repo.root, ["status", "--json", "--", pointer])?;
     if !output.success() {
@@ -558,6 +581,7 @@ pub fn hydrate(
         }
         targets
     };
+    require_addressable_metadata(&pointers)?;
     let outputs = output_paths(repo, &pointers)?;
     let mut report = HydrateReport {
         status: if dry_run { "dry_run" } else { "pending" }.to_owned(),
@@ -747,6 +771,22 @@ pub fn management(
     dry_run: bool,
 ) -> Result<serde_json::Value> {
     ensure_ready(repo, config)?;
+    match (operation, paths) {
+        ("track", paths) => {
+            for path in paths {
+                require_addressable(path, "S3 storage path", "rename it before placing it in S3")?;
+            }
+        }
+        ("move", [_, destination]) => require_addressable(
+            destination,
+            "managed-storage move destination",
+            "choose a path without backslashes",
+        )?,
+        // Removal would leave the engine's ignore rule behind and hide the
+        // payload from Git.
+        ("untrack", pointers) => require_addressable_metadata(pointers)?,
+        _ => {}
+    }
     if !dry_run {
         let mut args = match operation {
             "track" => vec!["add".to_owned(), "--".to_owned()],
@@ -1254,6 +1294,40 @@ mod tests {
 
         fs::write(&pointer, "outs:\n- path: data\n- path: other\n").unwrap();
         assert!(output_paths(&repo, &["task/data.dvc".to_owned()]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_metadata_keeps_backslashes_in_output_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("task");
+        fs::create_dir_all(task.join("d\\x")).unwrap();
+        fs::write(
+            task.join("top\\level.bin.dvc"),
+            "outs:\n- path: top\\level.bin\n",
+        )
+        .unwrap();
+        fs::write(task.join("d\\x/big.bin.dvc"), "outs:\n- path: big.bin\n").unwrap();
+        fs::create_dir_all(task.join("bundle/x")).unwrap();
+        fs::write(task.join("bundle/x\\y.txt"), b"alpha\n").unwrap();
+        fs::write(task.join("bundle/x/y.txt"), b"alpha\n").unwrap();
+        fs::write(
+            task.join("bundle.dvc"),
+            "outs:\n- path: bundle\n  files:\n  - relpath: x\\y.txt\n    md5: 9f9f90dbe3e5ee1218c86b8839db1995\n    size: 6\n  - relpath: x/y.txt\n    md5: 9f9f90dbe3e5ee1218c86b8839db1995\n    size: 6\n",
+        )
+        .unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+
+        let pointers = ["task/top\\level.bin.dvc", "task/d\\x/big.bin.dvc"].map(str::to_owned);
+        let outputs = output_paths(&repo, &pointers).unwrap();
+        assert_eq!(outputs[&pointers[0]], ["task/top\\level.bin"]);
+        assert_eq!(outputs[&pointers[1]], ["task/d\\x/big.bin"]);
+        assert!(pointer_matches_worktree(&repo, "task/bundle.dvc").unwrap());
+
+        fs::remove_file(task.join("bundle/x\\y.txt")).unwrap();
+        assert!(!pointer_matches_worktree(&repo, "task/bundle.dvc").unwrap());
     }
 
     #[test]

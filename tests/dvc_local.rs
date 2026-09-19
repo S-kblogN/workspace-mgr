@@ -122,6 +122,190 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     assert!(!task.join("second-large.bin.dvc").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+    );
+    fixture.commit_seed("Initialize automatic storage policy");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "backslash-placement",
+            "--title",
+            "Backslash placement",
+            "--purpose",
+            "Refuse storage boundaries the engine cannot address.",
+            "--timestamp",
+            "20260829-170455",
+        ],
+    );
+    let task_id = "20260829-170455-backslash-placement";
+    let task = fixture.shared.join(task_id);
+    let top_level = format!("{task_id}/top\\level.bin");
+    std::fs::write(task.join("top\\level.bin"), vec![7_u8; 10_485_761]).unwrap();
+
+    for args in [
+        vec!["plan"],
+        vec!["publish", "-m", "Publish a backslash file name"],
+        vec![
+            "storage",
+            "set",
+            &top_level,
+            "--to",
+            "s3",
+            "--reason",
+            "Explicit S3 placement is refused too.",
+        ],
+    ] {
+        let refused = workspace_unchecked(&task, &args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&format!("{top_level:?} contains a backslash")),
+            "{stderr}"
+        );
+        assert!(!task.join("top\\level.bin.dvc").exists());
+        assert!(!task.join(".gitignore").exists());
+        assert!(!storage_remote.exists());
+    }
+
+    workspace(
+        &task,
+        [
+            "storage",
+            "set",
+            &top_level,
+            "--to",
+            "git",
+            "--reason",
+            "Keep the backslash file name in Git.",
+        ],
+    );
+    let in_git = workspace(&task, ["publish", "-m", "Publish backslash file in Git"]);
+    assert_eq!(json(&in_git)["status"], "pushed");
+    let commit = json(&in_git)["commit_oid"].as_str().unwrap().to_owned();
+    assert!(
+        git_unchecked(
+            &fixture.remote,
+            ["cat-file", "-e", &format!("{commit}:{top_level}")]
+        )
+        .status
+        .success()
+    );
+
+    let nested = format!("{task_id}/d\\x/big.bin");
+    std::fs::create_dir(task.join("d\\x")).unwrap();
+    std::fs::write(task.join("d\\x").join("big.bin"), vec![7_u8; 10_485_761]).unwrap();
+    let refused = workspace_unchecked(&task, ["publish", "-m", "Publish a backslash directory"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains(&format!("{nested:?} contains a backslash"))
+    );
+    assert!(!task.join("d\\x").join("big.bin.dvc").exists());
+    assert!(!storage_remote.exists());
+
+    let renamed = format!("{task_id}/dx/big.bin");
+    workspace(&task, ["move", &nested, &renamed]);
+    let in_s3 = workspace(&task, ["publish", "-m", "Publish renamed data in S3"]);
+    assert_eq!(json(&in_s3)["status"], "pushed");
+    assert_eq!(
+        json(&in_s3)["storage"]["placement"]["placed_in_s3"],
+        serde_json::json!([renamed])
+    );
+    assert!(task.join("dx").join("big.bin.dvc").is_file());
+    assert!(storage_remote.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+    );
+    fixture.commit_seed("Initialize automatic storage policy");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "backslash-recovery",
+            "--title",
+            "Backslash recovery",
+            "--purpose",
+            "Recover metadata the engine cannot address.",
+            "--timestamp",
+            "20260829-170456",
+        ],
+    );
+    let task_id = "20260829-170456-backslash-recovery";
+    let task = fixture.shared.join(task_id);
+    let top_level = format!("{task_id}/top\\level.bin");
+    std::fs::write(task.join("top\\level.bin"), vec![7_u8; 10_485_761]).unwrap();
+    // Earlier releases let automatic placement create this metadata before
+    // publication failed, leaving every later transaction broken.
+    command(&task, "dvc", ["add", "--quiet", "--", "top\\level.bin"]);
+    assert!(task.join("top\\level.bin.dvc").is_file());
+    let stale_pointer = format!("{top_level}.dvc");
+
+    for args in [
+        vec!["plan"],
+        vec!["publish", "-m", "Publish unaddressable metadata"],
+        vec!["storage", "hydrate"],
+        vec![
+            "storage",
+            "set",
+            &top_level,
+            "--to",
+            "git",
+            "--reason",
+            "Removal would leave the payload ignored.",
+        ],
+    ] {
+        let refused = workspace_unchecked(&task, &args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&format!("{stale_pointer:?} contains a backslash")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("workspace-mgr move"), "{stderr}");
+        assert!(task.join("top\\level.bin.dvc").is_file());
+    }
+
+    let renamed = format!("{task_id}/top-level.bin");
+    workspace(&task, ["move", &top_level, &renamed]);
+    let published = workspace(&task, ["publish", "-m", "Publish recovered data"]);
+    assert_eq!(json(&published)["status"], "pushed");
+    let pointer = format!("{renamed}.dvc");
+    assert_eq!(
+        json(&published)["storage"]["s3"]["pushed"],
+        serde_json::json!([pointer])
+    );
+    assert!(!task.join("top\\level.bin.dvc").exists());
+    assert!(storage_remote.exists());
+}
+
 #[test]
 fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     if which::which("dvc").is_err() {
