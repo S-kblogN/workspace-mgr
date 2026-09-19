@@ -140,6 +140,7 @@ pub fn set(
     if target == StorageTarget::S3 {
         for path in &paths {
             reject_symlink_traversal(&repo.root, path, "S3 storage path")?;
+            dvc::require_addressable(path, "S3 storage path", "rename it before placing it in S3")?;
         }
     }
     if !dry_run {
@@ -633,6 +634,13 @@ pub fn apply_automatic(
                     "automatic policy selected S3 for {path:?}, but [s3] is not configured; configure S3 or run `workspace-mgr storage set {path} --to git --reason <reason>`"
                 )));
             }
+            dvc::require_addressable(
+                &path,
+                "automatic S3 placement path",
+                &format!(
+                    "rename it or run `workspace-mgr storage set {path} --to git --reason <reason>`"
+                ),
+            )?;
             candidates.push(path);
         }
     }

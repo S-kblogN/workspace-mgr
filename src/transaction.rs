@@ -211,6 +211,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         }
     }
     let initial_dvc = dvc::discover(&repo, &scopes)?;
+    dvc::require_addressable_metadata(&initial_dvc)?;
     let initial_outputs = dvc::output_paths(&repo, &initial_dvc)?;
     let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
     let preview_automatic_s3 = placement_preview.automatic_s3().to_vec();

@@ -215,6 +215,11 @@ Automatic evaluation treats each unclassified new file as its own candidate.
 Directory aggregation is meaningful only after the agent or user explicitly
 selects that directory as a semantic boundary.
 
+An S3 boundary path may not contain a backslash, because the storage engine
+reads it as a directory separator. Automatic placement and `storage set --to s3`
+refuse such a path before writing any metadata: rename it, or place it in Git
+explicitly with `storage set --to git`.
+
 A standalone S3 boundary below 1 MiB is usually less efficient than Git because
 its metadata and remote operations may outweigh the payload. Explicit S3 still
 succeeds but reports `small-s3-boundary`; prefer Git or a larger meaningful
