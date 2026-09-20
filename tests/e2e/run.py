@@ -416,6 +416,17 @@ class Harness:
             oid = self.git(self.shared, "rev-parse", "main").stdout.strip()
             self.check(oid == expected_oid, "shared main has expected object ID", oid=oid)
 
+    @staticmethod
+    def document_task(task: Path) -> None:
+        """Record something in the task's own files, which publication requires
+        before a deliverable task may publish substantive content. The record is
+        a file of its own rather than an addition to the README, because the
+        fixed policy keeps a task README out of the chronological-log role."""
+        (task / "record.md").write_text(
+            "# Record\n\nThis scenario publishes content, so the task records it here.\n",
+            encoding="utf-8",
+        )
+
     def initialize_workspace(self) -> None:
         assert self.shared is not None
         self.section("init, configuration, instructions, and doctor")
@@ -726,6 +737,10 @@ class Harness:
         )
         self.check(task.joinpath("README.md").is_file(), "task README created")
         self.check(task.joinpath(".workspace-mgr-task.toml").is_file(), "task manifest created")
+        self.check(
+            "and list them here." in task.joinpath("README.md").read_text(encoding="utf-8"),
+            "scaffolded README directory map asks the task to keep its record here",
+        )
         readme_before_collision = task.joinpath("README.md").read_bytes()
         collision = self.wm(
             self.shared,
@@ -788,6 +803,16 @@ class Harness:
         unicode_path.write_text("Unicode repository path\n", encoding="utf-8")
         (self.shared / "authorized.txt").write_text("authorized root content\n", encoding="utf-8")
         (self.shared / "unrelated.txt").write_text("another active task\n", encoding="utf-8")
+        undocumented = self.wm(task, "plan", expected=2)
+        self.check(
+            "publishes content but documents nothing" in undocumented["stderr"],
+            "a content publication is refused while the task documents nothing",
+        )
+        record = task / "record.md"
+        record.write_text(
+            "# Record\n\nDecisions, process, tools, and results for this task.\n",
+            encoding="utf-8",
+        )
         plan = self.wm(task, "plan")
         self.check(plan["status"] == "dry_run", "plan reports task changes")
         self.check(all(path.startswith(task_id + "/") for path in plan["changed_paths"]), "plan stays in task scope")
@@ -837,6 +862,7 @@ class Harness:
             "Unicode and spaces survive network Git publication",
         )
         self.check(self.remote_path_exists(commit, "authorized.txt"), "authorized extra scope exists in remote tree")
+        self.check(self.remote_path_exists(commit, f"{task_id}/record.md"), "the task record exists in remote tree")
         self.check(not self.remote_path_exists(commit, "unrelated.txt"), "unrelated overlay is absent from remote tree")
         message = self.run(
             ["git", "--git-dir", self.remote, "show", "-s", "--format=%B", commit],
@@ -870,6 +896,20 @@ class Harness:
             and self.remote_path_exists(moved_git_oid, f"{task_id}/renamed/结果.txt"),
             "ordinary Git move is represented exactly in the remote tree",
         )
+
+        self.check(
+            [warning["code"] for warning in moved_git_publish.get("warnings", [])]
+            == ["task-record-unchanged"],
+            "a publication that changes content without the task record warns",
+        )
+        record.write_text(
+            "# Record\n\nDecisions, process, tools, and results for this task.\n"
+            "Renamed the Git artifact to its final path.\n",
+            encoding="utf-8",
+        )
+        recorded = self.wm(task, "plan")
+        self.check("warnings" not in recorded, "recording the work clears the warning")
+        self.wm(task, "publish", "-m", "Publish the updated task record")
 
         no_changes = self.wm(task, "plan")
         self.check(no_changes["status"] == "no_changes", "post-publish plan is clean")
@@ -1513,6 +1553,7 @@ class Harness:
             "20260829-185000",
         )
         task = Path(created["path"])
+        self.document_task(task)
         payload = b"published payload preserved across task rename\n"
         artifact = task / "artifact.bin"
         artifact.write_bytes(payload)
@@ -1869,6 +1910,7 @@ class Harness:
             "20260914-120000",
         )
         task = Path(created["path"])
+        self.document_task(task)
         git_path = f"{task_id}/retained.txt"
         s3_path = f"{task_id}/retained.bin"
         git_payload = task / "retained.txt"
@@ -2043,6 +2085,7 @@ class Harness:
         )
         self.check(created["status"] == "created", "second task scaffold created")
         task = self.shared / task_id
+        self.document_task(task)
         explicit_git = task / "explicit-git.bin"
         automatic_s3 = task / "automatic-s3.bin"
         review_band = task / "review-band.bin"
@@ -2164,6 +2207,7 @@ class Harness:
             "20260829-193000",
         )
         task = Path(created["path"])
+        self.document_task(task)
         manifest = Path(created["manifest"])
         payload = b"discarded task payload retained in versioned S3\n"
         (task / "artifact.bin").write_bytes(payload)

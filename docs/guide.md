@@ -135,6 +135,20 @@ command succeeds, the agent runs `plan`, publishes the initial scaffold, and
 creates and verifies the matching draft pull request before substantial task
 work. That checkpoint is automatic and does not require another user prompt.
 
+The task directory is where the work happens, not only where finished results
+are filed. Scripts written to do the work, the materials they read, and the
+task's own notes are created inside it. Do not build a scratch workspace in a
+temporary directory outside the repository: the agent loses it at the end of the
+session, and so does anyone reading the task later.
+
+The product does not prescribe how the task organizes its record, only that it
+is written in Markdown. Choose the Markdown files that hold the decisions the
+conversation reached, the process it followed, the tools it wrote, and the
+results that are hard to reproduce; keep them inside the task directory and
+list them in the README's directory map. Publication refuses a deliverable task
+that adds or changes content inside its own directory while documenting
+nothing, so the record is written with the work rather than after it.
+
 Run task commands from inside the task directory so the manifest is discovered
 automatically. Use `--manifest <path>` when working elsewhere. The task
 directory is the default write boundary. The agent may read anywhere in the
@@ -177,7 +191,12 @@ slug while its identity-owned worktree remains in place.
 
 First decide whether content should be retained at all. Ignore safely
 reproducible caches and intermediate build output that are neither inputs,
-deliverables, nor evidence.
+deliverables, nor evidence. Tools the agent wrote and results that were
+expensive or impossible to reproduce are never in that category, even when they
+look like intermediate output. Retain them. If they are too large for ordinary
+Git, place them with `workspace-mgr storage` or keep the bytes locally with
+`workspace-mgr untrack`; do not move them outside the repository to avoid the
+decision.
 
 For retained content, choose the history model before considering size. Git is
 the collaboration/control plane for clone-ready content whose value comes from
@@ -320,17 +339,48 @@ keeps the title and living description aligned with the goal, scope,
 deliverables, validation, and known limitations, then verifies the base, head,
 draft/open state, and head revision after every material publication.
 
-Before every writable-task turn ends, the agent automatically runs a
-task-targeted plan, publishes all safe retained in-scope changes even if the
-work remains in progress, updates and verifies the draft pull request, and
-finishes with a no-change plan. If there is nothing to publish, it still verifies
-that the local task revision, remote branch, and pull-request head agree. A
+Before every writable-task turn ends, the agent automatically records the
+turn's decisions, process, tools, and hard-to-reproduce results in the task's
+own files when the turn produced any, runs a task-targeted plan, publishes all
+safe retained in-scope changes even if the work remains in progress, updates
+and verifies the draft pull request, and finishes with a no-change plan. If
+there is nothing to publish, it still verifies that the local task revision,
+remote branch, and pull-request head agree. A
 publication or provider blocker is reported with the exact unsynchronized state;
 the user never has to ask for routine turn-end synchronization.
 Hosting failures are reported immediately. The agent must not merge, enable
 auto-merge, approve, close, or mark the pull request ready unless the user
 explicitly requests that exact transition. An explicit request to discard one
 unmerged task authorizes closing only that task's pull request before cleanup.
+
+A plan or publication of a deliverable task can report structured `warnings`
+alongside its changed paths:
+
+| Code | Meaning | When to ignore it |
+| --- | --- | --- |
+| `task-record-unchanged` | The publication changes content inside the task directory, but none of the task's documentation changed with it | The turn produced no decision, tool, process step, or hard-to-reproduce result worth recording |
+
+The `warnings` list appears only when a plan or publication has something to
+report, so an ordinary clean report has no `warnings` key at all.
+
+Two conditions are refusals rather than warnings, and both fail at `plan`,
+before it changes placement or uploads anything. A deliverable publication that
+would add or change content inside its own task directory while that directory
+documents nothing is refused until the task records something of its own. A
+publication that only retires content is not held to it, and one that removes
+the task's last record while publishing content is refused by name. Content
+placed in S3 is judged by its pointer, so routing a result out of Git does not
+exempt it. A staged symbolic link whose target is outside the repository is
+refused, because the link points at content no other checkout has; copy what
+the task must keep into the declared scope instead. The link check reads the
+staged tree only, so a link inside a boundary already placed in S3 or kept
+local with `untrack` is not classified: that content never reaches the index.
+
+A plan or publication also reports `ignored_paths` beside `ignored_entries`
+when any path inside the resolved scopes is ignored. The count is exact and the
+list carries up to its first fifty entries, so a pattern rule such as `*.log`
+cannot fill the report. Read the list as a question: each entry should be
+reproducible output, not a tool or result that should have been retained.
 
 Repository-wide policy, root entrypoints, CI, and shared storage mechanisms use
 `task create --kind infrastructure`. The command returns an isolated worktree

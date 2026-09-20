@@ -29,6 +29,7 @@ fn create_task(fixture: &GitFixture) -> (String, PathBuf) {
     );
     let id = "20260914-120000-untrack-refresh".to_owned();
     let path = fixture.shared.join(&id);
+    document_task(&path);
     (id, path)
 }
 

@@ -112,12 +112,27 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("Nested placement boundaries"));
     assert!(guide.contains("small-s3-boundary"));
     assert!(guide.contains("semantic-placement-review"));
+    assert!(guide.contains("task-record-unchanged"));
+    assert!(guide.contains("ignored_paths"));
     assert!(guide.contains("permanently deletes every version"));
     assert!(commands.contains("force-with-lease"));
     assert!(normalized_model.contains("explicit opposite endpoint"));
     assert!(normalized_model.contains("current slug is a mutable topic label"));
     assert!(commands.contains("head branch can close"));
     assert!(commands.contains("payload_bytes"));
+    assert!(commands.contains("ignored_paths"));
+    for workplace_rule in [
+        "Where the work happens",
+        "It is where the work happens",
+        "rather than in a temporary directory elsewhere on the machine",
+        "only that they are Markdown files the README's directory map names",
+        "records the turn's decisions, process, tools, and hard-to-reproduce results",
+    ] {
+        assert!(
+            normalized_model.contains(workplace_rule),
+            "model is missing workplace rule {workplace_rule:?}"
+        );
+    }
     for fact in ["[git]", "remote", "branch", "[s3]", "endpoint_url"] {
         assert!(
             configuration.contains(fact),

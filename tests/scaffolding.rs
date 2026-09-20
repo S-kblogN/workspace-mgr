@@ -98,6 +98,18 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     let task = fixture.shared.join("20260829-170000-sample-task");
     assert!(task.join("README.md").is_file());
     assert!(task.join(".workspace-mgr-task.toml").is_file());
+    assert_eq!(
+        payload["files"].as_array().unwrap(),
+        &vec![
+            serde_json::json!("20260829-170000-sample-task/README.md"),
+            serde_json::json!("20260829-170000-sample-task/.workspace-mgr-task.toml"),
+        ]
+    );
+    let readme = std::fs::read_to_string(task.join("README.md")).unwrap();
+    assert!(readme.contains("## Directory map"));
+    assert!(readme.contains(
+        "- Keep this task's tools, process, decisions, and hard-to-reproduce results in this directory and list them here."
+    ));
     let branch = git(
         &fixture.shared,
         ["rev-parse", "--verify", "codex/sample-task"],
@@ -498,11 +510,37 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("default write boundary is its own task directory"));
     assert!(task_rules.contains("explicitly authorize the exact path and action"));
     assert!(task_rules.contains("they do not create authorization"));
+    assert!(task_rules.contains("outside the repository is outside the task directory too"));
+    assert!(task_rules.contains("own files are its durable record"));
+    assert!(task_rules.contains("Markdown files of your choosing inside the task directory"));
+
+    let artifact_rules = workspace(&fixture.shared, ["instructions", "artifacts"]);
+    let artifact_rules = String::from_utf8(artifact_rules.stdout).unwrap();
+    assert!(artifact_rules.contains("Do the work inside the task directory"));
+    assert!(artifact_rules.contains("a system temporary directory"));
+    assert!(artifact_rules.contains("are task artifacts, not disposables"));
+    assert!(artifact_rules.contains("never safely reproducible output"));
+    assert!(artifact_rules.contains("record how to regenerate them, never the values"));
+    assert!(artifact_rules.contains("Markdown files of your choosing inside the task directory"));
+
+    let core_rules = workspace(&fixture.shared, ["instructions", "core"]);
+    let core_rules = String::from_utf8(core_rules.stdout).unwrap();
+    assert!(
+        core_rules.contains("stops being read-only as soon as it produces something worth keeping")
+    );
+
+    let publication_rules = workspace(&fixture.shared, ["instructions", "publish"]);
+    let publication_rules = String::from_utf8(publication_rules.stdout).unwrap();
+    assert!(
+        publication_rules
+            .contains("record the turn's decisions, process, tools, and hard-to-reproduce results")
+    );
 
     let infrastructure_rules = workspace(&fixture.shared, ["instructions", "infrastructure"]);
     let infrastructure_rules = String::from_utf8(infrastructure_rules.stdout).unwrap();
     assert!(infrastructure_rules.contains("write only the declared paths"));
     assert!(infrastructure_rules.contains("separate explicit user approval"));
+    assert!(infrastructure_rules.contains("Its worktree is the workplace"));
 
     workspace(
         &fixture.shared,

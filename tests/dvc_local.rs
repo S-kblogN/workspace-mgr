@@ -32,6 +32,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     );
     let task_id = "20260829-170450-automatic-placement";
     let task = fixture.shared.join(task_id);
+    document_task(&task);
     std::fs::write(task.join("large.bin"), vec![7_u8; 10_485_761]).unwrap();
     std::fs::write(task.join("review-band.bin"), vec![6_u8; 2_097_152]).unwrap();
     std::fs::write(task.join("small.bin"), vec![5_u8; 1_048_575]).unwrap();
@@ -153,6 +154,7 @@ fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
     );
     let task_id = "20260829-170455-backslash-placement";
     let task = fixture.shared.join(task_id);
+    document_task(&task);
     let top_level = format!("{task_id}/top\\level.bin");
     std::fs::write(task.join("top\\level.bin"), vec![7_u8; 10_485_761]).unwrap();
 
@@ -260,6 +262,7 @@ fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
     );
     let task_id = "20260829-170456-backslash-recovery";
     let task = fixture.shared.join(task_id);
+    document_task(&task);
     let top_level = format!("{task_id}/top\\level.bin");
     std::fs::write(task.join("top\\level.bin"), vec![7_u8; 10_485_761]).unwrap();
     // Earlier releases let automatic placement create this metadata before
@@ -341,6 +344,7 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     );
     let task_name = "20260829-170500-dvc-flow";
     let task = fixture.shared.join(task_name);
+    document_task(&task);
     let data = task.join("data.bin");
     std::fs::write(&data, b"version one\n").unwrap();
     let bundle = task.join("bundle");
@@ -523,6 +527,7 @@ fn a_published_git_file_can_move_to_s3_without_remaining_in_git() {
     );
     let task_id = "20260829-171000-git-to-s3";
     let task = fixture.shared.join(task_id);
+    document_task(&task);
     std::fs::write(task.join("data.txt"), "published in Git first\n").unwrap();
     workspace(&task, ["publish", "-m", "Publish data in Git"]);
 
@@ -676,6 +681,7 @@ fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
     );
     let task_id = "20260829-171200-automatic-rollback";
     let task = fixture.shared.join(task_id);
+    document_task(&task);
     std::fs::write(task.join("large.bin"), vec![9_u8; 10_485_761]).unwrap();
 
     let fake_dvc = fixture.root.join("partial-automatic-dvc");
@@ -733,6 +739,7 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
     );
     let task_name = "20260829-170800-missing-dvc";
     let task = fixture.shared.join(task_name);
+    document_task(&task);
     let data = task.join("data.bin");
     std::fs::write(&data, b"content\n").unwrap();
     workspace(
@@ -798,4 +805,82 @@ fn object_version_adapter_and_engine_config_are_internal() {
     let internal = std::fs::read_to_string(fixture.seed.join(".dvc/config")).unwrap();
     assert!(internal.contains("remote = workspace-mgr"));
     assert!(internal.contains("version_aware = true"));
+}
+
+#[test]
+fn content_routed_to_s3_still_needs_a_task_record() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+    );
+    fixture.commit_seed("Initialize automatic storage policy");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "expensive-only",
+            "--title",
+            "Expensive only",
+            "--purpose",
+            "Publish an expensive result and nothing else.",
+            "--timestamp",
+            "20260829-171300",
+        ],
+    );
+    let task_id = "20260829-171300-expensive-only";
+    let task = fixture.shared.join(task_id);
+    let scaffold = workspace(&task, ["publish", "-m", "Publish the initial scaffold"]);
+    assert_eq!(json(&scaffold)["status"], "pushed");
+
+    // The payload never reaches the private index, so the guard has to read the
+    // placement decision. Otherwise it would be strongest for a small CSV and
+    // absent for exactly the results the policy calls hard to reproduce.
+    std::fs::write(task.join("expensive.bin"), vec![4_u8; 10_485_761]).unwrap();
+    let refused_plan = workspace_unchecked(&task, ["plan"]);
+    assert_eq!(refused_plan.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused_plan.stderr)
+            .contains("publishes content but documents nothing"),
+        "{}",
+        String::from_utf8_lossy(&refused_plan.stderr)
+    );
+    let refused_publish = workspace_unchecked(&task, ["publish", "-m", "Publish the dataset"]);
+    assert_eq!(refused_publish.status.code(), Some(2));
+    assert!(!task.join("expensive.bin.dvc").exists());
+
+    document_task(&task);
+    let published = workspace(
+        &task,
+        ["publish", "-m", "Publish the dataset and its record"],
+    );
+    let published = json(&published);
+    assert_eq!(published["status"], "pushed");
+    let changed = published["changed_paths"].as_array().unwrap();
+    assert!(
+        changed.contains(&serde_json::json!(format!("{task_id}/expensive.bin.dvc"))),
+        "{changed:?}"
+    );
+    assert!(
+        changed.contains(&serde_json::json!(format!("{task_id}/record.md"))),
+        "{changed:?}"
+    );
+    assert!(published["warnings"].is_null());
+
+    // A second expensive result with the record untouched warns at plan time,
+    // where the delta is still empty because the payload has not been placed.
+    std::fs::write(task.join("second.bin"), vec![5_u8; 10_485_761]).unwrap();
+    let stale = workspace(&task, ["plan"]);
+    let stale = json(&stale);
+    assert!(stale["changed_paths"].as_array().unwrap().is_empty());
+    let warnings = stale["warnings"].as_array().unwrap().clone();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0]["code"], "task-record-unchanged");
 }

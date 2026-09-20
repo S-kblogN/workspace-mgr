@@ -2,7 +2,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{GitFixture, git, git_unchecked, json, workspace, workspace_unchecked};
+use common::{GitFixture, document_task, git, git_unchecked, json, workspace, workspace_unchecked};
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
@@ -29,7 +29,9 @@ fn create_task(fixture: &GitFixture, slug: &str, timestamp: &str) -> (String, Pa
             timestamp,
         ],
     );
-    (task_id.clone(), fixture.shared.join(task_id), branch)
+    let task = fixture.shared.join(&task_id);
+    document_task(&task);
+    (task_id, task, branch)
 }
 
 fn remote_oid(repo: &Path, branch: &str) -> String {

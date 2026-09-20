@@ -137,12 +137,15 @@ workspace-mgr task create <slug> --title <title> --purpose <purpose>
 
 The slug is lowercase kebab case. The default `deliverable` kind creates a
 timestamped top-level directory, README, tracked manifest, and the unmounted
-target branch `codex/<slug>`. The `infrastructure` kind requires at least one
-`--scope` plus a `--scope-note`; it creates `codex/infra-<slug>` and an isolated
-worktree below private Git common state, with no repository task directory. Its
-manifest is private worktree state and every scope is explicit. Both kinds
-fetch the configured base branch, reject an existing directory or local/remote
-branch, and publish nothing.
+target branch `codex/<slug>`. The scaffolded README's directory map tells the
+task to keep its tools, process, decisions, and hard-to-reproduce results in
+that directory and to list them there; which files carry them is the agent's
+choice. The `infrastructure` kind requires at least one `--scope` plus a
+`--scope-note`; it creates `codex/infra-<slug>` and an isolated worktree below
+private Git common state, with no repository task directory. Its manifest is
+private worktree state and every scope is explicit. Both kinds fetch the
+configured base branch, reject an existing directory or local/remote branch, and
+publish nothing.
 
 The report contains a structured `review` handoff. Deliverable creation reports
 `creation_timing: immediate-after-scaffold-publication`; the agent must
@@ -476,6 +479,28 @@ by `publish`, because `plan` does not rewrite it. Plan may create ignored local
 locks or preview state. It never creates a commit, uploads S3 content, or pushes
 a Git branch.
 
+Plan reports the ignored paths inside the resolved scopes as `ignored_paths`
+beside the `ignored_entries` count, and structured `warnings`. Both fields are
+present only when they are not empty: `ignored_entries` is always exact, while
+`ignored_paths` carries up to its first fifty entries so a pattern-based ignore
+rule cannot fill the report. For a deliverable task, `task-record-unchanged`
+reports a publication that changes content inside the task directory while none
+of the task's own documentation changed with it; ignore it when the work
+produced nothing worth recording.
+
+Plan refuses, before it changes placement or uploads anything, a deliverable
+publication that would add or change content inside its own task directory
+while that directory documents nothing, and any staged symbolic link whose
+target is outside the repository. A task documents itself with Markdown files
+of its own choosing inside its directory; a README still carrying only the
+creation scaffold's directory map is not yet a record. A storage pointer or
+placement record counts as the content it addresses, so a result routed to S3
+is judged like one kept in Git. A publication that only retires content is not
+refused; one that removes the task's last record while publishing content is
+refused by name. The symbolic-link check reads the staged tree, so a link
+inside a boundary already placed in S3 or kept local with `untrack` is not
+classified. `publish` applies the same refusals.
+
 `--allow-non-shared-head` is an exceptional checkout override and requires a
 scope note. It still refuses when the target task branch is currently checked
 out.
@@ -505,7 +530,9 @@ branch object ID is verified after push. The checkout and shared Git index are
 not switched to the task branch.
 
 `publish --dry-run` performs the same non-publishing behavior as `plan` while
-still requiring a message argument.
+still requiring a message argument. Publication reports the same `warnings` and
+`ignored_paths` as `plan` and applies the same refusals before it changes
+placement or uploads content.
 
 ```sh
 workspace-mgr publish -m "Publish the training report"

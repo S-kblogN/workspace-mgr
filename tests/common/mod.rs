@@ -159,6 +159,21 @@ fn inject_test_storage_engine(_command: &mut Command) {
     }
 }
 
+/// Records something in the task's own documentation, which publication
+/// requires before a deliverable task may publish substantive content. The
+/// record is a file of its own rather than an addition to the README, because
+/// the fixed policy keeps a task README concise and out of the
+/// chronological-log role; these fixtures are the product's own worked examples
+/// of the shape it asks for.
+pub fn document_task(task: &Path) {
+    let record = task.join("record.md");
+    std::fs::write(
+        &record,
+        "# Record\n\nThis fixture publishes content, so the task records it here.\n",
+    )
+    .expect("write task record");
+}
+
 pub fn json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(

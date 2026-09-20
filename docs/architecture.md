@@ -114,12 +114,16 @@ For a task publication, the CLI:
 1. resolves the task and explicitly authorized scopes;
 2. fetches the configured base and target branches;
 3. verifies that an existing target branch belongs to the same task identity;
-4. evaluates placement and acquires task and storage-boundary locks;
+4. builds and validates a preview private index, then evaluates placement and
+   acquires task and storage-boundary locks. The step-7 refusals are decided on
+   that preview, before any placement change or upload;
 5. reconciles S3 metadata, uploads all live in-scope objects, and verifies them;
 6. builds a private Git index from the target branch, or the base branch when no
    target exists;
-7. stages only declared scopes and rejects gitlinks, invalid placement, and
-   whitespace errors;
+7. stages only declared scopes and rejects gitlinks, symbolic links that escape
+   the repository, invalid placement, whitespace errors, and a deliverable
+   publication that adds or changes content inside its own task directory while
+   that directory documents nothing;
 8. creates a commit with its task identity, updates the local target ref with compare-and-swap
    semantics, pushes an explicit refspec, and verifies the remote object ID;
 9. permanently deletes all versions at obsolete S3 object paths, deferring paths

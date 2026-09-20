@@ -479,6 +479,21 @@ pub struct TaskCreateReviewHandoff {
     pub synchronization_cadence: &'static str,
 }
 
+/// The fixed part of the scaffolded README: everything the command does not
+/// interpolate. Publication compares a task's README against this block, rather
+/// than against a whole rendering, so that editing the mutable task title or
+/// purpose cannot turn an untouched README into a record.
+pub fn task_readme_directory_map() -> String {
+    format!(
+        "## Directory map\n\n- `README.md` describes this task and its retained outputs.\n- `{TASK_MANIFEST_NAME}` declares the task scope and target branch.\n- Keep this task's tools, process, decisions, and hard-to-reproduce results in this directory and list them here.\n"
+    )
+}
+
+/// The exact scaffolded README for a deliverable task.
+pub fn task_readme(title: &str, purpose: &str) -> String {
+    format!("# {title}\n\n{purpose}\n\n{}", task_readme_directory_map())
+}
+
 pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
     let title = one_line(&options.title, "task title")?;
     let purpose = one_line(&options.purpose, "task purpose")?;
@@ -562,10 +577,7 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         purpose: purpose.clone(),
         additional_scopes,
     };
-    let readme = format!(
-        "# {}\n\n{}\n\n## Directory map\n\n- `README.md` describes this task and its retained outputs.\n- `{}` declares the task scope and target branch.\n",
-        title, purpose, TASK_MANIFEST_NAME
-    );
+    let readme = task_readme(&title, &purpose);
     let mut manifest_path = match options.kind {
         TaskKind::Deliverable => task_dir.join(TASK_MANIFEST_NAME),
         TaskKind::Infrastructure => task_dir.join("<private-git-state>/task.toml"),

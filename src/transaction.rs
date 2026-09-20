@@ -19,10 +19,11 @@ use crate::manifest::{
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
     AUTO_S3_ABOVE_BYTES, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
-    REVIEW_PULL_REQUEST,
+    REVIEW_PULL_REQUEST, TASK_MANIFEST_NAME,
 };
 use crate::s3_purge;
-use crate::storage;
+use crate::scaffold::task_readme_directory_map;
+use crate::storage::{self, PLACEMENT_SUFFIX};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
@@ -69,8 +70,12 @@ pub struct TransactionReport {
     pub scopes: Vec<String>,
     pub review: ReviewHandoff,
     pub changed_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<TransactionWarning>,
     pub storage: serde_json::Value,
     pub ignored_entries: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_paths: Vec<String>,
     pub tree_oid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_oid: Option<String>,
@@ -78,6 +83,12 @@ pub struct TransactionReport {
     pub remote_oid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransactionWarning {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -343,7 +354,16 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             automatic_s3: &automatic_s3,
         },
     )?;
-    let ignored_entries = count_ignored(&repo, &index, &scopes)?;
+    let (ignored_entries, ignored_paths) = count_ignored(&repo, &index, &scopes)?;
+    let warnings = match deliverable_task_path(&task) {
+        Some(task_path) if changes_task_content(task_path, &paths, &automatic_s3) => {
+            let projection = TaskProjection::resolve(&repo, &index, task_path)?;
+            documentation_warning(task_path, &projection.documentation, &paths, &automatic_s3)
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let tree_oid = repo
         .run_with_index(&index, ["write-tree"], None, true)?
         .stdout
@@ -374,8 +394,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             head_branch: task.branch.clone(),
         },
         changed_paths: paths.clone(),
+        warnings,
         storage: storage_report,
         ignored_entries,
+        ignored_paths,
         tree_oid: tree_oid.clone(),
         commit_oid: None,
         remote_oid: None,
@@ -505,7 +527,7 @@ fn validate_private_index(
             escaped.join(", ")
         )));
     }
-    check_gitlinks(repo, index, paths)?;
+    check_staged_entry_modes(repo, index, paths, policy)?;
     check_large_files(repo, scopes, base_oid, policy)?;
     repo.run_with_index(
         index,
@@ -513,6 +535,7 @@ fn validate_private_index(
         None,
         true,
     )?;
+    check_task_documentation(repo, index, paths, policy)?;
     Ok(())
 }
 
@@ -782,18 +805,337 @@ fn changed_paths(repo: &GitRepo, index: &Path, base: &str) -> Result<Vec<String>
     Ok(paths)
 }
 
-fn check_gitlinks(repo: &GitRepo, index: &Path, paths: &[String]) -> Result<()> {
-    for path in paths {
-        let output = repo.run_with_index(index, ["ls-files", "--stage", "--", path], None, true)?;
-        for line in output.stdout.lines() {
-            if line.split_whitespace().next() == Some("160000") {
+/// The largest pathspec argument payload handed to one `git` invocation. Modes
+/// are read for every changed path at once rather than one process per path,
+/// because on a large publication the per-path process cost dominates the
+/// transaction; the budget keeps the argument list well inside every platform's
+/// limit without reintroducing that cost.
+const PATHSPEC_ARGUMENT_BYTES: usize = 96 * 1024;
+
+fn pathspec_batches(paths: &[String]) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut budget = 0;
+    for (position, path) in paths.iter().enumerate() {
+        let cost = path.len() + 1;
+        if position > start && budget + cost > PATHSPEC_ARGUMENT_BYTES {
+            batches.push(&paths[start..position]);
+            start = position;
+            budget = 0;
+        }
+        budget += cost;
+    }
+    if start < paths.len() {
+        batches.push(&paths[start..]);
+    }
+    batches
+}
+
+/// Refuses the two staged entry modes that point at content no other checkout
+/// has: a nested Git checkout (gitlink) and a symbolic link whose target leaves
+/// the repository. Both are read from one staged-mode listing per batch of
+/// paths, so a publication pays one process per batch rather than two per path.
+///
+/// Only what reaches the private index is inspected. Content removed from it
+/// before validation — an S3-placed boundary or an `untrack`ed path — is not
+/// classified here; see `escapes_repository`.
+fn check_staged_entry_modes(
+    repo: &GitRepo,
+    index: &Path,
+    paths: &[String],
+    policy: &PrivateIndexPolicy<'_>,
+) -> Result<()> {
+    let destination = retained_content_destination(policy.task);
+    for batch in pathspec_batches(paths) {
+        let mut args = vec![
+            "ls-files".to_owned(),
+            "--stage".to_owned(),
+            "-z".to_owned(),
+            "--".to_owned(),
+        ];
+        args.extend(batch.iter().cloned());
+        let output = repo.run_with_index(index, args, None, true)?;
+        for entry in output.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((attributes, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            let mut fields = attributes.split_whitespace();
+            let mode = fields.next();
+            if mode == Some("160000") {
                 return Err(Error::message(format!(
-                    "{path:?} is staged as a nested Git checkout/gitlink; ignore the checkout instead"
+                    "{path:?} is staged as a nested Git checkout/gitlink; ignore the checkout instead, or copy the files this task needs into {destination}"
+                )));
+            }
+            if mode != Some("120000") {
+                continue;
+            }
+            let Some(oid) = fields.next() else {
+                continue;
+            };
+            let target = repo
+                .run_with_index(index, ["cat-file", "blob", oid], None, true)?
+                .stdout;
+            let target = target.trim();
+            if escapes_repository(path, target) {
+                return Err(Error::message(format!(
+                    "{path:?} is a symbolic link to {target:?}, which is outside the repository; keep the work inside {destination} and copy retained content into it instead of linking to it"
                 )));
             }
         }
     }
     Ok(())
+}
+
+/// Where a refusal tells this task to keep content it must retain. An
+/// infrastructure task has no repository task directory, so naming one would
+/// send it looking for a path it does not have.
+fn retained_content_destination(task: &ResolvedTask) -> &'static str {
+    match task.kind {
+        TaskKind::Deliverable => "the task directory",
+        TaskKind::Infrastructure => "a declared scope",
+    }
+}
+
+/// Classifies a staged symbolic link from its recorded target alone. This is a
+/// workspace-discipline guard, not a security boundary: it never reads the
+/// filesystem, so an unreadable or ignored directory is never inspected and a
+/// dangling target is classified like any other. It also sees only the staged
+/// tree, so a link inside a boundary placed in S3 or kept local with `untrack`
+/// is never classified, because that content is removed from the private index
+/// before validation runs.
+fn escapes_repository(link_path: &str, target: &str) -> bool {
+    if target.starts_with('/') || target.starts_with('~') {
+        return true;
+    }
+    let bytes = target.as_bytes();
+    let windows_drive = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && matches!(bytes.get(2), None | Some(b'/') | Some(b'\\'));
+    if target.starts_with("\\\\") || windows_drive {
+        return true;
+    }
+    let mut depth = link_path.split('/').count() - 1;
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
+fn deliverable_task_path(task: &ResolvedTask) -> Option<&str> {
+    if task.kind != TaskKind::Deliverable {
+        return None;
+    }
+    task.task_path.as_deref()
+}
+
+/// The task's own control surface: its README, its manifest, and its ignore
+/// rules. Every other path inside the task directory is content the task
+/// produced.
+fn is_housekeeping_name(name: &str) -> bool {
+    name == "README.md" || name == TASK_MANIFEST_NAME || name == ".gitignore"
+}
+
+fn is_markdown(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn inside(task_path: &str, path: &str) -> bool {
+    path.strip_prefix(task_path)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a changed path is content the task itself produced. Only the task's
+/// own directory counts: a user-authorized additional scope belongs to the
+/// request that authorized it, not to the task's record. A storage pointer or
+/// placement record stands in for the boundary it addresses, so routing a
+/// result to S3 does not make it invisible here — otherwise the guard would be
+/// strongest for a small CSV and absent for the expensive dataset it exists to
+/// protect.
+fn is_task_content(task_path: &str, path: &str) -> bool {
+    if !inside(task_path, path) {
+        return false;
+    }
+    let boundary = path
+        .strip_suffix(PLACEMENT_SUFFIX)
+        .or_else(|| path.strip_suffix(".dvc"))
+        .unwrap_or(path);
+    let name = boundary.rsplit('/').next().unwrap_or(boundary);
+    !name.is_empty() && !is_housekeeping_name(name)
+}
+
+/// The task's own documentation in the projected tree, and every task path that
+/// projection still tracks. The documentation is every tracked Markdown file
+/// inside the task directory, except a README that is still the creation
+/// scaffold. The product does not prescribe which files hold the record, only
+/// that the task has one.
+struct TaskProjection {
+    documentation: Vec<String>,
+    tracked: BTreeSet<String>,
+}
+
+impl TaskProjection {
+    fn resolve(repo: &GitRepo, index: &Path, task_path: &str) -> Result<Self> {
+        let listed = repo.run_with_index(
+            index,
+            ["ls-files", "--stage", "-z", "--", task_path],
+            None,
+            true,
+        )?;
+        let scaffold_readme = format!("{task_path}/README.md");
+        let mut projection = Self {
+            documentation: Vec::new(),
+            tracked: BTreeSet::new(),
+        };
+        for entry in listed.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((attributes, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            projection.tracked.insert(path.to_owned());
+            if !is_markdown(path) {
+                continue;
+            }
+            if path == scaffold_readme {
+                let Some(oid) = attributes.split_whitespace().nth(1) else {
+                    continue;
+                };
+                let content = repo
+                    .run_with_index(index, ["cat-file", "blob", oid], None, true)?
+                    .stdout;
+                if is_scaffold_readme(&content) {
+                    continue;
+                }
+            }
+            projection.documentation.push(path.to_owned());
+        }
+        Ok(projection)
+    }
+}
+
+/// Whether a README is still exactly what `task create` wrote. Only the fixed
+/// directory map is compared, plus the shape of the heading and purpose line
+/// the command interpolated. The title and purpose live in a tracked manifest
+/// the agent may edit, so comparing against a rendering of them would let one
+/// unrelated manifest edit silently retire the guard for that task.
+fn is_scaffold_readme(content: &str) -> bool {
+    let Some(prelude) = content.strip_suffix(&task_readme_directory_map()) else {
+        return false;
+    };
+    let mut lines = prelude.split('\n');
+    let (Some(heading), Some(""), Some(purpose), Some(""), Some(""), None) = (
+        lines.next(),
+        lines.next(),
+        lines.next(),
+        lines.next(),
+        lines.next(),
+        lines.next(),
+    ) else {
+        return false;
+    };
+    heading.starts_with("# ") && !purpose.is_empty()
+}
+
+/// Whether this publication adds or changes content inside the task directory.
+/// A path the projection no longer tracks is a deletion: a publication that
+/// only retires content cannot be an undocumented addition, so it is not judged
+/// here. Content on its way to S3 is counted from the placement decision,
+/// because its payload never reaches the private index.
+fn publishes_task_content(
+    task_path: &str,
+    paths: &[String],
+    automatic_s3: &[String],
+    tracked: &BTreeSet<String>,
+) -> bool {
+    automatic_s3
+        .iter()
+        .any(|path| is_task_content(task_path, path))
+        || paths
+            .iter()
+            .any(|path| is_task_content(task_path, path) && tracked.contains(path.as_str()))
+}
+
+/// Whether this publication changes content inside the task directory in any
+/// direction, including retiring it. Retiring a result is a decision worth
+/// recording, so the advisory warning counts it; the refusal does not.
+fn changes_task_content(task_path: &str, paths: &[String], automatic_s3: &[String]) -> bool {
+    paths
+        .iter()
+        .chain(automatic_s3.iter())
+        .any(|path| is_task_content(task_path, path))
+}
+
+fn removes_task_documentation(
+    task_path: &str,
+    paths: &[String],
+    tracked: &BTreeSet<String>,
+) -> bool {
+    paths.iter().any(|path| {
+        inside(task_path, path) && is_markdown(path) && !tracked.contains(path.as_str())
+    })
+}
+
+fn check_task_documentation(
+    repo: &GitRepo,
+    index: &Path,
+    paths: &[String],
+    policy: &PrivateIndexPolicy<'_>,
+) -> Result<()> {
+    let Some(task_path) = deliverable_task_path(policy.task) else {
+        return Ok(());
+    };
+    // A transaction that touches nothing inside the task directory cannot fail
+    // this check, so it does not pay for the projection listing either.
+    if !changes_task_content(task_path, paths, policy.automatic_s3) {
+        return Ok(());
+    }
+    let projection = TaskProjection::resolve(repo, index, task_path)?;
+    if !publishes_task_content(task_path, paths, policy.automatic_s3, &projection.tracked) {
+        return Ok(());
+    }
+    if !projection.documentation.is_empty() {
+        return Ok(());
+    }
+    if removes_task_documentation(task_path, paths, &projection.tracked) {
+        return Err(Error::message(format!(
+            "deliverable task {task_path:?} removes the last of its own documentation while publishing content; a published record is durable, so edit it instead of deleting it, or keep another Markdown file recording this task's decisions, process, tools, and hard-to-reproduce results inside {task_path:?}"
+        )));
+    }
+    Err(Error::message(format!(
+        "deliverable task {task_path:?} publishes content but documents nothing; record this task's decisions, process, tools, and hard-to-reproduce results in Markdown files of your choosing inside {task_path:?}, then list them in its README directory map"
+    )))
+}
+
+fn documentation_warning(
+    task_path: &str,
+    documentation: &[String],
+    paths: &[String],
+    automatic_s3: &[String],
+) -> Option<TransactionWarning> {
+    if !changes_task_content(task_path, paths, automatic_s3) {
+        return None;
+    }
+    if paths
+        .iter()
+        .any(|path| documentation.iter().any(|entry| entry == path))
+    {
+        return None;
+    }
+    Some(TransactionWarning {
+        code: "task-record-unchanged".to_owned(),
+        message: format!(
+            "this publication changes task content but none of the task documentation in {task_path}; record the decision, tool, process step, or hard-to-reproduce result when the work produced one, and ignore this warning otherwise"
+        ),
+    })
 }
 
 fn check_large_files(
@@ -837,21 +1179,34 @@ fn check_large_files(
     Ok(())
 }
 
-fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<usize> {
+/// How many ignored paths a report lists beside the exact `ignored_entries`
+/// count. `git status --ignored` collapses an ignored directory to one entry,
+/// but a pattern rule such as `*.log` yields one entry per file, and the report
+/// is emitted at every plan and publication. The list stays a sample the agent
+/// can read; the count stays complete.
+const REPORTED_IGNORED_PATHS: usize = 50;
+
+fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<(usize, Vec<String>)> {
     let mut args = vec![
         "status".to_owned(),
         "--ignored".to_owned(),
         "--short".to_owned(),
+        "-z".to_owned(),
         "--untracked-files=normal".to_owned(),
         "--".to_owned(),
     ];
     args.extend(scopes.iter().cloned());
-    Ok(repo
+    let mut paths: Vec<String> = repo
         .run_with_index(index, args, None, true)?
         .stdout
-        .lines()
-        .filter(|line| line.starts_with("!!"))
-        .count())
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("!! "))
+        .map(ToOwned::to_owned)
+        .collect();
+    paths.sort();
+    let entries = paths.len();
+    paths.truncate(REPORTED_IGNORED_PATHS);
+    Ok((entries, paths))
 }
 
 fn build_commit_message(
@@ -945,4 +1300,260 @@ pub struct TaskStatus {
     pub base_branch: String,
     pub scopes: Vec<String>,
     pub working_changes: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scaffold::task_readme;
+
+    fn owned(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn classifies_symbolic_link_targets_from_the_recorded_target_alone() {
+        for (link, target) in [
+            ("task/link", "/private/tmp/scratch"),
+            ("task/link", "~/scratch"),
+            ("task/link", "C:\\scratch"),
+            ("task/link", "\\\\server\\share"),
+            ("task/link", "../../outside"),
+            ("task/link", "./../.."),
+            ("link", "../outside"),
+            ("task/sub/link", "../../../outside"),
+        ] {
+            assert!(
+                escapes_repository(link, target),
+                "{target:?} from {link:?} must be refused"
+            );
+        }
+        for (link, target) in [
+            ("task/link", "notes.md"),
+            ("task/link", "./notes.md"),
+            ("task/link", "sub/notes.md"),
+            ("task/link", "sub/"),
+            ("task/link", "../sibling"),
+            ("task/sub/link", "../../outside"),
+            ("task/link", "a:b.txt"),
+            ("task/link", ""),
+        ] {
+            assert!(
+                !escapes_repository(link, target),
+                "{target:?} from {link:?} must be allowed"
+            );
+        }
+    }
+
+    const TASK: &str = "20260829-170100-task";
+
+    fn tracked(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn separates_task_housekeeping_from_task_content() {
+        for path in [
+            "20260829-170100-task/README.md",
+            "20260829-170100-task/.workspace-mgr-task.toml",
+            "20260829-170100-task/.gitignore",
+            "20260829-170101-other/tools/run.py",
+            "shared-area/config.yaml",
+            "docs/guide.md",
+            "20260829-170100-task",
+        ] {
+            assert!(!is_task_content(TASK, path), "{path} must not be content");
+        }
+        for path in [
+            "20260829-170100-task/notes.md",
+            "20260829-170100-task/tools/run.py",
+            "20260829-170100-task/data.bin",
+            "20260829-170100-task/data.bin.dvc",
+            "20260829-170100-task/data.bin.workspace-mgr-storage.toml",
+            "20260829-170100-task/dataset.dvc",
+        ] {
+            assert!(is_task_content(TASK, path), "{path} must be task content");
+        }
+    }
+
+    #[test]
+    fn a_storage_pointer_keeps_the_boundary_housekeeping_classification() {
+        for path in [
+            "20260829-170100-task/README.md.dvc",
+            "20260829-170100-task/.gitignore.workspace-mgr-storage.toml",
+        ] {
+            assert!(!is_task_content(TASK, path), "{path} must not be content");
+        }
+    }
+
+    #[test]
+    fn only_additions_and_edits_count_as_publishing_task_content() {
+        let projected = tracked(&[
+            "20260829-170100-task/README.md",
+            "20260829-170100-task/tools/run.py",
+        ]);
+        assert!(!publishes_task_content(TASK, &[], &[], &projected));
+        assert!(!publishes_task_content(
+            TASK,
+            &owned(&[
+                "20260829-170100-task/README.md",
+                "20260829-170100-task/.workspace-mgr-task.toml",
+            ]),
+            &[],
+            &projected,
+        ));
+        assert!(publishes_task_content(
+            TASK,
+            &owned(&["20260829-170100-task/tools/run.py"]),
+            &[],
+            &projected,
+        ));
+        // A path the projection no longer tracks is a deletion.
+        assert!(!publishes_task_content(
+            TASK,
+            &owned(&[
+                "20260829-170100-task/notes.md",
+                "20260829-170100-task/result.csv",
+            ]),
+            &[],
+            &projected,
+        ));
+        // Content on its way to S3 never reaches the index, so it is counted
+        // from the placement decision instead.
+        assert!(publishes_task_content(
+            TASK,
+            &[],
+            &owned(&["20260829-170100-task/expensive.bin"]),
+            &projected,
+        ));
+        // A user-authorized additional scope is not the task's own content.
+        assert!(!publishes_task_content(
+            TASK,
+            &owned(&["shared-area/config.yaml"]),
+            &owned(&["shared-area/large.bin"]),
+            &tracked(&["shared-area/config.yaml"]),
+        ));
+    }
+
+    #[test]
+    fn a_pristine_readme_survives_a_manifest_title_or_purpose_edit() {
+        assert!(is_scaffold_readme(&task_readme("Demo", "Demo purpose")));
+        assert!(is_scaffold_readme(&task_readme(
+            "Demo v2",
+            "Another purpose"
+        )));
+        assert!(!is_scaffold_readme(&format!(
+            "{}\n## Process\n\nRan the analysis.\n",
+            task_readme("Demo", "Demo purpose")
+        )));
+        assert!(!is_scaffold_readme(&format!(
+            "# Demo\n\nDemo purpose\n\nExtra prose.\n\n{}",
+            task_readme_directory_map()
+        )));
+        assert!(!is_scaffold_readme(&task_readme_directory_map()));
+        assert!(!is_scaffold_readme(""));
+    }
+
+    #[test]
+    fn detects_a_publication_that_removes_the_last_task_documentation() {
+        let projected = tracked(&["20260829-170100-task/result.csv"]);
+        assert!(removes_task_documentation(
+            TASK,
+            &owned(&[
+                "20260829-170100-task/notes.md",
+                "20260829-170100-task/result.csv",
+            ]),
+            &projected,
+        ));
+        assert!(!removes_task_documentation(
+            TASK,
+            &owned(&["20260829-170100-task/result.csv"]),
+            &projected,
+        ));
+        assert!(!removes_task_documentation(
+            TASK,
+            &owned(&["docs/guide.md"]),
+            &projected,
+        ));
+    }
+
+    #[test]
+    fn warns_only_when_task_content_changes_without_its_documentation() {
+        let documentation = owned(&[
+            "20260829-170100-task/README.md",
+            "20260829-170100-task/notes/process.md",
+        ]);
+        assert!(documentation_warning(TASK, &documentation, &[], &[]).is_none());
+        assert!(
+            documentation_warning(
+                TASK,
+                &documentation,
+                &owned(&["20260829-170100-task/README.md"]),
+                &[],
+            )
+            .is_none()
+        );
+        assert!(
+            documentation_warning(
+                TASK,
+                &documentation,
+                &owned(&["shared-area/config.yaml"]),
+                &[],
+            )
+            .is_none()
+        );
+        assert!(
+            documentation_warning(
+                TASK,
+                &documentation,
+                &owned(&[
+                    "20260829-170100-task/notes/process.md",
+                    "20260829-170100-task/tools/run.py",
+                ]),
+                &[],
+            )
+            .is_none()
+        );
+        let warning = documentation_warning(
+            TASK,
+            &documentation,
+            &owned(&[
+                "20260829-170100-task/.gitignore",
+                "20260829-170100-task/tools/run.py",
+            ]),
+            &[],
+        )
+        .expect("content without documentation warns");
+        assert_eq!(warning.code, "task-record-unchanged");
+        assert!(warning.message.contains(TASK));
+        assert!(
+            documentation_warning(
+                TASK,
+                &documentation,
+                &[],
+                &owned(&["20260829-170100-task/expensive.bin"]),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn batches_pathspec_arguments_without_dropping_any_path() {
+        let paths: Vec<String> = (0..5_000)
+            .map(|index| format!("20260829-170100-task/data/f{index:05}.txt"))
+            .collect();
+        let batches = pathspec_batches(&paths);
+        assert!(batches.len() > 1);
+        for batch in &batches {
+            assert!(!batch.is_empty());
+            let bytes: usize = batch.iter().map(|path| path.len() + 1).sum();
+            assert!(bytes <= PATHSPEC_ARGUMENT_BYTES || batch.len() == 1);
+        }
+        let flattened: Vec<&String> = batches.iter().flat_map(|batch| batch.iter()).collect();
+        assert_eq!(flattened.len(), paths.len());
+        assert!(flattened.iter().zip(paths.iter()).all(|(a, b)| *a == b));
+        assert!(pathspec_batches(&[]).is_empty());
+        let single = owned(&["a"]);
+        assert_eq!(pathspec_batches(&single).len(), 1);
+    }
 }
