@@ -884,3 +884,76 @@ fn content_routed_to_s3_still_needs_a_task_record() {
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert_eq!(warnings[0]["code"], "task-record-unchanged");
 }
+
+#[test]
+fn bulk_publication_counts_an_automatic_boundary_the_same_at_plan_and_publish() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+    );
+    fixture.commit_seed("Initialize automatic storage policy");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "bulk-with-boundary",
+            "--title",
+            "Bulk with boundary",
+            "--purpose",
+            "Count an automatically placed boundary once in both operations.",
+            "--timestamp",
+            "20260829-171600",
+        ],
+    );
+    let task_id = "20260829-171600-bulk-with-boundary";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    let results = task.join("results");
+    std::fs::create_dir(&results).unwrap();
+    // 199 results plus the record are 200 counted files; the boundary is the
+    // one that crosses the threshold.
+    for index in 0..199 {
+        std::fs::write(results.join(format!("run-{index:03}.json")), "{}\n").unwrap();
+    }
+    std::fs::write(task.join("dataset.bin"), vec![3_u8; 10_485_761]).unwrap();
+
+    let planned = json(&workspace(&task, ["plan"]));
+    let published = json(&workspace(
+        &task,
+        ["publish", "-m", "Publish the bulk task"],
+    ));
+
+    let message = |report: &serde_json::Value| {
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|warning| warning["code"] == "bulk-publication")
+            .unwrap_or_else(|| panic!("{report}"))["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let planned_message = message(&planned);
+    assert!(
+        planned_message.contains("201 new files"),
+        "{planned_message}"
+    );
+    // By publish time the boundary's pointer is staged as well. Counting both
+    // it and the payload would report more content than the plan did for a
+    // task nothing had touched in between.
+    assert_eq!(
+        planned_message,
+        message(&published),
+        "plan and publish must measure the same content"
+    );
+    assert_eq!(published["status"], "pushed");
+}

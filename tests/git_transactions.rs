@@ -1314,3 +1314,499 @@ fn an_escaping_symlink_refusal_names_the_workplace_each_task_kind_has() {
     );
     assert!(!message.contains("task directory"), "{message}");
 }
+
+#[test]
+fn publication_refuses_content_hidden_only_by_a_machine_local_ignore_rule() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "machine-local-ignore",
+            "--title",
+            "Machine local ignore",
+            "--purpose",
+            "Refuse content only an untracked rule hides.",
+            "--timestamp",
+            "20260829-171000",
+        ],
+    );
+    let task_id = "20260829-171000-machine-local-ignore";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    std::fs::write(task.join("search_log1.txt"), "per-run log\n").unwrap();
+    std::fs::write(
+        fixture.shared.join(".git/info/exclude"),
+        format!("{task_id}/search_log1.txt\n"),
+    )
+    .unwrap();
+
+    for operation in [
+        vec!["plan"],
+        vec!["publish", "-m", "Publish the machine-local fixture"],
+    ] {
+        let refused = workspace_unchecked(&task, operation.clone());
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{operation:?} was not refused"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("only an ignore rule this publication does not carry hides"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("\"{task_id}/search_log1.txt\"")),
+            "the path must be named: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("by rule \"{task_id}/search_log1.txt\"")),
+            "the rule must be named: {stderr}"
+        );
+        assert!(
+            stderr.contains("in \".git/info/exclude\""),
+            "the source must be named: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("`{task_id}/.gitignore`"))
+                && stderr.contains("`.workspace-mgr/repository.gitignore`"),
+            "both fixes must be offered: {stderr}"
+        );
+    }
+    // Nothing was published while the refusal stood.
+    assert!(
+        git_unchecked(
+            &fixture.shared,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/codex/machine-local-ignore"
+            ]
+        )
+        .stdout
+        .is_empty()
+    );
+
+    // The documented fix: carry the rule in the task's own ignore file.
+    std::fs::write(fixture.shared.join(".git/info/exclude"), "").unwrap();
+    std::fs::write(task.join(".gitignore"), "search_log1.txt\n").unwrap();
+
+    let plan = workspace(&task, ["plan"]);
+    let plan = json(&plan);
+    assert!(
+        plan["ignored_paths"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!("{task_id}/search_log1.txt"))),
+        "{plan}"
+    );
+    let published = workspace(
+        &task,
+        ["publish", "-m", "Publish with a carried ignore rule"],
+    );
+    assert_eq!(json(&published)["status"], "pushed");
+    let commit = json(&published)["commit_oid"].as_str().unwrap().to_owned();
+    let tracked = git(
+        &fixture.shared,
+        ["ls-tree", "-r", "--name-only", &commit, "--", task_id],
+    );
+    let tracked = String::from_utf8_lossy(&tracked.stdout);
+    assert!(
+        tracked.contains(&format!("{task_id}/.gitignore")),
+        "{tracked}"
+    );
+    assert!(!tracked.contains("search_log1.txt"), "{tracked}");
+}
+
+#[test]
+fn a_tracked_ignore_rule_outranks_a_machine_local_one() {
+    let fixture = managed_fixture();
+    let excludes = fixture.root.join("global-excludes");
+    std::fs::write(&excludes, ".DS_Store\n*.machine-local\n").unwrap();
+    git(
+        &fixture.shared,
+        ["config", "core.excludesFile", excludes.to_str().unwrap()],
+    );
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "global-excludes",
+            "--title",
+            "Global excludes",
+            "--purpose",
+            "Check that a tracked rule outranks a global one.",
+            "--timestamp",
+            "20260829-171100",
+        ],
+    );
+    let task_id = "20260829-171100-global-excludes";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    // The product's own root rules are tracked, and Git resolves an in-tree
+    // ignore file before the global excludes, so the everyday case is silent.
+    std::fs::write(task.join(".DS_Store"), "finder junk\n").unwrap();
+
+    let plan = workspace(&task, ["plan"]);
+    assert!(
+        json(&plan)["ignored_paths"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!("{task_id}/.DS_Store"))),
+        "{}",
+        json(&plan)
+    );
+
+    // A rule that only the global excludes file carries is refused, and the
+    // message names that file.
+    std::fs::write(task.join("bulk.machine-local"), "hidden only by me\n").unwrap();
+    let refused = workspace_unchecked(&task, ["plan"]);
+    assert_eq!(refused.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("\"*.machine-local\""), "{stderr}");
+    assert!(stderr.contains(excludes.to_str().unwrap()), "{stderr}");
+    assert!(
+        !stderr.contains(".DS_Store"),
+        "the tracked rule must not fire: {stderr}"
+    );
+}
+
+#[test]
+fn a_directory_whose_whole_content_is_ignored_is_still_resolved_to_its_rule() {
+    // `git status --ignored` collapses such a directory into one entry, and a
+    // file-level rule does not match the directory, so the entry arrives with
+    // no rule at all. That is the common shape of the problem this refusal
+    // exists for: a tree of per-run by-products hidden by one personal rule.
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "collapsed-ignore",
+            "--title",
+            "Collapsed ignore",
+            "--purpose",
+            "Resolve a wholly ignored directory to its rule.",
+            "--timestamp",
+            "20260829-171300",
+        ],
+    );
+    let task_id = "20260829-171300-collapsed-ignore";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    let results = task.join("results");
+    std::fs::create_dir(&results).unwrap();
+    for index in 1..=3 {
+        std::fs::write(results.join(format!("run-{index}.log")), "per-run log\n").unwrap();
+    }
+    std::fs::write(fixture.shared.join(".git/info/exclude"), "*.log\n").unwrap();
+    // Nothing else lives beside them, so Git reports exactly one entry.
+    let listed = git(
+        &fixture.shared,
+        ["status", "--ignored", "--short", "--", task_id],
+    );
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        listed.contains(&format!("!! {task_id}/results/")),
+        "the fixture must exercise the collapsed listing: {listed}"
+    );
+
+    for operation in [
+        vec!["plan"],
+        vec!["publish", "-m", "Publish the collapsed fixture"],
+    ] {
+        let refused = workspace_unchecked(&task, operation.clone());
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{operation:?} was not refused"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&format!("\"{task_id}/results/run-1.log\"")),
+            "the hidden file must be named: {stderr}"
+        );
+        assert!(stderr.contains("by rule \"*.log\""), "{stderr}");
+        assert!(stderr.contains("in \".git/info/exclude\""), "{stderr}");
+    }
+
+    // The outcome must not depend on an unrelated sibling existing: with one
+    // non-ignored file beside them Git lists the three individually, and the
+    // same refusal stands.
+    std::fs::write(results.join("summary.md"), "kept\n").unwrap();
+    assert_eq!(workspace_unchecked(&task, ["plan"]).status.code(), Some(2));
+
+    // Carried by the task's own rule, the same content plans cleanly.
+    std::fs::write(fixture.shared.join(".git/info/exclude"), "").unwrap();
+    std::fs::write(task.join(".gitignore"), "results/*.log\n").unwrap();
+    assert_eq!(json(&workspace(&task, ["plan"]))["status"], "dry_run");
+}
+
+#[test]
+fn the_products_own_rules_never_refuse_the_first_publication_of_a_repository() {
+    // Between `init` and the publication of the generated root file there is a
+    // window the product cannot close itself, because no task publication can
+    // carry a root path. The product's own fixed rules are carried by every
+    // installation regardless, so they must never be read as machine-local.
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    workspace(&fixture.shared, ["init"]);
+    assert!(
+        git_unchecked(&fixture.shared, ["ls-files", "--", ".gitignore"])
+            .stdout
+            .is_empty(),
+        "the fixture must exercise the uncommitted scaffold"
+    );
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "bootstrap",
+            "--title",
+            "Bootstrap",
+            "--purpose",
+            "Publish the initial scaffold before the root ignore file is carried.",
+            "--timestamp",
+            "20260829-171400",
+        ],
+    );
+    let task_id = "20260829-171400-bootstrap";
+    let task = fixture.shared.join(task_id);
+    // Nobody creates these on purpose; macOS and Python leave them behind.
+    std::fs::write(task.join(".DS_Store"), "finder junk\n").unwrap();
+    std::fs::create_dir(task.join("__pycache__")).unwrap();
+    std::fs::write(task.join("__pycache__/tool.pyc"), "bytecode\n").unwrap();
+
+    let plan = json(&workspace(&task, ["plan"]));
+
+    assert_eq!(plan["status"], "dry_run");
+    assert_eq!(plan["ignored_entries"], 2);
+}
+
+#[test]
+fn an_unpublished_rule_in_a_tracked_ignore_file_is_not_carried() {
+    // `git check-ignore` resolves against the work tree, so a rule written into
+    // a tracked ignore file and never staged decides locally while reaching no
+    // other clone. Checking only that the path is tracked would make the
+    // refusal's own remedy silence it without publishing anything.
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "unpublished-rule",
+            "--title",
+            "Unpublished rule",
+            "--purpose",
+            "Refuse a rule the publication does not carry.",
+            "--timestamp",
+            "20260829-171500",
+        ],
+    );
+    let task_id = "20260829-171500-unpublished-rule";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    std::fs::write(task.join("scratch.junk"), "per-run junk\n").unwrap();
+    let root_ignore = fixture.shared.join(".gitignore");
+    let generated = std::fs::read_to_string(&root_ignore).unwrap();
+    std::fs::write(&root_ignore, format!("{generated}*.junk\n")).unwrap();
+
+    let refused = workspace_unchecked(&task, ["plan"]);
+
+    assert_eq!(refused.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        stderr.contains(&format!("\"{task_id}/scratch.junk\"")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("by rule \"*.junk\""), "{stderr}");
+    assert!(stderr.contains("in \".gitignore\""), "{stderr}");
+
+    // The task's own rule is staged by this very publication, so it is carried.
+    std::fs::write(&root_ignore, generated).unwrap();
+    std::fs::write(task.join(".gitignore"), "*.junk\n").unwrap();
+    let plan = json(&workspace(&task, ["plan"]));
+    assert_eq!(plan["status"], "dry_run");
+    assert!(
+        plan["ignored_paths"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!("{task_id}/scratch.junk"))),
+        "{plan}"
+    );
+}
+
+#[test]
+fn a_bulk_publication_warns_above_the_file_threshold_and_is_silent_below() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "bulk-publication",
+            "--title",
+            "Bulk publication",
+            "--purpose",
+            "Check the bulk publication threshold.",
+            "--timestamp",
+            "20260829-171200",
+        ],
+    );
+    let task_id = "20260829-171200-bulk-publication";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    let results = task.join("results");
+    std::fs::create_dir(&results).unwrap();
+    // 199 results plus the task's record are exactly 200 new content files.
+    // The README and the manifest are housekeeping and are not counted.
+    for index in 0..199 {
+        std::fs::write(results.join(format!("run-{index:03}.json")), "{}\n").unwrap();
+    }
+
+    let quiet = json(&workspace(&task, ["plan"]));
+    assert_eq!(quiet["changed_paths"].as_array().unwrap().len(), 202);
+    assert!(
+        !warning_codes(&quiet).contains(&"bulk-publication"),
+        "the threshold itself is silent: {quiet}"
+    );
+
+    std::fs::write(results.join("run-199.json"), "{}\n").unwrap();
+    let loud = json(&workspace(&task, ["plan"]));
+    assert!(warning_codes(&loud).contains(&"bulk-publication"), "{loud}");
+    let message = loud["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "bulk-publication")
+        .unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("201 new files"), "{message}");
+    assert!(message.contains("rather than a refusal"), "{message}");
+
+    // It is a check, not a refusal.
+    assert_eq!(
+        json(&workspace(
+            &task,
+            ["publish", "-m", "Publish the bulk results"]
+        ))["status"],
+        "pushed"
+    );
+    // A second publication that adds nothing new is silent again.
+    std::fs::write(task.join("record.md"), "# Record\n\nOne edit.\n").unwrap();
+    let repeat = json(&workspace(&task, ["plan"]));
+    assert!(
+        !warning_codes(&repeat).contains(&"bulk-publication"),
+        "an edit to published content is not new bulk: {repeat}"
+    );
+
+    // A rename moves every published file at once. Nothing arrives, so nothing
+    // is bulk; counting the moved files would invite the agent to ignore or
+    // untrack content it already deliberately published.
+    assert_eq!(
+        json(&workspace(
+            &task,
+            ["task", "rename", "bulk-publication-renamed"]
+        ))["status"],
+        "renamed"
+    );
+    let renamed = fixture
+        .shared
+        .join("20260829-171200-bulk-publication-renamed");
+    let after_rename = json(&workspace(&renamed, ["plan"]));
+    assert!(
+        !warning_codes(&after_rename).contains(&"bulk-publication"),
+        "a rename adds no content: {after_rename}"
+    );
+}
+
+#[test]
+fn a_bulk_publication_warns_above_the_byte_threshold() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "bulk-bytes",
+            "--title",
+            "Bulk bytes",
+            "--purpose",
+            "Check the bulk publication byte threshold.",
+            "--timestamp",
+            "20260829-171300",
+        ],
+    );
+    let task_id = "20260829-171300-bulk-bytes";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    // One sparse file above 256 MiB: the byte threshold must fire on its own,
+    // with the file count far below its own threshold.
+    let payload = task.join("intermediate.bin");
+    std::fs::File::create(&payload)
+        .unwrap()
+        .set_len(268_435_457)
+        .unwrap();
+    workspace(
+        &task,
+        [
+            "storage",
+            "set",
+            &format!("{task_id}/intermediate.bin"),
+            "--to",
+            "git",
+            "--reason",
+            "Keep the fixture in Git so size alone is under test",
+        ],
+    );
+
+    let plan = json(&workspace(&task, ["plan"]));
+
+    let message = plan["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "bulk-publication")
+        .unwrap_or_else(|| panic!("{plan}"))["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("3 new files"), "{message}");
+    // The threshold is stated in the unit the rest of the policy uses, with
+    // the exact byte count beside it.
+    assert!(
+        message.contains("256 MiB (268435456 bytes) threshold"),
+        "{message}"
+    );
+    let reported: u64 = message
+        .split(" bytes of new content")
+        .next()
+        .unwrap()
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(reported > 268_435_456, "{message}");
+}
+
+fn warning_codes(report: &serde_json::Value) -> Vec<&str> {
+    report["warnings"]
+        .as_array()
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| warning["code"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}

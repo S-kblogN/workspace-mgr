@@ -15,11 +15,20 @@ share a repository lock; task and storage-boundary locks add narrower
 diagnostics.
 
 Scaffold ownership is structural. In a repository established by
-`.workspace-mgr.toml`, `AGENTS.md`, `.dvc/config`, `.dvc/.gitignore`, and
-`.dvcignore` have fixed roles: the TOML file is the user-editable source of
-Git/S3 facts, while the other four are whole-file generated paths owned by the
-product and reconciled by `init`, regardless of their prior content.
-`.workspace-mgr/instructions/repository.md` remains repository-owned content.
+`.workspace-mgr.toml`, `AGENTS.md`, the root `.gitignore`, `.dvc/config`,
+`.dvc/.gitignore`, and `.dvcignore` have fixed roles: the TOML file is the
+user-editable source of Git/S3 facts, while the other five are whole-file
+generated paths owned by the product and reconciled by `init`. Ownership is
+structural for all but one: the root `.gitignore` exists in most repositories
+before the product does, so it is claimed by the generated header the product
+writes rather than by its path, and a file without that header is refused with
+the migration into `.workspace-mgr/repository.gitignore` rather than
+reconciled. Git has no include directive, so the root ignore file is generated
+rather than merged: it carries the product's fixed rules, imports
+`.workspace-mgr/repository.gitignore` verbatim, and preserves any well-formed
+managed local-only block the file already holds.
+`.workspace-mgr/instructions/repository.md` and
+`.workspace-mgr/repository.gitignore` remain repository-owned content.
 Shared aggregate files such as `.gitattributes` keep unrelated repository
 content while the product enforces only its required rules. Before first
 initialization, existing reserved scaffold paths are reported as collisions
@@ -114,16 +123,18 @@ For a task publication, the CLI:
 1. resolves the task and explicitly authorized scopes;
 2. fetches the configured base and target branches;
 3. verifies that an existing target branch belongs to the same task identity;
-4. builds and validates a preview private index, then evaluates placement and
-   acquires task and storage-boundary locks. The step-7 refusals are decided on
-   that preview, before any placement change or upload;
+4. builds and validates a preview private index, then resolves the rule source
+   of every ignored path in the scopes in one batched pass, evaluates
+   placement, and acquires task and storage-boundary locks. The step-7 refusals
+   are decided on that preview, before any placement change or upload;
 5. reconciles S3 metadata, uploads all live in-scope objects, and verifies them;
 6. builds a private Git index from the target branch, or the base branch when no
    target exists;
 7. stages only declared scopes and rejects gitlinks, symbolic links that escape
-   the repository, invalid placement, whitespace errors, and a deliverable
+   the repository, invalid placement, whitespace errors, a deliverable
    publication that adds or changes content inside its own task directory while
-   that directory documents nothing;
+   that directory documents nothing, and scoped content that only an untracked
+   ignore source hides;
 8. creates a commit with its task identity, updates the local target ref with compare-and-swap
    semantics, pushes an explicit refspec, and verifies the remote object ID;
 9. permanently deletes all versions at obsolete S3 object paths, deferring paths

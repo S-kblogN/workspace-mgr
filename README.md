@@ -64,6 +64,14 @@ filed: the tools the agent writes, the materials they use, and the task's own
 record of decisions, process, and hard-to-reproduce results all live inside it,
 listed in its README directory map.
 
+What leaves the task directory is curated. Every file under a task is either
+selected for publication or ignored by a rule this repository tracks, so the
+by-products of a run are not published by accident. Rules for one task belong
+in that task's own `.gitignore`; this repository's own rules belong in
+`.workspace-mgr/repository.gitignore`, from which `init` generates the root
+`.gitignore` together with the product's fixed rules. A path that only a
+machine-local rule hides is refused.
+
 Immediately after creating a deliverable task, the agent publishes its initial
 scaffold and creates the one matching draft pull request. Before every later
 turn ends, it automatically records the turn's decisions, process, tools, and

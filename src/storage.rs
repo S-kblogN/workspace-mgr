@@ -15,6 +15,11 @@ use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, res
 use crate::policy::{AUTO_S3_ABOVE_BYTES, RECOMMENDED_S3_MINIMUM_BYTES, TASK_MANIFEST_NAME};
 
 pub const PLACEMENT_SUFFIX: &str = ".workspace-mgr-storage.toml";
+/// The markers around the ignore rule `untrack` writes for a local-only path.
+/// Scaffold regeneration of the root ignore file re-emits these blocks
+/// verbatim, so the two writers must agree on their exact shape.
+pub(crate) const LOCAL_IGNORE_BEGIN: &str = "# workspace-mgr local begin ";
+pub(crate) const LOCAL_IGNORE_END: &str = "# workspace-mgr local end ";
 const PLACEMENT_SCHEMA: u32 = 1;
 const LOCAL_REASON: &str = "Keep payload only in this checkout";
 
@@ -1434,8 +1439,8 @@ fn with_local_ignore(contents: &[u8], path: &str, add: bool) -> Result<Vec<u8>> 
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::message("local-only path must have a UTF-8 file name"))?;
     let key = crate::hex::encode_lower(name.as_bytes());
-    let begin = format!("# workspace-mgr local begin {key}");
-    let end = format!("# workspace-mgr local end {key}");
+    let begin = format!("{LOCAL_IGNORE_BEGIN}{key}");
+    let end = format!("{LOCAL_IGNORE_END}{key}");
     let mut pattern = String::from("/");
     for character in name.chars() {
         if matches!(character, '\\' | '*' | '?' | '[' | ']' | '!' | '#' | ' ') {

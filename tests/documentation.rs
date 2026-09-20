@@ -6,6 +6,7 @@ fn user_documentation_covers_the_complete_public_model() {
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
     let configuration = include_str!("../docs/configuration.md");
+    let changelog = include_str!("../CHANGELOG.md");
     let e2e_readme = include_str!("e2e/README.md");
     let e2e_coverage = include_str!("e2e/COVERAGE.md");
 
@@ -113,7 +114,10 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("small-s3-boundary"));
     assert!(guide.contains("semantic-placement-review"));
     assert!(guide.contains("task-record-unchanged"));
+    assert!(guide.contains("bulk-publication"));
     assert!(guide.contains("ignored_paths"));
+    assert!(guide.contains(".workspace-mgr/repository.gitignore"));
+    assert!(guide.contains(".git/info/exclude"));
     assert!(guide.contains("permanently deletes every version"));
     assert!(commands.contains("force-with-lease"));
     assert!(normalized_model.contains("explicit opposite endpoint"));
@@ -121,12 +125,53 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(commands.contains("head branch can close"));
     assert!(commands.contains("payload_bytes"));
     assert!(commands.contains("ignored_paths"));
+    assert!(commands.contains("bulk-publication"));
+    assert!(commands.contains(".workspace-mgr/repository.gitignore"));
+    assert!(commands.contains("# workspace-mgr local begin"));
+    // The thresholds and the product's fixed rules are literals in prose that
+    // no other test can see, so a retune of the constants must break a test
+    // that names the documents it invalidated.
+    for threshold in ["200 new files", "256 MiB (268435456 bytes)"] {
+        for (name, document) in [("guide", guide), ("commands", commands)] {
+            assert!(
+                document.contains(threshold),
+                "{name} states a stale bulk-publication threshold, expected {threshold:?}"
+            );
+        }
+    }
+    assert!(normalized_model.contains("256 MiB (268435456 bytes)"));
+    for product_rule in [
+        "`.DS_Store`",
+        "`__pycache__/`",
+        "`*.pyc`",
+        "`*.pyo`",
+        "`.ipynb_checkpoints/`",
+        "`.pytest_cache/`",
+        "`.mypy_cache/`",
+        "`.ruff_cache/`",
+        "`.venv/`",
+        "`venv/`",
+        "`node_modules/`",
+    ] {
+        assert!(
+            commands.contains(product_rule),
+            "the generated root ignore file's rules are documented in full, missing {product_rule}"
+        );
+    }
+    // The upgrade every existing repository must perform is documented where a
+    // maintainer looks for it.
+    assert!(guide.contains("Upgrading a repository that predates"));
+    assert!(changelog.contains("### Upgrading"));
     for workplace_rule in [
         "Where the work happens",
         "It is where the work happens",
         "rather than in a temporary directory elsewhere on the machine",
         "only that they are Markdown files the README's directory map names",
         "records the turn's decisions, process, tools, and hard-to-reproduce results",
+        "curating what leaves it is the other",
+        "ignored by a rule this repository tracks",
+        "Git has no include directive",
+        "S3 keeps Git small, it does not keep the workspace curated",
     ] {
         assert!(
             normalized_model.contains(workplace_rule),

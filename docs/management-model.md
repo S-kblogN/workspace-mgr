@@ -155,16 +155,55 @@ decision. The second is credentials. They are the single exception to the rule:
 they stay outside the repository entirely, and the task records how to
 regenerate them rather than their values.
 
+Keeping the work inside the task directory is one half of the rule; curating
+what leaves it is the other. Every file under a task is in one of two states.
+It is selected — published in Git, or placement-recorded for S3 or local-only
+retention — or it is ignored by a rule this repository tracks. There is no
+third state in which a file simply sits in the task directory while everyone
+remembers not to commit it. Publication stages the whole declared scope, so an
+unignored file is published by the next publication whether or not anyone
+intended it.
+
+The by-products of the work are therefore not published by default. Build
+output, caches, per-run logs and checkpoints, scratch copies of inputs, and
+intermediate data that can be regenerated cheaply from the retained inputs and
+tools are not what a reviewer or a later reader needs. The tools themselves,
+the results that were expensive or impossible to reproduce, and the evidence
+behind a claim are.
+
+Ignore rules are layered so that each one sits where its audience can see it.
+Rules that matter to one task belong in that task's own `.gitignore`, as the
+narrowest rule that covers the junk, where they travel with the task, are
+visible in its review, and stay inside the task's own write boundary. This
+repository's own rules live in `.workspace-mgr/repository.gitignore`. Git has
+no include directive, so `workspace-mgr` owns the root `.gitignore` as a whole
+and generates it from that module plus a small fixed set of product rules for
+output that is regenerated rather than retained; the root file is never
+hand-edited, and `init` reconciles it like any other product-owned path. That
+second layer is a pair of shared root paths, so reaching for it costs what any
+change outside the task directory costs: the user's explicit authorization,
+normally an infrastructure task, and a publication of its own before the rule
+means anything in another clone. Routing bulk by-products to S3 is not a
+substitute for either layer: S3 keeps Git small, it does not keep the workspace
+curated.
+
 Because no command can observe an agent writing to a temporary directory,
 publication enforces only what reaches the index. It refuses a deliverable
 publication that adds or changes content inside the task directory while that
 directory documents nothing, refuses a symbolic link whose target is outside
 the repository, and reports the ignored paths it found inside the task so the
 agent can confirm that each one is reproducible output rather than work that
-should have been retained. Content placed in S3 is judged by its pointer, so
-routing an expensive result out of Git does not exempt it. A symbolic link
-inside a boundary already placed in S3 or kept local with `untrack` is outside
-what publication can see, because that content never reaches the index.
+should have been retained. It refuses content that only a machine-local
+ignore rule hides — the user's global excludes, `.git/info/exclude`, or an
+ignore file whose matching bytes the publication does not carry — because such
+a rule keeps the file out of every other clone and out of review. It reports
+`bulk-publication` when one publication adds more than two hundred new files or
+more than 256 MiB (268435456 bytes) of new content inside the task, as a check
+rather than a refusal. Content placed
+in S3 is judged by its pointer, so routing an expensive result out of Git does
+not exempt it. A symbolic link inside a boundary already placed in S3 or kept
+local with `untrack` is outside what publication can see, because that content
+never reaches the index.
 
 ## Where task content lives
 

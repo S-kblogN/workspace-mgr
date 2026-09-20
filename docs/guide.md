@@ -67,13 +67,20 @@ Initialization creates:
 
 - `.workspace-mgr.toml`, the public Git and optional S3 facts;
 - a thin `AGENTS.md` bootstrap;
+- the root `.gitignore`, generated from the product's fixed rules for
+  regenerated output and from this repository's own rules in
+  `.workspace-mgr/repository.gitignore`;
 - internal storage scaffolding when S3 is configured.
 
-On first initialization, `AGENTS.md` and the private internal-storage scaffold
-paths are reserved. If any already exists, `init` reports the complete
-collision before writing anything; it does not inspect content to guess whether
-the path is managed. After `.workspace-mgr.toml` establishes the repository as
-initialized, `AGENTS.md`, generated internal storage configuration, and the
+On first initialization, `AGENTS.md`, the root `.gitignore`, and the private
+internal-storage scaffold paths are reserved. If any already exists, `init`
+reports the complete collision before writing anything; it does not inspect
+content to guess whether the path is managed. A repository that already keeps
+its own root `.gitignore` moves those rules into
+`.workspace-mgr/repository.gitignore`, removes the root file, and runs `init`
+again; nothing is migrated silently and nothing is discarded. After
+`.workspace-mgr.toml` establishes the repository as initialized, `AGENTS.md`,
+the root `.gitignore`, generated internal storage configuration, and the
 private engine's ignore files are product-owned. Every `init` deterministically
 creates, replaces, or removes them according to the installed CLI and current
 Git/S3 facts. This is also the scaffold-upgrade operation after installing a
@@ -81,8 +88,41 @@ newer CLI. In an initialized repository, an agent performs this reconciliation
 inside an infrastructure task so the generated repository-wide diff is
 reviewed like any other shared change.
 
+### Upgrading a repository that predates the generated root `.gitignore`
+
+The root `.gitignore` became product-owned after the 0.3.0 release, so every
+repository initialized before it performs one migration. Unlike the other
+owned paths, this one is claimed by content rather than by name alone: the
+product regenerates a root `.gitignore` only when it wrote the file that is
+there, which the generated first line records. Until the migration runs, `init`
+and `doctor` both refuse the file and say the same thing, so nothing is
+overwritten by following either of them:
+
+```sh
+mkdir -p .workspace-mgr
+git mv .gitignore .workspace-mgr/repository.gitignore
+workspace-mgr init
+```
+
+`init` then regenerates the root file from the product's fixed rules followed
+by that module, so every rule the repository had keeps working, negations
+included, and repository rules still win over the product's because they come
+last. Do this inside an infrastructure task like any other repository-wide
+change, and publish the result: an ignore rule reaches other clones only once
+the regenerated root file is on the shared branch.
+
 Repository-specific additions belong in
-`.workspace-mgr/instructions/repository.md`, which `init` preserves. Shared
+`.workspace-mgr/instructions/repository.md`, which `init` preserves, and this
+repository's own ignore rules belong in `.workspace-mgr/repository.gitignore`,
+which `init` imports verbatim into the generated root `.gitignore` under its
+own comment header. Both modules are repository-owned and limited to 64 KiB of
+UTF-8; the product validates nothing else about the ignore patterns, except
+that the ignore module may not contain the `# workspace-mgr local begin` and
+`# workspace-mgr local end` markers, which belong to `untrack`. Hand edits
+to the generated root file, below its generated header, are drift, which
+`doctor` reports and `init` repairs; a well-formed `# workspace-mgr local
+begin` block in the root file survives regeneration unchanged, while a marker
+left without its partner is dropped and named in the reported action. Shared
 files such as `.gitattributes` retain repository-owned content while `init`
 ensures the product-required rules. `--dry-run` reports every planned action
 without writing files.
@@ -196,7 +236,32 @@ expensive or impossible to reproduce are never in that category, even when they
 look like intermediate output. Retain them. If they are too large for ordinary
 Git, place them with `workspace-mgr storage` or keep the bytes locally with
 `workspace-mgr untrack`; do not move them outside the repository to avoid the
-decision.
+decision, and do not route bulk by-products to S3 to keep Git small.
+
+Every remaining file under the task is in one of two states: selected, meaning
+published in Git or placement-recorded for S3 or local-only retention, or
+ignored by a rule this repository tracks. Publication stages the whole declared
+scope, so there is no third state in which a file stays in the task directory
+and is remembered as not-to-be-committed. Write the ignore rule in the layer
+that matches its audience:
+
+| Rule | Where it belongs | Who sees it |
+| --- | --- | --- |
+| Specific to one task | `<task>/.gitignore`, the narrowest rule that covers it | Every clone, and the task's own review |
+| This repository's own, for every task | `.workspace-mgr/repository.gitignore`, imported into the generated root `.gitignore` by `init` | Every clone, once that change is published |
+| Only this machine | Nowhere the product accepts: a rule in your global excludes or `.git/info/exclude` makes `plan` and `publish` refuse | Only you |
+
+The first layer is the cheap one, and it is the one a deliverable task can
+reach: `<task>/.gitignore` is inside the task's own write boundary and is
+staged by the same publication. The second is a pair of shared root paths, so
+changing it needs the user's explicit authorization like any path outside the
+task directory, belongs in an infrastructure task, and takes effect elsewhere
+only once the regenerated root file is published on the shared branch.
+
+A path that only a machine-local rule hides is refused rather than published,
+because the rule keeps the file out of every other clone and out of review.
+Move the rule into one of the first two layers, or let the file be published
+when the task retains it.
 
 For retained content, choose the history model before considering size. Git is
 the collaboration/control plane for clone-ready content whose value comes from
@@ -359,6 +424,7 @@ alongside its changed paths:
 | Code | Meaning | When to ignore it |
 | --- | --- | --- |
 | `task-record-unchanged` | The publication changes content inside the task directory, but none of the task's documentation changed with it | The turn produced no decision, tool, process step, or hard-to-reproduce result worth recording |
+| `bulk-publication` | The publication adds more than 200 new files, or more than 256 MiB (268435456 bytes) of new content, inside the task directory | The content is genuinely retained inputs, tools, evidence, or deliverables |
 
 The `warnings` list appears only when a plan or publication has something to
 report, so an ordinary clean report has no `warnings` key at all.
@@ -375,6 +441,20 @@ refused, because the link points at content no other checkout has; copy what
 the task must keep into the declared scope instead. The link check reads the
 staged tree only, so a link inside a boundary already placed in S3 or kept
 local with `untrack` is not classified: that content never reaches the index.
+
+A third refusal covers the ignore layer. A path inside the task's scopes that
+only a machine-local rule hides — the user's global excludes, `.git/info/exclude`,
+or an ignore file whose matching bytes this publication does not carry — is
+refused with the path, the rule, and the file the rule came from. Carrying is
+decided on content rather than on the file being tracked, so a rule appended to
+the tracked root `.gitignore` and never published is machine-local too. Git
+resolves the deepest matching ignore file first, so a carried repository or task
+rule that also matches is the reported source, and the product's own fixed
+rules are always carried, so an ordinary `.DS_Store` never triggers it even
+before the generated root file has been published. A directory whose entire
+content is ignored, which Git reports as one collapsed entry, is expanded to the
+files inside it so that a file-level rule such as `*.log` is resolved rather than
+missed. The refusal names at most the first five paths and counts the rest.
 
 A plan or publication also reports `ignored_paths` beside `ignored_entries`
 when any path inside the resolved scopes is ignored. The count is exact and the

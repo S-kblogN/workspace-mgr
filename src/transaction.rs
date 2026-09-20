@@ -18,11 +18,12 @@ use crate::manifest::{
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
-    AUTO_S3_ABOVE_BYTES, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
-    REVIEW_PULL_REQUEST, TASK_MANIFEST_NAME,
+    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
+    REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
+    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME,
 };
 use crate::s3_purge;
-use crate::scaffold::task_readme_directory_map;
+use crate::scaffold::{PRODUCT_IGNORE_RULES, task_readme_directory_map};
 use crate::storage::{self, PLACEMENT_SUFFIX};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -250,6 +251,9 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             automatic_s3: &preview_automatic_s3,
         },
     )?;
+    // Decided on the preview, before any placement change or upload, so `plan`
+    // and `publish` refuse the same machine-local ignore rule at the same point.
+    let preview_ignored = check_untracked_ignore_sources(&repo, &preview_index, &scopes, &task)?;
     let mut lock_names = initial_dvc
         .iter()
         .map(|path| format!("pointer:{path}"))
@@ -354,16 +358,30 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             automatic_s3: &automatic_s3,
         },
     )?;
-    let (ignored_entries, ignored_paths) = count_ignored(&repo, &index, &scopes)?;
-    let warnings = match deliverable_task_path(&task) {
-        Some(task_path) if changes_task_content(task_path, &paths, &automatic_s3) => {
-            let projection = TaskProjection::resolve(&repo, &index, task_path)?;
-            documentation_warning(task_path, &projection.documentation, &paths, &automatic_s3)
-                .into_iter()
-                .collect()
-        }
-        _ => Vec::new(),
+    // A plan applies no placement and writes nothing, so its final index is
+    // built from the same inputs as the preview and the ignore listing taken
+    // there is still the listing now. A publication may have written pointers
+    // and their ignore rules since, so it pays for a second walk.
+    let (ignored_entries, ignored_paths) = if dry_run {
+        summarize_ignored(preview_ignored)
+    } else {
+        count_ignored(&repo, &index, &scopes)?
     };
+    let mut warnings = Vec::new();
+    if let Some(task_path) = deliverable_task_path(&task) {
+        if changes_task_content(task_path, &paths, &automatic_s3) {
+            let projection = TaskProjection::resolve(&repo, &index, task_path)?;
+            warnings.extend(documentation_warning(
+                task_path,
+                &projection.documentation,
+                &paths,
+                &automatic_s3,
+            ));
+            let (files, bytes) =
+                bulk_publication_volume(&repo, &index, &base_oid, task_path, &automatic_s3)?;
+            warnings.extend(bulk_publication_warning(files, bytes));
+        }
+    }
     let tree_oid = repo
         .run_with_index(&index, ["write-tree"], None, true)?
         .stdout
@@ -1138,6 +1156,96 @@ fn documentation_warning(
     })
 }
 
+/// The new content this publication adds inside the task directory, as a file
+/// count and a byte total.
+///
+/// Content routed to S3 is counted from the placement decision and measured on
+/// disk, because its payload never reaches the private index; the guard would
+/// otherwise be loudest for a directory of small notes and silent for the
+/// dataset beside them. An explicitly selected boundary appears as its pointer
+/// and counts as one file: that placement was already a deliberate decision,
+/// which is exactly what this warning asks for.
+///
+/// An automatically placed boundary is counted from the decision alone. By the
+/// time `publish` reaches this point the pointer it writes is staged too, so
+/// counting both would make `publish` report more content than the `plan` that
+/// preceded it for a task nothing had touched in between.
+fn bulk_publication_volume(
+    repo: &GitRepo,
+    index: &Path,
+    base_oid: &str,
+    task_path: &str,
+    automatic_s3: &[String],
+) -> Result<(u64, u64)> {
+    let added = added_paths(repo, index, base_oid)?;
+    let automatic_metadata: BTreeSet<String> = automatic_s3
+        .iter()
+        .flat_map(|path| [format!("{path}.dvc"), format!("{path}{PLACEMENT_SUFFIX}")])
+        .collect();
+    let mut files = 0;
+    let mut bytes = 0;
+    for path in added
+        .iter()
+        .filter(|path| !automatic_metadata.contains(path.as_str()))
+        .chain(automatic_s3.iter())
+        .filter(|path| is_task_content(task_path, path))
+    {
+        files += 1;
+        let absolute = resolved_under(&repo.root, path);
+        // A staged path always exists, and an automatic S3 candidate was just
+        // measured; a path that disappeared under a concurrent edit simply adds
+        // nothing to the total rather than failing an advisory count.
+        if let Ok(metadata) = fs::symlink_metadata(&absolute) {
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                bytes += metadata.len();
+            }
+        }
+    }
+    Ok((files, bytes))
+}
+
+fn bulk_publication_warning(files: u64, bytes: u64) -> Option<TransactionWarning> {
+    if files <= BULK_PUBLICATION_FILES && bytes <= BULK_PUBLICATION_BYTES {
+        return None;
+    }
+    Some(TransactionWarning {
+        code: "bulk-publication".to_owned(),
+        message: format!(
+            "this publication adds {files} new files and {bytes} bytes of new content inside the task directory, above the {BULK_PUBLICATION_FILES} file or {BULK_PUBLICATION_MIB} MiB ({BULK_PUBLICATION_BYTES} bytes) threshold; confirm that they are retained inputs, tools, evidence, or deliverables, and otherwise ignore the regenerable ones with the narrowest rule or keep bulk content on this machine with `workspace-mgr untrack`, then re-plan; this is a check rather than a refusal, so ignore it when the content is genuinely retained"
+        ),
+    })
+}
+
+/// The paths this publication adds, as opposed to the ones it edits, moves, or
+/// retires. The bulk check is about content arriving in the task, so an edit to
+/// a file the task already published is not part of it, and neither is the same
+/// file under a new path: `workspace-mgr task rename` moves every published
+/// file at once, which would otherwise read as the largest arrival the task
+/// ever made.
+fn added_paths(repo: &GitRepo, index: &Path, base: &str) -> Result<Vec<String>> {
+    let output = repo.run_with_index(
+        index,
+        [
+            "diff",
+            "--cached",
+            "--name-only",
+            "--find-renames",
+            "--diff-filter=A",
+            "-z",
+            base,
+            "--",
+        ],
+        None,
+        true,
+    )?;
+    Ok(output
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 fn check_large_files(
     repo: &GitRepo,
     scopes: &[String],
@@ -1186,7 +1294,10 @@ fn check_large_files(
 /// can read; the count stays complete.
 const REPORTED_IGNORED_PATHS: usize = 50;
 
-fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<(usize, Vec<String>)> {
+/// Every path inside the scopes that Git ignores. An ignored directory arrives
+/// collapsed to one entry, which is what keeps this from descending into a tree
+/// the checkout may not even be able to read.
+fn ignored_paths(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<Vec<String>> {
     let mut args = vec![
         "status".to_owned(),
         "--ignored".to_owned(),
@@ -1204,9 +1315,301 @@ fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<(usi
         .map(ToOwned::to_owned)
         .collect();
     paths.sort();
+    Ok(paths)
+}
+
+fn count_ignored(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<(usize, Vec<String>)> {
+    Ok(summarize_ignored(ignored_paths(repo, index, scopes)?))
+}
+
+fn summarize_ignored(mut paths: Vec<String>) -> (usize, Vec<String>) {
     let entries = paths.len();
     paths.truncate(REPORTED_IGNORED_PATHS);
-    Ok((entries, paths))
+    (entries, paths)
+}
+
+/// How many machine-local ignore rules a refusal names before it counts the
+/// rest. One untracked rule can hide a whole tree, so the message lists enough
+/// to diagnose the cause and then stops.
+const REPORTED_UNTRACKED_IGNORE_SOURCES: usize = 5;
+
+/// One decided ignore rule as `git check-ignore -v -z` reports it: the file the
+/// rule lives in, the pattern, and the path it hid. The line number is parsed
+/// and dropped, because the fix is to move the rule, not to edit that line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnoreRule<'a> {
+    source: &'a str,
+    pattern: &'a str,
+    path: &'a str,
+}
+
+fn parse_ignore_rules(raw: &str) -> Vec<IgnoreRule<'_>> {
+    let mut fields = raw.split('\0');
+    let mut rules = Vec::new();
+    loop {
+        let (Some(source), Some(_line), Some(pattern), Some(path)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return rules;
+        };
+        if source.is_empty() || path.is_empty() {
+            return rules;
+        }
+        rules.push(IgnoreRule {
+            source,
+            pattern,
+            path,
+        });
+    }
+}
+
+/// The rules this publication does not carry: the user's global excludes,
+/// `.git/info/exclude`, or an ignore file whose matching bytes are not in the
+/// projected publication. Git resolves the deepest matching ignore file first
+/// and only then falls back to `.git/info/exclude` and the global excludes, so
+/// a repository or task rule that also matches is the reported source and the
+/// common case never reaches here.
+fn machine_local_ignores<'a, 'b>(
+    rules: &'b [IgnoreRule<'a>],
+    carried: &BTreeSet<String>,
+) -> Vec<&'b IgnoreRule<'a>> {
+    rules
+        .iter()
+        // A negated pattern decides that the path is not ignored at all, so it
+        // hides nothing and names no rule to move.
+        .filter(|rule| !rule.pattern.starts_with('!'))
+        .filter(|rule| !is_product_ignore_rule(rule))
+        .filter(|rule| !carried.contains(rule.source))
+        .collect()
+}
+
+/// A rule the product itself writes into the root ignore file. `init`
+/// regenerates that file in every clone from the installed CLI, so such a rule
+/// is carried wherever the product is, including in the window between `init`
+/// and the publication of the generated file. Without this, the first plan of
+/// every freshly initialized repository would be refused over a stray
+/// `.DS_Store` hidden by the product's own wildcard, and the remedies the
+/// refusal offers would all regenerate the same unpublished file.
+fn is_product_ignore_rule(rule: &IgnoreRule<'_>) -> bool {
+    rule.source == ROOT_IGNORE_NAME && PRODUCT_IGNORE_RULES.contains(&rule.pattern)
+}
+
+fn untracked_ignore_message(rules: &[&IgnoreRule<'_>], destination: &str) -> String {
+    let listed = rules
+        .iter()
+        .take(REPORTED_UNTRACKED_IGNORE_SOURCES)
+        .map(|rule| {
+            format!(
+                "{:?} by rule {:?} in {:?}",
+                rule.path, rule.pattern, rule.source
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = rules
+        .len()
+        .saturating_sub(REPORTED_UNTRACKED_IGNORE_SOURCES);
+    let more = if remaining == 0 {
+        String::new()
+    } else {
+        format!(", and {remaining} more")
+    };
+    format!(
+        "this task's scopes hold content that only an ignore rule this publication does not carry hides, so the rule keeps it out of every other clone and out of review: {listed}{more}; put the rule in {destination}, which stays inside this task's write boundary and reaches review with the task, or let the content be published when the task retains it; a rule the whole repository needs belongs in `{REPOSITORY_IGNORE_MODULE}`, which `workspace-mgr init` imports into the root `{ROOT_IGNORE_NAME}`, but both are shared root paths whose change needs the user's explicit authorization and counts only once it is published on the shared branch"
+    )
+}
+
+/// Where a refusal tells this task to put an ignore rule it must keep. A
+/// deliverable owns one directory; an infrastructure task owns only the paths
+/// its manifest declares.
+fn ignore_rule_destination(task: &ResolvedTask) -> String {
+    match deliverable_task_path(task) {
+        Some(task_path) => format!("`{task_path}/.gitignore`"),
+        None => "the `.gitignore` of a declared scope".to_owned(),
+    }
+}
+
+/// Refuses content that Git hides because of a rule this publication does not
+/// carry. Such a rule is invisible to every other clone and to review, so the
+/// file it hides is in neither of the two states a task's content may be in:
+/// selected for publication, or ignored by a rule the repository carries.
+///
+/// Returns the ignored listing it produced, so the report does not pay for a
+/// second walk of the same scopes when nothing between the two points can have
+/// changed it.
+///
+/// Resolution is batched: one ignore listing, one rule resolution over all of
+/// its paths, one expansion of the directories that resolution could not
+/// explain, and one carried-source listing.
+fn check_untracked_ignore_sources(
+    repo: &GitRepo,
+    index: &Path,
+    scopes: &[String],
+    task: &ResolvedTask,
+) -> Result<Vec<String>> {
+    let ignored = ignored_paths(repo, index, scopes)?;
+    if ignored.is_empty() {
+        return Ok(ignored);
+    }
+    let mut resolved = resolve_ignore_rules(repo, index, &ignored)?;
+    // `git status --ignored` collapses a directory whose every entry is ignored
+    // into the directory itself, and a file-level rule such as `*.log` does not
+    // match that directory, so the entry arrives with no rule at all — which is
+    // exactly the shape this refusal exists for: a `results/` or `logs/` tree
+    // of by-products hidden by one personal rule. Only those directories are
+    // expanded, and `--ignored=matching` leaves a directory that a directory
+    // rule already covers collapsed, so a wholesale-ignored tree is still never
+    // walked.
+    let decided: BTreeSet<String> = parse_ignore_rules(&resolved)
+        .into_iter()
+        .map(|rule| rule.path.to_owned())
+        .collect();
+    let undecided: Vec<String> = ignored
+        .iter()
+        .filter(|path| path.ends_with('/') && !decided.contains(path.as_str()))
+        .cloned()
+        .collect();
+    if !undecided.is_empty() {
+        let expanded = matching_ignored_paths(repo, index, &undecided)?;
+        if !expanded.is_empty() {
+            let inner = resolve_ignore_rules(repo, index, &expanded)?;
+            resolved.push_str(&inner);
+        }
+    }
+    let rules = parse_ignore_rules(&resolved);
+    let carried = carried_ignore_sources(repo, index, &rules)?;
+    let machine_local = machine_local_ignores(&rules, &carried);
+    if machine_local.is_empty() {
+        return Ok(ignored);
+    }
+    Err(Error::message(untracked_ignore_message(
+        &machine_local,
+        &ignore_rule_destination(task),
+    )))
+}
+
+/// The rule that decides each of these paths, in `git check-ignore -v -z`
+/// framing, resolved in one process for the whole listing.
+fn resolve_ignore_rules(repo: &GitRepo, index: &Path, paths: &[String]) -> Result<String> {
+    let mut request = paths.join("\0");
+    request.push('\0');
+    let resolved = repo.run_with_index(
+        index,
+        ["check-ignore", "-v", "-z", "--no-index", "--stdin"],
+        Some(&request),
+        false,
+    )?;
+    // 0 reports at least one decided rule; 1 reports none, which a concurrent
+    // edit can produce between the two commands. Anything else is a failure.
+    if resolved.code != 0 && resolved.code != 1 {
+        return Err(Error::message(format!(
+            "cannot resolve the Git ignore rules for this task: {}",
+            resolved.stderr.trim()
+        )));
+    }
+    Ok(resolved.stdout)
+}
+
+/// The individual entries hidden inside directories the collapsed listing could
+/// not explain. `--ignored=matching` reports only paths that a pattern matches,
+/// so every entry it returns is one `check-ignore` can decide.
+fn matching_ignored_paths(
+    repo: &GitRepo,
+    index: &Path,
+    directories: &[String],
+) -> Result<Vec<String>> {
+    let literal: Vec<String> = directories
+        .iter()
+        .map(|path| format!(":(literal){}", path.trim_end_matches('/')))
+        .collect();
+    let mut paths = BTreeSet::new();
+    for batch in pathspec_batches(&literal) {
+        let mut args = vec![
+            "status".to_owned(),
+            "--ignored=matching".to_owned(),
+            "--short".to_owned(),
+            "-z".to_owned(),
+            "--untracked-files=all".to_owned(),
+            "--".to_owned(),
+        ];
+        args.extend(batch.iter().cloned());
+        paths.extend(
+            repo.run_with_index(index, args, None, true)?
+                .stdout
+                .split('\0')
+                .filter_map(|entry| entry.strip_prefix("!! "))
+                .map(ToOwned::to_owned),
+        );
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// The ignore files among these rules whose rules this publication carries.
+///
+/// Being a path in the projected index is not enough. `git check-ignore`
+/// resolves against the work tree, so a rule written into a tracked ignore file
+/// and never staged decides here while reaching no other clone — which is how
+/// the remedy for this very refusal could otherwise silence it without
+/// publishing anything. The publication carries a source only when its
+/// work-tree bytes are the bytes the projected index holds for that path, which
+/// is true of a task's own `.gitignore` because the scopes are staged from the
+/// work tree, and false of a local edit to a shared root file.
+///
+/// A source outside the work tree — the global excludes file, or anything below
+/// `.git` — can never be carried, so it is never asked about.
+fn carried_ignore_sources(
+    repo: &GitRepo,
+    index: &Path,
+    rules: &[IgnoreRule<'_>],
+) -> Result<BTreeSet<String>> {
+    let mut candidates = BTreeSet::new();
+    for rule in rules {
+        if Path::new(rule.source).is_absolute() || rule.source.starts_with(".git/") {
+            continue;
+        }
+        candidates.insert(format!(":(literal){}", rule.source));
+    }
+    if candidates.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let candidates: Vec<String> = candidates.into_iter().collect();
+    let mut carried = BTreeSet::new();
+    for batch in pathspec_batches(&candidates) {
+        let mut listing = vec!["ls-files".to_owned(), "-z".to_owned(), "--".to_owned()];
+        listing.extend(batch.iter().cloned());
+        carried.extend(
+            repo.run_with_index(index, listing, None, true)?
+                .stdout
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        // `status` refreshes the index against the work tree, so the
+        // work-tree column is a content comparison rather than a stat one.
+        let mut compare = vec![
+            "status".to_owned(),
+            "--porcelain".to_owned(),
+            "-z".to_owned(),
+            "--untracked-files=no".to_owned(),
+            "--no-renames".to_owned(),
+            "--".to_owned(),
+        ];
+        compare.extend(batch.iter().cloned());
+        for entry in repo
+            .run_with_index(index, compare, None, true)?
+            .stdout
+            .split('\0')
+        {
+            // `XY <path>`: X is this publication against the base tree, which
+            // is the whole point of the publication; Y is the work tree against
+            // this publication, which is what must be empty.
+            let Some(path) = entry.get(3..) else { continue };
+            if entry.as_bytes().get(1).is_some_and(|state| *state != b' ') {
+                carried.remove(path);
+            }
+        }
+    }
+    Ok(carried)
 }
 
 fn build_commit_message(
@@ -1555,5 +1958,220 @@ mod tests {
         assert!(pathspec_batches(&[]).is_empty());
         let single = owned(&["a"]);
         assert_eq!(pathspec_batches(&single).len(), 1);
+    }
+
+    fn rule_record(source: &str, line: u32, pattern: &str, path: &str) -> String {
+        format!("{source}\0{line}\0{pattern}\0{path}\0")
+    }
+
+    #[test]
+    fn parses_the_machine_readable_ignore_rule_framing() {
+        let raw = format!(
+            "{}{}{}",
+            rule_record(
+                ".gitignore",
+                1,
+                ".DS_Store",
+                "20260829-170100-task/.DS_Store"
+            ),
+            rule_record(
+                "/home/dev/.config/git/ignore",
+                2,
+                "*.scratch",
+                "20260829-170100-task/notes.scratch"
+            ),
+            rule_record(
+                ".git/info/exclude",
+                1,
+                "bulk/",
+                "20260829-170100-task/bulk/"
+            ),
+        );
+
+        let rules = parse_ignore_rules(&raw);
+
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].source, ".gitignore");
+        assert_eq!(rules[0].pattern, ".DS_Store");
+        assert_eq!(rules[0].path, "20260829-170100-task/.DS_Store");
+        assert_eq!(rules[1].source, "/home/dev/.config/git/ignore");
+        assert_eq!(rules[2].path, "20260829-170100-task/bulk/");
+        // `check-ignore` reports nothing when no path is ignored, and a
+        // truncated record is never half-believed.
+        assert!(parse_ignore_rules("").is_empty());
+        assert!(parse_ignore_rules("*.log\0.gitignore\0").is_empty());
+    }
+
+    #[test]
+    fn only_a_rule_the_publication_does_not_carry_is_machine_local() {
+        let raw = format!(
+            "{}{}{}{}",
+            rule_record(
+                ".gitignore",
+                1,
+                ".DS_Store",
+                "20260829-170100-task/.DS_Store"
+            ),
+            rule_record(
+                "20260829-170100-task/.gitignore",
+                1,
+                "*.tmp",
+                "20260829-170100-task/scratch.tmp"
+            ),
+            rule_record(
+                "/home/dev/.config/git/ignore",
+                2,
+                "*.scratch",
+                "20260829-170100-task/notes.scratch"
+            ),
+            rule_record(
+                ".git/info/exclude",
+                1,
+                "bulk/",
+                "20260829-170100-task/bulk/"
+            ),
+        );
+        let rules = parse_ignore_rules(&raw);
+        let carried = tracked(&[".gitignore", "20260829-170100-task/.gitignore"]);
+
+        let machine_local = machine_local_ignores(&rules, &carried);
+
+        assert_eq!(
+            machine_local
+                .iter()
+                .map(|rule| rule.source)
+                .collect::<Vec<_>>(),
+            vec!["/home/dev/.config/git/ignore", ".git/info/exclude"]
+        );
+        // A negated rule decides that the path is not ignored, so it hides
+        // nothing even when its own file is untracked.
+        let negation = rule_record(
+            "vendor/.gitignore",
+            3,
+            "!keep.log",
+            "20260829-170100-task/keep.log",
+        );
+        let negated = parse_ignore_rules(&negation);
+        assert!(machine_local_ignores(&negated, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_rule_the_product_itself_ships_is_never_machine_local() {
+        // The generated root file is unpublished between `init` and the first
+        // scaffold publication, and on macOS a `.DS_Store` appears in a browsed
+        // directory on its own. Refusing there would block the bootstrap the
+        // guide prescribes, with no remedy the task could apply.
+        let product = PRODUCT_IGNORE_RULES
+            .iter()
+            .map(|pattern| {
+                rule_record(
+                    ROOT_IGNORE_NAME,
+                    1,
+                    pattern,
+                    &format!("20260829-170100-task/{}", pattern.trim_end_matches('/')),
+                )
+            })
+            .collect::<String>();
+        let rules = parse_ignore_rules(&product);
+        assert_eq!(rules.len(), PRODUCT_IGNORE_RULES.len());
+        assert!(machine_local_ignores(&rules, &BTreeSet::new()).is_empty());
+
+        // Only the product's own list, and only in the file the product owns.
+        let repository = format!(
+            "{}{}",
+            rule_record(
+                ROOT_IGNORE_NAME,
+                20,
+                "*.scratchlog",
+                "20260829-170100-task/run.scratchlog"
+            ),
+            rule_record(
+                "vendor/.gitignore",
+                1,
+                ".DS_Store",
+                "20260829-170100-task/vendor/.DS_Store"
+            ),
+        );
+        let rules = parse_ignore_rules(&repository);
+        assert_eq!(
+            machine_local_ignores(&rules, &BTreeSet::new())
+                .iter()
+                .map(|rule| rule.pattern)
+                .collect::<Vec<_>>(),
+            vec!["*.scratchlog", ".DS_Store"]
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_rule_its_source_and_both_fixes() {
+        let raw = (0..7)
+            .map(|index| {
+                rule_record(
+                    ".git/info/exclude",
+                    1,
+                    "bulk/",
+                    &format!("20260829-170100-task/bulk{index}/"),
+                )
+            })
+            .collect::<String>();
+        let rules = parse_ignore_rules(&raw);
+        let machine_local = machine_local_ignores(&rules, &BTreeSet::new());
+
+        let message = untracked_ignore_message(&machine_local, "`20260829-170100-task/.gitignore`");
+
+        assert!(
+            message.contains("\"20260829-170100-task/bulk0/\""),
+            "{message}"
+        );
+        assert!(message.contains("by rule \"bulk/\""), "{message}");
+        assert!(message.contains("in \".git/info/exclude\""), "{message}");
+        assert!(message.contains(", and 2 more"), "{message}");
+        assert!(
+            !message.contains("20260829-170100-task/bulk5/"),
+            "the list is capped: {message}"
+        );
+        assert!(
+            message.contains("`20260829-170100-task/.gitignore`")
+                && message.contains(REPOSITORY_IGNORE_MODULE),
+            "{message}"
+        );
+        // The fix inside the task's own write boundary is the one the message
+        // leads with, and the repository layer states its cost rather than
+        // reading as an equally cheap alternative.
+        assert!(
+            message.contains("stays inside this task's write boundary"),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains("shared root paths whose change needs the user's explicit authorization")
+                && message.contains("published on the shared branch"),
+            "{message}"
+        );
+        let single = machine_local_ignores(&rules[..1], &BTreeSet::new());
+        assert!(!untracked_ignore_message(&single, "a scope").contains("more"));
+    }
+
+    #[test]
+    fn bulk_publication_warns_above_either_threshold_and_stays_silent_below() {
+        assert!(bulk_publication_warning(BULK_PUBLICATION_FILES, BULK_PUBLICATION_BYTES).is_none());
+        assert!(bulk_publication_warning(0, 0).is_none());
+        let many = bulk_publication_warning(BULK_PUBLICATION_FILES + 1, 1_024)
+            .expect("one file above the file threshold warns");
+        assert_eq!(many.code, "bulk-publication");
+        assert!(many.message.contains(&BULK_PUBLICATION_FILES.to_string()));
+        let large = bulk_publication_warning(1, BULK_PUBLICATION_BYTES + 1)
+            .expect("one byte above the byte threshold warns");
+        assert_eq!(large.code, "bulk-publication");
+        // The threshold is read by an agent deciding whether it is close to it,
+        // so it carries the unit the rest of the policy states sizes in.
+        assert!(
+            large.message.contains(&format!(
+                "{BULK_PUBLICATION_MIB} MiB ({BULK_PUBLICATION_BYTES} bytes)"
+            )),
+            "{}",
+            large.message
+        );
+        assert!(large.message.contains("rather than a refusal"));
     }
 }
