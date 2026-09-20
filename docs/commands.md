@@ -7,7 +7,18 @@ The [user guide](guide.md) explains how the commands form one workflow.
 ## Conventions
 
 - Repository paths are relative to the Git root, even when a command is run
-  from a task directory.
+  from a task directory. `/` is their only separator: on the supported Linux
+  and macOS targets a backslash is an ordinary file-name character that is
+  never rewritten, so typed paths, Git paths, and storage metadata compare
+  exactly. The storage engine reads a backslash as a separator, so an S3
+  boundary path may not contain one. Automatic placement, explicit
+  `storage set --to s3`, and a `storage reset` whose automatic policy selects
+  S3 refuse such a path before any metadata is written, and `move` refuses it
+  as a destination for content already in S3; rename the path, or keep it in
+  Git with `storage set --to git`. Storage metadata that an earlier release
+  left at such a path cannot be addressed at all, so `plan`, `publish`,
+  `storage hydrate`, `storage set`, and `untrack` refuse it with status 2 and
+  a `workspace-mgr move` recovery hint.
 - `--repo <path>` selects the starting repository or task path and defaults to
   the current directory.
 - Task-scoped commands discover `.workspace-mgr-task.toml` from the starting
@@ -27,6 +38,31 @@ The [user guide](guide.md) explains how the commands form one workflow.
   unchanged. The CLI never updates itself. Agents report the versions and ask
   the user before updating, then run `workspace-mgr setup`; scaffold changes are
   reconciled with `workspace-mgr init` in an infrastructure task.
+- A repository whose `.workspace-mgr.toml` declares a `minimum_cli_version`
+  that the installed CLI does not meet is refused, with status 2, by every
+  command that reads the repository configuration, including `instructions`;
+  only `doctor` still runs and reports it. The error names the required
+  version, where it was declared, and the installed version, and tells the
+  agent to report both versions to the user and ask before updating with
+  `cargo install --locked workspace-mgr`, followed by `workspace-mgr setup`.
+  Commands that fetch apply the same check to what they fetched before they
+  change anything: `task create` and `task discard` to the base branch,
+  `task rename`, `plan`, and `publish` to the base branch and the task branch,
+  and `refresh` to the incoming revision; their errors name
+  `.workspace-mgr.toml on <remote>/<branch>`. A pre-release meets a
+  declaration of its own release. The
+  [configuration reference](configuration.md) describes the declaration.
+- While a task is waiting for the user's cloud-usage decision, `storage
+  status`, `storage set`, `storage reset`, `storage hydrate`, `move`, `remove`,
+  `untrack`, `task rename`, and `task discard` print one `workspace-mgr: task
+  <id> is waiting for the user's cloud-usage decision` line on stderr as soon as
+  the task is resolved. It is a reminder that task work stops until the user
+  answers, not an error; stdout, structured output, and exit status are
+  unchanged. It repeats the projection last measured by `plan` or `publish`, so
+  it does not interrupt carrying out an answer the user already gave; `plan`
+  re-measures afterward. The line disappears once the approval recorded in the
+  task manifest covers the pending projection or a later `plan` or `publish`
+  measures the task within its limit.
 
 ## `workspace-mgr setup`
 
@@ -96,7 +132,8 @@ is a state this format supports rather than one a command produces; a marker
 without its partner has no readable extent, so regeneration drops it and the
 reported action names the marker it dropped. `doctor` reports a hand-edited
 root file through its `repository-scaffold` check. `init` refuses to change the S3
-location while retained S3 boundaries exist. It never contacts or writes a
+location while retained S3 boundaries exist. It keeps an existing
+`minimum_cli_version` exactly and never adds one. It never contacts or writes a
 remote. The generated `AGENTS.md` includes an approval-gated command that
 installs the latest stable release from crates.io, followed by `setup` and an
 instructions retry, so a new machine can bootstrap without inventing a
@@ -144,6 +181,21 @@ The command is read-only. When S3 is configured it reads the bucket-versioning
 setting and rejects a bucket that is not enabled. It exits with status 2 if any
 reported check is not healthy.
 
+Whenever `.workspace-mgr.toml` is readable, the `cli-version` check follows
+`repository-config`. It compares the installed CLI with the higher of the
+checkout's `minimum_cli_version` and the declaration committed at the base
+branch's remote-tracking ref, `refs/remotes/<remote>/<branch>`, as last
+fetched; doctor itself never fetches. Its detail is `installed <version>,
+repository requires <version>` for the checkout's declaration, `installed
+<version>, <remote>/<branch> requires <version>` when the fetched base branch
+requires more, or `installed <version>, repository declares no minimum
+version`. The check is `ok` when the installed CLI meets that requirement and
+`error` when it does not, for example in a checkout that still has to be
+refreshed after the base branch was raised. Unlike other commands, doctor does
+not refuse such a repository: it reads the declaration even when the rest of
+the file uses fields this CLI does not know, which `repository-config` then
+reports as an error.
+
 ## `workspace-mgr config show`
 
 Parse, validate, and print `.workspace-mgr.toml`.
@@ -176,7 +228,9 @@ choice. The `infrastructure` kind requires at least one `--scope` plus a
 private Git common state, with no repository task directory. Its manifest is
 private worktree state and every scope is explicit. Both kinds fetch the
 configured base branch, reject an existing directory or local/remote branch, and
-publish nothing.
+publish nothing. Before creating a branch, directory, or worktree, they refuse
+a base branch whose `minimum_cli_version` the installed CLI does not meet. `--dry-run` reads the remote base branch without moving any ref and
+fetches its commit only when it is not available locally.
 
 The report contains a structured `review` handoff. Deliverable creation reports
 `creation_timing: immediate-after-scaffold-publication`; the agent must
@@ -214,7 +268,9 @@ For a deliverable, the command preserves the timestamp and moves the entire
 task directory from `<timestamp>-<old-slug>` to
 `<timestamp>-<new-slug>`. Its README, retained content, S3 pointers, placement
 sidecars, and manifest move together. The manifest is atomically rewritten with
-schema 2 and records the new current slug and path. Infrastructure tasks keep
+the new current slug and path; it keeps every other field, including a
+cloud-usage approval, and uses schema 2, or schema 3 when it records an
+approval. Infrastructure tasks keep
 their identity-owned private worktree path and update only the private current
 slug metadata.
 
@@ -225,7 +281,10 @@ update that pull request's title and description after publication.
 
 Rename fetches the shared and task refs to reject merged tasks, changed remote
 identity, published destination collisions, local destination collisions, and
-staged source/destination changes. It writes no Git or S3 remote. On a published
+staged source/destination changes. Before it moves or rewrites anything, also
+with `--dry-run`, it refuses when the installed CLI does not meet the
+`minimum_cli_version` of the fetched shared branch or task branch. It writes no
+Git or S3 remote. On a published
 deliverable, the next normal `plan` includes the published old path as an
 identity-derived cleanup scope, preserves published Git/S3 placement at the new
 path, and `publish` deletes the old tree while advancing the same branch.
@@ -244,14 +303,19 @@ workspace-mgr publish -m "Rename the task for its current topic"
 ## `workspace-mgr task status`
 
 Show the immutable task identity, current slug, manifest, branch, remote, base
-branch, scopes, and current working changes inside those scopes.
+branch, scopes, current working changes inside those scopes, and the task's
+recorded cloud-usage state.
 
 ```text
 workspace-mgr task status [--repo <path>] [--manifest <path>]
 ```
 
 This is a local read-only view. Use `plan` for the complete prospective
-publication state.
+publication state. Its `cloud_usage` object reports the effective
+`threshold_bytes`, the task's `limit_bytes`, the `approval` recorded in the
+task manifest (`limit_bytes` and `note`), and the `pending` decision left in
+this clone's private state by the last `plan` or `publish` that measured the
+task above its limit; absent values are `null`.
 
 ## `workspace-mgr task discard`
 
@@ -287,6 +351,10 @@ workspace-mgr task discard \
   --confirm 20260830-120000-example
 ```
 
+Both modes fetch the shared branch first and refuse, before writing a plan,
+deleting a ref, or purging anything, when the installed CLI does not meet its
+`minimum_cli_version`.
+
 Confirmation requires the exact task ID and an unchanged private plan. It
 refuses changed refs, a branch with another task identity, a task already
 contained in the shared branch, an unmanaged infrastructure worktree, or an
@@ -304,6 +372,92 @@ discard queues every versioned S3 object path owned by the task. After the Git
 branch is removed, it permanently deletes every version of paths that no
 current remote branch or tag still references. Protected paths remain pending
 and are retried by a later publish, refresh, or discard.
+
+## `workspace-mgr task approve-cloud-usage`
+
+Record the user's explicit approval of a cloud-usage limit for this task.
+
+```text
+workspace-mgr task approve-cloud-usage --limit <size> --note <decision>
+  [--allow-non-shared-head --scope-note <reason>]
+  [--repo <path>] [--manifest <path>] [--dry-run]
+```
+
+The command records a decision the user already made in the task's chat. It does
+not create authorization; agents run it only after the user explicitly approves
+that limit. It writes only the manifest copy that the task's publications
+carry, so it applies the checkout rules of `plan` and `publish`: a deliverable
+approval runs from the shared checkout on the base branch while the task branch
+is not checked out anywhere, and an infrastructure approval runs from the
+task's managed worktree. In an explicitly authorized alternate workflow, where
+the deliverable is published from another checkout head with
+`--allow-non-shared-head --scope-note <reason>`, the approval takes the same
+override, with the same one-line scope note, and the task branch must still not
+be the checkout's head. Any other checkout, such as an infrastructure
+worktree's copy of a merged deliverable without that override, is refused
+before anything is written, also with `--dry-run`. Every task's default limit
+is the fixed 1 GiB (1073741824 bytes) threshold. `--limit` is a byte count
+or a number with a decimal unit (`B`, `KB`, `MB`, `GB`, `TB`) or binary unit
+(`KiB`, `MiB`, `GiB`, `TiB`), case-insensitive, with or without a space. A
+fraction needs a unit and must come to a whole number of bytes; bare `K`, `M`,
+`G`, and `T` suffixes are rejected. The limit must be at least the threshold,
+because an approval can only raise the limit, and at most 9223372036854775807
+bytes, the largest integer the manifest can hold. `--note` is required, must be
+one line, and records the user's decision.
+
+The approval is written into the task manifest as a `[cloud_usage_approval]`
+table with `limit_bytes` and `note`, which makes it a schema 3 manifest; the
+[configuration reference](configuration.md#task-manifests) describes the
+format. The command rewrites the manifest atomically, validates the result, and
+restores the previous manifest if validation fails. It replaces any earlier
+approval, and a limit equal to the threshold removes the table and returns the
+manifest to schema 2. `task rename` keeps the approval, and confirmed
+`task discard` removes it with the task. The command reads no remote and
+reports `remote_writes: false`.
+
+A deliverable manifest lies inside the task directory, so the next publication
+carries the change for review. If the published `.workspace-mgr.toml` does not
+yet require a release that reads schema 3, that publication also raises its
+`minimum_cli_version`, as described under `plan`; a build older than that
+release refuses to publish the approval at all. After a reset, the next
+publication withdraws a raise that no task manifest in it still needs, but
+never below the base branch's declaration. An infrastructure manifest stays
+private and never raises it. While the manifest records an approval, every
+publication commit carries an audit trailer:
+
+```text
+Cloud-Usage-Approval: limit_bytes=<n>; note=<note>
+```
+
+The trailer is written for reviewers; `workspace-mgr` never reads it back. For
+an infrastructure task it is the only published record of the approval.
+
+The report contains `status`, `operation`, `task_id`, the `manifest` path, the
+manifest's resulting `schema_version`, `threshold_bytes`,
+`previous_limit_bytes`, `limit_bytes` with its readable `limit`, `note`, the
+`pending` decision from the last over-limit `plan` or `publish`, `blocked`,
+`remote_writes`, and `next_step`. `status` is `recorded` when the manifest
+changed, `dry_run` for a rehearsal, and `unchanged` when the manifest already
+records exactly this decision, such as the same approval recorded again or a
+reset of a task that has no approval. Nothing is written then, and `next_step`
+says that this command changed nothing instead of pointing to a publication;
+for a deliverable it adds that `plan` shows whether earlier manifest changes,
+such as the same decision recorded before, are still unpublished.
+`blocked: true` means the pending projection from that last measurement still
+exceeds the new limit, so the approval alone does not unblock the task; if the
+user also chose a cleanup, perform it and let `plan` re-measure. The command
+works with or without a pending decision, so the user can approve a limit before
+large content is produced. Run `plan` afterward to re-measure the task, then
+`publish`. `--dry-run` validates and reports without writing the manifest; its
+`next_step` says that nothing was recorded and that the command must be rerun
+without `--dry-run` once the user has approved the limit.
+
+```sh
+workspace-mgr task approve-cloud-usage --limit 1.5GiB \
+  --note "The user approved 1.5 GiB for the training checkpoints"
+workspace-mgr task approve-cloud-usage --limit 3GiB \
+  --note "The user approved 3 GiB in this chat" --dry-run
+```
 
 ## `workspace-mgr storage status`
 
@@ -348,12 +502,13 @@ workspace-mgr storage set <path>... --to git|s3 --reason <reason>
 ```
 
 Every target must exist and remain in the resolved scopes. The reason must be a
-non-empty single line. S3 must be configured before selecting it. Setting a
-directory creates one recursive boundary; nested or overlapping existing
-boundaries are rejected. The command updates local desired state and reports
-`remote_writes: false`. Explicit S3 below the recommended 1 MiB aggregate
-boundary size remains valid but reports `small-s3-boundary`; select Git or a
-larger meaningful boundary when practical.
+non-empty single line. S3 must be configured before selecting it, and an S3
+target path may not contain a backslash, which the storage engine reads as a
+separator. Setting a directory creates one recursive boundary; nested or
+overlapping existing boundaries are rejected. The command updates local desired
+state and reports `remote_writes: false`. Explicit S3 below the recommended
+1 MiB aggregate boundary size remains valid but reports `small-s3-boundary`;
+select Git or a larger meaningful boundary when practical.
 
 ```sh
 workspace-mgr storage set 20260829-180000-report/report.pdf \
@@ -381,6 +536,9 @@ This may locally convert a prior S3 boundary back to ordinary content. Resetting
 a directory removes the directory boundary, so its files can be evaluated
 individually by the next `plan` or `publish`; the reset report therefore has no
 single placement row for an unpublished directory boundary. No remote is changed.
+Because the reset applies automatic policy immediately, resetting a path whose
+name contains a backslash into S3 is refused; the explicit choice is rolled back
+and kept.
 
 ## `workspace-mgr storage hydrate`
 
@@ -514,8 +672,103 @@ recommended S3 minimum and 10 MiB automatic threshold, automatic decisions in
 the 1–10 MiB semantic-review band or above the S3 threshold, and existing
 boundaries with actionable warnings. Exact generated S3 metadata is established
 by `publish`, because `plan` does not rewrite it. Plan may create ignored local
-locks or preview state. It never creates a commit, uploads S3 content, or pushes
-a Git branch.
+locks, preview state, or private cloud-usage state. It never creates a commit,
+uploads S3 content, or pushes a Git branch.
+
+Plan also measures the task's cloud usage and reports it in `cloud_usage`,
+directly after `status` and `operation`:
+
+- `status` is `within_limit` when the projected total is at most the limit and
+  `approval_required` otherwise; `publish_allowed` says whether `publish` would
+  pass the usage gate, and `cleanup_only` whether this publication only removes
+  content, apart from at most 1 MiB (1048576 bytes) of new workspace-mgr
+  control-file content per publication, where metadata that only drops entries
+  is free.
+- `threshold_bytes` is the fixed 1 GiB (1073741824 bytes) threshold,
+  `limit_bytes` the task's effective limit, and `approval` the approval
+  recorded in the task manifest (`limit_bytes` and `note`) or `null`.
+- `published` and `projected` each report `git_bytes`,
+  `git_uncompressed_bytes`, `git_lfs_bytes`, `s3_bytes`, and `total_bytes`.
+- `git_measure`, `headroom_bytes`, `suggested_limit_bytes`, and
+  `git_history_exceeds_limit` qualify those totals.
+- `contributors` lists up to ten of the largest paths with `store` (`git` or
+  `s3`), `bytes`, `versions`, and `state` (`published` or `pending`). Git
+  contributor bytes are compressed estimates when `git_measure` is `packed`,
+  so they compare with the packed totals, and uncompressed object sizes
+  otherwise; both include referenced Git LFS objects.
+- `message` explains the decision the task is waiting for and appears only when
+  approval is required.
+
+Published usage is what the task already keeps on the remotes: the Git objects
+its published branch adds beyond the base branch, plus every S3 object version
+its publications retain at paths that still exist, including superseded
+versions. Projected usage adds this publication: new Git objects from the
+preview tree, and S3 uploads for new automatic placements and for changed or
+not-yet-uploaded content, minus S3 paths this publication removes. Git bytes are
+uncompressed object sizes plus the sizes of referenced Git LFS objects. When a
+total exceeds the limit, Git objects are measured again as packed data, which
+is closer to what a hosting provider stores; `git_measure` then reads `packed`,
+and `git_uncompressed_bytes` keeps the uncompressed figure. Published Git
+history never shrinks, so `git_history_exceeds_limit: true` means only an
+approval or task discard can resolve the decision. `suggested_limit_bytes` is a
+ceiling with headroom for continued work: the projection plus the larger of 25%
+or 256 MiB (268435456 bytes), rounded up to a multiple of 256 MiB, and at least
+256 MiB above the current limit when approval is required.
+
+Plan never refuses because of cloud usage. An `approval_required` plan records
+the pending decision in the task's private `cloud-usage.json`, which
+task-scoped commands remind about and `task status` reports; a `within_limit`
+plan clears it, and the file exists only while a decision is pending. The
+user's approval is not private state: it lives in the task manifest. Plan also
+keeps a disposable measurement cache in `cloud-usage-cache.json` in the same
+private task state.
+
+Placement is evaluated before usage is measured. A plan that finds an S3
+boundary the storage engine cannot address therefore refuses with status 2 for
+that boundary instead of reporting `cloud_usage`, and leaves an earlier pending
+decision as it was until the renamed task is measured again.
+
+Plan refuses, like `publish`, when the installed CLI does not meet the
+`minimum_cli_version` of the fetched base branch or task branch. Plan also
+previews how `publish` reconciles that declaration with the task manifests in
+the published tree, as the
+[configuration reference](configuration.md#minimum-workspace-mgr-version)
+describes: a task that needs no newer release keeps the configuration of the
+point where its branch left the base branch, a schema 3 manifest that records
+a cloud-usage approval raises the declaration to at least 0.4.0, a branch
+whose manifests no longer need its earlier raise withdraws it but never below
+the fetched base branch's declaration, and a branch whose configuration
+carries a user-authorized change keeps it and only raises its declaration,
+also to follow the base branch. When a task manifest needs a newer release
+than the installed CLI, plan and publish refuse with status 2 because this
+build cannot publish that schema. The refusal offers recording the default
+limit to remove the approval only when that manifest is the task's own; for
+another task's manifest in the publication, such as one merged on the base
+branch, it names the manifest and asks only for an update. The
+reconciliation rewrites `.workspace-mgr.toml` in the private preview index
+only and lists it in `changed_paths` although it is outside the declared
+scopes. When the published declaration differs from the task branch's, plan
+reports `repository_requirement` directly after `changed_paths`:
+
+- `path` is `.workspace-mgr.toml`;
+- `change` is `raise` when a task manifest needs a newer release, `follow`
+  when the publication takes the fetched base branch's higher declaration,
+  either because a task manifest needs a newer release or because the task
+  branch must not declare less than the base branch, and `withdraw` when no
+  task manifest in the publication needs the task branch's earlier raise any
+  more and the base branch declares less;
+- `minimum_cli_version` is the published declaration, or `null` when the
+  withdrawal removes it;
+- `previous_minimum_cli_version` is the declaration in the publication's
+  `.workspace-mgr.toml` before the reconciliation, or `null`;
+- `task_manifest_schema` is the manifest schema that needs the newer release,
+  or `null` when no manifest drives the change.
+
+The field is omitted when the published declaration equals the task branch's.
+Plan and publish never change the shared checkout's `.workspace-mgr.toml`; it
+receives the declaration when the merged publication is refreshed. A
+publication whose tree needs a raise but has no `.workspace-mgr.toml` is
+refused.
 
 Plan reports the ignored paths inside the resolved scopes as `ignored_paths`
 beside the `ignored_entries` count, and structured `warnings`. Both fields are
@@ -602,14 +855,74 @@ workspace-mgr publish -m <message> [--manifest <path>]
 The message is required and must be one line. Publication uploads and verifies
 all live in-scope S3 boundaries before creating and pushing the Git commit. The
 Git tree is based on the existing remote task branch, or the configured base
-branch for its first publication, and includes only resolved scopes. The remote
-branch object ID is verified after push. The checkout and shared Git index are
-not switched to the task branch.
+branch for its first publication, and includes only resolved scopes plus the
+reconciled `.workspace-mgr.toml` that `plan` describes. The remote branch
+object ID is verified after push. The checkout and shared Git index are not
+switched to the task branch. When an infrastructure publication changes
+`.workspace-mgr.toml`, publish also writes the published file into the task's
+isolated worktree, which has the task branch checked out, so that worktree
+stays consistent with its branch.
+
+Before it places, commits, or uploads anything, publish evaluates the same
+`cloud_usage` report as `plan` and refuses with status 2 when
+`publish_allowed` is false: the projected total exceeds the task's limit and
+the publication is not cleanup-only. A cleanup-only publication uploads
+nothing to S3 and adds or changes no Git content other than workspace-mgr
+control files (task manifests, placement records, S3 metadata, `.gitignore`
+files, and the root `.workspace-mgr.toml`); every other change is a deletion.
+It may carry at most 1 MiB (1048576 bytes) of new workspace-mgr control-file
+content per publication, where metadata that only drops entries is free: each
+added or changed control file that the remote does not hold yet is charged its
+full new size, whether it grew, kept its size, or shrank. The exception is S3
+metadata in which every entry names an object path and version (or, where no
+version is recorded, content) that the metadata it replaces already names: it
+is charged only for the lines it does not share with that version. Each added
+control file is also charged its path plus 28 bytes for the entry it adds to
+the Git trees above it. More new control-file content counts as added content.
+A cleanup-only publication remains allowed while the task is over its limit.
+The refusal prints no report. Its message names the task, the published and
+projected Git, S3, and total usage, and the limit, says that the task is
+waiting for the user's decision, and points to `plan` for the largest
+contributors. The gate is not the first refusal: placement is evaluated before
+usage is measured, so a publication that also holds an S3 boundary the storage
+engine cannot address is refused for that boundary, before any usage is
+measured or recorded.
+
+A real publication checks again after local placement and S3 metadata are
+committed but before the upload, and again from the final Git tree before it
+creates the commit, because content can change while it runs. A late refusal
+leaves local placement and S3 metadata applied, like other publication failures
+after placement. A refusal from the final check can also leave objects already
+uploaded to S3 unreferenced; they count as projected usage until a later
+publication succeeds. Every evaluation records or clears the pending decision.
+The report's `cloud_usage` reflects the final check.
+
+The commit message ends with trailers in this order: `Workspace-Task`,
+`Workspace-Scope`, one `Scope-Authorization` per authorized additional scope,
+then `Workspace-Requirement` when the publication changes the task branch's
+`minimum_cli_version`, and `Cloud-Usage-Approval` while the task manifest
+records an approval:
+
+```text
+Workspace-Requirement: minimum_cli_version=<version> (task manifest schema <n>)
+Cloud-Usage-Approval: limit_bytes=<n>; note=<note>
+```
+
+The requirement trailer above records a raise. A follow reads
+`minimum_cli_version=<version> (task manifest schema <n>; follows
+<remote>/<branch>)`, or `(follows <remote>/<branch>)` when no manifest drives
+it. A withdrawal reads `minimum_cli_version=<version> (withdraws this branch's
+raise to <version>; no task manifest in this publication needs it)`, with
+`minimum_cli_version removed` in place of the first value when neither the
+task's starting point nor the base branch declares anything. Both trailers are written for reviewers only.
+The report includes `repository_requirement` as described for `plan`.
 
 `publish --dry-run` performs the same non-publishing behavior as `plan` while
-still requiring a message argument. Publication reports the same `warnings` and
-`ignored_paths` as `plan` and applies the same refusals before it changes
-placement or uploads content.
+still requiring a message argument, and also rehearses the cloud-usage gate:
+unlike `plan`, it refuses with status 2 wherever a real publication would be
+refused before placement.
+Publication reports the same `warnings` and `ignored_paths` as `plan` and
+applies the same refusals before it changes placement or uploads content.
 
 ```sh
 workspace-mgr publish -m "Publish the training report"
@@ -634,6 +947,11 @@ revision must be a fast-forward. Refresh preserves unrelated working-tree
 overlays, materializes safe ordinary Git additions, modifications, and
 deletions, and hydrates incoming S3 boundaries. It reads Git and S3 but writes
 no remote.
+
+Before it changes anything, refresh reads `minimum_cli_version` from the
+incoming revision's `.workspace-mgr.toml` and refuses with status 2 when that
+revision requires a newer CLI, leaving the checkout untouched. After the user
+approves and completes the update, rerun refresh.
 
 An incoming S3 boundary whose path contains a backslash is the one exception.
 The storage engine reads the backslash as a path separator in some commands,

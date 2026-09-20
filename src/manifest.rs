@@ -12,6 +12,8 @@ use crate::policy::{TASK_BRANCH_PREFIX, TASK_MANIFEST_NAME};
 
 pub const INFRASTRUCTURE_MANIFEST_NAME: &str = "workspace-mgr/task.toml";
 pub const TASK_SCHEMA_VERSION: u32 = 2;
+/// Schema 2 plus the optional `[cloud_usage_approval]` table.
+pub const CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION: u32 = 3;
 const LEGACY_TASK_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
@@ -36,6 +38,17 @@ pub struct TaskManifest {
     pub purpose: String,
     #[serde(default)]
     pub additional_scopes: Vec<AdditionalScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_usage_approval: Option<CloudUsageApproval>,
+}
+
+/// The user's decision to let this task keep more cloud data than the fixed
+/// threshold, recorded by `task approve-cloud-usage`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloudUsageApproval {
+    pub limit_bytes: u64,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +56,17 @@ pub struct TaskManifest {
 pub struct AdditionalScope {
     pub path: String,
     pub reason: String,
+}
+
+/// The identity fields of a task manifest published on some branch. Unknown
+/// fields are ignored so that optional fields added by newer releases cannot
+/// break the repository-wide scan; a task's own manifest is parsed strictly.
+#[derive(Debug, Deserialize)]
+struct PublishedTaskIdentity {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,12 +83,25 @@ pub struct ResolvedTask {
     pub base_branch: String,
     pub shared_head: String,
     pub additional_scopes: Vec<AdditionalScope>,
+    pub cloud_usage_approval: Option<CloudUsageApproval>,
 }
 
 impl TaskManifest {
+    /// Renders the manifest with the lowest schema that represents it, so a
+    /// manifest without an approval never requires a newer workspace-mgr.
     pub fn render(&self) -> Result<String> {
-        toml::to_string_pretty(self)
+        let mut manifest = self.clone();
+        manifest.schema_version = manifest.minimal_schema_version();
+        toml::to_string_pretty(&manifest)
             .map_err(|error| Error::message(format!("failed to render task manifest: {error}")))
+    }
+
+    pub fn minimal_schema_version(&self) -> u32 {
+        if self.cloud_usage_approval.is_some() {
+            CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
+        } else {
+            TASK_SCHEMA_VERSION
+        }
     }
 }
 
@@ -81,11 +118,16 @@ impl ResolvedTask {
         })?;
         if !matches!(
             manifest.schema_version,
-            LEGACY_TASK_SCHEMA_VERSION | TASK_SCHEMA_VERSION
+            LEGACY_TASK_SCHEMA_VERSION
+                | TASK_SCHEMA_VERSION
+                | CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
         ) {
             return Err(Error::message(format!(
-                "unsupported task schema {}, expected {} or {}",
-                manifest.schema_version, LEGACY_TASK_SCHEMA_VERSION, TASK_SCHEMA_VERSION
+                "unsupported task schema {}, expected {}, {}, or {}",
+                manifest.schema_version,
+                LEGACY_TASK_SCHEMA_VERSION,
+                TASK_SCHEMA_VERSION,
+                CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
             )));
         }
         let task_id = one_line(&manifest.id, "task id")?;
@@ -99,11 +141,24 @@ impl ResolvedTask {
                 }
                 identity.original_slug.clone()
             }
-            TASK_SCHEMA_VERSION => {
+            TASK_SCHEMA_VERSION | CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION => {
                 validate_task_slug(&manifest.slug)?;
                 manifest.slug.clone()
             }
             _ => unreachable!(),
+        };
+        let cloud_usage_approval = match manifest.cloud_usage_approval {
+            Some(_) if manifest.schema_version < CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION => {
+                return Err(Error::message(format!(
+                    "task schema {} must not declare the schema {} cloud_usage_approval table",
+                    manifest.schema_version, CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
+                )));
+            }
+            Some(approval) => Some(CloudUsageApproval {
+                limit_bytes: approval.limit_bytes,
+                note: one_line(&approval.note, "cloud-usage approval note")?,
+            }),
+            None => None,
         };
         let task_path = match manifest.kind {
             TaskKind::Deliverable => {
@@ -179,7 +234,26 @@ impl ResolvedTask {
             base_branch: config.git.branch.clone(),
             shared_head: config.git.branch.clone(),
             additional_scopes,
+            cloud_usage_approval,
         })
+    }
+
+    /// The manifest that represents this task, in its lowest schema.
+    pub fn manifest(&self) -> TaskManifest {
+        let mut manifest = TaskManifest {
+            schema_version: TASK_SCHEMA_VERSION,
+            kind: self.kind,
+            id: self.task_id.clone(),
+            slug: self.slug.clone(),
+            path: self.task_path.clone(),
+            branch: self.branch.clone(),
+            title: self.title.clone(),
+            purpose: self.purpose.clone(),
+            additional_scopes: self.additional_scopes.clone(),
+            cloud_usage_approval: self.cloud_usage_approval.clone(),
+        };
+        manifest.schema_version = manifest.minimal_schema_version();
+        manifest
     }
 
     pub fn discover(repo: &GitRepo, start: &Path) -> Result<PathBuf> {
@@ -253,7 +327,7 @@ pub(crate) fn published_task_paths(
         let raw = repo
             .run(["show", &format!("{oid}:{manifest_path}")])?
             .stdout;
-        let manifest: TaskManifest = toml::from_str(&raw).map_err(|error| {
+        let manifest: PublishedTaskIdentity = toml::from_str(&raw).map_err(|error| {
             Error::message(format!(
                 "failed to inspect published task manifest {manifest_path:?}: {error}"
             ))
@@ -261,7 +335,7 @@ pub(crate) fn published_task_paths(
         if manifest.id != task.task_id {
             continue;
         }
-        if manifest.kind != TaskKind::Deliverable {
+        if manifest.kind != "deliverable" {
             return Err(Error::message(format!(
                 "published manifest {manifest_path:?} has the task ID but the wrong task kind"
             )));
@@ -493,6 +567,128 @@ mod tests {
             ),
             "20260829-170000-sample-task/output.bin"
         );
+    }
+
+    #[test]
+    fn published_manifests_of_other_tasks_may_carry_unknown_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        let task_id = "20260829-170000-sample-task";
+        let write = |path: &str, raw: &str| {
+            let absolute = repo.root.join(path);
+            fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            fs::write(absolute, raw).unwrap();
+        };
+        write(
+            &format!("{task_id}/{TASK_MANIFEST_NAME}"),
+            &format!(
+                "schema_version = 2\nkind = \"deliverable\"\nid = \"{task_id}\"\nslug = \"sample-task\"\npath = \"{task_id}\"\nbranch = \"codex/sample-task\"\ntitle = \"Sample\"\npurpose = \"Sample\"\nadditional_scopes = []\n"
+            ),
+        );
+        write(
+            &format!("20260829-170001-newer/{TASK_MANIFEST_NAME}"),
+            "schema_version = 3\nkind = \"future-kind\"\nid = \"20260829-170001-newer\"\npath = \"20260829-170001-newer\"\nbranch = \"codex/newer\"\ntitle = \"Newer\"\npurpose = \"Newer\"\n\n[future_table]\nlimit_bytes = 3000000000\n",
+        );
+        repo.run(["add", "-A"]).unwrap();
+        let tree = repo.run(["write-tree"]).unwrap().stdout.trim().to_owned();
+        let task = ResolvedTask {
+            manifest_path: repo.root.join(task_id).join(TASK_MANIFEST_NAME),
+            kind: TaskKind::Deliverable,
+            task_id: task_id.to_owned(),
+            slug: "sample-task".to_owned(),
+            task_path: Some(task_id.to_owned()),
+            branch: "codex/sample-task".to_owned(),
+            title: "Sample".to_owned(),
+            purpose: "Sample".to_owned(),
+            remote: "origin".to_owned(),
+            base_branch: "main".to_owned(),
+            shared_head: "main".to_owned(),
+            additional_scopes: Vec::new(),
+            cloud_usage_approval: None,
+        };
+        assert_eq!(
+            published_task_paths(&repo, &tree, &task).unwrap(),
+            vec![task_id.to_owned()]
+        );
+    }
+
+    fn deliverable_manifest(schema: u32, approval: &str) -> String {
+        format!(
+            "schema_version = {schema}\nkind = \"deliverable\"\nid = \"20260918-120000-demo\"\nslug = \"demo\"\npath = \"20260918-120000-demo\"\nbranch = \"codex/demo\"\ntitle = \"Demo\"\npurpose = \"Demo\"\nadditional_scopes = []\n{approval}"
+        )
+    }
+
+    fn load_manifest(raw: &str) -> Result<ResolvedTask> {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().canonicalize().unwrap(),
+        };
+        let path = repo
+            .root
+            .join("20260918-120000-demo")
+            .join(TASK_MANIFEST_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, raw).unwrap();
+        ResolvedTask::load(&repo, &Config::default(), &path)
+    }
+
+    const APPROVAL_TABLE: &str = "\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \"The user approved 2 GiB for the training checkpoints\"\n";
+
+    #[test]
+    fn schema_3_manifests_carry_the_cloud_usage_approval() {
+        let raw = deliverable_manifest(3, APPROVAL_TABLE);
+        let task = load_manifest(&raw).unwrap();
+        let approval = CloudUsageApproval {
+            limit_bytes: 2_147_483_648,
+            note: "The user approved 2 GiB for the training checkpoints".to_owned(),
+        };
+        assert_eq!(task.cloud_usage_approval, Some(approval));
+        // Rendering keeps the documented layout and the lowest schema.
+        assert_eq!(task.manifest().render().unwrap(), raw);
+
+        let mut reset = task.manifest();
+        reset.cloud_usage_approval = None;
+        assert_eq!(reset.minimal_schema_version(), TASK_SCHEMA_VERSION);
+        assert_eq!(reset.render().unwrap(), deliverable_manifest(2, ""));
+
+        // Schema 3 without the table is still readable.
+        assert_eq!(
+            load_manifest(&deliverable_manifest(3, ""))
+                .unwrap()
+                .cloud_usage_approval,
+            None
+        );
+    }
+
+    #[test]
+    fn older_schemas_and_malformed_approvals_are_rejected() {
+        let error = load_manifest(&deliverable_manifest(2, APPROVAL_TABLE))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error
+                .contains("task schema 2 must not declare the schema 3 cloud_usage_approval table"),
+            "{error}"
+        );
+        for table in [
+            "\n[cloud_usage_approval]\nlimit_bytes = 2147483648\n",
+            "\n[cloud_usage_approval]\nnote = \"approved\"\n",
+            "\n[cloud_usage_approval]\nlimit_bytes = -1\nnote = \"approved\"\n",
+            "\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \"approved\"\nrecorded_at = \"2026-09-18T12:00:00Z\"\n",
+            "\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \" \"\n",
+        ] {
+            assert!(
+                load_manifest(&deliverable_manifest(3, table)).is_err(),
+                "{table:?} was accepted"
+            );
+        }
+        let error = load_manifest(&deliverable_manifest(4, ""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported task schema 4"), "{error}");
     }
 
     #[test]

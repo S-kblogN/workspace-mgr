@@ -33,9 +33,10 @@ safe and understandable while the agent carries out that work.
 
 The product applies the same management strategy to every initialized
 repository. Repositories provide different Git and optional S3 locations, but
-they do not select different task layouts, storage thresholds, review models,
-or agent responsibilities. This makes behavior portable: a user and agent can
-move between managed repositories without relearning their operating contract.
+they do not select different task layouts, storage thresholds, cloud-usage
+limits, review models, or agent responsibilities. This makes behavior portable:
+a user and agent can move between managed repositories without relearning their
+operating contract.
 
 A chat that remains purely conversational or read-only does not need to create
 repository state. As soon as a chat needs to create, change, download,
@@ -69,10 +70,10 @@ decisions the conversation reached, the process it followed, the tools it
 wrote, and the results that would be expensive or impossible to reproduce. The
 product does not prescribe their names or layout, only that they are Markdown
 files the README's directory map names. Its manifest records the task
-identity, declared scope, and target branch. An infrastructure task instead
-has an isolated worktree and a private manifest because its content belongs at
-shared repository paths rather than inside a timestamped deliverable
-directory.
+identity, declared scope, target branch, and any higher cloud-usage limit the
+user approved. An infrastructure task instead has an isolated worktree and a
+private manifest because its content belongs at shared repository paths rather
+than inside a timestamped deliverable directory.
 
 Reading and ownership are separate. Any chat may inspect any repository path
 when useful for context, including another chat's task directory. Reading a
@@ -266,6 +267,15 @@ None of these operations publishes a task. Placement and publication are
 separate so the agent can organize the proposed result before making it visible
 remotely.
 
+Retained content also costs the user cloud storage, so every task has a
+cloud-usage limit: 1 GiB (1073741824 bytes) unless the user approves a higher
+limit for that task. Cloud usage is what the task keeps on the remotes: the Git
+history its branch adds beyond the base branch, including Git LFS objects,
+every retained S3 object version of its paths, and the uploads its next
+publication would add. Content kept local only is not uploaded and does not add
+to it. The limit is the user's decision, not a placement choice: moving content
+into another task, location, or service does not change who must approve it.
+
 ## From local work to review
 
 Files in the task directory and local placement choices are proposed task
@@ -279,6 +289,29 @@ verifies the exact object versions first. It then constructs a Git commit from
 only the task's declared scopes, advances the target branch, and verifies the
 remote revision. The Git revision is the publication point for the combined
 state: a published branch must never refer to missing S3 content.
+
+Publication is also where the cloud-usage limit is enforced. `plan` reports
+the task's published and projected Git and S3 usage, its limit, and the largest
+contributors. `publish` refuses a publication that would take the task past its
+limit before it places, commits, or uploads anything, and checks again before
+the upload and before the Git commit because content can change while it runs.
+A publication that only removes content, apart from at most 1 MiB
+(1048576 bytes) of new workspace-mgr control-file content per publication,
+where metadata that only drops entries is free, remains allowed while the task
+is over its limit.
+
+When a task would exceed its limit, it waits for the user's decision. The agent
+stops all work on the task, reports the published and projected usage with the
+largest contributors, proposes one specific higher limit, names the cleanup
+alternatives, and ends its turn. Only the user's answer in that chat can
+approve a higher limit. `task approve-cloud-usage` records that answer in the
+task manifest; recording an approval documents the user's decision and never
+creates it. The next publication carries that manifest change, so the pull
+request shows the approved limit, and each publication commit also names it in
+a `Cloud-Usage-Approval` trailer. If the user declines, the agent performs only
+the cleanup the user chooses and publishes the reduction. Published Git history
+cannot shrink, so when it alone exceeds the limit, only an approval or
+discarding the task resolves the decision.
 
 Publishing makes the target branch ready for review; it does not merge it. The
 agent maintains the corresponding pull request through the repository's hosting
@@ -315,7 +348,9 @@ change still verifies that the local task revision, remote branch, and
 pull-request head already match. The user does not need to request this
 turn-ending synchronization. If publication or provider verification is
 blocked, the agent reports the exact unsynchronized state rather than claiming
-the task is current.
+the task is current. A task waiting for the user's cloud-usage decision is such
+a blocker: reconciliation stops at the plan, and the agent reports the paused
+state and its question instead of publishing.
 
 If Git publication fails after an S3 upload, an unreferenced S3 object version
 may remain, but no remote Git revision should point to missing content.
@@ -380,9 +415,12 @@ The complete story is:
    produced in the task's own files, `plan` explains the proposed reviewable
    state, `publish` advances the task branch when needed, and the agent updates
    and verifies the matching draft pull request.
-9. The matching draft pull request carries review, and the user or maintainer
-   decides whether to merge it or explicitly abandon the task.
-10. After merge, `refresh` brings the result into the shared workspace without
+9. If a publication would take the task past its cloud-usage limit, the task
+   pauses. The agent asks the user, who approves a higher limit or chooses
+   cleanup, and no further task work happens until the user answers.
+10. The matching draft pull request carries review, and the user or maintainer
+    decides whether to merge it or explicitly abandon the task.
+11. After merge, `refresh` brings the result into the shared workspace without
     disturbing other active chats. After abandonment, the agent closes the
     unmerged pull request and `task discard` removes the task workspace and
     branch, permanently purging its unreferenced S3 object paths.
@@ -390,6 +428,14 @@ The complete story is:
 `config show` reports the repository's Git and S3 facts, and `doctor` diagnoses
 the CLI, repository, Git, and storage environment without changing repository
 state.
+
+The repository also records the oldest `workspace-mgr` release that can read its
+task state. `workspace-mgr` maintains that declaration itself: when a
+publication introduces task state that older releases cannot read, such as a
+manifest that records a cloud-usage approval, the publication raises it, and
+nothing lowers it once it is merged. An older release refuses the repository
+instead of misreading it, and the agent tells the user both versions and asks
+before updating, just as it does for an update notice.
 
 The intended division of responsibility is simple: the user asks for outcomes,
 the agent performs the work inside one task, and `workspace-mgr` preserves the

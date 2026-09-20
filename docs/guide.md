@@ -53,6 +53,19 @@ If the release changes managed repository scaffolding, create an infrastructure
 task covering the affected product-owned paths and run `workspace-mgr init`
 from its isolated worktree. Review and publish that generated diff normally.
 
+A repository can also require a minimum release. `.workspace-mgr.toml` may
+declare `minimum_cli_version`, which `workspace-mgr` raises itself when a
+publication introduces task state that older releases cannot read, and never
+lowers once it is merged. From 0.4.0 on, a release older than the declaration
+refuses every repository command, including `instructions`, with a message
+that names both versions; `workspace-mgr doctor` still runs and reports the
+comparison as its `cli-version` check. Releases up to 0.3.0 do not know the
+key: they reject `.workspace-mgr.toml` with an unknown-field error for
+`minimum_cli_version`, and their `doctor` reports only that configuration
+error. In both cases the agent tells the user the installed version and the
+required one and asks before updating, exactly as for an update notice; nobody
+removes or edits the key to make an older release work.
+
 ### 2. Initialize a repository
 
 Run `init` once from the Git repository:
@@ -302,12 +315,16 @@ selects that directory as a semantic boundary.
 An S3 boundary path may not contain a backslash, because the storage engine
 reads it as a directory separator. Automatic placement and `storage set --to s3`
 refuse such a path before writing any metadata: rename it, or place it in Git
-explicitly with `storage set --to git`. `refresh` cannot refuse what a shared
-branch already carries, so it skips exactly that boundary instead: it advances
-the branch, hydrates every other incoming boundary, leaves that one payload
-unhydrated, and reports it with the rename that recovers it. Until the rename, a
-scope-wide `storage hydrate` over a scope containing that boundary refuses, so
-name the other boundaries there to hydrate them.
+explicitly with `storage set --to git`. Everywhere else a backslash is an
+ordinary file-name character that workspace-mgr never rewrites. Storage
+metadata that an earlier release left at such a path is refused the same way,
+with a `workspace-mgr move` hint, by every command that would have to address
+it. `refresh` cannot refuse what a shared branch already carries, so it skips
+exactly that boundary instead: it advances the branch, hydrates every other
+incoming boundary, leaves that one payload unhydrated, and reports it with the
+rename that recovers it. Until the rename, a scope-wide `storage hydrate` over a
+scope containing that boundary refuses, so name the other boundaries there to
+hydrate them.
 
 A standalone S3 boundary below 1 MiB is usually less efficient than Git because
 its metadata and remote operations may outweigh the payload. Explicit S3 still
@@ -417,7 +434,9 @@ and verifies the draft pull request, and finishes with a no-change plan. If
 there is nothing to publish, it still verifies that the local task revision,
 remote branch, and pull-request head agree. A
 publication or provider blocker is reported with the exact unsynchronized state;
-the user never has to ask for routine turn-end synchronization.
+the user never has to ask for routine turn-end synchronization. A task waiting
+for the user's cloud-usage decision is such a blocker: the reconciliation stops
+at the plan, as described in the next step.
 Hosting failures are reported immediately. The agent must not merge, enable
 auto-merge, approve, close, or mark the pull request ready unless the user
 explicitly requests that exact transition. An explicit request to discard one
@@ -482,7 +501,82 @@ and stores task metadata privately rather than creating a timestamped task
 directory. Work and publication happen from that worktree and remain limited to
 the scopes declared at creation.
 
-### 8. Discard an unmerged task instead of saving it
+### 8. Ask before a task exceeds its cloud-usage limit
+
+Each task has a cloud-usage limit of 1 GiB (1073741824 bytes) unless the user
+approves a higher limit for that task. Cloud usage is what the task keeps on the
+remotes: the Git history its branch adds beyond the base branch, including Git
+LFS objects, and every retained S3 object version of its paths, plus the
+uploads its next publication would add. `plan` reports the published and
+projected totals, the limit, and the largest contributors under `cloud_usage`.
+
+When the projected total exceeds the limit, `plan` reports
+`cloud_usage.status: approval_required` and `publish` refuses before it places,
+commits, or uploads anything. The task is then waiting for the user's decision.
+The agent stops all task work, including the routine turn-end publication, and
+asks in the chat. It reports the published and projected Git, S3, and total
+bytes, the limit, and the largest contributors, and proposes one specific new
+limit, normally the reported `suggested_limit_bytes`, alongside the cleanup
+alternatives. Task-scoped commands print a one-line reminder on stderr until a
+recorded approval covers the pending projection or a later `plan` or `publish`
+measures the task within its limit. The reminder repeats the last measurement,
+so after the user answers, the agent carries out exactly that answer, then
+runs `plan` and acts on its result.
+
+If the user approves, the agent records exactly that answer, re-measures, and
+publishes:
+
+```sh
+workspace-mgr task approve-cloud-usage --limit 1.5GiB \
+  --note "The user approved 1.5 GiB for the training checkpoints"
+workspace-mgr plan
+workspace-mgr publish -m "Publish the training checkpoints"
+```
+
+Recording an approval documents the user's decision; it never creates one. The
+command writes the approved limit and the user's note into the task manifest,
+which becomes schema 3, and the next publication carries that change, so
+reviewers see it in the pull request. Each publication commit also names the
+approval in a `Cloud-Usage-Approval` trailer; for an infrastructure task, whose
+manifest is private, the trailer is the only published record. A user may also
+approve a limit before large content is produced, and approving a limit equal
+to the threshold removes the approval again.
+
+Older workspace-mgr releases cannot read a schema 3 manifest, so the first
+publication that carries one in a deliverable task also raises
+`minimum_cli_version` in the published `.workspace-mgr.toml` when that file
+does not already require a release that reads it. `plan` then lists that file in
+`changed_paths` and reports `repository_requirement`, and the commit gains a
+`Workspace-Requirement` trailer. This workspace-mgr-maintained change needs no
+additional scope, and the shared checkout's copy changes only when the merged
+task is refreshed. The agent notes the raised requirement in the pull-request
+description, because after the merge every clone needs a release that meets it.
+A build older than that release refuses to publish the approval at all, so the
+agent reports both versions and asks the user how to continue. If the user
+later resets the approval, the next publication withdraws the raise and reports
+it with `change: withdraw`, and the agent drops the note from the pull-request
+description; a withdrawal never goes below what the base branch already
+declares, so the branch keeps a raise that other merged approvals need. A
+branch raised before the base branch was raised further follows the base
+branch's declaration on its next publication, so both merge cleanly.
+
+If the user declines, the agent performs only the cleanup the user chooses:
+`remove` or `untrack` of named content, `storage hydrate` only when that cleanup
+needs absent S3 content, or discarding the task. It then runs `plan` and
+publishes the reduction; a publication that only removes content, apart from
+at most 1 MiB (1048576 bytes) of new workspace-mgr control-file content per
+publication, where metadata that only drops entries is free, remains allowed
+while the task is over its limit. The reduction takes effect when that
+publication permanently deletes the retired S3 versions. Published Git history
+cannot shrink: when it alone exceeds the limit, only an approval or discarding
+the task resolves the decision, and hosting providers may still retain
+pull-request refs.
+
+The threshold is fixed product policy with no repository setting. Moving
+content into another task, a shared path, or another storage service is not a
+way around it.
+
+### 9. Discard an unmerged task instead of saving it
 
 If the user decides that a task should not be retained, first inspect the exact
 destructive scope:
@@ -524,7 +618,7 @@ still references. Its report distinguishes deleted paths from protected pending
 paths. A later publish, refresh, or discard retries protected paths after their
 last current reference disappears.
 
-### 9. Refresh after merge
+### 10. Refresh after merge
 
 In a shared checkout, use:
 
@@ -538,6 +632,11 @@ overwriting unrelated working-tree overlays, then materializes safe ordinary
 Git changes and verifies incoming S3 content. If the update fails after the
 local ref changes, it attempts to restore the previous ref, index, ordinary Git
 files, metadata, and outputs.
+
+Before it changes anything, refresh checks the incoming `minimum_cli_version`.
+If the merged work requires a newer release than the installed one, refresh
+refuses and leaves the checkout untouched; after the user approves and
+completes the update, run it again.
 
 ## Git versus S3
 
@@ -571,13 +670,14 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `instructions`, `config show` | Read-only checks/output | None | None |
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
-| `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks and collisions | None |
+| `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
+| `task approve-cloud-usage` | Rewrites the task manifest with the user's approval | None | None |
 | `task discard --confirm` | Removes an unmerged task workspace and local refs | Git and S3 reference verification | Deletes the exact remote task branch, then purges unreferenced S3 paths |
 | `storage set`, `storage reset`, `move`, `remove`, `untrack` | Changes local content/placement metadata | None | None |
 | `storage hydrate` | Materializes S3 content | S3 | None |
-| `plan` | Creates ignored/private preview state | Git refs and S3 bucket settings when configured | None |
+| `plan` | Creates ignored/private preview and cloud-usage state | Git refs and S3 bucket settings when configured | None |
 | `publish` | Updates private state and a local target ref | Git and S3 verification | S3 first, then Git, then purge obsolete S3 paths |
 | `refresh` | Fast-forwards, materializes incoming content, and retries pending purge | Git and, when needed, S3 | Deletes pending unreferenced S3 paths |
 
@@ -595,6 +695,19 @@ missing content. Retrying `publish` is safe. Once Git publication succeeds,
 object paths removed by a delete, move, rename, untrack, or S3-to-Git transition are
 permanently purged, including all older versions at those paths. Current remote
 branches and tags defer deletion until the last live reference disappears.
+
+A cloud-usage refusal at the start of `publish` leaves task content and remotes
+unchanged; it only records the pending decision in private state. `publish`
+checks usage again before its S3 upload and before its Git commit; a refusal at
+either point leaves local placement and S3 metadata applied, and one at the
+final check may leave an unreferenced uploaded S3 version. No Git revision is
+published in either case.
+
+Placement is previewed before usage is measured, so a task that both exceeds
+its limit and holds an S3 boundary the storage engine cannot address is refused
+for that boundary first, and no cloud-usage decision is recorded yet. Rename
+the boundary, then run `plan` to see whether the limit still needs the user's
+decision.
 
 All repository paths accepted by task, storage, plan, and publish operations are
 repository-relative and must remain inside the resolved scopes. A refusal is a

@@ -73,6 +73,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "task rename",
         "task status",
         "task discard",
+        "task approve-cloud-usage",
         "storage status",
         "storage set",
         "storage reset",
@@ -131,6 +132,77 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(commands.contains("force-with-lease"));
     assert!(normalized_model.contains("explicit opposite endpoint"));
     assert!(normalized_model.contains("current slug is a mutable topic label"));
+    assert!(
+        normalized_model
+            .contains("recording an approval documents the user's decision and never creates it")
+    );
+    assert!(normalized_model.contains("records that answer in the task manifest"));
+    assert!(normalized_model.contains("oldest `workspace-mgr` release"));
+    for requirement_fact in [
+        "`cli-version`",
+        "repository_requirement",
+        "Workspace-Requirement: minimum_cli_version=",
+        "Cloud-Usage-Approval: limit_bytes=<n>; note=<note>",
+    ] {
+        assert!(
+            commands.contains(requirement_fact),
+            "command reference is missing {requirement_fact:?}"
+        );
+    }
+    for fact in [
+        "`unchanged`",
+        "`raise`",
+        "`follow`",
+        "`withdraw`",
+        "task create` and `task discard",
+        "Workspace-Requirement: minimum_cli_version=<version>",
+    ] {
+        assert!(
+            commands.contains(fact),
+            "command reference is missing {fact:?}"
+        );
+    }
+    let normalized_commands = commands.split_whitespace().collect::<Vec<_>>().join(" ");
+    for fact in [
+        "`task rename`, `plan`, and `publish`",
+        "this command changed nothing",
+        "the approval takes the same override",
+        "never below the base branch's declaration",
+    ] {
+        assert!(
+            normalized_commands.contains(fact),
+            "command reference is missing {fact:?}"
+        );
+    }
+    // Only releases from 0.4.0 on know the declaration; older ones reject it
+    // as an unknown field, which the user-facing overviews must not hide.
+    for (name, document) in [("README.md", readme), ("guide.md", guide)] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        for fact in [
+            "From 0.4.0 on",
+            "Releases up to 0.3.0",
+            "unknown-field error",
+        ] {
+            assert!(
+                normalized.contains(fact),
+                "{name} does not qualify the older-release behavior: {fact:?}"
+            );
+        }
+    }
+    for removed in ["recorded_at", "adopts", "private task state until"] {
+        for (name, document) in [
+            ("README.md", readme),
+            ("management-model.md", model),
+            ("guide.md", guide),
+            ("commands.md", commands),
+            ("configuration.md", configuration),
+        ] {
+            assert!(
+                !document.contains(removed),
+                "{name} still describes the removed private approval record: {removed:?}"
+            );
+        }
+    }
     assert!(commands.contains("head branch can close"));
     assert!(commands.contains("payload_bytes"));
     assert!(commands.contains("ignored_paths"));
@@ -209,6 +281,23 @@ fn user_documentation_covers_the_complete_public_model() {
         );
     }
     assert!(configuration.contains("deliberately not configurable"));
+    assert!(configuration.contains("minimum_cli_version"));
+    assert!(configuration.contains("not a policy switch"));
+    let normalized_configuration = configuration
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for fact in [
+        "never below the fetched base branch's declaration",
+        "even only comments or formatting",
+        "`task rename`, `plan`, and `publish` check",
+    ] {
+        assert!(
+            normalized_configuration.contains(fact),
+            "configuration reference is missing {fact:?}"
+        );
+    }
+    assert!(configuration.contains("[cloud_usage_approval]"));
     assert!(e2e_readme.contains("COVERAGE.md"));
     for boundary in [
         "Transaction concurrency",
@@ -218,6 +307,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "Refresh ancestry",
         "Pull-request ownership",
         "Task slug rename",
+        "Cloud usage approval",
     ] {
         assert!(
             e2e_coverage.contains(boundary),

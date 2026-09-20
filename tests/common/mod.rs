@@ -5,6 +5,14 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+/// Test builds may lower the cloud-usage approval threshold through this
+/// variable. Every helper clears it unless a test passes it explicitly.
+pub const CLOUD_USAGE_THRESHOLD_ENV: &str = "WORKSPACE_MGR_TEST_CLOUD_USAGE_THRESHOLD_BYTES";
+
+/// Test builds may stand in for another workspace-mgr release through this
+/// variable. Every helper clears it unless a test passes it explicitly.
+pub const CLI_VERSION_ENV: &str = "WORKSPACE_MGR_TEST_CLI_VERSION";
+
 pub struct GitFixture {
     pub temp: TempDir,
     pub root: PathBuf,
@@ -107,13 +115,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    checked(program, configured(cwd, program, args, &[]))
+}
+
+fn configured<I, S>(cwd: &Path, program: &str, args: I, env: &[(&str, &str)]) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let mut command = Command::new(program);
     command
         .args(args)
         .current_dir(cwd)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1");
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
+        .env_remove(CLOUD_USAGE_THRESHOLD_ENV)
+        .env_remove(CLI_VERSION_ENV);
     inject_test_storage_engine(&mut command);
+    command.envs(env.iter().copied());
+    command
+}
+
+fn checked(program: &str, mut command: Command) -> Output {
     let output = command.output().expect("run command");
     if !output.status.success() {
         panic!(
@@ -129,6 +152,19 @@ pub fn binary() -> PathBuf {
     PathBuf::from(assert_cmd::cargo::cargo_bin!("workspace-mgr"))
 }
 
+/// A workspace-mgr command that ignores the developer's environment: both
+/// test overrides are cleared and the update check is disabled. Tests that
+/// spawn the binary directly start from this instead of `Command::new`, then
+/// add their own arguments, directory, and environment.
+pub fn binary_command() -> Command {
+    let mut command = Command::new(binary());
+    command
+        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
+        .env_remove(CLOUD_USAGE_THRESHOLD_ENV)
+        .env_remove(CLI_VERSION_ENV);
+    command
+}
+
 pub fn workspace<I, S>(cwd: &Path, args: I) -> Output
 where
     I: IntoIterator<Item = S>,
@@ -142,14 +178,29 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let mut command = Command::new(binary());
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1");
-    inject_test_storage_engine(&mut command);
-    command.output().expect("run workspace-mgr")
+    workspace_env_unchecked(cwd, args, &[])
+}
+
+/// Runs workspace-mgr like [`workspace`] with extra environment variables,
+/// which are applied last and may replace the injected storage engine.
+pub fn workspace_env<I, S>(cwd: &Path, args: I, env: &[(&str, &str)]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let program = binary();
+    let program = program.to_str().unwrap();
+    checked(program, configured(cwd, program, args, env))
+}
+
+pub fn workspace_env_unchecked<I, S>(cwd: &Path, args: I, env: &[(&str, &str)]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    configured(cwd, binary().to_str().unwrap(), args, env)
+        .output()
+        .expect("run workspace-mgr")
 }
 
 fn inject_test_storage_engine(_command: &mut Command) {

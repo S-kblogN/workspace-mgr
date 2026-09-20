@@ -3,24 +3,29 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::Config;
+use crate::cloud_usage::{CloudUsageReport, LocalUsageStatus, UsageGate, UsageInputs};
+use crate::config::{
+    CONFIG_NAME, Config, cli_version_satisfies, declared_minimum_cli_version,
+    installed_cli_version, require_supported_cli_at,
+};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    AdditionalScope, ResolvedTask, TaskKind, one_line, published_history_path,
+    AdditionalScope, CloudUsageApproval, ResolvedTask, TaskKind, one_line, published_history_path,
     published_task_paths, validate_additional_scopes,
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
     AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
     REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
-    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME,
+    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{PRODUCT_IGNORE_RULES, task_readme_directory_map};
@@ -63,6 +68,7 @@ pub struct TransactionOptions {
 pub struct TransactionReport {
     pub status: String,
     pub operation: String,
+    pub cloud_usage: CloudUsageReport,
     pub head: Option<String>,
     pub branch: String,
     pub base: String,
@@ -73,6 +79,8 @@ pub struct TransactionReport {
     pub changed_paths: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<TransactionWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_requirement: Option<RepositoryRequirement>,
     pub storage: serde_json::Value,
     pub ignored_entries: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -84,6 +92,66 @@ pub struct TransactionReport {
     pub remote_oid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push: Option<String>,
+}
+
+/// A change of the repository's `minimum_cli_version` that a publication
+/// carries relative to the task branch it updates. Only the private index
+/// changes; the shared worktree keeps its configuration until the
+/// publication is merged and refreshed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryRequirement {
+    pub path: String,
+    pub change: RequirementChange,
+    /// The published declaration, or `None` when the publication removes it.
+    pub minimum_cli_version: Option<String>,
+    /// The declaration the publication's `.workspace-mgr.toml` carried before
+    /// workspace-mgr reconciled it.
+    pub previous_minimum_cli_version: Option<String>,
+    /// The task manifest schema that needs the newer release; `None` when the
+    /// change is not driven by a manifest.
+    pub task_manifest_schema: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementChange {
+    /// A task manifest in the publication needs a newer release.
+    Raise,
+    /// The publication needs a newer release and adopts the higher
+    /// declaration of the base branch, so both carry the same configuration.
+    Follow,
+    /// No task manifest in the publication needs the task branch's earlier
+    /// raise any more, so the declaration returns to the base branch's value
+    /// at the task's fork point.
+    Withdraw,
+}
+
+impl RepositoryRequirement {
+    /// The audit trailer for this change. `base` names the base branch, such
+    /// as `origin/main`.
+    fn trailer(&self, base: &str) -> String {
+        let key = crate::config::MINIMUM_CLI_VERSION_KEY;
+        let value = match &self.minimum_cli_version {
+            Some(version) => format!("{key}={version}"),
+            None => format!("{key} removed"),
+        };
+        let reason = match (self.change, self.task_manifest_schema) {
+            (RequirementChange::Raise, Some(schema)) => format!("task manifest schema {schema}"),
+            (RequirementChange::Follow, Some(schema)) => {
+                format!("task manifest schema {schema}; follows {base}")
+            }
+            (RequirementChange::Raise | RequirementChange::Follow, None) => {
+                format!("follows {base}")
+            }
+            (RequirementChange::Withdraw, _) => format!(
+                "withdraws this branch's raise to {}; no task manifest in this publication needs it",
+                self.previous_minimum_cli_version
+                    .as_deref()
+                    .unwrap_or("an earlier version")
+            ),
+        };
+        format!("Workspace-Requirement: {value} ({reason})")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,6 +235,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     )?;
 
     let remote_base_oid = repo.fetch_branch(&task.remote, &task.base_branch)?;
+    // The shared branch may already require a newer workspace-mgr than the
+    // local checkout declares.
+    let remote_base_minimum = require_supported_cli_at(
+        &repo,
+        &remote_base_oid,
+        &format!("{}/{}", task.remote, task.base_branch),
+    )?;
     let remote_target_oid = repo.remote_branch_oid(&task.remote, &task.branch)?;
     let has_remote_target = remote_target_oid.is_some();
     let (base_ref, base_oid) = if let Some(remote_target_oid) = remote_target_oid {
@@ -177,6 +252,9 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             ));
         }
         validate_remote_task_identity(&repo, &task, &fetched)?;
+        // A newer release may have published the task branch with a
+        // declaration this one does not meet.
+        require_supported_cli_at(&repo, &fetched, &format!("{}/{}", task.remote, task.branch))?;
         (
             format!("refs/remotes/{}/{}", task.remote, task.branch),
             fetched,
@@ -213,6 +291,21 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         scopes.dedup();
     }
 
+    let installed = installed_cli_version();
+    let base_location = format!("{}/{}", task.remote, task.base_branch);
+    let own_manifest = task
+        .task_path
+        .as_ref()
+        .map(|path| format!("{path}/{TASK_MANIFEST_NAME}"));
+    let requirement_inputs = RequirementInputs {
+        base_oid: &base_oid,
+        remote_base_oid: &remote_base_oid,
+        remote_base_minimum: remote_base_minimum.as_ref(),
+        config_in_scope: allowed(CONFIG_NAME, &scopes),
+        own_manifest: own_manifest.as_deref(),
+        installed: &installed,
+    };
+
     let local_only = storage::local_boundaries(&repo, &scopes)?;
     for boundary in &local_only {
         let pointer = format!("{boundary}.dvc");
@@ -237,6 +330,9 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     remove_stored_outputs_from_index(&repo, &preview_index, &initial_outputs)?;
     remove_output_paths_from_index(&repo, &preview_index, preview_automatic_s3.iter())?;
     remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
+    // The preview runs first, so a publication this build cannot declare is
+    // refused before anything is placed or uploaded.
+    reconcile_repository_requirement(&repo, &preview_index, &requirement_inputs)?;
     let preview_paths = changed_paths(&repo, &preview_index, &base_oid)?;
     validate_private_index(
         &repo,
@@ -270,6 +366,35 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         && (!initial_dvc.is_empty() || !preview_automatic_s3.is_empty())
     {
         dvc::verify_object_versioning(&repo, &config)?;
+    } else if config.s3_enabled() && !initial_dvc.is_empty() {
+        // The usage gate trusts the storage engine's report of changed outputs.
+        dvc::ensure_ready(&repo, &config)?;
+    }
+    // Nothing has been placed, committed, or uploaded yet: this is the last
+    // point where a publication can be refused without leaving local changes.
+    let projected_tree_oid = repo
+        .run_with_index(&preview_index, ["write-tree"], None, true)?
+        .stdout
+        .trim()
+        .to_owned();
+    let usage_inputs = UsageInputs {
+        state_dir: &state_dir,
+        remote_base_oid: &remote_base_oid,
+        remote_target_oid: has_remote_target.then_some(base_oid.as_str()),
+        projected_tree_oid: &projected_tree_oid,
+        pointers: &initial_dvc,
+        automatic_s3: &preview_automatic_s3,
+        inspect_outputs: true,
+    };
+    let mut usage = UsageGate::open(
+        &repo,
+        &config,
+        &task,
+        &usage_inputs,
+        crate::cloud_usage::effective_threshold(),
+    )?;
+    if options.operation == Operation::Publish {
+        usage.enforce()?;
     }
 
     let placement = if dry_run {
@@ -290,6 +415,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         stage_scopes(&repo, &preflight_index, &scopes)?;
         remove_stored_outputs_from_index(&repo, &preflight_index, &preflight_outputs)?;
         remove_output_paths_from_index(&repo, &preflight_index, local_only.iter())?;
+        reconcile_repository_requirement(&repo, &preflight_index, &requirement_inputs)?;
         let preflight_paths = changed_paths(&repo, &preflight_index, &base_oid)?;
         validate_private_index(
             &repo,
@@ -305,7 +431,23 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             },
         )?;
     }
-    let s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
+    let mut s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
+    if !dry_run {
+        // Background writers may have changed outputs since the gate; the
+        // committed metadata is exactly what the upload would send.
+        usage.recheck_storage(
+            &repo,
+            &config,
+            &UsageInputs {
+                pointers: &pointers,
+                automatic_s3: &[],
+                inspect_outputs: false,
+                ..usage_inputs
+            },
+        )?;
+        usage.enforce()?;
+        dvc::push_outputs(&repo, &config, &mut s3)?;
+    }
     let mut purge_preview = s3_purge::preview(&repo)?;
     if !local_only.is_empty() {
         let retired_pointers = local_only
@@ -344,6 +486,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     remove_stored_outputs_from_index(&repo, &index, &s3.outputs)?;
     remove_output_paths_from_index(&repo, &index, automatic_s3.iter())?;
     remove_output_paths_from_index(&repo, &index, local_only.iter())?;
+    let requirement = reconcile_repository_requirement(&repo, &index, &requirement_inputs)?;
     let paths = changed_paths(&repo, &index, &base_oid)?;
     validate_private_index(
         &repo,
@@ -396,11 +539,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     let mut report = TransactionReport {
         status: if dry_run { "dry_run" } else { "pending" }.to_owned(),
         operation: options.operation.name().to_owned(),
+        cloud_usage: usage.report().clone(),
         head: repo.current_branch()?,
         branch: task.branch.clone(),
         base: base_ref,
         base_oid: base_oid.clone(),
-        remote_base_oid,
+        remote_base_oid: remote_base_oid.clone(),
         scopes: scopes.clone(),
         review: ReviewHandoff {
             pull_request: REVIEW_PULL_REQUEST,
@@ -413,6 +557,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         },
         changed_paths: paths.clone(),
         warnings,
+        repository_requirement: requirement.clone(),
         storage: storage_report,
         ignored_entries,
         ignored_paths,
@@ -445,6 +590,18 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         report.status = "no_changes".to_owned();
         return Ok(report);
     }
+    usage.recheck_git(
+        &repo,
+        &UsageInputs {
+            projected_tree_oid: &tree_oid,
+            pointers: &pointers,
+            automatic_s3: &[],
+            inspect_outputs: false,
+            ..usage_inputs
+        },
+    )?;
+    report.cloud_usage = usage.report().clone();
+    usage.enforce()?;
 
     let commit_message = build_commit_message(
         message
@@ -453,6 +610,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &task.task_id,
         &scopes,
         &authorizations,
+        requirement
+            .as_ref()
+            .map(|requirement| requirement.trailer(&base_location)),
+        usage.approval(),
     );
     let commit_oid = repo
         .run_with_index(
@@ -479,6 +640,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     ])?;
     if task.kind == TaskKind::Infrastructure {
         repo.run(["read-tree", &commit_oid])?;
+        if requirement.is_some()
+            || (!requirement_inputs.config_in_scope && paths.iter().any(|path| path == CONFIG_NAME))
+        {
+            // The isolated worktree checks out the task branch, so it must
+            // match the configuration the branch now carries.
+            sync_worktree_config(&repo, &commit_oid)?;
+        }
     }
     let refspec = format!("{commit_oid}:refs/heads/{}", task.branch);
     repo.run(["push", "--porcelain", &task.remote, &refspec])?;
@@ -537,6 +705,9 @@ fn validate_private_index(
     let escaped: Vec<String> = paths
         .iter()
         .filter(|path| !allowed(path, scopes))
+        // Outside the scopes, only the requirement reconciliation stages the
+        // repository configuration.
+        .filter(|path| path.as_str() != CONFIG_NAME)
         .cloned()
         .collect();
     if !escaped.is_empty() {
@@ -1617,6 +1788,8 @@ fn build_commit_message(
     task_id: &str,
     scopes: &[String],
     authorizations: &[AdditionalScope],
+    requirement_trailer: Option<String>,
+    approval: Option<&CloudUsageApproval>,
 ) -> String {
     let mut lines = vec![
         message.to_owned(),
@@ -1630,7 +1803,573 @@ fn build_commit_message(
             authorization.path, authorization.reason
         ));
     }
+    lines.extend(requirement_trailer);
+    lines.extend(approval.map(crate::cloud_usage::approval_trailer));
     lines.join("\n") + "\n"
+}
+
+/// What the requirement reconciliation compares a publication with.
+struct RequirementInputs<'a> {
+    /// The fetched task-branch tip, or the fetched base tip for a first
+    /// publication; every private index starts from it.
+    base_oid: &'a str,
+    remote_base_oid: &'a str,
+    remote_base_minimum: Option<&'a Version>,
+    /// `.workspace-mgr.toml` lies inside the publication's user-authorized
+    /// scopes, so its staged content is the user's.
+    config_in_scope: bool,
+    /// The repository path of this task's own manifest, which only a
+    /// deliverable publishes.
+    own_manifest: Option<&'a str>,
+    installed: &'a Version,
+}
+
+/// Reconciles `minimum_cli_version` in a private publication index with the
+/// task manifests the index holds.
+///
+/// Outside the publication's scopes the declaration belongs to
+/// workspace-mgr while the task branch's configuration is exactly what
+/// workspace-mgr wrote there: the configuration at the branch's fork point
+/// with the base branch, or that configuration rendered canonically with the
+/// branch's declaration. The index then receives the fork point's
+/// configuration exactly when the branch never changed it and no manifest
+/// needs more than the fork point declares. When a manifest needs more, it
+/// receives the fork point's configuration rendered canonically with the
+/// higher of the requirement and the fetched base branch's declaration. When
+/// the branch raised the declaration earlier and no manifest needs more than
+/// the fork point any more, it withdraws that raise, but never below the
+/// fetched base branch's declaration. A branch that never needed a newer
+/// release therefore never changes the configuration, a branch raised
+/// earlier follows a base branch that was raised further, and no publication
+/// lowers a declaration the base branch already carries.
+///
+/// Inside the scopes, or when the task branch carries any other change of
+/// the configuration, the staged declaration is only ever raised, to the
+/// highest of the requirement and the fetched base branch's declaration,
+/// and never lowered.
+///
+/// The publication is refused when this build does not meet a declaration it
+/// would raise. Only a declaration that differs from the task-branch tip's is
+/// reported.
+fn reconcile_repository_requirement(
+    repo: &GitRepo,
+    index: &Path,
+    inputs: &RequirementInputs<'_>,
+) -> Result<Option<RepositoryRequirement>> {
+    let needs = manifest_requirement(repo, index, inputs.own_manifest)?;
+    let staged = staged_config(repo, index)?;
+    if !inputs.config_in_scope {
+        let fork = fork_point(repo, inputs.base_oid, inputs.remote_base_oid)?;
+        let fork_config = tree_config(repo, &fork)?;
+        if managed_since_fork_point(repo, staged.as_ref(), fork_config.as_ref())? {
+            return reconcile_from_fork_point(
+                repo,
+                index,
+                inputs,
+                staged.as_ref(),
+                fork_config.as_ref(),
+                &needs,
+            );
+        }
+    }
+    raise_staged_requirement(repo, index, inputs, staged.as_ref(), &needs)
+}
+
+fn reconcile_from_fork_point(
+    repo: &GitRepo,
+    index: &Path,
+    inputs: &RequirementInputs<'_>,
+    staged: Option<&IndexEntry>,
+    fork_config: Option<&IndexEntry>,
+    needs: &ManifestNeeds,
+) -> Result<Option<RepositoryRequirement>> {
+    let previous = match staged {
+        Some(entry) => declared_minimum_cli_version(&blob_text(repo, &entry.oid)?),
+        None => None,
+    };
+    let fork = match fork_config {
+        Some(entry) => Some((entry, blob_text(repo, &entry.oid)?)),
+        None => None,
+    };
+    let fork_declared = fork
+        .as_ref()
+        .and_then(|(_, raw)| declared_minimum_cli_version(raw));
+    let trigger = needs.highest().filter(|(version, _)| {
+        fork_declared
+            .as_ref()
+            .is_none_or(|declared| version.cmp_precedence(declared).is_gt())
+    });
+    let published = match (&trigger, &fork) {
+        (Some((version, _)), Some((entry, raw))) => {
+            let raised = highest(version, inputs.remote_base_minimum);
+            require_publishable(inputs.installed, needs, &raised)?;
+            let rendered = render_declaring(raw, &raised)?;
+            stage_config_content(repo, index, &entry.mode, &rendered)?;
+            Some(raised)
+        }
+        (Some((version, schema)), None) => {
+            require_publishable(inputs.installed, needs, version)?;
+            return Err(missing_configuration(version, *schema));
+        }
+        (None, Some((entry, raw))) => {
+            let untouched = staged.is_some_and(|staged| staged.oid == entry.oid);
+            // A withdrawal never goes below the base branch's declaration,
+            // so no merge of this branch, not even one that replays its
+            // commits onto the base branch, lowers what the base branch
+            // already requires.
+            let floor = match (&fork_declared, inputs.remote_base_minimum) {
+                (Some(fork), Some(base)) if base.cmp_precedence(fork).is_gt() => Some(base),
+                (None, Some(base)) => Some(base),
+                _ => None,
+            };
+            match floor {
+                Some(floor) if !untouched => {
+                    require_publishable(inputs.installed, &ManifestNeeds::default(), floor)?;
+                    let rendered = render_declaring(raw, floor)?;
+                    stage_config_content(repo, index, &entry.mode, &rendered)?;
+                    Some(floor.clone())
+                }
+                _ => {
+                    stage_config_entry(repo, index, &entry.mode, &entry.oid)?;
+                    fork_declared
+                }
+            }
+        }
+        (None, None) => {
+            if staged.is_some() {
+                repo.run_with_index(
+                    index,
+                    ["update-index", "--force-remove", "--", CONFIG_NAME],
+                    None,
+                    true,
+                )?;
+            }
+            None
+        }
+    };
+    Ok(describe_requirement_change(previous, published, trigger))
+}
+
+/// Raises the staged declaration to the highest of what the manifests need
+/// and the fetched base branch's declaration, keeping every other part of the
+/// staged configuration and never lowering it.
+fn raise_staged_requirement(
+    repo: &GitRepo,
+    index: &Path,
+    inputs: &RequirementInputs<'_>,
+    staged: Option<&IndexEntry>,
+    needs: &ManifestNeeds,
+) -> Result<Option<RepositoryRequirement>> {
+    let required = needs.highest();
+    let Some(entry) = staged else {
+        if let Some((version, schema)) = &required {
+            require_publishable(inputs.installed, needs, version)?;
+            return Err(missing_configuration(version, *schema));
+        }
+        return Ok(None);
+    };
+    if required.is_none() && inputs.remote_base_minimum.is_none() {
+        return Ok(None);
+    }
+    if !entry.is_regular_file() {
+        if required.is_none() {
+            return Ok(None);
+        }
+        return Err(Error::message(format!(
+            "{CONFIG_NAME} must be a regular file in the publication"
+        )));
+    }
+    let raw = blob_text(repo, &entry.oid)?;
+    let declared = declared_minimum_cli_version(&raw);
+    let target = [
+        required.as_ref().map(|(version, _)| version),
+        inputs.remote_base_minimum,
+    ]
+    .into_iter()
+    .flatten()
+    .max_by(|left, right| left.cmp_precedence(right))
+    .cloned();
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    if declared
+        .as_ref()
+        .is_some_and(|declared| declared.cmp_precedence(&target).is_ge())
+    {
+        return Ok(None);
+    }
+    require_publishable(inputs.installed, needs, &target)?;
+    let rendered = render_declaring(&raw, &target)?;
+    stage_config_content(repo, index, &entry.mode, &rendered)?;
+    // A configuration inside the task's scope may stage a lower declaration
+    // than the branch already publishes; restoring it is not a change.
+    if crate::config::minimum_cli_version_at(repo, inputs.base_oid)?
+        .is_some_and(|published| published.cmp_precedence(&target).is_ge())
+    {
+        return Ok(None);
+    }
+    let raise = required
+        .as_ref()
+        .is_some_and(|(version, _)| target.cmp_precedence(version).is_le());
+    Ok(Some(RepositoryRequirement {
+        path: CONFIG_NAME.to_owned(),
+        change: if raise {
+            RequirementChange::Raise
+        } else {
+            RequirementChange::Follow
+        },
+        minimum_cli_version: Some(target.to_string()),
+        previous_minimum_cli_version: declared.map(|version| version.to_string()),
+        task_manifest_schema: required.map(|(_, schema)| schema),
+    }))
+}
+
+/// Describes how the published declaration differs from `previous`, the
+/// declaration staged before reconciliation.
+fn describe_requirement_change(
+    previous: Option<Version>,
+    published: Option<Version>,
+    trigger: Option<(Version, u32)>,
+) -> Option<RepositoryRequirement> {
+    let ordering = match (&previous, &published) {
+        (None, None) => return None,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(previous), Some(published)) => published.cmp_precedence(previous),
+    };
+    let (change, task_manifest_schema) = match ordering {
+        std::cmp::Ordering::Equal => return None,
+        std::cmp::Ordering::Greater => {
+            let raise = match (&trigger, &published) {
+                (Some((required, _)), Some(published)) => {
+                    published.cmp_precedence(required).is_le()
+                }
+                _ => false,
+            };
+            (
+                if raise {
+                    RequirementChange::Raise
+                } else {
+                    RequirementChange::Follow
+                },
+                trigger.map(|(_, schema)| schema),
+            )
+        }
+        std::cmp::Ordering::Less => (RequirementChange::Withdraw, None),
+    };
+    Some(RepositoryRequirement {
+        path: CONFIG_NAME.to_owned(),
+        change,
+        minimum_cli_version: published.map(|version| version.to_string()),
+        previous_minimum_cli_version: previous.map(|version| version.to_string()),
+        task_manifest_schema,
+    })
+}
+
+/// Refuses to publish a declaration this build does not meet, because the
+/// repository would then refuse the very build that raised it. The advice
+/// depends on whose manifest needs the newer release: only this task's own
+/// approval can be removed by this task.
+fn require_publishable(
+    installed: &Version,
+    needs: &ManifestNeeds,
+    declaration: &Version,
+) -> Result<()> {
+    if let Some(other) = &needs.others {
+        if !cli_version_satisfies(installed, &other.version) {
+            return Err(Error::message(format!(
+                "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because its schema {} requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                other.path, other.schema, other.version
+            )));
+        }
+    }
+    if let Some(own) = &needs.own {
+        if !cli_version_satisfies(installed, &own.version) {
+            return Err(Error::message(format!(
+                "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval.",
+                own.schema, own.version
+            )));
+        }
+    }
+    if !cli_version_satisfies(installed, declaration) {
+        return Err(Error::message(format!(
+            "this build (workspace-mgr {installed}) cannot publish `{}` {declaration}; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+            crate::config::MINIMUM_CLI_VERSION_KEY
+        )));
+    }
+    Ok(())
+}
+
+fn missing_configuration(required: &Version, schema: u32) -> Error {
+    Error::message(format!(
+        "task manifest schema {schema} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first"
+    ))
+}
+
+/// A task manifest that needs a newer workspace-mgr than schemas without a
+/// requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestNeed {
+    version: Version,
+    schema: u32,
+    path: String,
+}
+
+/// What the task manifests in a private index need, split by whether the
+/// manifest is this task's own, since only this task's approval can be
+/// withdrawn by this task.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ManifestNeeds {
+    own: Option<ManifestNeed>,
+    /// The most demanding other task manifest, such as one merged on the base
+    /// branch.
+    others: Option<ManifestNeed>,
+}
+
+impl ManifestNeeds {
+    /// The newest workspace-mgr any manifest needs, with the schema that
+    /// needs it.
+    fn highest(&self) -> Option<(Version, u32)> {
+        [&self.own, &self.others]
+            .into_iter()
+            .flatten()
+            .max_by(|left, right| left.version.cmp_precedence(&right.version))
+            .map(|need| (need.version.clone(), need.schema))
+    }
+}
+
+/// What the task manifests one directory below the root of the index need.
+fn manifest_requirement(
+    repo: &GitRepo,
+    index: &Path,
+    own_manifest: Option<&str>,
+) -> Result<ManifestNeeds> {
+    let manifests = index_entries(repo, index, &format!(":(glob)*/{TASK_MANIFEST_NAME}"))?
+        .into_iter()
+        .filter(IndexEntry::is_regular_file)
+        .collect::<Vec<_>>();
+    let oids = manifests
+        .iter()
+        .map(|entry| entry.oid.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut schemas = std::collections::BTreeMap::new();
+    crate::cloud_usage::read_blobs(repo, &oids, |oid, content| {
+        if let Some(schema) = manifest_schema(content) {
+            schemas.insert(oid.to_owned(), schema);
+        }
+        Ok(())
+    })?;
+    let mut needs = ManifestNeeds::default();
+    for entry in manifests {
+        let Some(schema) = schemas.get(&entry.oid).copied() else {
+            continue;
+        };
+        let Some(version) = minimum_cli_version_for_task_schema(schema) else {
+            continue;
+        };
+        let slot = if own_manifest == Some(entry.path.as_str()) {
+            &mut needs.own
+        } else {
+            &mut needs.others
+        };
+        let higher = slot
+            .as_ref()
+            .is_none_or(|current| version.cmp_precedence(&current.version).is_gt());
+        if higher {
+            *slot = Some(ManifestNeed {
+                version,
+                schema,
+                path: entry.path,
+            });
+        }
+    }
+    Ok(needs)
+}
+
+fn highest(required: &Version, other: Option<&Version>) -> Version {
+    match other {
+        Some(other) if other.cmp_precedence(required).is_gt() => other.clone(),
+        _ => required.clone(),
+    }
+}
+
+fn render_declaring(raw: &str, version: &Version) -> Result<String> {
+    let mut config = Config::parse_ignoring_cli_requirement(raw, Path::new(CONFIG_NAME))?;
+    config.minimum_cli_version = Some(version.to_string());
+    config.render()
+}
+
+/// The commit where the task branch left the base branch; for a first
+/// publication both are the fetched base tip.
+fn fork_point(repo: &GitRepo, tip: &str, base: &str) -> Result<String> {
+    if tip == base {
+        return Ok(tip.to_owned());
+    }
+    let output = repo.run_unchecked(["merge-base", tip, base])?;
+    match output.code {
+        0 => Ok(output.stdout.trim().to_owned()),
+        // Unrelated histories share no fork point; the task branch is then
+        // the only reference.
+        1 => Ok(tip.to_owned()),
+        _ => Err(Error::message(format!(
+            "failed to find where the task branch left the base branch: {}",
+            output.stderr.trim()
+        ))),
+    }
+}
+
+fn staged_config(repo: &GitRepo, index: &Path) -> Result<Option<IndexEntry>> {
+    Ok(
+        index_entries(repo, index, &format!(":(literal){CONFIG_NAME}"))?
+            .into_iter()
+            .find(|entry| entry.path == CONFIG_NAME),
+    )
+}
+
+fn tree_config(repo: &GitRepo, revision: &str) -> Result<Option<IndexEntry>> {
+    let listed = repo.run(["ls-tree", "-z", revision, "--", CONFIG_NAME])?;
+    for record in listed
+        .stdout
+        .split('\0')
+        .filter(|record| !record.is_empty())
+    {
+        let parsed = record.split_once('\t').and_then(|(metadata, path)| {
+            let mut fields = metadata.split(' ');
+            let mode = fields.next()?.to_owned();
+            let _kind = fields.next()?;
+            Some(IndexEntry {
+                mode,
+                oid: fields.next()?.to_owned(),
+                path: path.to_owned(),
+            })
+        });
+        let entry =
+            parsed.ok_or_else(|| Error::message(format!("unexpected tree entry {record:?}")))?;
+        if entry.path == CONFIG_NAME {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the task branch's configuration is exactly what workspace-mgr
+/// writes there: the fork point's blob, or the fork point's configuration
+/// rendered canonically with the branch's declaration. Any other difference,
+/// even one in comments or formatting only, is a user-authorized change.
+fn managed_since_fork_point(
+    repo: &GitRepo,
+    staged: Option<&IndexEntry>,
+    fork: Option<&IndexEntry>,
+) -> Result<bool> {
+    let (staged, fork) = match (staged, fork) {
+        (None, None) => return Ok(true),
+        (Some(staged), Some(fork)) => (staged, fork),
+        _ => return Ok(false),
+    };
+    if staged.mode != fork.mode || !staged.is_regular_file() {
+        return Ok(false);
+    }
+    if staged.oid == fork.oid {
+        return Ok(true);
+    }
+    let staged_raw = blob_text(repo, &staged.oid)?;
+    let Some(declared) = declared_minimum_cli_version(&staged_raw) else {
+        return Ok(false);
+    };
+    let fork_raw = blob_text(repo, &fork.oid)?;
+    // workspace-mgr only ever renders a declaration higher than the fork
+    // point's, so a canonical copy at or below it is the user's own change.
+    if declared_minimum_cli_version(&fork_raw).is_some_and(|forked| declared <= forked) {
+        return Ok(false);
+    }
+    Ok(render_declaring(&fork_raw, &declared).is_ok_and(|rendered| rendered == staged_raw))
+}
+
+fn blob_text(repo: &GitRepo, oid: &str) -> Result<String> {
+    Ok(repo.run(["cat-file", "blob", oid])?.stdout)
+}
+
+fn stage_config_content(repo: &GitRepo, index: &Path, mode: &str, content: &str) -> Result<()> {
+    let blob = repo.run_bytes(["hash-object", "-w", "--stdin"], Some(content.as_bytes()))?;
+    let blob = String::from_utf8_lossy(&blob.stdout).trim().to_owned();
+    stage_config_entry(repo, index, mode, &blob)
+}
+
+fn stage_config_entry(repo: &GitRepo, index: &Path, mode: &str, oid: &str) -> Result<()> {
+    repo.run_with_index(
+        index,
+        [
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("{mode},{oid},{CONFIG_NAME}"),
+        ],
+        None,
+        true,
+    )?;
+    Ok(())
+}
+
+/// Brings an isolated infrastructure worktree's configuration to the
+/// published commit, whose index `read-tree` has already loaded.
+fn sync_worktree_config(repo: &GitRepo, commit_oid: &str) -> Result<()> {
+    let object = format!("{commit_oid}:{CONFIG_NAME}");
+    if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
+        repo.run(["checkout-index", "--force", "--", CONFIG_NAME])?;
+        return Ok(());
+    }
+    let path = repo.root.join(CONFIG_NAME);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io { path, source }),
+    }
+}
+
+/// The schema a task manifest declares, read without validating the rest.
+fn manifest_schema(content: &[u8]) -> Option<u32> {
+    let table = toml::from_str::<toml::Table>(std::str::from_utf8(content).ok()?).ok()?;
+    u32::try_from(table.get("schema_version")?.as_integer()?).ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexEntry {
+    mode: String,
+    oid: String,
+    path: String,
+}
+
+impl IndexEntry {
+    fn is_regular_file(&self) -> bool {
+        matches!(self.mode.as_str(), "100644" | "100755")
+    }
+}
+
+fn index_entries(repo: &GitRepo, index: &Path, pathspec: &str) -> Result<Vec<IndexEntry>> {
+    let listed = repo.run_with_index(
+        index,
+        ["ls-files", "--stage", "-z", "--", pathspec],
+        None,
+        true,
+    )?;
+    listed
+        .stdout
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let parsed = record.split_once('\t').and_then(|(metadata, path)| {
+                let mut fields = metadata.split(' ');
+                Some(IndexEntry {
+                    mode: fields.next()?.to_owned(),
+                    oid: fields.next()?.to_owned(),
+                    path: path.to_owned(),
+                })
+            });
+            parsed.ok_or_else(|| Error::message(format!("unexpected index entry {record:?}")))
+        })
+        .collect()
 }
 
 pub(crate) fn validate_remote_task_identity(
@@ -1675,6 +2414,7 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
         .lines()
         .map(ToOwned::to_owned)
         .collect();
+    let cloud_usage = crate::cloud_usage::local_status(&repo, &task)?;
     Ok(TaskStatus {
         kind: task.kind,
         task_id: task.task_id,
@@ -1687,6 +2427,7 @@ pub fn task_status(start: &Path, manifest: Option<&Path>) -> Result<TaskStatus> 
         base_branch: task.base_branch,
         scopes,
         working_changes,
+        cloud_usage,
     })
 }
 
@@ -1703,10 +2444,891 @@ pub struct TaskStatus {
     pub base_branch: String,
     pub scopes: Vec<String>,
     pub working_changes: Vec<String>,
+    pub cloud_usage: LocalUsageStatus,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn requirement(
+        change: RequirementChange,
+        minimum: Option<&str>,
+        previous: Option<&str>,
+        schema: Option<u32>,
+    ) -> RepositoryRequirement {
+        RepositoryRequirement {
+            path: CONFIG_NAME.to_owned(),
+            change,
+            minimum_cli_version: minimum.map(ToOwned::to_owned),
+            previous_minimum_cli_version: previous.map(ToOwned::to_owned),
+            task_manifest_schema: schema,
+        }
+    }
+
+    #[test]
+    fn requirement_and_approval_trailers_follow_the_scope_trailers() {
+        let approval = CloudUsageApproval {
+            limit_bytes: 3_221_225_472,
+            note: "The user approved 3 GiB in chat".to_owned(),
+        };
+        let raise = requirement(RequirementChange::Raise, Some("0.4.0"), None, Some(3));
+        let scopes = vec![
+            "20260918-120000-demo".to_owned(),
+            "docs/shared.md".to_owned(),
+        ];
+        let authorizations = vec![AdditionalScope {
+            path: "docs/shared.md".to_owned(),
+            reason: "The user requested this update".to_owned(),
+        }];
+        let message = build_commit_message(
+            "Publish checkpoints",
+            "20260918-120000-demo",
+            &scopes,
+            &authorizations,
+            Some(raise.trailer("origin/main")),
+            Some(&approval),
+        );
+        assert_eq!(
+            message,
+            "Publish checkpoints\n\nWorkspace-Task: 20260918-120000-demo\nWorkspace-Scope: 20260918-120000-demo, docs/shared.md\nScope-Authorization: docs/shared.md -- The user requested this update\nWorkspace-Requirement: minimum_cli_version=0.4.0 (task manifest schema 3)\nCloud-Usage-Approval: limit_bytes=3221225472; note=The user approved 3 GiB in chat\n"
+        );
+        let plain = build_commit_message(
+            "Publish checkpoints",
+            "20260918-120000-demo",
+            &scopes,
+            &authorizations,
+            None,
+            None,
+        );
+        assert!(!plain.contains(crate::cloud_usage::APPROVAL_TRAILER));
+        assert!(!plain.contains("Workspace-Requirement"));
+    }
+
+    #[test]
+    fn requirement_trailers_name_the_change() {
+        for (change, expected) in [
+            (
+                requirement(
+                    RequirementChange::Raise,
+                    Some("0.4.0"),
+                    Some("0.2.0"),
+                    Some(3),
+                ),
+                "Workspace-Requirement: minimum_cli_version=0.4.0 (task manifest schema 3)",
+            ),
+            (
+                requirement(
+                    RequirementChange::Follow,
+                    Some("0.5.0"),
+                    Some("0.4.0"),
+                    Some(3),
+                ),
+                "Workspace-Requirement: minimum_cli_version=0.5.0 (task manifest schema 3; follows origin/main)",
+            ),
+            (
+                requirement(
+                    RequirementChange::Follow,
+                    Some("0.5.0"),
+                    Some("0.2.0"),
+                    None,
+                ),
+                "Workspace-Requirement: minimum_cli_version=0.5.0 (follows origin/main)",
+            ),
+            (
+                requirement(
+                    RequirementChange::Withdraw,
+                    Some("0.2.0"),
+                    Some("0.4.0"),
+                    None,
+                ),
+                "Workspace-Requirement: minimum_cli_version=0.2.0 (withdraws this branch's raise to 0.4.0; no task manifest in this publication needs it)",
+            ),
+            (
+                requirement(RequirementChange::Withdraw, None, Some("0.4.0"), None),
+                "Workspace-Requirement: minimum_cli_version removed (withdraws this branch's raise to 0.4.0; no task manifest in this publication needs it)",
+            ),
+        ] {
+            assert_eq!(change.trailer("origin/main"), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(requirement(
+                RequirementChange::Withdraw,
+                None,
+                Some("0.4.0"),
+                None
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "path": CONFIG_NAME,
+                "change": "withdraw",
+                "minimum_cli_version": null,
+                "previous_minimum_cli_version": "0.4.0",
+                "task_manifest_schema": null,
+            })
+        );
+    }
+
+    const PLAIN_CONFIG: &str = "[git]\nremote = \"origin\"\nbranch = \"main\"\n";
+    const TASK: &str = "20260918-120000-approved";
+
+    fn declaring(version: &str, config: &str) -> String {
+        format!("minimum_cli_version = \"{version}\"\n\n{config}")
+    }
+
+    /// A repository whose `main` holds a configuration, and a private index
+    /// built the way publication builds it: from a base revision plus the
+    /// staged task paths.
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        repo: GitRepo,
+        index: PathBuf,
+        main: String,
+    }
+
+    impl Fixture {
+        fn new(config: Option<&str>) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("repo");
+            fs::create_dir(&root).unwrap();
+            let repo = GitRepo { root };
+            repo.run(["init", "-q", "-b", "main"]).unwrap();
+            repo.run(["config", "user.name", "workspace-mgr test"])
+                .unwrap();
+            repo.run(["config", "user.email", "test@example.invalid"])
+                .unwrap();
+            let index = temp.path().join("index");
+            let mut fixture = Self {
+                _temp: temp,
+                repo,
+                index,
+                main: String::new(),
+            };
+            fixture.write("README.md", "base\n");
+            if let Some(config) = config {
+                fixture.write(CONFIG_NAME, config);
+            }
+            fixture.main = fixture.commit();
+            fixture
+        }
+
+        fn write(&self, path: &str, content: &str) {
+            let path = self.repo.root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+
+        fn manifest(&self, directory: &str, schema: u32) {
+            self.write(
+                &format!("{directory}/{TASK_MANIFEST_NAME}"),
+                &format!("schema_version = {schema}\nkind = \"deliverable\"\n"),
+            );
+        }
+
+        /// Commits the worktree to the checked-out branch.
+        fn commit(&self) -> String {
+            self.repo.run(["add", "-A"]).unwrap();
+            self.repo
+                .run(["commit", "-q", "--allow-empty", "-m", "change"])
+                .unwrap();
+            self.repo
+                .run(["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout
+                .trim()
+                .to_owned()
+        }
+
+        fn stage(&self, base: &str, paths: &[&str]) {
+            let _ = fs::remove_file(&self.index);
+            self.repo
+                .run_with_index(&self.index, ["read-tree", base], None, true)
+                .unwrap();
+            let mut add = vec!["add", "-A", "--"];
+            add.extend(paths);
+            self.repo
+                .run_with_index(&self.index, add, None, true)
+                .unwrap();
+        }
+
+        /// Records the private index as a task-branch commit on `parent`.
+        fn publish(&self, parent: &str) -> String {
+            let tree = self
+                .repo
+                .run_with_index(&self.index, ["write-tree"], None, true)
+                .unwrap()
+                .stdout
+                .trim()
+                .to_owned();
+            self.repo
+                .run(["commit-tree", &tree, "-p", parent, "-m", "publish"])
+                .unwrap()
+                .stdout
+                .trim()
+                .to_owned()
+        }
+
+        fn reconcile(
+            &self,
+            base: &str,
+            remote_base: &str,
+            remote_minimum: Option<&str>,
+            config_in_scope: bool,
+            installed: &str,
+        ) -> Result<Option<RepositoryRequirement>> {
+            let remote_minimum = remote_minimum.map(|version| Version::parse(version).unwrap());
+            let installed = Version::parse(installed).unwrap();
+            let own_manifest = format!("{TASK}/{TASK_MANIFEST_NAME}");
+            reconcile_repository_requirement(
+                &self.repo,
+                &self.index,
+                &RequirementInputs {
+                    base_oid: base,
+                    remote_base_oid: remote_base,
+                    remote_base_minimum: remote_minimum.as_ref(),
+                    config_in_scope,
+                    own_manifest: Some(&own_manifest),
+                    installed: &installed,
+                },
+            )
+        }
+
+        fn staged_config(&self) -> Option<String> {
+            staged_config(&self.repo, &self.index)
+                .unwrap()
+                .map(|entry| blob_text(&self.repo, &entry.oid).unwrap())
+        }
+
+        fn staged_config_oid(&self) -> Option<String> {
+            staged_config(&self.repo, &self.index)
+                .unwrap()
+                .map(|entry| entry.oid)
+        }
+
+        fn config_oid_at(&self, revision: &str) -> Option<String> {
+            tree_config(&self.repo, revision)
+                .unwrap()
+                .map(|entry| entry.oid)
+        }
+    }
+
+    #[test]
+    fn schema_3_manifests_raise_only_the_private_configuration() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let main = fixture.main.clone();
+        fixture.manifest("20260918-120000-old", 2);
+        fixture.stage(&main, &["20260918-120000-old"]);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.4.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+
+        // Nested files that merely share the manifest name are not tasks.
+        fixture.manifest("20260918-120000-old/copy", 3);
+        fixture.stage(&main, &["20260918-120000-old"]);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.4.0")
+                .unwrap(),
+            None
+        );
+
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.4.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Raise,
+                Some("0.4.0"),
+                None,
+                Some(3)
+            ))
+        );
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.4.0", PLAIN_CONFIG)
+        );
+        // The worktree configuration is untouched.
+        assert_eq!(
+            fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
+            PLAIN_CONFIG
+        );
+
+        // Once the task branch declares it, nothing changes again.
+        let tip = fixture.publish(&main);
+        fixture.write(&format!("{TASK}/notes.md"), "notes\n");
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, None, false, "0.4.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&tip));
+    }
+
+    #[test]
+    fn a_build_never_publishes_a_declaration_it_does_not_meet() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.3.0")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "this build (workspace-mgr 0.3.0) cannot publish task manifest schema 3, which requires workspace-mgr 0.4.0 or newer; update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval."
+        );
+        assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+        // An authorized configuration change is refused the same way.
+        let error = fixture
+            .reconcile(&main, &main, None, true, "0.3.9")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "this build (workspace-mgr 0.3.9) cannot publish task manifest schema 3"
+            ),
+            "{error}"
+        );
+        assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+
+        // A release candidate publishes the declaration of its release.
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.4.0-rc.1")
+                .unwrap()
+                .unwrap()
+                .minimum_cli_version
+                .as_deref(),
+            Some("0.4.0")
+        );
+
+        // Defensively, a base declaration this build does not meet is never
+        // copied either; fetching such a base already refuses.
+        fixture.stage(&main, &[TASK]);
+        let error = fixture
+            .reconcile(&main, &main, Some("0.7.1"), false, "0.4.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "this build (workspace-mgr 0.4.0) cannot publish `minimum_cli_version` 0.7.1"
+            ),
+            "{error}"
+        );
+        assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+    }
+
+    #[test]
+    fn a_raise_takes_the_higher_declaration_of_the_base_branch() {
+        let lower = declaring("0.3.5", PLAIN_CONFIG);
+        let fixture = Fixture::new(Some(&lower));
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        // The shared branch already requires more, so every task branch
+        // writes the same value and merges cleanly.
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, Some("0.7.1"), false, "1.0.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Follow,
+                Some("0.7.1"),
+                Some("0.3.5"),
+                Some(3)
+            ))
+        );
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.7.1", PLAIN_CONFIG)
+        );
+
+        // A declaration that already meets the manifests stays as it is.
+        let higher = declaring("0.5.0", PLAIN_CONFIG);
+        let fixture = Fixture::new(Some(&higher));
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, Some("0.5.0"), false, "0.5.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config().unwrap(), higher);
+
+        // Declarations are release versions, so a pre-release one cannot be
+        // raised from.
+        let prerelease = declaring("0.4.0-rc.1", PLAIN_CONFIG);
+        let fixture = Fixture::new(Some(&prerelease));
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.4.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a pre-release"), "{error}");
+    }
+
+    #[test]
+    fn a_raised_branch_follows_a_base_branch_raised_further() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let fork = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&fork, &[TASK]);
+        fixture
+            .reconcile(&fork, &fork, None, false, "0.4.0")
+            .unwrap();
+        let tip = fixture.publish(&fork);
+
+        // A later release raises main for its own schema.
+        fixture.write(CONFIG_NAME, &declaring("0.5.0", PLAIN_CONFIG));
+        fixture.write("later.md", "later\n");
+        let main = fixture.commit();
+        fixture.write(&format!("{TASK}/notes.md"), "notes\n");
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, Some("0.5.0"), false, "0.5.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Follow,
+                Some("0.5.0"),
+                Some("0.4.0"),
+                Some(3)
+            ))
+        );
+        // The branch now carries main's configuration blob exactly.
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&main));
+    }
+
+    #[test]
+    fn a_branch_withdraws_a_raise_its_manifests_no_longer_need() {
+        for fork_config in [PLAIN_CONFIG.to_owned(), declaring("0.2.0", PLAIN_CONFIG)] {
+            let fixture = Fixture::new(Some(&fork_config));
+            let fork = fixture.main.clone();
+            let fork_declared =
+                declared_minimum_cli_version(&fork_config).map(|version| version.to_string());
+            fixture.manifest(TASK, 3);
+            fixture.stage(&fork, &[TASK]);
+            let raised = fixture
+                .reconcile(&fork, &fork, None, false, "0.4.0")
+                .unwrap()
+                .unwrap();
+            assert_eq!(raised.change, RequirementChange::Raise);
+            let tip = fixture.publish(&fork);
+
+            // Main moves on without touching the configuration.
+            fixture.write("later.md", "later\n");
+            let main = fixture.commit();
+            fixture.manifest(TASK, 2);
+            fixture.stage(&tip, &[TASK]);
+            assert_eq!(
+                fixture
+                    .reconcile(
+                        &tip,
+                        &main,
+                        fork_declared.as_deref().map(|_| "0.2.0"),
+                        false,
+                        "0.4.0"
+                    )
+                    .unwrap(),
+                Some(requirement(
+                    RequirementChange::Withdraw,
+                    fork_declared.as_deref(),
+                    Some("0.4.0"),
+                    None
+                ))
+            );
+            // The branch configuration is the fork point's blob again.
+            assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&fork));
+            let withdrawn = fixture.publish(&tip);
+            fixture.stage(&withdrawn, &[TASK]);
+            assert_eq!(
+                fixture
+                    .reconcile(&withdrawn, &main, None, false, "0.4.0")
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn branches_that_need_no_raise_never_touch_the_configuration() {
+        // Main already declares what its merged schema 3 manifests need.
+        let fixture = Fixture::new(Some(&declaring("0.4.0", PLAIN_CONFIG)));
+        fixture.manifest("20260918-110000-merged", 3);
+        let fork = fixture.commit();
+        fixture.manifest(TASK, 2);
+        fixture.stage(&fork, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&fork, &fork, Some("0.4.0"), false, "0.4.0")
+                .unwrap(),
+            None
+        );
+        let tip = fixture.publish(&fork);
+
+        // Main later changes its configuration and raises it further; the
+        // untouched branch keeps its fork point's configuration.
+        fixture.write(
+            CONFIG_NAME,
+            &format!(
+                "{}\n[s3]\nurl = \"s3://bucket/prefix\"\n",
+                declaring("0.5.0", PLAIN_CONFIG)
+            ),
+        );
+        let main = fixture.commit();
+        fixture.write(&format!("{TASK}/notes.md"), "notes\n");
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, Some("0.5.0"), false, "0.5.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&fork));
+    }
+
+    #[test]
+    fn authorized_configuration_changes_are_only_ever_raised() {
+        let published = declaring("0.4.0", PLAIN_CONFIG);
+        let fixture = Fixture::new(Some(&published));
+        fixture.manifest(TASK, 3);
+        let base = fixture.commit();
+        // An authorized configuration change in the task's scope stages an
+        // older declaration than the branch already publishes.
+        fixture.write(CONFIG_NAME, &declaring("0.2.0", PLAIN_CONFIG));
+        fixture.stage(&base, &[TASK, CONFIG_NAME]);
+        assert_eq!(
+            fixture
+                .reconcile(&base, &base, None, true, "0.4.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config().unwrap(), published);
+
+        // Against a branch that declares less, the same staging is a raise.
+        let plain = Fixture::new(Some(PLAIN_CONFIG));
+        let base = plain.main.clone();
+        plain.manifest(TASK, 3);
+        plain.write(CONFIG_NAME, &declaring("0.2.0", PLAIN_CONFIG));
+        plain.stage(&base, &[TASK, CONFIG_NAME]);
+        assert_eq!(
+            plain.reconcile(&base, &base, None, true, "0.4.0").unwrap(),
+            Some(requirement(
+                RequirementChange::Raise,
+                Some("0.4.0"),
+                Some("0.2.0"),
+                Some(3)
+            ))
+        );
+
+        // A branch that published an authorized change of more than the
+        // declaration keeps it, even when a later publication leaves the
+        // configuration outside its scopes.
+        let s3 = format!("{PLAIN_CONFIG}\n[s3]\nurl = \"s3://bucket/prefix\"\n");
+        plain.write(CONFIG_NAME, &declaring("0.4.0", &s3));
+        plain.stage(&base, &[TASK, CONFIG_NAME]);
+        let tip = plain.publish(&base);
+        plain.manifest(TASK, 2);
+        plain.stage(&tip, &[TASK]);
+        assert_eq!(
+            plain.reconcile(&tip, &base, None, false, "0.4.0").unwrap(),
+            None
+        );
+        assert_eq!(plain.staged_config_oid(), plain.config_oid_at(&tip));
+    }
+
+    #[test]
+    fn a_publication_without_configuration_cannot_record_the_requirement() {
+        let fixture = Fixture::new(None);
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.4.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires workspace-mgr 0.4.0 or newer, but the publication has no .workspace-mgr.toml"),
+            "{error}"
+        );
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.3.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot publish task manifest schema 3"),
+            "{error}"
+        );
+        assert_eq!(fixture.staged_config(), None);
+    }
+
+    #[test]
+    fn a_withdrawal_never_lowers_the_base_branch_declaration() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let fork = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&fork, &[TASK]);
+        fixture
+            .reconcile(&fork, &fork, None, false, "0.4.0")
+            .unwrap();
+        let tip = fixture.publish(&fork);
+
+        // Hosting rebased the branch onto main, so main carries the raise in
+        // commits the branch does not share, and another task's manifest
+        // there still needs it.
+        fixture.write(CONFIG_NAME, &declaring("0.4.0", PLAIN_CONFIG));
+        fixture.manifest("20260918-110000-merged", 3);
+        let main = fixture.commit();
+
+        // The user resets the approval and the branch keeps publishing: its
+        // commit keeps the declaration main already carries.
+        fixture.manifest(TASK, 2);
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, Some("0.4.0"), false, "0.4.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&tip));
+
+        // After a later release raised main further, the branch follows it
+        // instead of withdrawing.
+        fixture.write(CONFIG_NAME, &declaring("0.5.0", PLAIN_CONFIG));
+        let later = fixture.commit();
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &later, Some("0.5.0"), false, "0.5.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Follow,
+                Some("0.5.0"),
+                Some("0.4.0"),
+                None
+            ))
+        );
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&later));
+        let followed = fixture.publish(&tip);
+        fixture.stage(&followed, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&followed, &later, Some("0.5.0"), false, "0.5.0")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn authorized_comment_and_formatting_changes_are_never_reverted() {
+        let commented_declaring = format!(
+            "# Owned by the data team.\n{}",
+            declaring("0.4.0", PLAIN_CONFIG)
+        );
+        for (fork_config, authorized) in [
+            (
+                PLAIN_CONFIG.to_owned(),
+                format!("# Owned by the data team.\n{PLAIN_CONFIG}"),
+            ),
+            (
+                PLAIN_CONFIG.to_owned(),
+                "[git]\nremote = 'origin'\nbranch = 'main'\n".to_owned(),
+            ),
+            // Removing a comment from a configuration that already declares a
+            // version yields exactly what workspace-mgr would render, but
+            // workspace-mgr never renders a declaration that is not higher
+            // than the fork point's, so the change is still the user's.
+            (commented_declaring, declaring("0.4.0", PLAIN_CONFIG)),
+        ] {
+            let fixture = Fixture::new(Some(&fork_config));
+            let fork = fixture.main.clone();
+            fixture.manifest(TASK, 2);
+            // An earlier publication carried the user-authorized change.
+            fixture.write(CONFIG_NAME, &authorized);
+            fixture.stage(&fork, &[TASK, CONFIG_NAME]);
+            assert_eq!(
+                fixture
+                    .reconcile(&fork, &fork, None, true, "0.4.0")
+                    .unwrap(),
+                None
+            );
+            let tip = fixture.publish(&fork);
+            // A later publication leaves the configuration outside its
+            // scopes and keeps the change.
+            fixture.write(&format!("{TASK}/notes.md"), "notes\n");
+            fixture.stage(&tip, &[TASK]);
+            assert_eq!(
+                fixture
+                    .reconcile(&tip, &fork, None, false, "0.4.0")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(fixture.staged_config().unwrap(), authorized);
+        }
+
+        // What workspace-mgr itself wrote is recognized by its exact text, so
+        // a raise of a commented configuration still withdraws to the fork
+        // point's blob, comment included.
+        let commented = format!("# Owned by the data team.\n{PLAIN_CONFIG}");
+        let fixture = Fixture::new(Some(&commented));
+        let fork = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.stage(&fork, &[TASK]);
+        fixture
+            .reconcile(&fork, &fork, None, false, "0.4.0")
+            .unwrap();
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.4.0", PLAIN_CONFIG)
+        );
+        let tip = fixture.publish(&fork);
+        fixture.manifest(TASK, 2);
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &fork, None, false, "0.4.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Withdraw,
+                None,
+                Some("0.4.0"),
+                None
+            ))
+        );
+        assert_eq!(fixture.staged_config().unwrap(), commented);
+    }
+
+    #[test]
+    fn authorized_configuration_changes_follow_the_base_branch() {
+        let s3 = format!("{PLAIN_CONFIG}\n[s3]\nurl = \"s3://bucket/prefix\"\n");
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let fork = fixture.main.clone();
+        fixture.manifest(TASK, 3);
+        fixture.write(CONFIG_NAME, &s3);
+        fixture.stage(&fork, &[TASK, CONFIG_NAME]);
+        assert_eq!(
+            fixture
+                .reconcile(&fork, &fork, None, true, "0.4.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Raise,
+                Some("0.4.0"),
+                None,
+                Some(3)
+            ))
+        );
+        assert_eq!(fixture.staged_config().unwrap(), declaring("0.4.0", &s3));
+        let tip = fixture.publish(&fork);
+
+        // A later release raises main further; the branch's next publication
+        // follows it although the configuration is outside its scopes.
+        fixture.write(CONFIG_NAME, &declaring("0.5.0", PLAIN_CONFIG));
+        let main = fixture.commit();
+        fixture.write(&format!("{TASK}/notes.md"), "notes\n");
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, Some("0.5.0"), false, "0.5.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Follow,
+                Some("0.5.0"),
+                Some("0.4.0"),
+                Some(3)
+            ))
+        );
+        assert_eq!(fixture.staged_config().unwrap(), declaring("0.5.0", &s3));
+
+        // An authorized configuration that declares less than the base
+        // branch, such as a stale checkout's copy, is raised to the base
+        // branch's declaration even when no manifest needs it.
+        fixture.manifest(TASK, 2);
+        fixture.write(CONFIG_NAME, &s3);
+        fixture.stage(&tip, &[TASK, CONFIG_NAME]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, Some("0.5.0"), true, "0.5.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Follow,
+                Some("0.5.0"),
+                None,
+                None
+            ))
+        );
+        assert_eq!(fixture.staged_config().unwrap(), declaring("0.5.0", &s3));
+
+        // A higher authorized declaration is never lowered.
+        let higher = declaring("0.6.0", &s3);
+        fixture.write(CONFIG_NAME, &higher);
+        fixture.stage(&tip, &[TASK, CONFIG_NAME]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, Some("0.5.0"), true, "0.6.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config().unwrap(), higher);
+    }
+
+    #[test]
+    fn only_this_tasks_approval_is_offered_for_removal() {
+        // Another task's schema 3 manifest reached main, whose declaration
+        // was later removed by hand.
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        fixture.manifest("20260918-110000-merged", 3);
+        let main = fixture.commit();
+        let other_task = "this build (workspace-mgr 0.3.0) cannot publish 20260918-110000-merged/.workspace-mgr-task.toml, another task's manifest in this publication, because its schema 3 requires workspace-mgr 0.4.0 or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.";
+        fixture.manifest(TASK, 2);
+        fixture.stage(&main, &[TASK]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.3.0")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, other_task);
+        assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+
+        // Removing this task's own approval would not help either.
+        fixture.manifest(TASK, 3);
+        fixture.stage(&main, &[TASK]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.3.0")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, other_task);
+
+        // A build that reads the schema restores the declaration.
+        fixture.manifest(TASK, 2);
+        fixture.stage(&main, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.4.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Raise,
+                Some("0.4.0"),
+                None,
+                Some(3)
+            ))
+        );
+    }
+}
+
+#[cfg(test)]
+mod curation_tests {
     use super::*;
     use crate::scaffold::task_readme;
 

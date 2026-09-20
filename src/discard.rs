@@ -110,6 +110,7 @@ pub fn discard(options: &TaskDiscardOptions) -> Result<TaskDiscardReport> {
         None => ResolvedTask::discover(&task_repo, &options.start)?,
     };
     let task = ResolvedTask::load(&task_repo, &config, &manifest)?;
+    crate::cloud_usage::remind(&task_repo, &task);
     let mut context = build_context(task_repo, task, config)?;
     let plan_path = context.state_dir.join(DISCARD_PLAN_NAME);
 
@@ -272,6 +273,13 @@ fn snapshot(repo: &GitRepo, task: &ResolvedTask) -> Result<DiscardSnapshot> {
         .optional_oid(&format!("refs/heads/{}", task.base_branch))?
         .ok_or_else(|| Error::message("configured local shared branch does not exist"))?;
     let remote_base_oid = repo.fetch_branch(&task.remote, &task.base_branch)?;
+    // Refuse before any plan, ref deletion, or purge when the shared branch
+    // requires a newer workspace-mgr than this one.
+    crate::config::require_supported_cli_at(
+        repo,
+        &remote_base_oid,
+        &format!("{}/{}", task.remote, task.base_branch),
+    )?;
     let remote_branch_oid = repo.remote_branch_oid(&task.remote, &task.branch)?;
     if let Some(observed) = &remote_branch_oid {
         let fetched = repo.fetch_branch(&task.remote, &task.branch)?;

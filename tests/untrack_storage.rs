@@ -369,12 +369,11 @@ fn failed_s3_untrack_rolls_back_all_metadata_and_keeps_payload() {
     let engine = fixture.root.join("failing-engine");
     fs::write(&engine, "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--version\" ]; then printf '3.67.1\\n'; exit 0; fi\nif [ \"${1:-}\" = \"remove\" ]; then rm -- \"$3\"; printf 'partial mutation\\n' > \"${3%/*}/.gitignore\"; exit 23; fi\nexit 23\n").unwrap();
     fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = std::process::Command::new(binary())
+    let output = binary_command()
         .current_dir(&task)
         .args(["untrack", &payload])
         .env("WORKSPACE_MGR_STORAGE_DVC", &engine)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .output()
         .unwrap();
     assert!(!output.status.success());

@@ -864,16 +864,26 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         )));
     }
     let base_oid = if options.dry_run {
-        repo.remote_branch_oid(&config.git.remote, &config.git.branch)?
+        let oid = repo
+            .remote_branch_oid(&config.git.remote, &config.git.branch)?
             .ok_or_else(|| {
                 Error::message(format!(
                     "remote base branch does not exist: {}/{}",
                     config.git.remote, config.git.branch
                 ))
-            })?
+            })?;
+        repo.fetch_branch_objects(&config.git.remote, &config.git.branch, &oid)?;
+        oid
     } else {
         repo.fetch_branch(&config.git.remote, &config.git.branch)?
     };
+    // The new task starts from the shared branch, which may already require
+    // a newer workspace-mgr than the local checkout declares.
+    crate::config::require_supported_cli_at(
+        &repo,
+        &base_oid,
+        &format!("{}/{}", config.git.remote, config.git.branch),
+    )?;
     let manifest = TaskManifest {
         schema_version: TASK_SCHEMA_VERSION,
         kind: options.kind,
@@ -884,6 +894,7 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         title: title.clone(),
         purpose: purpose.clone(),
         additional_scopes,
+        cloud_usage_approval: None,
     };
     let readme = task_readme(&title, &purpose);
     let mut manifest_path = match options.kind {

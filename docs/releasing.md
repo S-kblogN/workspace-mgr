@@ -29,7 +29,17 @@ an error rather than an instruction to overwrite state.
 ## Preparing a release
 
 1. In a review branch, update `package.version` in `Cargo.toml` and let Cargo
-   update the root package version in `Cargo.lock`.
+   update the root package version in `Cargo.lock`. When the release ships a
+   new task manifest schema, the version must equal the minimum version that
+   `src/policy.rs` assigns to that schema, because publications write it into
+   each repository's `minimum_cli_version`. A build never publishes a
+   declaration it does not meet, so a smaller version could not publish the
+   new schema at all; a pre-release of the assigned version, such as
+   0.4.0-rc.1, meets it. The first release with manifest schema 3 is therefore
+   0.4.0. The unit test
+   `production_build_package_version_meets_every_task_schema_minimum` reads
+   the package version and fails CI when it is below any schema's assigned
+   minimum.
 2. Move the release notes out of `[Unreleased]` into a dated
    `## [<version>] - YYYY-MM-DD` section.
 3. Review the package with `cargo publish --dry-run --locked` and merge the
