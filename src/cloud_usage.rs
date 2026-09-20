@@ -2294,11 +2294,14 @@ mod tests {
         // Consolidation: per-file metadata becomes one directory listing in a
         // commit whose rows list the new directory before the deletions.
         let history = vec![
-            vec![row(&[], &[a1.clone()]), row(&[], &[b1.clone()])],
+            vec![
+                row(&[], std::slice::from_ref(&a1)),
+                row(&[], std::slice::from_ref(&b1)),
+            ],
             vec![
                 row(&[], &[a2.clone(), b2.clone()]),
-                row(&[a1.clone()], &[]),
-                row(&[b1.clone()], &[]),
+                row(std::slice::from_ref(&a1), &[]),
+                row(std::slice::from_ref(&b1), &[]),
             ],
         ];
         let usage = versioned_storage(&history, &[], &PendingSources::default());
@@ -2310,8 +2313,8 @@ mod tests {
             vec![row(&[], &[a1.clone(), b1.clone()])],
             vec![
                 row(&[a1.clone(), b1.clone()], &[]),
-                row(&[], &[a2.clone()]),
-                row(&[], &[b2.clone()]),
+                row(&[], std::slice::from_ref(&a2)),
+                row(&[], std::slice::from_ref(&b2)),
             ],
         ];
         let usage = versioned_storage(&history, &[], &PendingSources::default());
@@ -2327,7 +2330,7 @@ mod tests {
         let first = vec![vec![row(&[], &[a1.clone(), b1.clone()])]];
         let restructure = vec![
             row(&[a1.clone(), b1.clone()], &[]),
-            row(&[], &[reused.clone()]),
+            row(&[], std::slice::from_ref(&reused)),
             row(&[], &moved),
         ];
         let mut history = first.clone();
