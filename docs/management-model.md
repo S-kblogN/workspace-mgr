@@ -12,7 +12,10 @@ research a question, compare products, study a paper, write a report, analyze
 data, prepare media, build software, organize records, or combine several of
 those activities. The chat is the user-facing interface. The repository gives
 that conversation a place to retain inputs, working materials, outputs, and
-reproducibility evidence when the result should outlive the chat.
+reproducibility evidence when the result should outlive the chat. The tools the
+agent writes, the process it followed, and the conclusions the conversation
+reached are retained regardless, because they are what makes the result
+understandable later.
 
 The user should normally describe the desired outcome rather than plan task
 directories, branches, commits, or storage mechanics. The agent translates the
@@ -37,7 +40,8 @@ move between managed repositories without relearning their operating contract.
 A chat that remains purely conversational or read-only does not need to create
 repository state. As soon as a chat needs to create, change, download,
 generate, or retain files, it becomes a writable conversation and owns exactly
-one task in this workspace.
+one task in this workspace. This includes files it would otherwise create
+outside the repository.
 
 ## From a chat to a task
 
@@ -55,12 +59,20 @@ These are four views of one reviewable intention:
 - The **draft pull request** is the task's review and merge record.
 
 An ordinary deliverable task directory holds the conversation's retained
-inputs, working files, tools, evidence, and deliverables. Its README explains
-the task's current purpose and important outputs; it is not a transcript or
-chronological log. Its manifest records the task identity, declared scope, and
-target branch. An infrastructure task instead has an isolated worktree and a
-private manifest because its content belongs at shared repository paths rather
-than inside a timestamped deliverable directory.
+inputs, working files, tools, evidence, and deliverables. It is where the work
+happens, not only where finished results are filed: the agent writes its
+scripts, runs its analyses, and keeps its intermediate materials inside it
+rather than in a temporary directory elsewhere on the machine. Its README
+explains the task's current purpose and important outputs; it is not a
+transcript or chronological log. Its other files carry the durable record: the
+decisions the conversation reached, the process it followed, the tools it
+wrote, and the results that would be expensive or impossible to reproduce. The
+product does not prescribe their names or layout, only that they are Markdown
+files the README's directory map names. Its manifest records the task
+identity, declared scope, and target branch. An infrastructure task instead
+has an isolated worktree and a private manifest because its content belongs at
+shared repository paths rather than inside a timestamped deliverable
+directory.
 
 Reading and ownership are separate. Any chat may inspect any repository path
 when useful for context, including another chat's task directory. Reading a
@@ -119,6 +131,79 @@ Infrastructure is a kind of task, not a bypass around task ownership.
 
 The draft-pull-request relationship is the review model for every managed
 repository. It is part of the product strategy, not a per-repository option.
+
+## Where the work happens
+
+The task directory is the workplace, not only the filing cabinet. A chat that
+builds its scratch workspace in a system temporary directory, a `mktemp`
+directory, or the home directory keeps its polished output and loses everything
+that explains it: the scripts it wrote, the commands it actually ran, the dead
+ends, and the reason it chose one option over another. The agent therefore
+creates those materials inside the task directory in the first place, rather
+than producing them elsewhere and copying a result back.
+
+Ephemeral output that is reproducible and will be discarded may live wherever
+the environment puts it: package caches, virtual environments, build trees, and
+throwaway command output are not task materials. The dividing line is whether
+the task would want to consult the content later.
+
+Two cases otherwise push work outside the repository, so each needs an explicit
+answer. The first is content too large or too private to publish. It still
+belongs in the task directory, where `storage set` and `untrack` decide what
+leaves the machine; moving it out of the repository is not a way to avoid that
+decision. The second is credentials. They are the single exception to the rule:
+they stay outside the repository entirely, and the task records how to
+regenerate them rather than their values.
+
+Keeping the work inside the task directory is one half of the rule; curating
+what leaves it is the other. Every file under a task is in one of two states.
+It is selected — published in Git, or placement-recorded for S3 or local-only
+retention — or it is ignored by a rule this repository tracks. There is no
+third state in which a file simply sits in the task directory while everyone
+remembers not to commit it. Publication stages the whole declared scope, so an
+unignored file is published by the next publication whether or not anyone
+intended it.
+
+The by-products of the work are therefore not published by default. Build
+output, caches, per-run logs and checkpoints, scratch copies of inputs, and
+intermediate data that can be regenerated cheaply from the retained inputs and
+tools are not what a reviewer or a later reader needs. The tools themselves,
+the results that were expensive or impossible to reproduce, and the evidence
+behind a claim are.
+
+Ignore rules are layered so that each one sits where its audience can see it.
+Rules that matter to one task belong in that task's own `.gitignore`, as the
+narrowest rule that covers the junk, where they travel with the task, are
+visible in its review, and stay inside the task's own write boundary. This
+repository's own rules live in `.workspace-mgr/repository.gitignore`. Git has
+no include directive, so `workspace-mgr` owns the root `.gitignore` as a whole
+and generates it from that module plus a small fixed set of product rules for
+output that is regenerated rather than retained; the root file is never
+hand-edited, and `init` reconciles it like any other product-owned path. That
+second layer is a pair of shared root paths, so reaching for it costs what any
+change outside the task directory costs: the user's explicit authorization,
+normally an infrastructure task, and a publication of its own before the rule
+means anything in another clone. Routing bulk by-products to S3 is not a
+substitute for either layer: S3 keeps Git small, it does not keep the workspace
+curated.
+
+Because no command can observe an agent writing to a temporary directory,
+publication enforces only what reaches the index. It refuses a deliverable
+publication that adds or changes content inside the task directory while that
+directory documents nothing, refuses a symbolic link whose target is outside
+the repository, and reports the ignored paths it found inside the task so the
+agent can confirm that each one is reproducible output rather than work that
+should have been retained. It refuses content that only a machine-local
+ignore rule hides — the user's global excludes, `.git/info/exclude`, or an
+ignore file whose matching bytes the publication does not carry — because such
+a rule keeps the file out of every other clone and out of review. It reports
+`bulk-publication` when one publication adds more than two hundred new files or
+more than 256 MiB (268435456 bytes) of new content inside the task, as a check
+rather than a refusal. Content placed
+in S3 is judged by its pointer, so routing an expensive result out of Git does
+not exempt it. A symbolic link inside a boundary already placed in S3 or kept
+local with `untrack` is outside what publication can see, because that content
+never reaches the index.
 
 ## Where task content lives
 
@@ -221,9 +306,11 @@ its pull-request description reflects the same intention, and a final plan
 reports no remaining task changes.
 
 Before ending every turn in a writable task, the agent automatically reconciles
-that state. It plans the task, publishes all safe retained in-scope changes even
-when the deliverable is still work in progress, updates and verifies the draft
-pull request, and finishes with a no-change plan. A turn with no publishable
+that state. It records the turn's decisions, process, tools, and
+hard-to-reproduce results in the task's own files when the turn produced any,
+plans the task, publishes all safe retained in-scope changes even when the
+deliverable is still work in progress, updates and verifies the draft pull
+request, and finishes with a no-change plan. A turn with no publishable
 change still verifies that the local task revision, remote branch, and
 pull-request head already match. The user does not need to request this
 turn-ending synchronization. If publication or provider verification is
@@ -285,9 +372,10 @@ The complete story is:
    rename` updates its current slug without replacing its branch or review.
 7. Retained artifacts are placed in Git or S3 automatically or by an explicit
    user or agent choice. An explicit `untrack` choice keeps content local only.
-8. At every turn end, `plan` explains the proposed reviewable state, `publish`
-   advances the task branch when needed, and the agent updates and verifies the
-   matching draft pull request.
+8. At every turn end, the agent records what the turn decided, did, wrote, and
+   produced in the task's own files, `plan` explains the proposed reviewable
+   state, `publish` advances the task branch when needed, and the agent updates
+   and verifies the matching draft pull request.
 9. The matching draft pull request carries review, and the user or maintainer
    decides whether to merge it or explicitly abandon the task.
 10. After merge, `refresh` brings the result into the shared workspace without

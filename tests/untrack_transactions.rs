@@ -42,6 +42,7 @@ fn create_task(fixture: &GitFixture, slug: &str) -> (String, PathBuf) {
     );
     let task_id = format!("20260914-120000-{slug}");
     let task = fixture.shared.join(&task_id);
+    document_task(&task);
     (task_id, task)
 }
 

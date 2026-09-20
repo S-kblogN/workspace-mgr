@@ -66,26 +66,54 @@ where
             source,
         },
     })?;
-    if let Some(input) = input {
-        use std::io::Write;
-        let write_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::message("child stdin was not available"))?
-            .write_all(input.as_bytes());
-        if let Err(source) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Error::Io {
-                path: cwd.to_path_buf(),
-                source,
-            });
+    let stdin = if input.is_some() {
+        Some(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::message("child stdin was not available"))?,
+        )
+    } else {
+        None
+    };
+    // Input is written on its own thread while this one drains the child's
+    // output. Writing it all first deadlocks as soon as the child's reply
+    // outgrows the pipe buffer: the child blocks writing, stops reading, and
+    // the remaining input has nowhere to go. Commands that answer per input
+    // line, such as `git check-ignore --stdin`, reach that size easily.
+    let mut write_error = None;
+    let waited = std::thread::scope(|scope| {
+        let writer = match (input, stdin) {
+            (Some(input), Some(mut stdin)) => Some(scope.spawn(move || {
+                use std::io::Write;
+                let result = stdin.write_all(input.as_bytes());
+                // Dropping the handle closes the pipe, so the child sees the
+                // end of its input without a second signal.
+                drop(stdin);
+                result
+            })),
+            _ => None,
+        };
+        let waited = child.wait_with_output();
+        if let Some(writer) = writer {
+            if let Ok(Err(error)) = writer.join() {
+                write_error = Some(error);
+            }
         }
-    }
-    let output = child.wait_with_output().map_err(|source| Error::Io {
+        waited
+    });
+    let output = waited.map_err(|source| Error::Io {
         path: cwd.to_path_buf(),
         source,
     })?;
+    if let Some(source) = write_error {
+        // The child stopped reading before its input ran out, so the command
+        // never saw everything it was given.
+        return Err(Error::Io {
+            path: cwd.to_path_buf(),
+            source,
+        });
+    }
     let result = CommandOutput {
         code: output.status.code().unwrap_or(1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -129,5 +157,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.stdout, "input line");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streams_input_larger_than_the_pipe_buffer_while_the_child_answers() {
+        // A child that answers as it reads fills its output pipe long before
+        // this much input is consumed. Writing the input and reading the reply
+        // must therefore overlap, or the two processes wait on each other.
+        let input = "workspace-mgr\n".repeat(300_000);
+        let output = run_with(
+            "cat",
+            ["-"],
+            Path::new("."),
+            &BTreeMap::new(),
+            Some(&input),
+            true,
+        )
+        .unwrap();
+        assert_eq!(output.stdout.len(), input.len());
     }
 }

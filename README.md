@@ -59,12 +59,26 @@ workspace-mgr plan
 workspace-mgr publish -m "Publish the deliverable"
 ```
 
+A task directory is where the work happens, not only where finished results are
+filed: the tools the agent writes, the materials they use, and the task's own
+record of decisions, process, and hard-to-reproduce results all live inside it,
+listed in its README directory map.
+
+What leaves the task directory is curated. Every file under a task is either
+selected for publication or ignored by a rule this repository tracks, so the
+by-products of a run are not published by accident. Rules for one task belong
+in that task's own `.gitignore`; this repository's own rules belong in
+`.workspace-mgr/repository.gitignore`, from which `init` generates the root
+`.gitignore` together with the product's fixed rules. A path that only a
+machine-local rule hides is refused.
+
 Immediately after creating a deliverable task, the agent publishes its initial
 scaffold and creates the one matching draft pull request. Before every later
-turn ends, it automatically publishes all safe retained in-scope changes,
-updates the draft pull request, and verifies that the local task, remote branch,
-and pull-request head agree. This synchronization does not require a separate
-user request.
+turn ends, it automatically records the turn's decisions, process, tools, and
+hard-to-reproduce results in the task's own files, publishes all safe retained
+in-scope changes, updates the draft pull request, and verifies that the local
+task, remote branch, and pull-request head agree. This synchronization does not
+require a separate user request.
 
 When a conversation's topic changes, `task rename <new-slug>` moves the complete
 deliverable directory and updates task metadata while preserving the immutable

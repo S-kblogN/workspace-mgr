@@ -3,7 +3,7 @@ mod common;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use common::{GitFixture, git, git_unchecked, json, workspace, workspace_unchecked};
+use common::{GitFixture, document_task, git, git_unchecked, json, workspace, workspace_unchecked};
 
 fn create_task(fixture: &GitFixture, slug: &str, timestamp: &str) -> (String, std::path::PathBuf) {
     let task_id = format!("{timestamp}-{slug}");
@@ -22,6 +22,7 @@ fn create_task(fixture: &GitFixture, slug: &str, timestamp: &str) -> (String, st
         ],
     );
     let task = fixture.shared.join(&task_id);
+    document_task(&task);
     (task_id, task)
 }
 
@@ -171,6 +172,7 @@ fn published_deliverable_discard_deletes_branches_and_restores_additional_scopes
         ],
     );
     let task = fixture.shared.join(task_id);
+    document_task(&task);
     let manifest = task.join(".workspace-mgr-task.toml");
     std::fs::write(task.join("result.txt"), "published task\n").unwrap();
     std::fs::write(fixture.shared.join("shared.txt"), "task value\n").unwrap();

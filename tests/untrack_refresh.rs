@@ -29,6 +29,7 @@ fn create_task(fixture: &GitFixture) -> (String, PathBuf) {
     );
     let id = "20260914-120000-untrack-refresh".to_owned();
     let path = fixture.shared.join(&id);
+    document_task(&path);
     (id, path)
 }
 
@@ -98,7 +99,15 @@ fn incoming_local_choice_preserves_an_unchanged_git_file() {
     workspace(&fixture.shared, ["refresh"]);
 
     local_placement(&fixture.seed, "payload.bin");
-    std::fs::write(fixture.seed.join(".gitignore"), "/payload.bin\n").unwrap();
+    // The root ignore file is product-owned, so a repository rule is added
+    // through its own module and `init` regenerates the root file from it.
+    std::fs::create_dir_all(fixture.seed.join(".workspace-mgr")).unwrap();
+    std::fs::write(
+        fixture.seed.join(".workspace-mgr/repository.gitignore"),
+        "/payload.bin\n",
+    )
+    .unwrap();
+    workspace(&fixture.seed, ["init"]);
     git(&fixture.seed, ["rm", "--cached", "--", "payload.bin"]);
     fixture.commit_seed("Keep payload local");
     workspace(&fixture.shared, ["refresh"]);

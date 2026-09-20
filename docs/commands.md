@@ -63,8 +63,39 @@ initialized repository and reserved path, not inferred from file content, so
 old, edited, or damaged `AGENTS.md` and internal storage configuration are
 replaced with their current deterministic forms, as are the private engine's
 ignore files. Before the first successful initialization, an existing
-`AGENTS.md` or private internal-storage scaffold is instead an atomic collision
-that the caller must move or remove explicitly. `init` refuses to change the S3
+`AGENTS.md`, root `.gitignore`, or private internal-storage scaffold is instead
+an atomic collision that the caller must move or remove explicitly; for the
+root `.gitignore` the message says where its rules belong.
+
+The root `.gitignore` is the one reserved path a repository is likely to have
+arranged for itself long before workspace-mgr existed, so the product owns it
+only once it wrote it, which the generated first line records. A root
+`.gitignore` that the product did not generate is never reconciled over: `init`
+and `doctor` both refuse it and say to move this repository's own rules into
+`.workspace-mgr/repository.gitignore`, remove the root file, and run `init`
+again. Every repository initialized by an earlier release performs that
+migration once; see the upgrade note in the guide. Below the generated header
+the file is product-owned like the others, so a hand edit there is drift that
+`init` repairs.
+
+The generated root `.gitignore` is the product's fixed rules for output that is
+regenerated rather than retained — `.DS_Store`, `__pycache__/`, `*.pyc`,
+`*.pyo`, `.ipynb_checkpoints/`, `.pytest_cache/`, `.mypy_cache/`,
+`.ruff_cache/`, `.venv/`, `venv/`, and `node_modules/` — followed by this
+repository's own rules imported verbatim from
+`.workspace-mgr/repository.gitignore`, followed by any
+`# workspace-mgr local begin` blocks the root file already holds.
+The module is optional, repository-owned, and limited to 64 KiB of UTF-8; an
+absent or empty module produces no import section. It carries ignore patterns
+only: those two block markers belong to `untrack`, and a module containing one
+is refused, because regeneration harvests them back out of the file it writes
+and the file would never settle. Regeneration preserves a well-formed block
+byte for byte. `untrack` writes its block into the ignore file of the path's
+own directory, which today is always inside a task, so a block in the root file
+is a state this format supports rather than one a command produces; a marker
+without its partner has no readable extent, so regeneration drops it and the
+reported action names the marker it dropped. `doctor` reports a hand-edited
+root file through its `repository-scaffold` check. `init` refuses to change the S3
 location while retained S3 boundaries exist. It never contacts or writes a
 remote. The generated `AGENTS.md` includes an approval-gated command that
 installs the latest stable release from crates.io, followed by `setup` and an
@@ -137,12 +168,15 @@ workspace-mgr task create <slug> --title <title> --purpose <purpose>
 
 The slug is lowercase kebab case. The default `deliverable` kind creates a
 timestamped top-level directory, README, tracked manifest, and the unmounted
-target branch `codex/<slug>`. The `infrastructure` kind requires at least one
-`--scope` plus a `--scope-note`; it creates `codex/infra-<slug>` and an isolated
-worktree below private Git common state, with no repository task directory. Its
-manifest is private worktree state and every scope is explicit. Both kinds
-fetch the configured base branch, reject an existing directory or local/remote
-branch, and publish nothing.
+target branch `codex/<slug>`. The scaffolded README's directory map tells the
+task to keep its tools, process, decisions, and hard-to-reproduce results in
+that directory and to list them there; which files carry them is the agent's
+choice. The `infrastructure` kind requires at least one `--scope` plus a
+`--scope-note`; it creates `codex/infra-<slug>` and an isolated worktree below
+private Git common state, with no repository task directory. Its manifest is
+private worktree state and every scope is explicit. Both kinds fetch the
+configured base branch, reject an existing directory or local/remote branch, and
+publish nothing.
 
 The report contains a structured `review` handoff. Deliverable creation reports
 `creation_timing: immediate-after-scaffold-publication`; the agent must
@@ -476,6 +510,67 @@ by `publish`, because `plan` does not rewrite it. Plan may create ignored local
 locks or preview state. It never creates a commit, uploads S3 content, or pushes
 a Git branch.
 
+Plan reports the ignored paths inside the resolved scopes as `ignored_paths`
+beside the `ignored_entries` count, and structured `warnings`. Both fields are
+present only when they are not empty: `ignored_entries` is always exact, while
+`ignored_paths` carries up to its first fifty entries so a pattern-based ignore
+rule cannot fill the report. For a deliverable task, `task-record-unchanged`
+reports a publication that changes content inside the task directory while none
+of the task's own documentation changed with it; ignore it when the work
+produced nothing worth recording. `bulk-publication` reports a publication that
+adds more than 200 new files, or more than 256 MiB (268435456 bytes), of new
+content inside the task directory; the thresholds are fixed product policy. New
+content routed to S3 by automatic placement is counted from the placement
+decision and measured on disk, because its payload never reaches the private
+index, and its pointer is not counted a second time once `publish` has written
+it; an explicitly selected boundary counts as the one pointer it adds. A file
+that only moved — every published file of a renamed task, for instance — is not
+new content and is not counted. Both are checks rather than refusals.
+
+Plan refuses, before it changes placement or uploads anything, a deliverable
+publication that would add or change content inside its own task directory
+while that directory documents nothing, and any staged symbolic link whose
+target is outside the repository. A task documents itself with Markdown files
+of its own choosing inside its directory; a README still carrying only the
+creation scaffold's directory map is not yet a record. A storage pointer or
+placement record counts as the content it addresses, so a result routed to S3
+is judged like one kept in Git. A publication that only retires content is not
+refused; one that removes the task's last record while publishing content is
+refused by name. The symbolic-link check reads the staged tree, so a link
+inside a boundary already placed in S3 or kept local with `untrack` is not
+classified.
+
+Plan also refuses, at the same point, a path inside the resolved scopes that
+only a machine-local ignore rule hides: the user's global excludes file,
+`.git/info/exclude`, or an ignore file whose matching bytes this publication
+does not carry. Such a rule keeps the file out of every other clone and out of
+review, so the path is in neither of the two states task content may be in. The
+message names the path, the rule, and the file the rule came from, lists at most
+the first five paths, and counts the rest. It points first at the task's own
+`<task>/.gitignore`, which this publication stages and which stays inside a
+deliverable task's write boundary, and states that the repository layer is a
+shared root path needing explicit authorization and its own publication.
+
+Carrying is decided on content, not on the path being tracked: the work-tree
+bytes of the ignore file must be the bytes this publication holds for it, so a
+rule added to a tracked root `.gitignore` and never published is machine-local
+like any other. The product's own fixed rules are the exception — every
+installation regenerates them — so an ordinary `.DS_Store` never triggers the
+refusal, including before the generated root file has been published. Git
+resolves the deepest matching ignore file before `.git/info/exclude` and the
+global excludes, so a carried repository or task rule that also matches is the
+reported source and does not trigger the refusal. An ignore file this
+publication itself adds already counts as carried.
+
+`git status --ignored` collapses a directory whose every entry is ignored into
+a single entry, which a file-level rule such as `*.log` does not itself match.
+Those directories, and only those, are re-listed with `--ignored=matching` so
+the individual files resolve to their rule; a directory a directory rule already
+covers stays collapsed and is never walked. The same rule applies to an
+infrastructure task over its declared scopes.
+
+`publish` applies the same refusals.
+
 `--allow-non-shared-head` is an exceptional checkout override and requires a
 scope note. It still refuses when the target task branch is currently checked
 out.
@@ -505,7 +600,9 @@ branch object ID is verified after push. The checkout and shared Git index are
 not switched to the task branch.
 
 `publish --dry-run` performs the same non-publishing behavior as `plan` while
-still requiring a message argument.
+still requiring a message argument. Publication reports the same `warnings` and
+`ignored_paths` as `plan` and applies the same refusals before it changes
+placement or uploads content.
 
 ```sh
 workspace-mgr publish -m "Publish the training report"

@@ -5,8 +5,114 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `init` owns the root `.gitignore` and generates it from the product's fixed
+  rules for output that is regenerated rather than retained, this repository's
+  own rules imported verbatim from the new optional
+  `.workspace-mgr/repository.gitignore` module, and any well-formed
+  `# workspace-mgr local begin` block the root file already holds, which
+  regeneration preserves byte for byte. A hand edit below the generated header
+  is drift that `doctor` reports and `init` repairs; a block marker left
+  without its partner is dropped and named in the reported action. The ignore
+  module carries ignore patterns only, and one containing those markers is
+  refused. Git has no include directive, so the file is generated rather than
+  merged.
+- Before the first successful initialization, an existing root `.gitignore` is a
+  scaffold collision like `AGENTS.md`. Nothing is migrated silently and nothing
+  is discarded: move the repository's rules into
+  `.workspace-mgr/repository.gitignore`, remove the root file, and run
+  `workspace-mgr init` again.
+- `plan` and `publish` refuse a path inside the resolved scopes that only a
+  machine-local ignore rule hides — the user's global excludes,
+  `.git/info/exclude`, or an ignore file whose matching bytes the publication
+  does not carry — because such a rule keeps the file out of every other clone
+  and out of review. The refusal names the path, the rule, and the file the rule
+  came from, lists the first five and counts the rest, and is decided before
+  placement or upload. Carrying is decided on content, so a rule appended to a
+  tracked ignore file and never published is machine-local too. Git resolves the
+  deepest matching ignore file first, so a carried repository or task rule that
+  also matches is the reported source, and the product's own fixed rules are
+  carried by every installation, so an ordinary `.DS_Store` never triggers it. A
+  directory whose whole content is ignored, which Git reports as one collapsed
+  entry, is expanded so a file-level rule is resolved rather than missed.
+- `plan` and `publish` report the `bulk-publication` warning when one
+  publication adds more than 200 new files, or more than 256 MiB (268435456
+  bytes) of new content, inside a deliverable task directory, counting content
+  automatic placement routes to S3 once rather than twice, and not counting a
+  file that only moved. It is a check rather than a refusal.
+- Publication refuses a deliverable task that adds or changes content inside its
+  own task directory while that directory documents nothing. A task documents
+  itself with Markdown files of its own choosing inside its directory; a README
+  still carrying only the creation scaffold's directory map does not count. A
+  storage pointer counts as the content it addresses, so a result routed to S3
+  is judged like one kept in Git. A publication that only retires content is
+  allowed; one that removes the task's last record while publishing content is
+  refused by name. `plan` applies the same refusal, before it changes placement
+  or uploads anything.
+- Publication refuses a staged symbolic link whose target is outside the
+  repository. The target is classified from the staged link alone, without
+  reading the filesystem, so a link inside a boundary placed in S3 or kept local
+  with `untrack` is outside what the check can see.
+- `plan` and `publish` report structured `warnings` when there is something to
+  report. `task-record-unchanged` reports a publication that changes content
+  inside the task directory while none of the task's own documentation changed
+  with it, and says when to ignore it.
+- `plan` and `publish` report `ignored_paths` beside the existing
+  `ignored_entries` count when any path inside the resolved scopes is ignored,
+  so ignored content inside a task can be reviewed as reproducible output rather
+  than lost work. The count stays exact; the list carries up to fifty entries.
+
+### Upgrading
+
+- The root `.gitignore` is now product-owned, so a repository initialized by an
+  earlier release performs one migration before its next `init`. Unlike the
+  other owned paths, this one is claimed by the generated header rather than by
+  its name, so `init` and `doctor` refuse a root `.gitignore` the product did
+  not write instead of replacing it. Move the repository's rules into
+  `.workspace-mgr/repository.gitignore` (`git mv .gitignore
+  .workspace-mgr/repository.gitignore`) and run `workspace-mgr init`, which
+  regenerates the root file from the product's fixed rules followed by that
+  module; every existing rule keeps working, negations included. Publish the
+  result like any other repository-wide change.
+
+### Changed
+
+- The fixed policy, the workspace model, and the user guide state the curation
+  half of the workplace rule: every file under a task is either selected for
+  publication or ignored by a rule this repository tracks, the by-products of
+  the work are not published by default, task-specific ignore rules belong in
+  `<task>/.gitignore` while repository-wide rules belong in
+  `.workspace-mgr/repository.gitignore` — a shared root path that costs the same
+  authorization and publication as any change outside the task directory — and
+  S3 is not a way to keep Git small. The turn-end
+  reconciliation now reads the plan's `changed_paths`, `ignored_paths`, and
+  placement decisions and resolves anything that is neither retained content nor
+  ignored.
+- The fixed policy, the workspace model, and the user guide state that the task
+  directory is the workplace: tools, intermediate materials, and the task's
+  record of decisions, process, and hard-to-reproduce results are created inside
+  it rather than in a temporary directory, a `mktemp` directory, or the home
+  directory. They also answer the two cases that push work outside a repository,
+  large scratch content and credentials, and the instruction policy version
+  moves from 9 to 10.
+- The scaffolded task README's directory map asks the task to keep its tools,
+  process, decisions, and hard-to-reproduce results in the task directory and to
+  list them there. Existing tasks are unaffected: a task whose README was ever
+  edited already satisfies the new publication guard, and no upgrade step or
+  repository change is required.
+- The nested-checkout refusal message now also names copying the needed files
+  into the task directory, or into a declared scope for an infrastructure task,
+  which has no task directory. The escaping-symbolic-link refusal names the same
+  destination.
+
 ### Fixed
 
+- A command that receives input on its standard input no longer deadlocks once
+  its reply outgrows the operating system's pipe buffer. The input is written
+  while the reply is read, rather than in full beforehand, so resolving the
+  ignore rules of a task with thousands of ignored files, or validating the
+  ignore rules of a large `untrack` boundary, completes instead of hanging.
 - Repository paths keep backslashes as ordinary file-name characters instead of
   rewriting them to `/`, so storage metadata, user-typed paths, and Git paths
   compare exactly.
