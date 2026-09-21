@@ -32,8 +32,16 @@ pub struct RefreshReport {
     pub working_changes_after: Vec<String>,
     pub materialized_git_paths: Vec<String>,
     pub storage: RefreshStorageReport,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RefreshWarning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshWarning {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +50,13 @@ pub struct RefreshStorageReport {
     pub changed_files: Vec<String>,
     pub old_files: Vec<String>,
     pub new_files: Vec<String>,
+    /// Incoming boundaries the storage engine cannot address. Their metadata
+    /// advances with the shared branch like any other Git file. Refresh
+    /// neither hydrates nor verifies their payload rather than fail the whole
+    /// refresh, and it keeps one this checkout holds only when that payload
+    /// already matches the incoming metadata.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unaddressable: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_prepared: Option<PreparedRevision>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +160,28 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
             )));
         }
     }
+    // A shared branch published before the addressability refusal can still
+    // carry metadata the storage engine cannot address, and the engine cannot
+    // verify such a boundary, so handing it over would fail and roll back the
+    // whole refresh. Refusing the whole refresh instead would freeze inbound
+    // synchronization for every checkout of this repository, while recovering
+    // one boundary needs no refresh at all. So detect those boundaries here,
+    // before the ref, index, worktree, purge queue, or engine state changes,
+    // then advance everything else and report them.
+    let (addressable_new_dvc, unaddressable_new_dvc): (Vec<String>, Vec<String>) = new_dvc
+        .iter()
+        .cloned()
+        .partition(|pointer| dvc::is_addressable(pointer));
+    let unaddressable_boundaries: Vec<String> = unaddressable_new_dvc
+        .iter()
+        .map(|pointer| {
+            pointer
+                .strip_suffix(".dvc")
+                .expect("incoming metadata was selected by that extension above")
+                .to_owned()
+        })
+        .collect();
+    let warnings = unaddressable_warnings(&unaddressable_boundaries);
     let working_before = working_changes(&repo)?;
     let purge_candidates = if old_oid == new_oid {
         Vec::new()
@@ -172,11 +209,13 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
             changed_files: incoming_dvc.clone(),
             old_files: old_dvc.clone(),
             new_files: new_dvc.clone(),
+            unaddressable: unaddressable_boundaries.clone(),
             old_prepared: None,
             new_prepared: None,
             materialized: Vec::new(),
             purge: s3_purge::preview(&repo)?,
         },
+        warnings,
         method: None,
     };
     report.storage.purge.queued = purge_candidates.clone();
@@ -202,12 +241,15 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         )?;
         let updated_pointers: Vec<String> = incoming_dvc
             .iter()
-            .filter(|pointer| !retired_local_pointers.contains(*pointer))
+            .filter(|pointer| {
+                !retired_local_pointers.contains(*pointer) && dvc::is_addressable(pointer)
+            })
             .cloned()
             .collect();
         if !updated_pointers.is_empty() {
             dvc::validate_worktree(&repo, &config, &updated_pointers)?;
         }
+        refuse_unreconcilable_payloads(&repo, &new_oid, &unaddressable_new_dvc)?;
         overlays
     };
     if options.dry_run {
@@ -224,15 +266,17 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         // neither refresh nor rollback needs them to retain the local bytes.
         let old_checkout_pointers: Vec<String> = old_dvc
             .iter()
-            .filter(|pointer| !retired_local_pointers.contains(*pointer))
+            .filter(|pointer| {
+                !retired_local_pointers.contains(*pointer) && dvc::is_addressable(pointer)
+            })
             .cloned()
             .collect();
         let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_checkout_pointers)?;
-        let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &new_dvc)?;
+        let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &addressable_new_dvc)?;
         for output in new_prepared.outputs.values().flatten() {
             reject_symlink_traversal(&repo.root, output, "incoming managed-storage output")?;
         }
-        let unsafe_outputs: Vec<String> = new_dvc
+        let unsafe_outputs: Vec<String> = addressable_new_dvc
             .iter()
             .filter(|pointer| !resolved_under(&repo.root, pointer).is_file())
             .flat_map(|pointer| new_prepared.outputs.get(pointer).into_iter().flatten())
@@ -245,7 +289,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
                 unsafe_outputs.join(", ")
             )));
         }
-        outputs_absent_before = new_dvc
+        outputs_absent_before = addressable_new_dvc
             .iter()
             .flat_map(|pointer| new_prepared.outputs.get(pointer).into_iter().flatten())
             .filter(|output| !resolved_under(&repo.root, output).exists())
@@ -273,13 +317,13 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         materialize_git_paths(&repo, &new_oid, &materialized_git_paths)?;
         if !incoming_dvc.is_empty() {
             report.storage.materialized = materialize_metadata(&repo, &new_oid, &incoming_dvc)?;
-            if !new_dvc.is_empty() {
+            if !addressable_new_dvc.is_empty() {
                 let args = ["checkout".to_owned(), "--".to_owned()]
                     .into_iter()
-                    .chain(new_dvc.iter().cloned())
+                    .chain(addressable_new_dvc.iter().cloned())
                     .collect::<Vec<_>>();
                 dvc::execute_engine(&repo.root, args)?;
-                dvc::verify(&repo, &config, &new_dvc)?;
+                dvc::verify(&repo, &config, &addressable_new_dvc)?;
             }
         }
         if repo.optional_oid(&local_ref)?.as_deref() != Some(&new_oid) {
@@ -320,6 +364,107 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
     report.storage.purge.queued = purge_candidates;
     Ok(report)
+}
+
+/// Refresh cannot hydrate, replace, or verify the payload of a boundary the
+/// storage engine cannot address, so it advances that boundary's metadata only
+/// where that leaves no payload in this checkout the metadata does not
+/// describe. Without a payload the boundary is simply unhydrated, as in every
+/// other checkout, and a payload that already matches the incoming metadata
+/// byte for byte needs nothing. Any other payload would sit silently under
+/// metadata that no longer describes it, and a later rename would carry it
+/// into publication, so refresh refuses before anything changes, as it refuses
+/// to overwrite the local output of a boundary the engine can address.
+fn refuse_unreconcilable_payloads(
+    repo: &GitRepo,
+    new_oid: &str,
+    pointers: &[String],
+) -> Result<()> {
+    let mut without_metadata = Vec::new();
+    let mut mismatched = Vec::new();
+    for pointer in pointers {
+        let metadata = file_at(repo, new_oid, pointer)?.ok_or_else(|| {
+            Error::message(format!(
+                "incoming storage metadata is missing from {new_oid}: {pointer}"
+            ))
+        })?;
+        let boundary = dvc::metadata_output(repo, pointer, &metadata)?;
+        let payload = resolved_under(&repo.root, &boundary);
+        match fs::symlink_metadata(&payload) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    path: payload,
+                    source,
+                });
+            }
+        }
+        if !resolved_under(&repo.root, pointer).is_file() {
+            without_metadata.push(boundary);
+        } else if !dvc::payload_matches_metadata(repo, pointer, &metadata)? {
+            mismatched.push(boundary);
+        }
+    }
+    if !without_metadata.is_empty() {
+        return Err(Error::message(format!(
+            "incoming stored outputs already exist without matching local metadata and will not be overwritten: {}",
+            without_metadata.join(", ")
+        )));
+    }
+    if !mismatched.is_empty() {
+        return Err(Error::message(format!(
+            "incoming storage metadata does not describe the payload this checkout holds for {}, and the storage engine cannot address that path to replace it; preserve that payload elsewhere or remove it, with the user's approval, then refresh again",
+            mismatched.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Reports incoming boundaries the storage engine cannot address, and the
+/// recovery that works for them. Until one is renamed, `storage hydrate`
+/// refuses it like any other unaddressable metadata, and a scope-wide hydrate
+/// refuses its whole scope, so the warning says how to hydrate the rest. The
+/// recovery's scope is the directory holding the boundary: the rename rewrites
+/// that directory's ignore file and both metadata files, and publication stages
+/// a declared path with `git add`, which refuses an exact path naming the
+/// ignored payload.
+fn unaddressable_warnings(boundaries: &[String]) -> Vec<RefreshWarning> {
+    if boundaries.is_empty() {
+        return Vec::new();
+    }
+    let at_root = boundaries.iter().any(|boundary| !boundary.contains('/'));
+    let mut directories = boundaries
+        .iter()
+        .filter_map(|boundary| boundary.rsplit_once('/'))
+        .map(|(directory, _)| format!("`{directory}`"))
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories.dedup();
+    let mut message = format!(
+        "the storage engine cannot address {}: {} a backslash, which the engine reads as a path separator. Refresh advanced the shared branch and hydrated every other incoming boundary, but did not hydrate, replace, or verify these, so they stay unhydrated in every checkout that does not already hold their exact payload. Until one is renamed, a scope-wide `workspace-mgr storage hydrate` over a scope that contains it refuses; name the other boundaries to hydrate them. Recover each one with the user's authorization for its directory, in an infrastructure task, which starts from the fetched base branch and so needs no refresh. Declare as the task's scope the directory that holds the boundary",
+        boundaries.join(", "),
+        if boundaries.len() == 1 {
+            "its path contains"
+        } else {
+            "each path contains"
+        },
+    );
+    if !directories.is_empty() {
+        message.push_str(&format!(" ({})", directories.join(", ")));
+    }
+    message.push_str(
+        ", and the directory that will hold the destination if that differs, because the rename rewrites each directory's `.gitignore` and both metadata files. In the task's worktree run `workspace-mgr move <boundary> <destination>` to a destination without backslashes, which fetches the payload through the old metadata and materializes it at the destination; hydrate the other boundaries in those directories by naming them, as in `workspace-mgr storage hydrate <path> ...`, because publication requires every boundary in its scope to be present; then publish the task and merge it. A later refresh hydrates the renamed boundary in every checkout",
+    );
+    if at_root {
+        message.push_str(
+            ". A boundary at the repository root has no directory a task can declare, so report it to the user instead",
+        );
+    }
+    vec![RefreshWarning {
+        code: "unaddressable-storage-metadata".to_owned(),
+        message,
+    }]
 }
 
 fn ensure_shared_index_clean(repo: &GitRepo) -> Result<()> {
@@ -426,7 +571,11 @@ fn capture_overlays(
             path.clone(),
             StorageOverlay {
                 contents: Some(current.clone()),
-                checkout_output: !retired_local_pointers.contains(path),
+                // Restoring the metadata is enough for a boundary the engine
+                // cannot address: refresh never checked its output out, so
+                // there is nothing for a rollback to put back.
+                checkout_output: !retired_local_pointers.contains(path)
+                    && dvc::is_addressable(path),
             },
         );
         if Some(&current) != old_content.as_ref() && Some(&current) != new_content.as_ref() {
@@ -775,4 +924,69 @@ fn working_changes(repo: &GitRepo) -> Result<Vec<String>> {
         .lines()
         .map(ToOwned::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refresh_with_nothing_to_report_carries_no_warning() {
+        assert!(unaddressable_warnings(&[]).is_empty());
+    }
+
+    #[test]
+    fn unaddressable_boundaries_are_reported_once_with_the_move_recovery() {
+        let boundaries = ["task/top\\level.bin", "other/d\\x/big.bin"].map(str::to_owned);
+
+        let warnings = unaddressable_warnings(&boundaries);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "unaddressable-storage-metadata");
+        let message = &warnings[0].message;
+        for boundary in &boundaries {
+            assert!(message.contains(boundary), "{message}");
+        }
+        assert!(
+            message.contains("each path contains a backslash"),
+            "{message}"
+        );
+        // The message is the only place the recovery is stated. Its scope is
+        // what `move` and publication check: a scope of the boundary alone
+        // refuses the destination, and the rename also rewrites the ignore file
+        // beside the boundary. tests/refresh_unaddressable.rs runs the whole
+        // sequence against the engine exactly as stated here.
+        for step in [
+            "infrastructure task",
+            "(`other/d\\x`, `task`)",
+            "`workspace-mgr move <boundary> <destination>`",
+            "`workspace-mgr storage hydrate <path> ...`",
+            "publish the task",
+        ] {
+            assert!(
+                message.contains(step),
+                "recovery is missing {step:?}: {message}"
+            );
+        }
+        // A scope-wide hydrate refuses while one of these is in scope, so the
+        // warning says so rather than leave it to be discovered.
+        assert!(message.contains("scope-wide `workspace-mgr storage hydrate`"));
+        assert!(!message.contains("repository root"), "{message}");
+    }
+
+    #[test]
+    fn a_boundary_at_the_repository_root_is_named_as_unrecoverable_by_a_task() {
+        let warnings = unaddressable_warnings(&["top\\level.bin".to_owned()]);
+
+        let message = &warnings[0].message;
+        assert!(
+            message.contains("its path contains a backslash"),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains("A boundary at the repository root has no directory a task can declare"),
+            "{message}"
+        );
+    }
 }

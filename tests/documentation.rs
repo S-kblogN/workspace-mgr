@@ -115,6 +115,15 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("semantic-placement-review"));
     assert!(guide.contains("task-record-unchanged"));
     assert!(guide.contains("bulk-publication"));
+    // The one warning refresh reports, and the report field beside it, are
+    // named wherever an agent looks up a code it just received.
+    for (name, document) in [("guide", guide), ("commands", commands)] {
+        assert!(
+            document.contains("unaddressable-storage-metadata"),
+            "{name} does not name the warning refresh reports"
+        );
+    }
+    assert!(commands.contains("storage.unaddressable"));
     assert!(guide.contains("ignored_paths"));
     assert!(guide.contains(".workspace-mgr/repository.gitignore"));
     assert!(guide.contains(".git/info/exclude"));

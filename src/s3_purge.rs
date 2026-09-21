@@ -215,6 +215,11 @@ fn pointers_at(repo: &GitRepo, revision: &str, scopes: &[String]) -> Result<Vec<
         .run(args)?
         .stdout
         .split('\0')
+        // Metadata whose path contains a backslash stays in: the purge adapter
+        // collects each pointer through the engine's Python API, which reads
+        // that path literally, unlike the engine's `status` command. Dropping
+        // it here would leave the versions of a path a rename or deletion
+        // retires in the bucket forever.
         .filter(|path| path.ends_with(".dvc"))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();

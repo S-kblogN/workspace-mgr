@@ -308,45 +308,60 @@ pub fn output_paths(repo: &GitRepo, pointers: &[String]) -> Result<BTreeMap<Stri
         reject_symlink_traversal(&repo.root, pointer, "managed-storage metadata")?;
         let pointer_path = resolved_under(&repo.root, pointer);
         let raw = fs::read_to_string(&pointer_path).at(&pointer_path)?;
-        let parsed: Pointer = serde_yaml::from_str(&raw).map_err(|source| Error::Yaml {
-            path: pointer_path.clone(),
-            source,
-        })?;
-        if parsed.outs.len() != 1 {
-            return Err(Error::message(format!(
-                "managed-storage metadata must define exactly one output: {pointer}"
-            )));
-        }
-        let parent = Path::new(pointer).parent().unwrap_or_else(|| Path::new(""));
-        let mut outputs = BTreeSet::new();
-        for output in parsed.outs {
-            let raw = if parent.as_os_str().is_empty() {
-                output.path
-            } else {
-                format!("{}/{}", crate::path::to_slash(parent), output.path)
-            };
-            let output = repo_path(&raw, "managed-storage output")?;
-            let expected = pointer
-                .strip_suffix(".dvc")
-                .ok_or_else(|| Error::message(format!("invalid metadata path: {pointer}")))?;
-            if output != expected {
-                return Err(Error::message(format!(
-                    "managed-storage output {output:?} must match metadata boundary {expected:?}"
-                )));
-            }
-            reject_symlink_traversal(&repo.root, &output, "managed-storage output")?;
-            outputs.insert(output);
-        }
-        result.insert(pointer.clone(), outputs.into_iter().collect());
+        result.insert(pointer.clone(), vec![metadata_output(repo, pointer, &raw)?]);
     }
     Ok(result)
 }
 
-/// The storage engine rewrites every `\` in a command target to `/`, even on
-/// Unix, so a boundary whose repository path contains one could be created but
-/// never addressed again.
+/// The one output the metadata `raw` of `pointer` defines, which must be the
+/// boundary the metadata file is named after. It reads no file and runs no
+/// engine command, so it also validates metadata taken from a Git revision.
+pub fn metadata_output(repo: &GitRepo, pointer: &str, raw: &str) -> Result<String> {
+    let parsed: Pointer = serde_yaml::from_str(raw).map_err(|source| Error::Yaml {
+        path: resolved_under(&repo.root, pointer),
+        source,
+    })?;
+    let [output] = parsed.outs.as_slice() else {
+        return Err(Error::message(format!(
+            "managed-storage metadata must define exactly one output: {pointer}"
+        )));
+    };
+    let parent = Path::new(pointer).parent().unwrap_or_else(|| Path::new(""));
+    let raw = if parent.as_os_str().is_empty() {
+        output.path.clone()
+    } else {
+        format!("{}/{}", crate::path::to_slash(parent), output.path)
+    };
+    let output = repo_path(&raw, "managed-storage output")?;
+    let expected = pointer
+        .strip_suffix(".dvc")
+        .ok_or_else(|| Error::message(format!("invalid metadata path: {pointer}")))?;
+    if output != expected {
+        return Err(Error::message(format!(
+            "managed-storage output {output:?} must match metadata boundary {expected:?}"
+        )));
+    }
+    reject_symlink_traversal(&repo.root, &output, "managed-storage output")?;
+    Ok(output)
+}
+
+/// The storage engine resolves a `\` in a command target inconsistently.
+/// Measured with the pinned engine on Unix, `add`, `fetch`, `checkout`, and
+/// `move` address such a path literally, while `status` rewrites the `\` to
+/// `/`, reports the rewritten path missing, and fails, so nothing can verify
+/// such a boundary through the engine. Which subcommands rewrite is
+/// undocumented and free to change between engine versions, so the commands
+/// that place content refuse such a path outright rather than rest on the ones
+/// that happen to work today. `refresh` does not choose what a shared branch
+/// carries, so it skips that one boundary and reports it instead of refusing
+/// the whole update; `move`, which fetches the payload through the old
+/// metadata and then renames it, is the recovery.
+pub fn is_addressable(path: &str) -> bool {
+    !path.contains('\\')
+}
+
 pub fn require_addressable(path: &str, field: &str, remedy: &str) -> Result<()> {
-    if path.contains('\\') {
+    if !is_addressable(path) {
         return Err(Error::message(format!(
             "{field} {path:?} contains a backslash, which the storage engine reads as a path separator; {remedy}"
         )));
@@ -664,8 +679,17 @@ fn pointer_matches_worktree(repo: &GitRepo, pointer: &str) -> Result<bool> {
     reject_symlink_traversal(&repo.root, pointer, "managed-storage metadata")?;
     let pointer_path = resolved_under(&repo.root, pointer);
     let raw = fs::read_to_string(&pointer_path).at(&pointer_path)?;
-    let parsed: Pointer = serde_yaml::from_str(&raw).map_err(|source| Error::Yaml {
-        path: pointer_path,
+    payload_matches_metadata(repo, pointer, &raw)
+}
+
+/// Whether the payload at `pointer`'s boundary matches the metadata `raw` byte
+/// for byte, decided without the storage engine, which cannot address every
+/// path. A directory whose metadata does not list its files cannot be compared
+/// this way, so it never matches: callers treat a mismatch as a conflict, never
+/// as permission to overwrite.
+pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Result<bool> {
+    let parsed: Pointer = serde_yaml::from_str(raw).map_err(|source| Error::Yaml {
+        path: resolved_under(&repo.root, pointer),
         source,
     })?;
     if parsed.outs.len() != 1 {
@@ -1294,6 +1318,36 @@ mod tests {
 
         fs::write(&pointer, "outs:\n- path: data\n- path: other\n").unwrap();
         assert!(output_paths(&repo, &["task/data.dvc".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn addressability_turns_only_on_a_backslash_anywhere_in_the_path() {
+        for addressable in [
+            "task/data.bin",
+            "task/data.bin.dvc",
+            "task/d-x/big.bin",
+            "task/spaced name.bin",
+            "task/colon:name.bin",
+            "",
+        ] {
+            assert!(is_addressable(addressable), "{addressable:?}");
+            require_addressable(addressable, "field", "remedy").unwrap();
+        }
+        for unaddressable in [
+            "task/top\\level.bin",
+            "task/top\\level.bin.dvc",
+            "task/d\\x/big.bin",
+            "\\leading.bin",
+            "trailing.bin\\",
+            "task/two\\back\\slashes.bin",
+        ] {
+            assert!(!is_addressable(unaddressable), "{unaddressable:?}");
+            let error = require_addressable(unaddressable, "S3 storage path", "rename it")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("contains a backslash"), "{error}");
+            assert!(error.contains("rename it"), "{error}");
+        }
     }
 
     #[cfg(unix)]

@@ -410,12 +410,19 @@ workspace-mgr move <old-path> <new-path>
 ```
 
 Both paths must remain inside the resolved scopes, the source must exist, and
-the destination must not. A move may stay within a containing directory
+the destination must not. An S3 boundary exists once its metadata does, so its
+payload need not be materialized. A move may stay within a containing directory
 boundary or move the boundary itself; it may not cross into or out of another
 directory boundary. The command changes local desired state only. A later
 `publish` writes and verifies the new S3 object path, publishes the Git revision,
 then permanently deletes every version of the old path unless another current
 remote branch or tag still references it.
+
+The recorded S3 version belongs to the old object path, so the move discards it.
+When the source payload is not materialized, `move` therefore first fetches it
+through the old metadata, before it changes anything, and then materializes it
+at the destination, where the next publication uploads it under the new path. A
+fetch failure leaves everything as it was.
 
 ## `workspace-mgr remove`
 
@@ -627,6 +634,37 @@ revision must be a fast-forward. Refresh preserves unrelated working-tree
 overlays, materializes safe ordinary Git additions, modifications, and
 deletions, and hydrates incoming S3 boundaries. It reads Git and S3 but writes
 no remote.
+
+An incoming S3 boundary whose path contains a backslash is the one exception.
+The storage engine reads the backslash as a path separator in some commands,
+including the one that verifies content, so that boundary cannot be verified,
+and refresh hydrates only what it verifies. Handing it to the engine would fail
+and roll back the whole refresh, and refusing the whole refresh would freeze
+inbound synchronization for every checkout over one path. Refresh detects those
+boundaries before it changes the branch, the index, the working tree, or stored
+content, then advances everything else and leaves only their payload
+unhydrated. It lists them in `storage.unaddressable` and reports one
+`unaddressable-storage-metadata` entry in `warnings`, which names them and the
+recovery. `refresh --dry-run` reports the same condition, so a preview never
+reports plain success for a refresh that would leave a boundary behind.
+
+Refresh cannot replace or verify a payload at such a path either, so it refuses,
+before anything changes, when this checkout already holds one that the incoming
+metadata does not describe byte for byte, or holds one without metadata beside
+it. A payload that already matches is kept.
+
+Until such a boundary is renamed, `storage hydrate` refuses it, and a
+scope-wide `storage hydrate` refuses its whole scope; name the other boundaries
+to hydrate them. Recover each boundary with the user's authorization in an
+infrastructure task, which starts from the fetched base branch and so needs no
+refresh. Declare as its scope the directory that holds the boundary, and the
+directory that will hold the destination if that differs: the rename rewrites
+each directory's `.gitignore` and both metadata files. In the task's worktree,
+`move` the boundary to a path without backslashes, which fetches its payload
+and materializes it at the destination; hydrate the other boundaries in those
+directories by naming them, because publication requires every boundary in its
+scope to be present; then publish the task and merge it. A later refresh
+hydrates the renamed boundary in every checkout.
 
 ## Help and version
 

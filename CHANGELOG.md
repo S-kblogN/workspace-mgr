@@ -105,6 +105,13 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   into the task directory, or into a declared scope for an infrastructure task,
   which has no task directory. The escaping-symbolic-link refusal names the same
   destination.
+- `move` accepts a storage boundary whose payload is not materialized, which a
+  fresh checkout and an unaddressable boundary both have, so the `refresh`
+  recovery under Fixed is possible. It fetches that payload through the source
+  metadata before it changes anything and materializes it at the destination,
+  because the rename drops the recorded S3 version a version-aware remote needs
+  to find the old object; a failed move removes what it materialized and
+  restores the metadata.
 
 ### Fixed
 
@@ -121,6 +128,27 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   path before the storage engine writes metadata it cannot address, and
   metadata left by earlier releases is reported with a `workspace-mgr move`
   recovery hint.
+- `refresh` no longer fails and rolls back, freezing inbound synchronization,
+  because the shared branch carries one S3 boundary whose path contains a
+  backslash, and `refresh --dry-run` no longer reports plain success for such a
+  refresh. The storage engine's `status` rewrites that backslash, reports the
+  rewritten path missing, and fails, so verifying the boundary rolled back the
+  whole refresh, while the preview reported success for a boundary arriving
+  new, because it inspects only metadata already present. Refresh now detects
+  those boundaries before it changes the branch, the index, the working tree,
+  the purge queue, or stored content, advances the branch, hydrates every other
+  incoming boundary, and leaves only the unaddressable payload unhydrated. It
+  names them in `storage.unaddressable` and in a new
+  `unaddressable-storage-metadata` entry in `warnings`, which gives the
+  recovery: in an infrastructure task scoped to the directory that holds the
+  boundary, `move` it to a path without backslashes, hydrate the directory's
+  other boundaries by name, publish, and merge. Refusing the whole refresh was
+  rejected deliberately: it would freeze inbound synchronization for every
+  checkout over one path, while the recovery needs no refresh at all. Refresh
+  cannot replace or verify a payload at such a path either, so it refuses,
+  before any change, in a checkout that holds a payload there the incoming
+  metadata does not describe byte for byte, or one without metadata beside it;
+  a payload that already matches is kept.
 
 ## [0.3.0] - 2026-09-14
 

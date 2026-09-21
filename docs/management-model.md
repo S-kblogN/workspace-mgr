@@ -350,8 +350,12 @@ Agents may read that state for context, but must not mutate it without explicit
 user approval for the exact path and action. Untracked does not mean unowned.
 
 After the user merges a task, `refresh` safely advances the shared branch,
-preserves unrelated overlays, and materializes incoming Git and S3 content.
-Refresh is inbound synchronization; it does not publish a task.
+preserves unrelated overlays, and materializes incoming Git and S3 content. One
+stored boundary the storage engine cannot address does not hold that up: refresh
+advances the branch, hydrates everything else, and names the boundary it left
+unhydrated together with the rename that recovers it, because refusing inbound
+synchronization for every checkout is the larger harm. Refresh is inbound
+synchronization; it does not publish a task.
 
 ## The workspace lifecycle
 

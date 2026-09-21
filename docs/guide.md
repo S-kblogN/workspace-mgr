@@ -302,7 +302,12 @@ selects that directory as a semantic boundary.
 An S3 boundary path may not contain a backslash, because the storage engine
 reads it as a directory separator. Automatic placement and `storage set --to s3`
 refuse such a path before writing any metadata: rename it, or place it in Git
-explicitly with `storage set --to git`.
+explicitly with `storage set --to git`. `refresh` cannot refuse what a shared
+branch already carries, so it skips exactly that boundary instead: it advances
+the branch, hydrates every other incoming boundary, leaves that one payload
+unhydrated, and reports it with the rename that recovers it. Until the rename, a
+scope-wide `storage hydrate` over a scope containing that boundary refuses, so
+name the other boundaries there to hydrate them.
 
 A standalone S3 boundary below 1 MiB is usually less efficient than Git because
 its metadata and remote operations may outweigh the payload. Explicit S3 still
@@ -428,6 +433,15 @@ alongside its changed paths:
 
 The `warnings` list appears only when a plan or publication has something to
 report, so an ordinary clean report has no `warnings` key at all.
+
+`refresh` reports one warning of its own, in the same shape:
+
+| Code | Meaning | When to ignore it |
+| --- | --- | --- |
+| `unaddressable-storage-metadata` | The incoming revision carries an S3 boundary whose path contains a backslash, so the storage engine cannot hydrate or verify it; the branch advances and every other boundary hydrates, but that payload does not | Never: the named boundary stays unhydrated in every checkout until it is renamed, in an infrastructure task scoped to the directory that holds it |
+
+`refresh --dry-run` reports it before anything changes, and `storage.unaddressable`
+names the same boundaries.
 
 Two conditions are refusals rather than warnings, and both fail at `plan`,
 before it changes placement or uploads anything. A deliverable publication that

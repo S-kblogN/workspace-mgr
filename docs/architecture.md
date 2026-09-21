@@ -168,9 +168,29 @@ that used the removed path non-hydratable.
 ## Shared-checkout refresh
 
 `refresh` requires the configured shared branch and a clean shared Git index. It
-verifies a fast-forward, prefetches incoming S3 revisions, compare-and-swap
-updates the local branch ref, resets the index, materializes ordinary Git paths
-whose prior working state was clean or absent, and hydrates stored content.
-Existing working-tree overlays are preserved. A failure after the ref update
-rolls back the ref, index, ordinary files, metadata, and outputs created by the
-refresh.
+verifies a fast-forward, detects incoming boundaries the storage engine cannot
+address, prefetches incoming S3 revisions, compare-and-swap updates the local
+branch ref, resets the index, materializes ordinary Git paths whose prior
+working state was clean or absent, and hydrates stored content. Existing
+working-tree overlays are preserved. A failure after the ref update rolls back
+the ref, index, ordinary files, metadata, and outputs created by the refresh.
+
+Detection precedes every change, including the purge queue, so `--dry-run`
+reports the same condition an applied refresh does. An unaddressable boundary is
+excluded from prefetch, checkout, verification, and the unsafe-output scan,
+which resolve each pointer as an engine command target: the engine's `status`
+rewrites the backslash, reports the rewritten path missing, and fails, so
+verifying such a boundary would roll back the whole refresh. The purge adapter
+still enumerates it, because it collects pointers through the engine's Python
+API, which reads the path literally. Its metadata advances with the branch, and
+refresh places no payload for it. A payload this checkout already holds there is
+compared with the incoming metadata without the engine: an exact match is kept,
+and anything else, including a payload with no metadata beside it, refuses the
+refresh before any change, because refresh can neither replace nor verify it.
+Rollback therefore restores such a boundary from its metadata alone, because
+refresh never placed or removed an output for it.
+
+A `move` whose source payload is not materialized fetches it through the source
+metadata before any change and checks it out at the destination, because the
+rename drops the recorded S3 version, which a version-aware remote needs to
+locate the old object.
