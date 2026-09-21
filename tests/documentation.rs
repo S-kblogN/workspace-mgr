@@ -221,21 +221,25 @@ fn user_documentation_covers_the_complete_public_model() {
         }
     }
     assert!(normalized_model.contains("256 MiB (268435456 bytes)"));
-    for product_rule in [
-        "`.DS_Store`",
-        "`__pycache__/`",
-        "`*.pyc`",
-        "`*.pyo`",
-        "`.ipynb_checkpoints/`",
-        "`.pytest_cache/`",
-        "`.mypy_cache/`",
-        "`.ruff_cache/`",
-        "`.venv/`",
-        "`venv/`",
-        "`node_modules/`",
-    ] {
+    // Every rule the generated root ignore file carries is documented, read
+    // from the source list itself so the two cannot drift apart.
+    let scaffold = include_str!("../src/scaffold.rs");
+    let groups = scaffold
+        .split("pub(crate) const PRODUCT_IGNORE_GROUPS")
+        .nth(1)
+        .and_then(|rest| rest.split("\n];\n").next())
+        .expect("product ignore groups");
+    let product_rules = groups
+        .lines()
+        // Rules sit one level deeper than the group titles.
+        .filter_map(|line| line.strip_prefix("            \""))
+        .filter_map(|line| line.strip_suffix("\","))
+        .map(|line| line.replace("\\\\", "\\"))
+        .collect::<Vec<_>>();
+    assert!(product_rules.len() > 50, "{product_rules:?}");
+    for product_rule in product_rules {
         assert!(
-            commands.contains(product_rule),
+            commands.contains(&format!("`{product_rule}`")),
             "the generated root ignore file's rules are documented in full, missing {product_rule}"
         );
     }
