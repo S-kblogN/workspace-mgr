@@ -399,7 +399,12 @@ pub fn move_path(
     }
     let old = resolved_under(&repo.root, &old_path);
     let new = resolved_under(&repo.root, &new_path);
-    if !old.exists() {
+    // A storage boundary exists once its metadata does, whether or not its
+    // payload is currently materialized. A fresh checkout holds the metadata of
+    // every S3 boundary but the payload of none, and a boundary the engine
+    // cannot address can never be hydrated, so renaming it is the only way out.
+    let old_materialized = old.exists();
+    if !old_materialized && !pointer_path(repo, &old_path).is_file() {
         return Err(Error::message(format!(
             "move source does not exist: {old_path}"
         )));
@@ -434,6 +439,14 @@ pub fn move_path(
     let history = task_history(repo, config, scopes)?;
     let before = placement_status(repo, config, &old_path, history.as_ref())?;
     if !dry_run {
+        if !old_materialized {
+            // The rename drops the version the remote stored the payload under,
+            // because that version belongs to the old object path, and a
+            // version-aware remote locates an object only by path and version.
+            // So fetch the payload while the old metadata still locates it,
+            // before anything changes; a failed fetch leaves nothing to undo.
+            fetch_unmaterialized_source(repo, config, &old_path)?;
+        }
         let snapshot = MetadataSnapshot::capture(repo, &[old_path.clone(), new_path.clone()])?;
         let result = (|| {
             if pointer_path(repo, &old_path).is_file() {
@@ -455,10 +468,19 @@ pub fn move_path(
                 let new_sidecar = sidecar_path(repo, &new_path);
                 fs::rename(&old_sidecar, &new_sidecar).at(&old_sidecar)?;
             }
+            if !old_materialized {
+                // Materialized at the destination, the payload is uploaded
+                // under its new path by the next publication, exactly as the
+                // payload of a boundary that was hydrated before its move.
+                materialize_moved_destination(repo, &new_path)?;
+            }
             Ok(())
         })();
         if let Err(error) = result {
-            return Err(rollback_error(error, rollback_move(&old, &new, snapshot)));
+            return Err(rollback_error(
+                error,
+                rollback_move(&old, &new, old_materialized, snapshot),
+            ));
         }
     }
     let mut placement = before;
@@ -1709,21 +1731,64 @@ impl MetadataSnapshot {
     }
 }
 
-fn rollback_move(old: &Path, new: &Path, snapshot: MetadataSnapshot) -> Result<()> {
-    let output_result = match (old.exists(), new.exists()) {
-        (false, true) => {
-            if let Some(parent) = old.parent() {
-                fs::create_dir_all(parent).at(parent)?;
+/// Brings the payload of a boundary whose metadata is present but whose
+/// payload is not into the local cache, through that metadata.
+fn fetch_unmaterialized_source(repo: &GitRepo, config: &Config, boundary: &str) -> Result<()> {
+    dvc::ensure_ready(repo, config)?;
+    dvc::execute_engine(&repo.root, ["fetch", "--", &format!("{boundary}.dvc")]).map_err(
+        |error| {
+            Error::message(format!(
+                "move could not fetch the payload of {boundary}, which is not materialized here, so it left the boundary unchanged: {error}"
+            ))
+        },
+    )?;
+    Ok(())
+}
+
+/// Checks the renamed boundary out of the local cache, where
+/// `fetch_unmaterialized_source` placed its payload, and confirms the result
+/// matches the renamed metadata.
+fn materialize_moved_destination(repo: &GitRepo, boundary: &str) -> Result<()> {
+    let pointer = format!("{boundary}.dvc");
+    dvc::execute_engine(&repo.root, ["checkout", "--", &pointer])?;
+    let clean = dvc::status(repo, &pointer)?
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty);
+    if !clean {
+        return Err(Error::message(format!(
+            "the payload materialized for moved boundary {boundary} does not match its metadata"
+        )));
+    }
+    Ok(())
+}
+
+fn rollback_move(
+    old: &Path,
+    new: &Path,
+    old_materialized: bool,
+    snapshot: MetadataSnapshot,
+) -> Result<()> {
+    let output_result = if old_materialized {
+        match (old.exists(), new.exists()) {
+            (false, true) => {
+                if let Some(parent) = old.parent() {
+                    fs::create_dir_all(parent).at(parent)?;
+                }
+                fs::rename(new, old).at(new)
             }
-            fs::rename(new, old).at(new)
+            (true, false) => Ok(()),
+            (false, false) => Err(Error::message(
+                "move rollback could not find either source or destination output",
+            )),
+            (true, true) => Err(Error::message(
+                "move rollback found both source and destination outputs",
+            )),
         }
-        (true, false) => Ok(()),
-        (false, false) => Err(Error::message(
-            "move rollback could not find either source or destination output",
-        )),
-        (true, true) => Err(Error::message(
-            "move rollback found both source and destination outputs",
-        )),
+    } else {
+        // The source had no payload, and the destination did not exist before
+        // the move, so whatever the move materialized there is removed and the
+        // snapshot restores the rest of the boundary: its metadata.
+        remove_moved_output(new)
     };
     let metadata_result = snapshot.restore();
     match (output_result, metadata_result) {
@@ -1732,6 +1797,20 @@ fn rollback_move(old: &Path, new: &Path, snapshot: MetadataSnapshot) -> Result<(
         (Err(output), Err(metadata)) => Err(Error::message(format!(
             "output rollback failed: {output}; metadata rollback failed: {metadata}"
         ))),
+    }
+}
+
+fn remove_moved_output(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path).at(path)
+        }
+        Ok(_) => fs::remove_file(path).at(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

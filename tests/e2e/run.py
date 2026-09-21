@@ -2476,6 +2476,215 @@ class Harness:
             "non-fast-forward refusal preserves a clean shared index",
         )
 
+    def exercise_unaddressable_refresh_recovery(self) -> None:
+        """A release before the addressability refusal could publish an S3
+        boundary whose path contains a backslash. Reproduce that history on the
+        versioned bucket with the engine and Git directly, then prove that
+        refresh advances past it and that the recovery its warning names works
+        against object versions, which a filesystem remote cannot show: the
+        move fetches through the old version ID before the rename drops it,
+        publication uploads the payload under the new path, and the old path's
+        versions are purged once no reference protects them."""
+        assert self.shared is not None and self.seed is not None
+        self.section("refresh past storage metadata the engine cannot address")
+        synced = self.wm(self.shared, "refresh")
+        self.check(
+            synced["status"] in {"updated", "no_changes", "s3_purged"},
+            "shared checkout synchronizes before the unaddressable scenario",
+            status=synced["status"],
+        )
+        task_id = "20260920-090000-e2e-unaddressable"
+        branch = "codex/e2e-unaddressable"
+        boundary = f"{task_id}/top\\level.bin"
+        destination = f"{task_id}/top-level.bin"
+        first = b"addressable boundary published before the crafted revision\n"
+        second = b"addressable boundary held only by the versioned bucket\n"
+        unaddressable = b"payload of a path the storage engine cannot address\n"
+        self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-unaddressable",
+            "--title",
+            "E2E unaddressable boundary",
+            "--purpose",
+            "Refresh past and recover metadata the storage engine cannot address.",
+            "--timestamp",
+            "20260920-090000",
+        )
+        task = self.shared / task_id
+        self.document_task(task)
+        (task / "first.bin").write_bytes(first)
+        self.wm(
+            task,
+            "storage",
+            "set",
+            f"{task_id}/first.bin",
+            "--to",
+            "s3",
+            "--reason",
+            "Exercise an addressable S3 boundary beside the unaddressable one.",
+        )
+        published = self.wm(task, "publish", "-m", "Publish the addressable boundary")
+        self.check(published["status"] == "pushed", "unaddressable scenario publishes its first boundary")
+        self.merge_branch_to_main(branch)
+        self.wm(self.shared, "refresh")
+
+        # No current command can place this boundary, so craft the revision an
+        # older release would have published. Targeting the pointer would make
+        # the engine resolve its path; pushing the task directory uploads both
+        # objects and records their version IDs without naming either.
+        runtime_dvc = (
+            self.home / ".local" / "share" / "workspace-mgr" / "storage-3.67.1" / "bin" / "dvc"
+        )
+        publisher = self.root / "unaddressable-publisher"
+        self.run(["git", "clone", self.remote_url, publisher], cwd=self.root)
+        self.configure_git(publisher)
+        publisher_task = publisher / task_id
+        (publisher_task / "second.bin").write_bytes(second)
+        (publisher_task / "top\\level.bin").write_bytes(unaddressable)
+        self.run([runtime_dvc, "add", "--quiet", "--", "second.bin"], cwd=publisher_task)
+        self.run([runtime_dvc, "add", "--quiet", "--", "top\\level.bin"], cwd=publisher_task)
+        self.run([runtime_dvc, "push", "--quiet", "-R", task_id], cwd=publisher)
+        crafted_pointer = (publisher_task / "top\\level.bin.dvc").read_text(encoding="utf-8")
+        self.check("version_id" in crafted_pointer, "crafted unaddressable metadata records its S3 version")
+        old_version = self.s3_version_for_body(unaddressable)
+        self.git(publisher, "add", "-A")
+        self.git(
+            publisher,
+            "commit",
+            "-m",
+            "Publish metadata the engine cannot address\n\n"
+            f"Workspace-Task: {task_id}\nWorkspace-Scope: {task_id}\n",
+        )
+        self.git(publisher, "push", "origin", "HEAD:refs/heads/main")
+        self.git(publisher, "push", "origin", f"HEAD:refs/heads/{branch}")
+        crafted_oid = self.git(publisher, "rev-parse", "HEAD").stdout.strip()
+        original_main = self.git(self.shared, "rev-parse", "main").stdout.strip()
+
+        dry = self.wm(self.shared, "refresh", "--dry-run")
+        self.check(dry["status"] == "dry_run", "refresh dry-run sees the crafted revision")
+        self.check(
+            dry["storage"].get("unaddressable") == [boundary],
+            "refresh dry-run reports the unaddressable boundary instead of a false green",
+            storage=dry["storage"],
+        )
+        self.check(
+            [warning["code"] for warning in dry.get("warnings", [])]
+            == ["unaddressable-storage-metadata"],
+            "refresh dry-run carries the unaddressable-storage-metadata warning",
+        )
+        self.check(
+            self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
+            "refresh dry-run leaves main unchanged",
+        )
+
+        refreshed = self.wm(self.shared, "refresh")
+        self.check(refreshed["status"] == "updated", "refresh advances past unaddressable metadata")
+        self.assert_shared_head(crafted_oid)
+        self.check(
+            (task / "second.bin").read_bytes() == second,
+            "refresh hydrates the other incoming boundary from the versioned bucket",
+        )
+        self.check((task / "top\\level.bin.dvc").is_file(), "unaddressable metadata advances with the branch")
+        self.check(not (task / "top\\level.bin").exists(), "refresh leaves the unaddressable payload unhydrated")
+        self.check(
+            refreshed["storage"].get("unaddressable") == [boundary],
+            "refresh reports the unaddressable boundary",
+            storage=refreshed["storage"],
+        )
+        warning = refreshed["warnings"][0]
+        self.check(warning["code"] == "unaddressable-storage-metadata", "refresh warns about the skipped boundary")
+        self.check(f"(`{task_id}`)" in warning["message"], "the warning names the directory to scope the recovery to")
+
+        consumer = self.root / "unaddressable-consumer"
+        self.run(["git", "clone", self.remote_url, consumer], cwd=self.root)
+        self.configure_git(consumer)
+        self.check(
+            (consumer / f"{boundary}.dvc").is_file() and not (consumer / boundary).exists(),
+            "another checkout holds the unaddressable metadata without its payload",
+        )
+
+        created = self.wm(
+            self.shared,
+            "task",
+            "create",
+            "e2e-recover-boundary",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "Recover an unaddressable boundary",
+            "--purpose",
+            "Rename a storage boundary the engine cannot address.",
+            "--scope",
+            task_id,
+            "--scope-note",
+            "The E2E scenario authorizes renaming this boundary.",
+        )
+        worktree = Path(created["path"])
+        self.check(
+            (worktree / f"{boundary}.dvc").is_file() and not (worktree / boundary).exists(),
+            "the recovery task starts from the fetched base without the payload",
+        )
+        moved = self.wm(worktree, "move", boundary, destination)
+        self.check(moved["status"] == "updated", "move renames an un-hydrated unaddressable boundary")
+        self.check(
+            (worktree / destination).read_bytes() == unaddressable,
+            "move fetches the payload through its old version ID and materializes it at the destination",
+        )
+        self.check(
+            not (worktree / f"{boundary}.dvc").exists() and not (worktree / boundary).exists(),
+            "move leaves nothing at the unaddressable path",
+        )
+        self.check(
+            "version_id" not in (worktree / f"{destination}.dvc").read_text(encoding="utf-8"),
+            "the renamed metadata carries no version until publication uploads the new path",
+        )
+        hydrated = self.wm(
+            worktree,
+            "storage",
+            "hydrate",
+            f"{task_id}/first.bin",
+            f"{task_id}/second.bin",
+        )
+        self.check(hydrated["status"] == "hydrated", "the other boundaries hydrate by name before publication")
+        recovered = self.wm(worktree, "publish", "-m", "Recover the unaddressable boundary")
+        self.check(recovered["status"] == "pushed", "the recovery task publishes")
+        self.check(
+            "version_id" in (worktree / f"{destination}.dvc").read_text(encoding="utf-8"),
+            "publication records the renamed boundary's new S3 version",
+        )
+        self.merge_branch_to_main(created["branch"])
+        # The deliverable branch still names the old path; once it is gone no
+        # reference protects that path's versions.
+        self.git(self.seed, "push", "origin", "--delete", branch)
+
+        for checkout in (consumer, self.shared):
+            after = self.wm(checkout, "refresh")
+            self.check(after["status"] == "updated", "refresh takes the recovery", checkout=str(checkout))
+            self.check(
+                "warnings" not in after and "unaddressable" not in after["storage"],
+                "refresh after the recovery reports nothing unaddressable",
+                checkout=str(checkout),
+            )
+            self.check(
+                (checkout / destination).read_bytes() == unaddressable,
+                "refresh hydrates the renamed boundary from its new S3 version",
+                checkout=str(checkout),
+            )
+            self.check(
+                not (checkout / f"{boundary}.dvc").exists() and not (checkout / boundary).exists(),
+                "refresh retires the unaddressable path",
+                checkout=str(checkout),
+            )
+        surviving = self.s3_version_for_body(unaddressable)
+        self.check(
+            surviving["key"] != old_version["key"] and surviving["key"].endswith(destination),
+            "only the renamed path's version survives; the old path's versions are purged",
+            old=old_version,
+            surviving=surviving,
+        )
+
     def close(self) -> None:
         if self.git_daemon is not None:
             self.git_daemon.terminate()
@@ -2501,6 +2710,7 @@ class Harness:
         self.exercise_untrack()
         self.exercise_automatic_and_explicit_git()
         self.discard_published_deliverable()
+        self.exercise_unaddressable_refresh_recovery()
         self.exercise_non_fast_forward_refresh_guard()
         summary = {
             "status": "passed",
