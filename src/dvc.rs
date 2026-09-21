@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -274,6 +274,385 @@ struct PointerFile {
     size: u64,
 }
 
+/// Storage metadata reduced to what usage accounting needs. It does not depend
+/// on the metadata file's location, so it can be cached per Git blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PointerDocument {
+    pub outs: Vec<PointerOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PointerOutput {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<PointerFileVersion>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PointerFileVersion {
+    pub relpath: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+}
+
+/// One stored object named by a metadata file: a file boundary, one file of a
+/// directory boundary, or a directory recorded only by its aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PointerEntry {
+    pub key: String,
+    pub md5: Option<String>,
+    pub size: Option<u64>,
+    pub version_id: Option<String>,
+    pub etag: Option<String>,
+    pub aggregate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPointer {
+    #[serde(default)]
+    outs: Vec<RawPointerOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPointerOutput {
+    path: String,
+    #[serde(default)]
+    md5: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    cloud: Option<serde_yaml::Value>,
+    #[serde(default)]
+    files: Option<Vec<RawPointerFile>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPointerFile {
+    relpath: String,
+    #[serde(default)]
+    md5: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    cloud: Option<serde_yaml::Value>,
+}
+
+pub(crate) fn parse_pointer_document(raw: &str, origin: &str) -> Result<PointerDocument> {
+    let parsed: RawPointer = serde_yaml::from_str(raw).map_err(|error| {
+        Error::message(format!(
+            "invalid managed-storage metadata {origin}: {error}"
+        ))
+    })?;
+    Ok(PointerDocument {
+        outs: parsed
+            .outs
+            .into_iter()
+            .map(|output| {
+                let (version_id, etag) = internal_cloud_version(output.cloud.as_ref());
+                PointerOutput {
+                    path: output.path,
+                    md5: output.md5,
+                    size: output.size,
+                    version_id,
+                    etag,
+                    files: output.files.map(|files| {
+                        files
+                            .into_iter()
+                            .map(|file| {
+                                let (version_id, etag) =
+                                    internal_cloud_version(file.cloud.as_ref());
+                                PointerFileVersion {
+                                    relpath: file.relpath,
+                                    md5: file.md5,
+                                    size: file.size,
+                                    version_id,
+                                    etag,
+                                }
+                            })
+                            .collect()
+                    }),
+                }
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn read_pointer_document(repo: &GitRepo, pointer: &str) -> Result<PointerDocument> {
+    reject_symlink_traversal(&repo.root, pointer, "managed-storage metadata")?;
+    let pointer_path = resolved_under(&repo.root, pointer);
+    let raw = fs::read_to_string(&pointer_path).at(&pointer_path)?;
+    parse_pointer_document(&raw, pointer)
+}
+
+fn internal_cloud_version(cloud: Option<&serde_yaml::Value>) -> (Option<String>, Option<String>) {
+    let Some(remote) = cloud.and_then(|cloud| cloud.get(INTERNAL_REMOTE)) else {
+        return (None, None);
+    };
+    let field = |name: &str| match remote.get(name) {
+        Some(serde_yaml::Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        Some(serde_yaml::Value::Number(value)) => Some(value.to_string()),
+        _ => None,
+    };
+    (field("version_id"), field("etag"))
+}
+
+impl PointerDocument {
+    /// Lists stored objects keyed by repository-relative path.
+    ///
+    /// Keys only label usage accounting and are never used for file access.
+    /// Names the storage engine accepted, including ones with surrounding
+    /// whitespace or control characters, are kept as written, so a published
+    /// metadata blob can never make a measurement fail. A path that would be
+    /// empty or escape its parent is charged to the enclosing boundary.
+    pub(crate) fn entries(&self, pointer: &str) -> Vec<PointerEntry> {
+        let parent = Path::new(pointer).parent().unwrap_or_else(|| Path::new(""));
+        let metadata_boundary = pointer.strip_suffix(".dvc").unwrap_or(pointer);
+        let mut entries = Vec::new();
+        for output in &self.outs {
+            let boundary = accounting_path(&output.path)
+                .map(|path| {
+                    if parent.as_os_str().is_empty() {
+                        path
+                    } else {
+                        format!("{}/{path}", crate::path::to_slash(parent))
+                    }
+                })
+                .unwrap_or_else(|| metadata_boundary.to_owned());
+            match &output.files {
+                Some(files) => {
+                    for file in files {
+                        entries.push(PointerEntry {
+                            key: object_key(&boundary, &file.relpath),
+                            md5: file.md5.clone(),
+                            size: file.size,
+                            version_id: file.version_id.clone(),
+                            etag: file.etag.clone(),
+                            aggregate: false,
+                        });
+                    }
+                }
+                None => entries.push(PointerEntry {
+                    key: boundary,
+                    md5: output.md5.clone(),
+                    size: output.size,
+                    version_id: output.version_id.clone(),
+                    etag: output.etag.clone(),
+                    aggregate: output
+                        .md5
+                        .as_deref()
+                        .is_some_and(|md5| md5.ends_with(".dir")),
+                }),
+            }
+        }
+        entries
+    }
+}
+
+/// Accounting key of a file that a directory boundary lists by `relpath`.
+pub(crate) fn object_key(boundary: &str, relpath: &str) -> String {
+    match accounting_path(relpath) {
+        Some(relative) => format!("{boundary}/{relative}"),
+        None => boundary.to_owned(),
+    }
+}
+
+/// Drops empty and `.` components without judging the names themselves. It
+/// separates on `/` alone, exactly like [`crate::path::repo_path`], so a
+/// backslash stays an ordinary name character and keys match worktree paths
+/// and object paths. Unlike `repo_path` it never fails: an empty, absolute,
+/// or escaping path yields `None`, so no published metadata can make a
+/// measurement fail.
+fn accounting_path(raw: &str) -> Option<String> {
+    if raw.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            name => parts.push(name),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// File-level differences between metadata and the worktree, as reported by
+/// the storage engine. Paths are repository-relative with `/` separators and
+/// are kept exactly as reported, because a backslash is an ordinary name
+/// character on Linux and macOS; directory rows keep a trailing `/`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct DataStatus {
+    #[serde(default)]
+    pub not_in_cache: Vec<String>,
+    #[serde(default)]
+    pub uncommitted: DataChanges,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct DataChanges {
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub modified: Vec<String>,
+    #[serde(default)]
+    pub deleted: Vec<String>,
+    #[serde(default)]
+    pub renamed: Vec<DataRename>,
+    #[serde(default)]
+    pub unknown: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct DataRename {
+    pub old: String,
+    pub new: String,
+}
+
+/// Runs one granular data-status pass over the given output paths.
+///
+/// Targets must be output paths: metadata file paths are accepted by the
+/// engine but silently match nothing.
+pub(crate) fn data_status(repo: &GitRepo, outputs: &[String]) -> Result<DataStatus> {
+    if outputs.is_empty() {
+        return Ok(DataStatus::default());
+    }
+    let args = ["data", "status", "--granular", "--json", "--"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .chain(outputs.iter().cloned())
+        .collect::<Vec<_>>();
+    let output = inspect_engine(&repo.root, args)?;
+    if !output.success() {
+        return Err(Error::message(format!(
+            "managed-storage data status failed: {}",
+            private_detail(&output)
+        )));
+    }
+    parse_data_status(&output.stdout)
+}
+
+pub(crate) fn parse_data_status(raw: &str) -> Result<DataStatus> {
+    serde_json::from_str(raw.trim().if_empty("{}")).map_err(|error| {
+        Error::message(format!(
+            "managed-storage data status returned invalid data: {error}"
+        ))
+    })
+}
+
+/// One file of a directory version, as the version's manifest lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedFile {
+    pub relpath: String,
+    pub md5: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestEntry {
+    md5: String,
+    relpath: String,
+}
+
+/// Local object stores that can hold directory manifests and file objects:
+/// the repository's storage cache and, for a filesystem remote, the remote
+/// itself. Neither is contacted over a network.
+pub(crate) fn local_object_stores(repo: &GitRepo, config: &Config) -> Vec<PathBuf> {
+    let engine_dir = repo.root.join(".dvc");
+    let mut stores = vec![cache_dir(&engine_dir)];
+    if let Some(s3) = config.s3.as_ref().filter(|s3| !s3.url.contains("://")) {
+        // The engine resolves a relative remote path against its config file.
+        stores.push(engine_dir.join(&s3.url));
+    }
+    stores
+}
+
+/// The engine's cache directory: `cache.dir` from the private or generated
+/// engine config, relative to the config directory, or the default.
+fn cache_dir(engine_dir: &Path) -> PathBuf {
+    ["config.local", "config"]
+        .iter()
+        .filter_map(|name| fs::read_to_string(engine_dir.join(name)).ok())
+        .find_map(|raw| configured_cache_dir(&raw))
+        .map_or_else(|| engine_dir.join("cache"), |dir| engine_dir.join(dir))
+}
+
+fn configured_cache_dir(raw: &str) -> Option<String> {
+    let mut in_cache = false;
+    for line in raw.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_cache = line == "[cache]";
+            continue;
+        }
+        if !in_cache {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let value = value.trim();
+            if key.trim() == "dir" && !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Resolves the files of a directory version recorded as `<md5>.dir` from
+/// its manifest, sizing each file by its stored object. Returns `None` when
+/// the manifest, or the object of any file it lists, is not available in a
+/// local object store, so the caller can fall back to the directory's
+/// aggregate size.
+pub(crate) fn directory_listing(stores: &[PathBuf], digest: &str) -> Option<Vec<ListedFile>> {
+    let manifest = stored_object(stores, digest.strip_suffix(".dir")?, ".dir")?;
+    let raw = fs::read(manifest).ok()?;
+    let entries: Vec<ManifestEntry> = serde_json::from_slice(&raw).ok()?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            let object = stored_object(stores, &entry.md5, "")?;
+            let size = fs::metadata(object).ok()?.len();
+            Some(ListedFile {
+                relpath: entry.relpath,
+                md5: entry.md5,
+                size,
+            })
+        })
+        .collect()
+}
+
+/// Finds an object in the current or the legacy cache layout. Only a plain
+/// MD5 digest can name an object, so metadata cannot point outside a store.
+fn stored_object(stores: &[PathBuf], md5: &str, suffix: &str) -> Option<PathBuf> {
+    if md5.len() != 32 || !md5.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (prefix, rest) = md5.split_at(2);
+    let name = format!("{rest}{suffix}");
+    stores
+        .iter()
+        .flat_map(|store| {
+            [
+                store.join("files/md5").join(prefix).join(&name),
+                store.join(prefix).join(&name),
+            ]
+        })
+        .find(|path| path.is_file())
+}
+
 pub fn discover(repo: &GitRepo, scopes: &[String]) -> Result<Vec<String>> {
     let mut found = BTreeSet::new();
     for path in repo.visible_paths(scopes)? {
@@ -395,6 +774,9 @@ pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
     })
 }
 
+/// Checks every output against its metadata and, unless `dry_run`, commits
+/// changed outputs to the local cache. Nothing is uploaded until
+/// [`push_outputs`], so a caller can re-check the committed metadata first.
 pub fn reconcile(
     repo: &GitRepo,
     config: &Config,
@@ -448,15 +830,20 @@ pub fn reconcile(
     for pointer in &dirty {
         execute_engine(&repo.root, ["commit", "--force", "--", pointer])?;
     }
-    if !pointers.is_empty() {
-        let mut args = vec!["push".to_owned(), "--".to_owned()];
-        args.extend(pointers.iter().cloned());
-        execute_engine(&repo.root, args)?;
-        report.verification = Some(verify(repo, config, pointers)?);
-    }
     report.committed = dirty;
-    report.pushed = pointers.to_vec();
     Ok(report)
+}
+
+/// Uploads every output that [`reconcile`] prepared and verifies the result.
+pub fn push_outputs(repo: &GitRepo, config: &Config, report: &mut DvcReport) -> Result<()> {
+    if !report.files.is_empty() {
+        let mut args = vec!["push".to_owned(), "--".to_owned()];
+        args.extend(report.files.iter().cloned());
+        execute_engine(&repo.root, args)?;
+        report.verification = Some(verify(repo, config, &report.files)?);
+    }
+    report.pushed = report.files.clone();
+    Ok(())
 }
 
 pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<serde_json::Value> {
@@ -1134,6 +1521,11 @@ fn private_engine_error(error: Error) -> Error {
             code,
             detail: sanitize_private_detail(&detail),
         },
+        Error::Terminated { status, detail, .. } => Error::Terminated {
+            command: "managed-storage".to_owned(),
+            status,
+            detail: sanitize_private_detail(&detail),
+        },
         Error::MissingCommand(_) => {
             Error::message("managed-storage runtime is unavailable; run `workspace-mgr setup`")
         }
@@ -1223,6 +1615,17 @@ mod tests {
         assert!(!detail.contains(&runtime.display().to_string()));
         assert!(!detail.contains("DVC"));
         assert!(!detail.contains("dvc"));
+
+        // An engine that a signal ended is named and sanitized the same way.
+        let error = private_engine_error(Error::Terminated {
+            command: runtime.join("bin/dvc").display().to_string(),
+            status: "signal: 9 (SIGKILL)".to_owned(),
+            detail: format!("DVC stopped in {}", runtime.display()),
+        });
+        assert_eq!(
+            error.to_string(),
+            "managed-storage did not exit normally (signal: 9 (SIGKILL)): internal engine stopped in <private-runtime>"
+        );
     }
 
     #[test]
@@ -1413,5 +1816,259 @@ mod tests {
         fs::write(task.join("bundle/extra.txt"), b"extra\n").unwrap();
         assert!(!pointer_matches_worktree(&repo, "task/data.bin.dvc").unwrap());
         assert!(!pointer_matches_worktree(&repo, "task/bundle.dvc").unwrap());
+    }
+    #[test]
+    fn pointer_entries_cover_every_metadata_shape() {
+        let file = parse_pointer_document(
+            "outs:\n- md5: 48036ac48f0d02ad143b45123e44d7fd\n  size: 11\n  hash: md5\n  path: data.bin\n",
+            "task/data.bin.dvc",
+        )
+        .unwrap();
+        assert_eq!(
+            file.entries("task/data.bin.dvc"),
+            vec![PointerEntry {
+                key: "task/data.bin".to_owned(),
+                md5: Some("48036ac48f0d02ad143b45123e44d7fd".to_owned()),
+                size: Some(11),
+                version_id: None,
+                etag: None,
+                aggregate: false,
+            }]
+        );
+
+        let directory = parse_pointer_document(
+            "outs:\n- md5: eb2dfde6d481867e4c338a60e69ba734.dir\n  size: 12\n  nfiles: 2\n  hash: md5\n  path: bundle\n",
+            "bundle.dvc",
+        )
+        .unwrap();
+        let entries = directory.entries("bundle.dvc");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "bundle");
+        assert_eq!(entries[0].size, Some(12));
+        assert!(entries[0].aggregate);
+
+        let versioned_file = parse_pointer_document(
+            "outs:\n- md5: aaa\n  size: 5\n  hash: md5\n  path: model.pt\n  cloud:\n    workspace-mgr:\n      etag: '\"etag-one\"'\n      version_id: v1\n    other:\n      version_id: foreign\n",
+            "task/run/model.pt.dvc",
+        )
+        .unwrap();
+        let entries = versioned_file.entries("task/run/model.pt.dvc");
+        assert_eq!(entries[0].key, "task/run/model.pt");
+        assert_eq!(entries[0].version_id.as_deref(), Some("v1"));
+        assert_eq!(entries[0].etag.as_deref(), Some("\"etag-one\""));
+
+        let versioned_directory = parse_pointer_document(
+            "outs:\n- hash: md5\n  path: bundle\n  files:\n  - relpath: alpha.txt\n    md5: a1\n    size: 6\n    cloud:\n      workspace-mgr:\n        etag: e1\n        version_id: va\n  - relpath: nested/beta.txt\n    md5: b1\n    size: 5\n    cloud:\n      workspace-mgr:\n        version_id: 12345\n  - relpath: gamma.txt\n    md5: c1\n    size: 7\n",
+            "task/bundle.dvc",
+        )
+        .unwrap();
+        let entries = versioned_directory.entries("task/bundle.dvc");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.key.as_str(),
+                    entry.size,
+                    entry.version_id.as_deref(),
+                    entry.aggregate
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("task/bundle/alpha.txt", Some(6), Some("va"), false),
+                ("task/bundle/nested/beta.txt", Some(5), Some("12345"), false),
+                ("task/bundle/gamma.txt", Some(7), None, false),
+            ]
+        );
+
+        let cached = serde_json::to_string(&versioned_directory).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PointerDocument>(&cached).unwrap(),
+            versioned_directory
+        );
+        assert!(parse_pointer_document("outs: [", "broken.dvc").is_err());
+        assert!(parse_pointer_document("outs:\n- md5: a\n", "pathless.dvc").is_err());
+    }
+
+    #[test]
+    fn pointer_entries_keep_every_name_the_storage_engine_accepted() {
+        // A version-aware push lists files by the names the engine read from
+        // disk; a published blob must never make usage accounting fail.
+        let odd = parse_pointer_document(
+            "outs:\n- hash: md5\n  path: bundle\n  files:\n  - relpath: \"Icon\\r\"\n    md5: i1\n    size: 1\n  - relpath: 'name '\n    md5: n1\n    size: 2\n  - relpath: ' lead'\n    md5: l1\n    size: 3\n  - relpath: ./nested//deep\\file.txt\n    md5: d1\n    size: 4\n  - relpath: ../x\n    md5: x1\n    size: 5\n  - relpath: /abs\n    md5: a1\n    size: 6\n  - relpath: .\n    md5: e1\n    size: 7\n",
+            "task/bundle.dvc",
+        )
+        .unwrap();
+        assert_eq!(
+            odd.entries("task/bundle.dvc")
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.size))
+                .collect::<Vec<_>>(),
+            vec![
+                ("task/bundle/Icon\r", Some(1)),
+                ("task/bundle/name ", Some(2)),
+                ("task/bundle/ lead", Some(3)),
+                // A backslash is part of the name, not a separator.
+                ("task/bundle/nested/deep\\file.txt", Some(4)),
+                ("task/bundle", Some(5)),
+                ("task/bundle", Some(6)),
+                ("task/bundle", Some(7)),
+            ]
+        );
+
+        let trailing = parse_pointer_document(
+            "outs:\n- md5: t1\n  size: 8\n  path: 'report '\n",
+            "task/report .dvc",
+        )
+        .unwrap();
+        assert_eq!(trailing.entries("task/report .dvc")[0].key, "task/report ");
+        let root =
+            parse_pointer_document("outs:\n- md5: r1\n  size: 9\n  path: data\n", "data.dvc")
+                .unwrap();
+        assert_eq!(root.entries("data.dvc")[0].key, "data");
+        let escape = parse_pointer_document("outs:\n- path: ../escape\n", "task/escape.dvc")
+            .unwrap()
+            .entries("task/escape.dvc");
+        assert_eq!(escape[0].key, "task/escape");
+    }
+
+    #[test]
+    fn existing_pointer_readers_still_accept_cloud_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("task");
+        fs::create_dir(&task).unwrap();
+        fs::write(
+            task.join("data.dvc"),
+            "outs:\n- md5: aaa\n  size: 1\n  path: data\n  cloud:\n    workspace-mgr:\n      version_id: v1\n",
+        )
+        .unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+        let outputs = output_paths(&repo, &["task/data.dvc".to_owned()]).unwrap();
+        assert_eq!(outputs["task/data.dvc"], vec!["task/data".to_owned()]);
+        let document = read_pointer_document(&repo, "task/data.dvc").unwrap();
+        assert_eq!(document.outs[0].version_id.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn granular_data_status_keeps_the_reported_names() {
+        let status = parse_data_status(
+            r#"{"not_in_cache": ["T\\g.bin"], "uncommitted": {"modified": ["T/dir/", "T/sub/f.bin", "T/dir/a.txt", "T/dir/a\\b.bin"], "added": ["T/dir/d.txt"], "renamed": [{"old": "T/dir/b.txt", "new": "T/dir/e.txt"}], "deleted": ["T/dir/c.txt"]}, "committed": {"added": ["T/other"]}}"#,
+        )
+        .unwrap();
+        // A backslash is an ordinary name character on Linux and macOS. A
+        // boundary at such a path is refused before any status runs, so the
+        // top-level row only proves that no metadata can mangle a name;
+        // names inside a directory boundary are reported and charged.
+        assert_eq!(status.not_in_cache, vec!["T\\g.bin".to_owned()]);
+        assert_eq!(
+            status.uncommitted.modified,
+            vec![
+                "T/dir/".to_owned(),
+                "T/sub/f.bin".to_owned(),
+                "T/dir/a.txt".to_owned(),
+                "T/dir/a\\b.bin".to_owned()
+            ]
+        );
+        assert_eq!(status.uncommitted.added, vec!["T/dir/d.txt".to_owned()]);
+        assert_eq!(status.uncommitted.deleted, vec!["T/dir/c.txt".to_owned()]);
+        assert_eq!(
+            status.uncommitted.renamed,
+            vec![DataRename {
+                old: "T/dir/b.txt".to_owned(),
+                new: "T/dir/e.txt".to_owned(),
+            }]
+        );
+        assert_eq!(parse_data_status("").unwrap(), DataStatus::default());
+        assert!(parse_data_status("not json").is_err());
+    }
+
+    #[test]
+    fn directory_listings_resolve_from_local_object_stores() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let remote = temp.path().join("remote");
+        let write = |path: PathBuf, content: &[u8]| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        };
+        let a = "0cc175b9c0f1b6a831c399e269772661";
+        let b = "92eb5ffee6ae2fec3ad71c777531578f";
+        let dir = "00aa73e716a615de21f40969f0ea1dd1";
+        write(
+            cache.join(format!("files/md5/00/{}.dir", &dir[2..])),
+            format!(r#"[{{"md5": "{a}", "relpath": "a.txt"}}, {{"md5": "{b}", "relpath": "sub/b\\c.bin"}}]"#)
+                .as_bytes(),
+        );
+        write(cache.join(format!("files/md5/0c/{}", &a[2..])), b"a");
+        // A file object may be found in another store or the legacy layout.
+        write(remote.join(format!("92/{}", &b[2..])), b"bbbb");
+        let stores = vec![cache.clone(), remote.clone()];
+        let listing = directory_listing(&stores, &format!("{dir}.dir")).unwrap();
+        assert_eq!(
+            listing,
+            vec![
+                ListedFile {
+                    relpath: "a.txt".to_owned(),
+                    md5: a.to_owned(),
+                    size: 1,
+                },
+                ListedFile {
+                    relpath: "sub/b\\c.bin".to_owned(),
+                    md5: b.to_owned(),
+                    size: 4,
+                },
+            ]
+        );
+        assert_eq!(
+            object_key("T/data", &listing[1].relpath),
+            "T/data/sub/b\\c.bin"
+        );
+        // Anything that cannot be resolved completely falls back to the
+        // aggregate, and metadata can never name a path outside a store.
+        assert_eq!(directory_listing(&stores[..1], &format!("{dir}.dir")), None);
+        assert_eq!(directory_listing(&stores, dir), None);
+        assert_eq!(
+            directory_listing(&stores, "ffffffffffffffffffffffffffffffff.dir"),
+            None
+        );
+        assert_eq!(directory_listing(&stores, "../../../etc/passwd.dir"), None);
+        assert_eq!(stored_object(&stores, "0c/../../x", ""), None);
+    }
+
+    #[test]
+    fn object_stores_follow_the_engine_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+        let engine = temp.path().join(".dvc");
+        fs::create_dir(&engine).unwrap();
+        let mut config = Config {
+            s3: Some(crate::config::S3Config {
+                url: "s3://bucket/prefix".to_owned(),
+                endpoint_url: None,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(
+            local_object_stores(&repo, &config),
+            vec![engine.join("cache")]
+        );
+        config.s3.as_mut().unwrap().url = "/srv/storage".to_owned();
+        assert_eq!(
+            local_object_stores(&repo, &config),
+            vec![engine.join("cache"), PathBuf::from("/srv/storage")]
+        );
+        config.s3.as_mut().unwrap().url = "../storage".to_owned();
+        fs::write(
+            engine.join("config.local"),
+            "[core]\n    dir = ignored\n[cache]\n    type = copy\n    dir = /shared/cache\n",
+        )
+        .unwrap();
+        assert_eq!(
+            local_object_stores(&repo, &config),
+            vec![PathBuf::from("/shared/cache"), engine.join("../storage")]
+        );
     }
 }

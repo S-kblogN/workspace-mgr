@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod cli;
+mod cloud_usage;
 mod config;
 mod discard;
 mod doctor;
@@ -20,6 +21,7 @@ mod runtime;
 mod s3_purge;
 mod scaffold;
 mod storage;
+mod task_approval;
 mod task_rename;
 mod transaction;
 mod update;
@@ -39,6 +41,7 @@ use crate::path::repo_path;
 use crate::refresh::{RefreshOptions, execute as refresh};
 use crate::runtime::{SetupOptions, setup};
 use crate::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
+use crate::task_approval::{CloudUsageApprovalOptions, approve as approve_cloud_usage};
 use crate::task_rename::{TaskRenameOptions, rename as rename_task};
 use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
@@ -141,6 +144,18 @@ fn run(cli: Cli) -> Result<()> {
                     manifest: args.manifest,
                     dry_run: args.dry_run,
                     confirm: args.confirm,
+                })?,
+                cli.format,
+            ),
+            TaskCommand::ApproveCloudUsage(args) => emit(
+                &approve_cloud_usage(&CloudUsageApprovalOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
+                    limit_bytes: args.limit,
+                    note: args.note,
+                    scope_note: args.scope_note,
+                    allow_non_shared_head: args.allow_non_shared_head,
+                    dry_run: args.dry_run,
                 })?,
                 cli.format,
             ),
@@ -304,6 +319,7 @@ fn scoped_context(
         None => ResolvedTask::discover(&repo, &args.repo)?,
     };
     let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
+    cloud_usage::remind(&repo, &task);
     let (scopes, _) = hydrate_scopes(&task, &args.include, args.scope_note.as_deref())?;
     Ok((repo, config, scopes, lock))
 }

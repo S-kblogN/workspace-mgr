@@ -506,3 +506,88 @@ fn a_failed_move_restores_a_boundary_that_has_no_payload_to_put_back() {
     assert!(!task.join("still\\bad.bin").exists());
     assert!(!task.join("top\\level.bin").exists());
 }
+
+/// A newer release may write storage metadata this one cannot read, so refresh
+/// checks the incoming `minimum_cli_version` before it inspects any incoming
+/// boundary. The requirement wins over every outcome the unaddressable
+/// boundary would otherwise produce, including the refusal over a payload this
+/// checkout holds there, and it does so at dry run and at apply before anything
+/// changes.
+#[test]
+fn an_incoming_requirement_is_refused_before_unaddressable_metadata_is_inspected() {
+    if which::which("dvc").is_err() {
+        eprintln!("skipping: dvc is unavailable");
+        return;
+    }
+    let branch = shared_branch_carrying_unaddressable_metadata();
+    let fixture = &branch.fixture;
+    let shared = &fixture.shared;
+    let task = branch.task();
+
+    // A later release raises the requirement in the same incoming range and
+    // rewrites the unaddressable metadata in a form this release cannot read.
+    let raiser = fixture.root.join("raiser");
+    command(
+        &fixture.root,
+        "git",
+        [
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            raiser.to_str().unwrap(),
+        ],
+    );
+    configure_git(&raiser);
+    let config = raiser.join(".workspace-mgr.toml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("minimum_cli_version = \"99.0.0\"\n\n{original}"),
+    )
+    .unwrap();
+    std::fs::write(
+        raiser.join(TASK_ID).join("top\\level.bin.dvc"),
+        "schema: 99\nouts: metadata only a newer release reads\n",
+    )
+    .unwrap();
+    git(&raiser, ["add", "-A"]);
+    git(&raiser, ["commit", "-m", "Require a newer workspace-mgr"]);
+    git(&raiser, ["push", "origin", "HEAD:refs/heads/main"]);
+
+    // On its own, this payload would refuse the refresh for a different
+    // reason: the incoming metadata does not describe it.
+    let local_payload = b"a payload this checkout holds at the unaddressable path\n";
+    std::fs::write(task.join("top\\level.bin"), local_payload).unwrap();
+    let before = revision(shared, "HEAD");
+    let status_before = git(shared, ["status", "--porcelain"]).stdout;
+    let installed = String::from_utf8(workspace(shared, ["--version"]).stdout)
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned();
+    let expected = format!(
+        "workspace-mgr: this repository requires workspace-mgr 99.0.0 or newer (`minimum_cli_version` in .workspace-mgr.toml on origin/main); this is workspace-mgr {installed}. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`, then run `workspace-mgr setup`.\n"
+    );
+    for args in [&["refresh", "--dry-run"][..], &["refresh"][..]] {
+        let refused = workspace_unchecked(shared, args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            expected,
+            "{args:?}"
+        );
+        assert_eq!(revision(shared, "HEAD"), before, "{args:?}");
+        assert_eq!(
+            git(shared, ["status", "--porcelain"]).stdout,
+            status_before,
+            "{args:?}"
+        );
+        assert!(!task.join("second.bin.dvc").exists(), "{args:?}");
+        assert!(!task.join("top\\level.bin.dvc").exists(), "{args:?}");
+        assert_eq!(
+            std::fs::read(task.join("top\\level.bin")).unwrap(),
+            local_payload
+        );
+    }
+}

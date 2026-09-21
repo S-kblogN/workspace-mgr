@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::process::{CommandOutput, run_unchecked, run_with};
+use crate::process::{ByteOutput, CommandOutput, run_bytes, run_unchecked, run_with, stream};
 
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -77,6 +77,36 @@ impl GitRepo {
         let mut full = vec!["-C".to_owned(), self.root.to_string_lossy().into_owned()];
         full.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
         run_with("git", full, &self.root, &BTreeMap::new(), None, false)
+    }
+
+    pub fn run_bytes<I, S>(&self, args: I, input: Option<&[u8]>) -> Result<ByteOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut full = vec!["-C".to_owned(), self.root.to_string_lossy().into_owned()];
+        full.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+        run_bytes("git", full, &self.root, &BTreeMap::new(), input, true)
+    }
+
+    pub fn stream<I, S, F>(&self, args: I, input: Option<&[u8]>, on_stdout: F) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let mut full = vec!["-C".to_owned(), self.root.to_string_lossy().into_owned()];
+        full.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+        stream(
+            "git",
+            full,
+            &self.root,
+            &BTreeMap::new(),
+            input,
+            true,
+            on_stdout,
+        )?;
+        Ok(())
     }
 
     pub fn run_with_index<I, S>(
@@ -217,6 +247,31 @@ impl GitRepo {
         ])?;
         self.optional_oid(&remote_ref)?
             .ok_or_else(|| Error::message(format!("fetch did not create {remote_ref}")))
+    }
+
+    /// Makes the commit `oid` that `remote`'s `branch` pointed to available
+    /// locally without updating any ref, fetching the branch only when the
+    /// object is missing.
+    pub fn fetch_branch_objects(&self, remote: &str, branch: &str, oid: &str) -> Result<()> {
+        let commit = format!("{oid}^{{commit}}");
+        if self.run_unchecked(["cat-file", "-e", &commit])?.success() {
+            return Ok(());
+        }
+        self.run([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ])?;
+        if self.run_unchecked(["cat-file", "-e", &commit])?.success() {
+            return Ok(());
+        }
+        Err(Error::message(format!(
+            "{remote}/{branch} changed while it was being inspected; retry"
+        )))
     }
 
     pub fn remote_branch_oid(&self, remote: &str, branch: &str) -> Result<Option<String>> {

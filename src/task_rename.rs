@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, require_supported_cli_at};
 use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    ResolvedTask, TASK_SCHEMA_VERSION, TaskKind, TaskManifest, build_task_path,
-    parse_task_identity, validate_additional_scopes, validate_task_slug,
+    ResolvedTask, TaskKind, build_task_path, parse_task_identity, validate_additional_scopes,
+    validate_task_slug,
 };
 use crate::path::{reject_symlink_traversal, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
@@ -75,6 +75,7 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         None => ResolvedTask::discover(&task_repo, &options.start)?,
     };
     let task = ResolvedTask::load(&task_repo, &config, &manifest_path)?;
+    crate::cloud_usage::remind(&task_repo, &task);
     if task.slug == options.new_slug {
         return Err(Error::message(format!(
             "task already uses slug {:?}",
@@ -83,7 +84,7 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
     }
     task_repo.validate_branch(&task.branch)?;
     task_repo.validate_remote_name(&task.remote)?;
-    validate_checkout(&task_repo, &task)?;
+    validate_checkout(&task_repo, &task, "task rename")?;
 
     let identity = parse_task_identity(task.kind, &task.task_id)?;
     let new_task_path =
@@ -93,6 +94,13 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         .optional_oid(&format!("refs/heads/{}", task.branch))?
         .ok_or_else(|| Error::message("task local branch does not exist"))?;
     let remote_base_oid = task_repo.fetch_branch(&task.remote, &task.base_branch)?;
+    // The shared branch may already require a newer workspace-mgr than the
+    // local checkout declares.
+    require_supported_cli_at(
+        &task_repo,
+        &remote_base_oid,
+        &format!("{}/{}", task.remote, task.base_branch),
+    )?;
     let remote_branch_oid = inspect_remote_task(&task_repo, &task, &remote_base_oid)?;
     validate_paths(
         &task_repo,
@@ -102,17 +110,11 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         remote_branch_oid.as_deref(),
     )?;
 
-    let new_manifest = TaskManifest {
-        schema_version: TASK_SCHEMA_VERSION,
-        kind: task.kind,
-        id: task.task_id.clone(),
-        slug: options.new_slug.clone(),
-        path: new_task_path.clone(),
-        branch: task.branch.clone(),
-        title: task.title.clone(),
-        purpose: task.purpose.clone(),
-        additional_scopes: task.additional_scopes.clone(),
-    };
+    // The rewritten manifest keeps every other field, including a recorded
+    // cloud-usage approval, and uses the lowest schema that represents it.
+    let mut new_manifest = task.manifest();
+    new_manifest.slug = options.new_slug.clone();
+    new_manifest.path = new_task_path.clone();
     let rendered = new_manifest.render()?;
     let new_manifest_path = match &new_task_path {
         Some(path) => resolved_under(&task_repo.root, &format!("{path}/{TASK_MANIFEST_NAME}")),
@@ -178,13 +180,20 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
     })
 }
 
-fn validate_checkout(repo: &GitRepo, task: &ResolvedTask) -> Result<()> {
+/// Requires the checkout that owns the task's manifest: the shared checkout
+/// on the base branch for a deliverable, and the task's managed worktree for
+/// an infrastructure task. `operation` names the command in refusals.
+pub(crate) fn validate_checkout(
+    repo: &GitRepo,
+    task: &ResolvedTask,
+    operation: &str,
+) -> Result<()> {
     let current = repo.current_branch()?;
     match task.kind {
         TaskKind::Deliverable => {
             if current.as_deref() != Some(&task.base_branch) {
                 return Err(Error::message(format!(
-                    "deliverable task rename must run from the shared checkout on {:?}; current branch is {:?}",
+                    "deliverable {operation} must run from the shared checkout on {:?}; current branch is {:?}",
                     task.base_branch,
                     current.as_deref().unwrap_or("detached HEAD")
                 )));
@@ -194,7 +203,7 @@ fn validate_checkout(repo: &GitRepo, task: &ResolvedTask) -> Result<()> {
         TaskKind::Infrastructure => {
             if current.as_deref() != Some(&task.branch) {
                 return Err(Error::message(format!(
-                    "infrastructure task rename must run from its isolated worktree on {:?}",
+                    "infrastructure {operation} must run from its isolated worktree on {:?}",
                     task.branch
                 )));
             }
@@ -234,6 +243,9 @@ fn inspect_remote_task(
         ));
     }
     validate_remote_task_identity(repo, task, &fetched)?;
+    // A newer release may have published the task branch with a declaration
+    // this one does not meet.
+    require_supported_cli_at(repo, &fetched, &format!("{}/{}", task.remote, task.branch))?;
     let merged = repo.run_unchecked(["merge-base", "--is-ancestor", &fetched, remote_base_oid])?;
     match merged.code {
         0 => Err(Error::message(
@@ -430,7 +442,7 @@ fn path_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::message("task manifest has no parent"))?;

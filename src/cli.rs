@@ -140,6 +140,8 @@ pub enum TaskCommand {
     Status(TaskStatusArgs),
     /// Permanently discard an unmerged task after its pull request is closed.
     Discard(TaskDiscardArgs),
+    /// Record the user's explicit approval of a cloud-usage limit for this task.
+    ApproveCloudUsage(TaskApproveCloudUsageArgs),
 }
 
 #[derive(Debug, Args)]
@@ -211,6 +213,32 @@ pub struct TaskDiscardArgs {
     /// Confirm the exact task ID after the agent closes or verifies absence of its PR.
     #[arg(long, value_name = "TASK_ID", conflicts_with = "dry_run")]
     pub confirm: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskApproveCloudUsageArgs {
+    /// Approved limit: a byte count or a size such as 1.5GiB or 2GB.
+    #[arg(long, value_parser = crate::cloud_usage::parse_size)]
+    pub limit: u64,
+
+    /// The user's decision from this chat, on one line.
+    #[arg(long)]
+    pub note: String,
+
+    #[arg(long)]
+    pub scope_note: Option<String>,
+
+    #[arg(long)]
+    pub allow_non_shared_head: bool,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -386,7 +414,7 @@ pub struct RefreshArgs {
 mod tests {
     use clap::Parser;
 
-    use super::Cli;
+    use super::{Cli, Command, TaskArgs, TaskCommand};
 
     #[test]
     fn documented_command_shapes_are_accepted_by_clap() {
@@ -448,6 +476,46 @@ mod tests {
                 "--manifest",
                 "task/manifest.toml",
                 "--dry-run",
+            ],
+            &[
+                "task",
+                "approve-cloud-usage",
+                "--limit",
+                "1.5GB",
+                "--note",
+                "The user approved 1.5 GB for the training checkpoints",
+            ],
+            &[
+                "task",
+                "approve-cloud-usage",
+                "--limit",
+                "3GiB",
+                "--note",
+                "The user approved 3 GiB in this chat",
+                "--manifest",
+                "task/manifest.toml",
+                "--dry-run",
+            ],
+            &[
+                "task",
+                "approve-cloud-usage",
+                "--limit",
+                "2000000000",
+                "--note",
+                "The user approved 2000000000 bytes",
+                "--repo",
+                "/tmp/repository",
+            ],
+            &[
+                "task",
+                "approve-cloud-usage",
+                "--limit",
+                "2GiB",
+                "--note",
+                "The user approved 2 GiB in this chat",
+                "--allow-non-shared-head",
+                "--scope-note",
+                "The user selected an alternate checkout",
             ],
             &["storage", "status"],
             &[
@@ -515,6 +583,45 @@ mod tests {
                 panic!("documented command failed to parse: {args:?}\n{error}")
             });
         }
+    }
+
+    #[test]
+    fn approval_limits_are_parsed_as_exact_byte_counts() {
+        let limit = |raw: &str| -> Result<u64, clap::Error> {
+            let cli = Cli::try_parse_from([
+                "workspace-mgr",
+                "task",
+                "approve-cloud-usage",
+                "--limit",
+                raw,
+                "--note",
+                "Approved in chat",
+            ])?;
+            match cli.command {
+                Command::Task(TaskArgs {
+                    command: TaskCommand::ApproveCloudUsage(args),
+                }) => Ok(args.limit),
+                other => panic!("unexpected command {other:?}"),
+            }
+        };
+        assert_eq!(limit("1.5GB").unwrap(), 1_500_000_000);
+        assert_eq!(limit("1.5 GB").unwrap(), 1_500_000_000);
+        assert_eq!(limit("3GiB").unwrap(), 3 << 30);
+        assert_eq!(limit("2000000000").unwrap(), 2_000_000_000);
+        for invalid in ["1G", "1.5", "-1GB", "20000000 TB"] {
+            assert!(limit(invalid).is_err(), "{invalid:?} was accepted");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "workspace-mgr",
+                "task",
+                "approve-cloud-usage",
+                "--limit",
+                "2GB"
+            ])
+            .is_err(),
+            "the user's decision must be recorded"
+        );
     }
 
     #[test]

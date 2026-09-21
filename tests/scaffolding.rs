@@ -61,6 +61,17 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     assert!(text.contains("explicitly authorize the exact path and action"));
     assert!(text.contains("they do not create authorization"));
     assert!(text.contains("write boundary is instead the exact user-authorized paths"));
+    assert!(text.contains("is limited to 1 GiB (1073741824 bytes)"));
+    assert!(text.contains("stop this task's work immediately"));
+    assert!(text.contains("records the user's explicit answer from this chat"));
+    assert!(text.contains("this repository requires a newer workspace-mgr"));
+    assert!(text.contains("Never add, edit, or remove either by hand"));
+    // The cloud-usage pause and the curation habits share one turn end.
+    assert!(text.contains("The pause outranks the turn-end reconciliation"));
+    assert!(text.contains("decide their structural refusals before they measure cloud usage"));
+    assert!(text.contains("if it reports `cloud_usage.status: approval_required`, stop there"));
+    assert!(text.contains("the `changed_paths` that remain unpublished"));
+    assert!(text.contains("Publish that reduction on its own"));
     assert!(text.contains("policy="));
 
     let model_only = workspace(
@@ -261,11 +272,10 @@ fn setup_installs_and_reuses_a_verified_private_runtime() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&bootstrap, permissions).unwrap();
 
-    let install = std::process::Command::new(binary())
+    let install = binary_command()
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
         .output()
         .unwrap();
@@ -287,11 +297,10 @@ fn setup_installs_and_reuses_a_verified_private_runtime() {
         format!("#!{}/bin/python\n", runtime.display())
     );
 
-    let repeated = std::process::Command::new(binary())
+    let repeated = binary_command()
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
         .output()
         .unwrap();
@@ -328,10 +337,9 @@ fn failed_runtime_install_restores_the_previous_directory() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&bootstrap, permissions).unwrap();
 
-    let failed = std::process::Command::new(binary())
+    let failed = binary_command()
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
         .output()
         .unwrap();
@@ -394,10 +402,9 @@ fn concurrent_runtime_install_is_rejected_before_provisioning() {
         .unwrap();
     lock.try_lock_exclusive().unwrap();
 
-    let blocked = std::process::Command::new(binary())
+    let blocked = binary_command()
         .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
         .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .output()
         .unwrap();
     assert_eq!(blocked.status.code(), Some(2));
@@ -518,6 +525,12 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("they do not create authorization"));
     assert!(task_rules.contains("outside the repository is outside the task directory too"));
     assert!(task_rules.contains("own files are its durable record"));
+    // A record added to a cleanup would make it growth the limit refuses, so
+    // the lifecycle and hygiene rules defer it to the same publication.
+    assert!(
+        task_rules
+            .contains("record it in the task's files in the first publication the limit allows")
+    );
     assert!(task_rules.contains("Markdown files of your choosing inside the task directory"));
 
     let artifact_rules = workspace(&fixture.shared, ["instructions", "artifacts"]);
@@ -529,6 +542,9 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(artifact_rules.contains("record how to regenerate them, never the values"));
     assert!(artifact_rules.contains("Markdown files of your choosing inside the task directory"));
     assert!(artifact_rules.contains("Curate what the task publishes"));
+    assert!(artifact_rules.contains(
+        "publish the cleanup on its own and record the decision in the first publication the limit allows"
+    ));
     assert!(artifact_rules.contains("There is no third state"));
     assert!(artifact_rules.contains("The by-products of the work are not published by default"));
     assert!(artifact_rules.contains("Ignore rules live in two layers"));
@@ -646,10 +662,9 @@ fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {
     let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_dvc, permissions).unwrap();
-    let output = std::process::Command::new(binary())
+    let output = binary_command()
         .args(["init", "--s3-url", "s3://example.invalid/workspace"])
         .current_dir(&fixture.shared)
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .output()
         .unwrap();
@@ -675,10 +690,9 @@ fn partially_failing_storage_initialization_rolls_back_all_scaffolding() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_dvc, permissions).unwrap();
     let storage = fixture.root.join("storage");
-    let output = std::process::Command::new(binary())
+    let output = binary_command()
         .args(["init", "--s3-url", storage.to_str().unwrap()])
         .current_dir(&fixture.shared)
-        .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
         .output()
         .unwrap();

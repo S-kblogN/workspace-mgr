@@ -94,6 +94,16 @@ instead decides to retain none of the task, the
 agent closes its unmerged pull request and uses `task discard --dry-run` followed
 by `task discard --confirm <task-id>` to remove its branch and local workspace.
 
+Each task's cloud usage across Git history and retained S3 versions is limited
+to 1 GiB (1073741824 bytes). `plan` reports the published and projected usage,
+and `publish` refuses to grow a task past its limit; while a task is over its
+limit, only publications that remove content, apart from at most 1 MiB
+(1048576 bytes) of new workspace-mgr control-file content per publication,
+where metadata that only drops entries is free, remain allowed. The agent then
+stops the task and asks the user, who either approves a higher limit, recorded
+in the task manifest with `task approve-cloud-usage` and published with the
+task for review, or chooses the cleanup to publish.
+
 ## Placement policy
 
 Git is the collaboration/control plane for clone-ready, directly reviewable
@@ -110,10 +120,11 @@ warning. Existing published placement stays stable when size changes, and
 `storage reset` returns a path to published history or the fallback.
 
 Directories may be placed in S3 as one logical boundary whose aggregate payload
-size is reported. `move` preserves a path's placement, and `remove` explicitly
-deletes a file or boundary without confusing an unhydrated S3 output for an
-intentional deletion. `storage hydrate` materializes S3 content without
-publishing.
+size is reported. Git and S3 placement both count toward the task's cloud-usage
+limit; placement never changes who approves growth. `move` preserves a path's
+placement, and `remove` explicitly deletes a file or boundary without confusing
+an unhydrated S3 output for an intentional deletion. `storage hydrate`
+materializes S3 content without publishing.
 
 `untrack` keeps a materialized file or complete storage boundary locally and
 adds an exact ignore rule. After publication, its payload is absent from the
@@ -178,6 +189,17 @@ CLI writes one agent-directed notice to stderr without changing command output
 or exit status. It never updates itself. The agent reports the versions and asks
 the user before updating, then runs `workspace-mgr setup`; managed repository
 scaffolding is reconciled with `workspace-mgr init` in an infrastructure task.
+
+A repository can also declare the oldest compatible release as
+`minimum_cli_version` in `.workspace-mgr.toml`. `workspace-mgr` maintains that
+declaration itself: a publication raises it when it introduces task state that
+older releases cannot read, such as a task manifest that records a cloud-usage
+approval, and nothing lowers it once it is merged. From 0.4.0 on, a release
+older than the declaration refuses the repository with a message naming both
+versions, and the agent asks the user before updating. Releases up to 0.3.0 do
+not know the key and reject `.workspace-mgr.toml` with an unknown-field error
+for `minimum_cli_version`; update the CLI instead of removing or editing the
+key.
 
 Configuration is documented in
 [docs/configuration.md](docs/configuration.md), transaction guarantees in

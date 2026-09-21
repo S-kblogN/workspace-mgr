@@ -26,7 +26,12 @@ fixed policy with a minimal Git/S3-only public configuration,
 Git-to-S3 and S3-to-Git transitions, explicit remove, delete/move/rename purge,
 failure ordering, successful and rolled-back
 ordinary Git/S3 shared-checkout refresh, fresh-clone hydration, missing exact S3
-versions, cross-process locks, alternate checkouts, and network non-fast-forwards.
+versions, the per-task cloud-usage gate at the real 1 GiB threshold (version-aware
+usage accounting, refusal before any cloud write, an approval recorded in the
+task manifest, a plan within the approved limit clearing the pending decision,
+and the publication's commit trailers and raised repository minimum version),
+the network minimum-version guard for refresh, plan, and publish, cross-process
+locks, alternate checkouts, and network non-fast-forwards.
 It checks that placement commands never write either remote, that S3 object
 versions exist before the corresponding Git ref, and that remote failure cannot
 produce a Git commit pointing to missing content. Every command and assertion is

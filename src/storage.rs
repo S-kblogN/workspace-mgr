@@ -1825,7 +1825,7 @@ fn rollback_error(error: Error, rollback: Result<()>) -> Error {
     }
 }
 
-fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::message("storage metadata path has no parent"))?;
@@ -1906,5 +1906,29 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placement_boundaries_may_not_be_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+        fs::create_dir(temp.path().join("task")).unwrap();
+        fs::write(temp.path().join("task/data.bin"), [1_u8; 12]).unwrap();
+        std::os::unix::fs::symlink("data.bin", temp.path().join("task/latest.bin")).unwrap();
+        assert_eq!(
+            payload_metrics(&repo, "task/data.bin")
+                .unwrap()
+                .unwrap()
+                .bytes,
+            12
+        );
+        let error = payload_metrics(&repo, "task/latest.bin")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("may not be a symlink"), "{error}");
+        assert!(payload_metrics(&repo, "task/absent.bin").unwrap().is_none());
     }
 }

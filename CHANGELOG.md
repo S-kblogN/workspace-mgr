@@ -5,8 +5,64 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-20
+
 ### Added
 
+- Every task has a cloud-usage limit of 1 GiB (1073741824 bytes) across the Git
+  history its branch adds, including Git LFS objects, and its retained S3
+  object versions. `plan` and `publish` report published and projected usage,
+  the limit, a suggested higher limit, and the largest contributors in a new
+  `cloud_usage` object. Sizes are reported in binary units with exact byte
+  counts.
+- `workspace-mgr task approve-cloud-usage --limit <size> --note <decision>`
+  records the user's explicit approval of a higher limit in the task manifest's
+  new `[cloud_usage_approval]` table. A deliverable's next publication carries
+  the manifest change for review, and while an approval is in effect every
+  publication commit ends with a write-only
+  `Cloud-Usage-Approval: limit_bytes=<n>; note=<note>` audit trailer. A limit
+  equal to the threshold removes the approval. The command writes only the
+  manifest copy that the task's publications carry, so it follows the checkout
+  rules of `plan` and `publish`, including `--allow-non-shared-head` with
+  `--scope-note` in an authorized alternate workflow, and refuses any other
+  checkout. It reports `status: unchanged` when the manifest already records
+  the same decision, and then points to `plan` to see whether earlier manifest
+  changes are still unpublished.
+- `.workspace-mgr.toml` accepts an optional top-level `minimum_cli_version`,
+  the oldest release that can read the repository's tracked task state, as a
+  plain release version. It is maintained by `workspace-mgr`, not a policy
+  setting: publication reconciles it in the published tree, never in the
+  shared checkout. A task branch whose manifests need a newer release raises
+  it, following the base branch's declaration when that is higher, a branch
+  that no longer needs its raise withdraws it, but never below the base
+  branch's declaration, and a branch that never needs one keeps the
+  configuration it started from. A configuration that the user authorized the
+  task to change, even only in comments or formatting, is kept and its
+  declaration is only raised, also to follow the base branch. Nothing lowers a
+  merged declaration. Publications that change the branch's declaration list
+  `.workspace-mgr.toml` in `changed_paths`, report a `repository_requirement`
+  object with its `change` (`raise`, `follow`, or `withdraw`), and add a
+  `Workspace-Requirement` commit trailer such as
+  `Workspace-Requirement: minimum_cli_version=<version> (task manifest schema <n>)`.
+- `doctor` reports a `cli-version` check that compares the installed release
+  with the repository's `minimum_cli_version` and with the declaration last
+  fetched from the base branch.
+- `task status` reports the task's threshold, effective limit, approval, and
+  pending cloud-usage decision.
+- While a task waits for the user's cloud-usage decision, task-scoped storage,
+  move, remove, untrack, rename, and discard commands print a one-line stderr
+  reminder of the last measurement without changing their output or exit
+  status.
+- Effective instructions require agents to stop all task work while a task
+  waits for a cloud-usage decision, ask the user with concrete numbers and one
+  proposed limit, record only the user's explicit answer, perform only the
+  cleanup the user chooses, and never edit the approval table or
+  `minimum_cli_version` by hand. The pause outranks the turn-end
+  reconciliation: until the user answers, the agent records nothing in the
+  task's files and curates nothing, and its turn-end report names the usage,
+  the question, the unpublished `changed_paths`, and any path that is neither
+  retained nor ignored. A cleanup the user chose is published on its own, with
+  its record following in the first publication the limit allows.
 - `init` owns the root `.gitignore` and generates it from the product's fixed
   rules for output that is regenerated rather than retained, this repository's
   own rules imported verbatim from the new optional
@@ -46,10 +102,22 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   itself with Markdown files of its own choosing inside its directory; a README
   still carrying only the creation scaffold's directory map does not count. A
   storage pointer counts as the content it addresses, so a result routed to S3
-  is judged like one kept in Git. A publication that only retires content is
-  allowed; one that removes the task's last record while publishing content is
-  refused by name. `plan` applies the same refusal, before it changes placement
-  or uploads anything.
+  is judged like one kept in Git, including a change inside a boundary that
+  the storage engine has not committed yet. A publication that only retires
+  content is allowed; one that removes the task's last record while publishing
+  content is refused by name. Removing files from a directory boundary in S3
+  retires content when the rewritten metadata adds no line beyond the entries
+  it keeps, and so does `untrack` of published content: the placement record
+  then stands for payload or metadata the publication takes out of Git and S3,
+  so a task that documents nothing can still publish the cleanup its user chose
+  while it is over its cloud-usage limit. A result kept local before it was
+  ever published retires nothing, and its placement record counts as content
+  once the task is within its limit; while the task waits for the user's
+  cloud-usage decision it does not, because a record added to that cleanup
+  would be refused as growth. `plan` applies the same refusal, before it
+  changes placement or uploads anything, and `publish` judges the metadata the
+  storage engine commits once more before the upload, restoring that metadata
+  when the refusal or the cloud-usage re-check stops the publication there.
 - Publication refuses a staged symbolic link whose target is outside the
   repository. The target is classified from the staged link alone, without
   reading the filesystem, so a link inside a boundary placed in S3 or kept local
@@ -57,7 +125,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - `plan` and `publish` report structured `warnings` when there is something to
   report. `task-record-unchanged` reports a publication that changes content
   inside the task directory while none of the task's own documentation changed
-  with it, and says when to ignore it.
+  with it, and says when to ignore it. When a task is over its cloud-usage
+  limit and the publication is allowed only as a cleanup, it says to publish
+  that cleanup as it is and record the decision in the first publication the
+  limit allows, because a record added to it would be refused as growth. `plan`
+  counts the S3 metadata of outputs that changed, which `publish` commits, and
+  not metadata whose objects are only missing from the local cache.
 - `plan` and `publish` report `ignored_paths` beside the existing
   `ignored_entries` count when any path inside the resolved scopes is ignored,
   so ignored content inside a task can be reviewed as reproducible output rather
@@ -78,6 +151,48 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Changed
 
+- Task manifests gain schema 3: schema 2 plus the optional
+  `[cloud_usage_approval]` table. `workspace-mgr` writes the lowest schema
+  that represents a manifest, so tasks without an approval stay at schema 2,
+  and `task rename` keeps an approval. Schema 1 and 2 manifests that contain
+  the table are rejected. Reading schema 3 requires 0.4.0, so publishing a
+  deliverable manifest with an approval raises the repository's
+  `minimum_cli_version` to 0.4.0.
+- Every command except `doctor` refuses a repository whose
+  `minimum_cli_version` the installed release does not meet, with a message
+  that names both versions and asks the agent to get the user's approval
+  before updating. A pre-release meets a declaration of its own release.
+  Commands that fetch check what they fetched before changing anything:
+  `task create` and `task discard` the base branch, `task rename`, `plan`, and
+  `publish` the base branch and the task branch, and `refresh` the incoming
+  revision. `init` keeps an existing declaration.
+- A build never publishes a `minimum_cli_version` it does not meet: `plan`,
+  `publish --dry-run`, and `publish` refuse a task manifest schema that needs a
+  newer release before anything is placed or uploaded. Only when the task's own
+  manifest needs it does the refusal offer removing the approval; another
+  task's manifest is named with update advice only.
+- Releases up to 0.3.0 do not know `minimum_cli_version`. Once a task with a
+  cloud-usage approval is merged, they fail on the unknown configuration key
+  and must be updated.
+- `publish` and `publish --dry-run` refuse, before any placement, upload, or
+  commit, a publication that would take a task past its cloud-usage limit.
+  Publication re-checks usage before its upload and before its Git commit.
+  Publications that only remove content, apart from at most 1 MiB
+  (1048576 bytes) of new workspace-mgr control-file content per publication,
+  where metadata that only drops entries is free, remain allowed over the
+  limit.
+- The documentation, escaping-link, and machine-local-ignore refusals come
+  before the cloud-usage gate in `plan`, `publish --dry-run`, and `publish`,
+  so the user is asked about usage only for a publication those guards accept,
+  and a refused transaction records no pending decision. `refresh` checks the
+  incoming `minimum_cli_version` before it inspects incoming storage metadata,
+  including boundaries the storage engine cannot address.
+- Existing unmerged tasks that already exceed 1 GiB report `approval_required`
+  on their next plan, and their next growing publication is refused until the
+  user approves a higher limit or chooses cleanup.
+- Other tasks' published manifests are read with only the identity fields
+  placement history needs, so future optional manifest fields cannot break
+  repository-wide storage and publication commands.
 - The fixed policy, the workspace model, and the user guide state the curation
   half of the workplace rule: every file under a task is either selected for
   publication or ignored by a rule this repository tracks, the by-products of
@@ -95,7 +210,7 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   it rather than in a temporary directory, a `mktemp` directory, or the home
   directory. They also answer the two cases that push work outside a repository,
   large scratch content and credentials, and the instruction policy version
-  moves from 9 to 10.
+  moves from 9 to 11.
 - The scaffolded task README's directory map asks the task to keep its tools,
   process, decisions, and hard-to-reproduce results in the task directory and to
   list them there. Existing tasks are unaffected: a task whose README was ever
@@ -119,7 +234,10 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   its reply outgrows the operating system's pipe buffer. The input is written
   while the reply is read, rather than in full beforehand, so resolving the
   ignore rules of a task with thousands of ignored files, or validating the
-  ignore rules of a large `untrack` boundary, completes instead of hanging.
+  ignore rules of a large `untrack` boundary, completes instead of hanging. A
+  command that stops reading before its input ends, or that a signal ends, is
+  always an error rather than an exit code, so an ignore-rule check killed
+  partway through can no longer read as nothing ignored.
 - Repository paths keep backslashes as ordinary file-name characters instead of
   rewriting them to `/`, so storage metadata, user-typed paths, and Git paths
   compare exactly.

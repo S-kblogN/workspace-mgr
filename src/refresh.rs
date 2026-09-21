@@ -92,6 +92,9 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         .optional_oid(&local_ref)?
         .ok_or_else(|| Error::message(format!("local branch does not exist: {branch}")))?;
     let new_oid = repo.fetch_branch(&remote, &branch)?;
+    // Refuse an incoming revision that requires a newer workspace-mgr before
+    // anything in the checkout changes.
+    crate::config::require_supported_cli_at(&repo, &new_oid, &format!("{remote}/{branch}"))?;
     if old_oid != new_oid {
         let ancestor = repo.run_unchecked(["merge-base", "--is-ancestor", &old_oid, &new_oid])?;
         if ancestor.code == 1 {

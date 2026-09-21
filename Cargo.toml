@@ -1,6 +1,6 @@
 [package]
 name = "workspace-mgr"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fixed-policy repository workspace manager for coding agents"
@@ -15,8 +15,10 @@ exclude = [".github/", "scripts/", "tests/e2e/"]
 
 [features]
 default = []
-# Enables the filesystem-backed storage adapter used only by isolated tests.
-# Release archives are built without this feature.
+# Enables the filesystem-backed storage adapter and the test-only overrides that
+# can lower the cloud-usage approval threshold or stand in for another release
+# version. They are used only by isolated tests; release archives are built
+# without this feature.
 test-storage = []
 
 [[bin]]
