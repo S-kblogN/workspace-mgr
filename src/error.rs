@@ -35,6 +35,15 @@ pub enum Error {
         code: i32,
         detail: String,
     },
+
+    /// A child that a signal ended has no exit code, and its partial output
+    /// answers nothing, so no caller may read it as a result.
+    #[error("{command} did not exit normally ({status}): {detail}")]
+    Terminated {
+        command: String,
+        status: String,
+        detail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

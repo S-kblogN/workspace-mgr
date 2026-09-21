@@ -1270,6 +1270,7 @@ fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-gate", "20260918-120000");
+    document_task(&task);
     let branch = "refs/heads/codex/usage-gate";
     let env = &LIMIT_10MB[..];
     workspace_env(&task, ["publish", "-m", "Publish scaffold"], env);
@@ -1547,6 +1548,7 @@ fn an_unaddressable_boundary_is_refused_before_the_cloud_usage_gate() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "gate-order", "20260918-130000");
+    document_task(&task);
     let branch = "refs/heads/codex/gate-order";
     let env = &LIMIT_10MB[..];
     workspace_env(&task, ["publish", "-m", "Publish scaffold"], env);
@@ -1636,6 +1638,7 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-cleanup", "20260918-130000");
+    document_task(&task);
     let branch = "refs/heads/codex/usage-cleanup";
     let env = &LIMIT_10MB[..];
     let large = format!("{task_id}/large.bin");
@@ -1774,6 +1777,7 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
 fn git_history_counts_toward_the_limit_and_cleanup_cannot_shrink_it() {
     let fixture = managed_fixture(false);
     let (task_id, task) = create_task(&fixture, "usage-history", "20260918-140000");
+    document_task(&task);
     let branch = "refs/heads/codex/usage-history";
     let env = &LIMIT_300KB[..];
     let weights = format!("{task_id}/weights.bin");
@@ -1906,6 +1910,7 @@ fn git_history_counts_toward_the_limit_and_cleanup_cannot_shrink_it() {
 fn packed_git_contributors_report_compressed_bytes() {
     let fixture = managed_fixture(false);
     let (task_id, task) = create_task(&fixture, "usage-packed", "20260918-143000");
+    document_task(&task);
     let env = &LIMIT_300KB[..];
     std::fs::write(task.join("weights.bin"), noise(400_000, 9)).unwrap();
     std::fs::write(task.join("zeros.log"), vec![0_u8; 2_000_000]).unwrap();
@@ -1941,6 +1946,7 @@ fn packed_git_contributors_report_compressed_bytes() {
 fn new_control_file_content_is_not_a_cleanup() {
     let fixture = managed_fixture(false);
     let (task_id, task) = create_task(&fixture, "usage-control", "20260918-145000");
+    document_task(&task);
     let branch = "refs/heads/codex/usage-control";
     let env = &LIMIT_300KB[..];
     workspace_env(&task, ["publish", "-m", "Publish scaffold"], env);
@@ -2085,6 +2091,7 @@ fn new_control_file_content_is_not_a_cleanup() {
 fn another_clone_continues_with_the_approval_in_the_published_manifest() {
     let fixture = managed_fixture(false);
     let (task_id, task) = create_task(&fixture, "usage-continue", "20260918-150000");
+    document_task(&task);
     let branch = "codex/usage-continue";
     let env = &LIMIT_300KB[..];
     // Commit messages never carry approvals: only the manifest does.
@@ -2189,6 +2196,7 @@ fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-late", "20260918-160000");
+    document_task(&task);
     let branch = "refs/heads/codex/usage-late";
     let env = &LIMIT_300KB[..];
     let storage_remote = fixture.root.join("storage-remote");
@@ -2319,6 +2327,7 @@ fn content_addressed_directories_are_charged_per_file_at_every_check() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-directory", "20260918-163000");
+    document_task(&task);
     let branch = "refs/heads/codex/usage-directory";
     let storage = fixture.root.join("storage-remote");
     let env = &LIMIT_10MB[..];
@@ -2480,6 +2489,7 @@ fn symlinks_in_a_published_s3_directory_are_measured_by_their_targets() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-links", "20260918-164500");
+    document_task(&task);
     let env = &LIMIT_10MB[..];
     let data = task.join("my dir");
     std::fs::create_dir(&data).unwrap();
@@ -2557,6 +2567,7 @@ fn the_real_threshold_refuses_a_sparse_upload_before_tracking() {
     }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "sparse-gate", "20260918-170000");
+    document_task(&task);
     let branch = "refs/heads/codex/sparse-gate";
     workspace(&task, ["publish", "-m", "Publish scaffold"]);
     let tip = rev(&fixture.remote, branch);

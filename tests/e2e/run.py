@@ -2389,6 +2389,10 @@ class Harness:
             report=scaffold,
         )
 
+        # Publishing content requires the task to document itself, and the
+        # record must already be published when the later checks compare
+        # `changed_paths` exactly.
+        self.document_task(task)
         self.exercise_versioned_cloud_usage(task_id, task)
 
         # A sparse file reports its full logical size without writing 1 GiB.
@@ -2502,24 +2506,10 @@ class Harness:
         )
         self.check(reminder not in covered.stderr, "the reminder stops once an approval covers the projection")
 
-        # Task manifest schema 3 needs workspace-mgr 0.4.0, and a build never
-        # publishes a declaration it does not meet. Release builds from 0.4.0
-        # on take the full publication path; an older build, such as one from
-        # before the 0.4.0 release, exercises the guard instead.
-        version = self.run([self.binary, "--version"]).stdout.split()[-1]
-        core = tuple(int(part) for part in version.split("+")[0].split("-")[0].split("."))
-        if core < (0, 4, 0):
-            self.refuse_unpublishable_approval(
-                task_id,
-                task,
-                version,
-                remote_before=remote_before,
-                versions_before=versions_before,
-                approved_manifest=approved_manifest,
-                manifest_before=manifest_before,
-            )
-            return task_id, task, branch
-
+        # Task manifest schema 3 needs workspace-mgr 0.4.0. Every build this
+        # suite runs is at least that release, so it takes the full
+        # publication path; the refusal of an older build is covered by the
+        # test-only release override in the isolated integration tests.
         requirement = {
             "path": config_name,
             "change": "raise",
@@ -2527,6 +2517,25 @@ class Harness:
             "previous_minimum_cli_version": None,
             "task_manifest_schema": 3,
         }
+        # Recording the approval does not measure, so the pending decision
+        # stays until the next measurement: this plan, within the approved
+        # limit, is what clears it.
+        self.check(
+            self.wm(task, "task", "status")["cloud_usage"]["pending"] == pending,
+            "the approval leaves the pending decision to the next measurement",
+        )
+        approved_plan = self.wm(task, "plan")
+        self.check(
+            approved_plan["status"] == "dry_run"
+            and approved_plan["cloud_usage"]["status"] == "within_limit"
+            and approved_plan["cloud_usage"]["approval"] == approval
+            and approved_plan["cloud_usage"]["projected"]["s3_bytes"] == threshold + 1
+            and approved_plan["repository_requirement"] == requirement
+            and self.wm(task, "task", "status")["cloud_usage"]["pending"] is None,
+            "a plan within the approved limit clears the pending decision",
+            report=approved_plan,
+        )
+        self.check(not sparse_pointer.exists(), "the plan does not track the oversized file")
         rehearsal = self.wm(task, "publish", "-m", "Publish sparse checkpoint", "--dry-run")
         self.check(
             rehearsal["status"] == "dry_run"
@@ -2556,10 +2565,6 @@ class Harness:
             and cleaned["cloud_usage"]["approval"] == approval,
             "after cleanup only the approval and the raised requirement remain to publish",
             report=cleaned,
-        )
-        self.check(
-            self.wm(task, "task", "status")["cloud_usage"]["pending"] is None,
-            "a plan within the limit clears the pending decision",
         )
         (task / "usage-notes.md").write_text(
             "The sparse checkpoint was cleaned up instead of published.\n",
@@ -2613,127 +2618,6 @@ class Harness:
             "the cleaned-up oversized file never reached S3",
         )
         return task_id, task, branch
-
-    def refuse_unpublishable_approval(
-        self,
-        task_id: str,
-        task: Path,
-        version: str,
-        *,
-        remote_before: str | None,
-        versions_before: list[dict[str, Any]],
-        approved_manifest: str,
-        manifest_before: str,
-    ) -> None:
-        """A build older than 0.4.0 refuses to publish a schema 3 manifest."""
-        assert self.shared is not None
-        branch = "codex/usage-approval"
-        config_name = ".workspace-mgr.toml"
-        manifest = task / ".workspace-mgr-task.toml"
-        sparse = task / "sparse-checkpoint.bin"
-        shared_config = (self.shared / config_name).read_text(encoding="utf-8")
-        guard = (
-            f"workspace-mgr: this build (workspace-mgr {version}) cannot publish task manifest "
-            "schema 3, which requires workspace-mgr 0.4.0 or newer; update workspace-mgr, or "
-            "record the default limit to remove the approval. Tell the user both versions and "
-            "ask before updating with `cargo install --locked workspace-mgr` or removing the "
-            "approval.\n"
-        )
-        for args in (
-            ("plan",),
-            ("publish", "-m", "Publish sparse checkpoint", "--dry-run"),
-            ("publish", "-m", "Publish sparse checkpoint"),
-        ):
-            rejected = self.wm(task, *args, expected=2)
-            self.check(
-                rejected["stdout"] == "" and rejected["stderr"] == guard,
-                "a build older than 0.4.0 refuses to publish the schema 3 manifest",
-                args=list(args),
-                stderr=rejected["stderr"],
-            )
-        self.check(
-            not (task / "sparse-checkpoint.bin.dvc").exists()
-            and self.remote_ref(branch) == remote_before
-            and self.list_s3_versions() == versions_before
-            and manifest.read_text(encoding="utf-8") == approved_manifest
-            and (self.shared / config_name).read_text(encoding="utf-8") == shared_config
-            and self.git(self.shared, "status", "--porcelain", "--", config_name).stdout == "",
-            "the refused publications track, push, and upload nothing",
-        )
-
-        # The user keeps the default limit and chooses cleanup instead.
-        sparse.unlink()
-        reset_note = "The E2E user kept the default limit"
-        reset = self.wm(
-            task, "task", "approve-cloud-usage", "--limit", "1GiB", "--note", reset_note
-        )
-        self.check(
-            reset["status"] == "recorded"
-            and reset["schema_version"] == 2
-            and reset["previous_limit_bytes"] == 2_147_483_648
-            and reset["limit_bytes"] == 1_073_741_824
-            and manifest.read_text(encoding="utf-8") == manifest_before,
-            "resetting to the threshold removes the approval from the manifest",
-            report=reset,
-        )
-        again = self.wm(
-            task, "task", "approve-cloud-usage", "--limit", "1GiB", "--note", reset_note
-        )
-        # The pending projection is the one measured before the cleanup until
-        # `plan` measures again, so the report still asks for that plan.
-        self.check(
-            again["status"] == "unchanged"
-            and again["blocked"] is True
-            and again["next_step"]
-            == "The pending projection from the last `workspace-mgr plan` or `workspace-mgr "
-            "publish` still exceeds this limit. If the user also chose cleanup, perform it and "
-            "run `workspace-mgr plan`; otherwise ask the user for a larger limit or cleanup. "
-            "The task manifest already records no approval, so the task keeps the default "
-            "limit and this command changed nothing.",
-            "resetting again reports that this command changed nothing",
-            report=again,
-        )
-        cleaned = self.wm(task, "plan")
-        self.check(
-            cleaned["status"] == "no_changes"
-            and "repository_requirement" not in cleaned
-            and cleaned["cloud_usage"]["status"] == "within_limit"
-            and cleaned["cloud_usage"]["approval"] is None
-            and self.wm(task, "task", "status")["cloud_usage"]["pending"] is None,
-            "after cleanup and the reset nothing is left to publish",
-            report=cleaned,
-        )
-        (task / "usage-notes.md").write_text(
-            "The sparse checkpoint was cleaned up instead of published.\n",
-            encoding="utf-8",
-        )
-        main_before = self.remote_ref("main")
-        published = self.wm(task, "publish", "-m", "Publish cloud-usage notes")
-        commit = published["commit_oid"]
-        self.check(
-            published["status"] == "pushed"
-            and self.remote_ref(branch) == commit
-            and "repository_requirement" not in published
-            and published["changed_paths"] == [f"{task_id}/usage-notes.md"],
-            "the task continues at the default limit without touching the requirement",
-            report=published,
-        )
-        message = self.run(
-            ["git", "--git-dir", self.remote, "show", "-s", "--format=%B", commit],
-            cwd=self.root,
-        ).stdout
-        self.check(
-            "Workspace-Requirement" not in message and "Cloud-Usage-Approval" not in message,
-            "the publication carries neither a requirement nor an approval trailer",
-            commit_message=message,
-        )
-        self.check(
-            self.remote_file(commit, config_name) == shared_config
-            and self.remote_file(commit, f"{task_id}/.workspace-mgr-task.toml") == manifest_before
-            and self.remote_ref("main") == main_before
-            and self.list_s3_versions() == versions_before,
-            "the published tree keeps schema 2 and the shared configuration",
-        )
 
     def exercise_versioned_cloud_usage(self, task_id: str, task: Path) -> None:
         """Version-aware S3 usage counts every retained version until retirement."""
@@ -3109,6 +2993,24 @@ class Harness:
             f"{task_id}/second.bin",
         )
         self.check(hydrated["status"] == "hydrated", "the other boundaries hydrate by name before publication")
+        usage = self.wm(worktree, "plan")["cloud_usage"]
+        self.check(
+            usage["status"] == "within_limit"
+            and usage["published"]["s3_bytes"] == 0
+            and usage["projected"]["s3_bytes"] == len(unaddressable)
+            and [item for item in usage["contributors"] if item["store"] == "s3"]
+            == [
+                {
+                    "path": destination,
+                    "store": "s3",
+                    "bytes": len(unaddressable),
+                    "versions": 1,
+                    "state": "pending",
+                }
+            ],
+            "the moved boundary is charged once, as one pending upload at its new path",
+            cloud_usage=usage,
+        )
         recovered = self.wm(worktree, "publish", "-m", "Recover the unaddressable boundary")
         self.check(recovered["status"] == "pushed", "the recovery task publishes")
         self.check(
@@ -3152,9 +3054,12 @@ class Harness:
         config_name = ".workspace-mgr.toml"
         version = self.run([self.binary, "--version"]).stdout.split()[-1]
         local_main = self.git(self.shared, "rev-parse", "main").stdout.strip()
-        # Undo the divergent root, then advance main by a fast-forward whose
-        # configuration requires a release that does not exist yet.
-        self.git(self.shared, "push", "--force", "origin", f"{local_main}:refs/heads/main")
+        self.check(
+            self.remote_ref("main") == local_main,
+            "the shared checkout starts the minimum-version guard synchronized with network main",
+        )
+        # Advance main by a fast-forward whose configuration requires a
+        # release that does not exist yet.
         config = self.remote_file(local_main, config_name)
         self.check("minimum_cli_version" not in config, "shared main declares no minimum version yet")
         raised = self.root / "raised-workspace-config.toml"
@@ -3226,6 +3131,14 @@ class Harness:
             status["task_id"] == task_id,
             "local commands still work because the checkout declares no requirement",
         )
+        # No later section may inherit a network main this release refuses.
+        self.git(self.shared, "push", "--force", "origin", f"{local_main}:refs/heads/main")
+        restored = self.wm(self.shared, "refresh", "--dry-run")
+        self.check(
+            self.remote_ref("main") == local_main and restored["status"] == "no_changes",
+            "network main no longer requires a newer workspace-mgr",
+            status=restored["status"],
+        )
 
     def close(self) -> None:
         if self.git_daemon is not None:
@@ -3254,8 +3167,12 @@ class Harness:
         usage_task = self.exercise_cloud_usage_approval()
         self.discard_published_deliverable()
         self.exercise_unaddressable_refresh_recovery()
-        self.exercise_non_fast_forward_refresh_guard()
+        # Every section above leaves network main as a fast-forward this
+        # release can refresh. The minimum-version guard raises main past this
+        # release and restores it; the non-fast-forward guard, which leaves
+        # main diverged, runs last.
         self.exercise_repository_requirement_guard(*usage_task)
+        self.exercise_non_fast_forward_refresh_guard()
         summary = {
             "status": "passed",
             "assertions": self.assertions,

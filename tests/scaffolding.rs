@@ -66,6 +66,12 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     assert!(text.contains("records the user's explicit answer from this chat"));
     assert!(text.contains("this repository requires a newer workspace-mgr"));
     assert!(text.contains("Never add, edit, or remove either by hand"));
+    // The cloud-usage pause and the curation habits share one turn end.
+    assert!(text.contains("The pause outranks the turn-end reconciliation"));
+    assert!(text.contains("decide their structural refusals before they measure cloud usage"));
+    assert!(text.contains("if it reports `cloud_usage.status: approval_required`, stop there"));
+    assert!(text.contains("the `changed_paths` that remain unpublished"));
+    assert!(text.contains("Publish that reduction on its own"));
     assert!(text.contains("policy="));
 
     let model_only = workspace(
@@ -519,6 +525,12 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("they do not create authorization"));
     assert!(task_rules.contains("outside the repository is outside the task directory too"));
     assert!(task_rules.contains("own files are its durable record"));
+    // A record added to a cleanup would make it growth the limit refuses, so
+    // the lifecycle and hygiene rules defer it to the same publication.
+    assert!(
+        task_rules
+            .contains("record it in the task's files in the first publication the limit allows")
+    );
     assert!(task_rules.contains("Markdown files of your choosing inside the task directory"));
 
     let artifact_rules = workspace(&fixture.shared, ["instructions", "artifacts"]);
@@ -530,6 +542,9 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(artifact_rules.contains("record how to regenerate them, never the values"));
     assert!(artifact_rules.contains("Markdown files of your choosing inside the task directory"));
     assert!(artifact_rules.contains("Curate what the task publishes"));
+    assert!(artifact_rules.contains(
+        "publish the cleanup on its own and record the decision in the first publication the limit allows"
+    ));
     assert!(artifact_rules.contains("There is no third state"));
     assert!(artifact_rules.contains("The by-products of the work are not published by default"));
     assert!(artifact_rules.contains("Ignore rules live in two layers"));

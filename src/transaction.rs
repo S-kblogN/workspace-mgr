@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -7,12 +7,15 @@ use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::cloud_usage::{CloudUsageReport, LocalUsageStatus, UsageGate, UsageInputs};
+use crate::cloud_usage::{
+    CloudUsageReport, LocalUsageStatus, UsageGate, UsageInputs, blobs_at, read_blobs,
+    retires_content_only,
+};
 use crate::config::{
     CONFIG_NAME, Config, cli_version_satisfies, declared_minimum_cli_version,
     installed_cli_version, require_supported_cli_at,
 };
-use crate::dvc;
+use crate::dvc::{self, DataStatus};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
@@ -334,18 +337,24 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     // refused before anything is placed or uploaded.
     reconcile_repository_requirement(&repo, &preview_index, &requirement_inputs)?;
     let preview_paths = changed_paths(&repo, &preview_index, &base_oid)?;
+    let preview_policy = PrivateIndexPolicy {
+        task: &task,
+        published_task_path: published_task_path.as_deref(),
+        large_file_threshold: AUTO_S3_ABOVE_BYTES,
+        automatic_s3: &preview_automatic_s3,
+        local_only: &local_only,
+        config: &config,
+        uncommitted: &initial_dvc,
+        // Decided once the gate has measured, below.
+        withheld_records_are_content: false,
+    };
     validate_private_index(
         &repo,
         &preview_index,
         &base_oid,
         &scopes,
         &preview_paths,
-        &PrivateIndexPolicy {
-            task: &task,
-            published_task_path: published_task_path.as_deref(),
-            large_file_threshold: AUTO_S3_ABOVE_BYTES,
-            automatic_s3: &preview_automatic_s3,
-        },
+        &preview_policy,
     )?;
     // Decided on the preview, before any placement change or upload, so `plan`
     // and `publish` refuse the same machine-local ignore rule at the same point.
@@ -393,6 +402,32 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &usage_inputs,
         crate::cloud_usage::effective_threshold(),
     )?;
+    // The placement record of a result kept local before it was ever
+    // published is that result's only durable trace, so the documentation
+    // guard counts it as content, except while the task waits for the user's
+    // cloud-usage decision: then the question comes first, and a record added
+    // to a cleanup the limit allows would make it growth the limit refuses.
+    // Only the measurement tells the two apart, so the preview left these
+    // records to this point.
+    let withheld_records_are_content = !usage.report().approval_required();
+    if withheld_records_are_content
+        && preview_paths
+            .iter()
+            .any(|path| records_local_retention(path, &local_only))
+    {
+        check_task_documentation(
+            &repo,
+            &preview_index,
+            &base_oid,
+            &preview_paths,
+            &PrivateIndexPolicy {
+                // The preview already asked the storage engine.
+                uncommitted: &[],
+                withheld_records_are_content,
+                ..preview_policy
+            },
+        )?;
+    }
     if options.operation == Operation::Publish {
         usage.enforce()?;
     }
@@ -403,6 +438,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         storage::apply_automatic(&repo, &config, &scopes, &base_oid, false)?
     };
     let automatic_s3 = placement.automatic_s3().to_vec();
+    let publication_policy = PrivateIndexPolicy {
+        automatic_s3: &automatic_s3,
+        uncommitted: &[],
+        withheld_records_are_content,
+        ..preview_policy
+    };
     let pointers = dvc::discover(&repo, &scopes)?;
     if !dry_run {
         let preflight_outputs = dvc::output_paths(&repo, &pointers)?;
@@ -423,29 +464,54 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             &base_oid,
             &scopes,
             &preflight_paths,
-            &PrivateIndexPolicy {
-                task: &task,
-                published_task_path: published_task_path.as_deref(),
-                large_file_threshold: AUTO_S3_ABOVE_BYTES,
-                automatic_s3: &automatic_s3,
-            },
+            &publication_policy,
         )?;
     }
+    // The metadata as the storage engine finds it, so that a refusal before
+    // the upload leaves the worktree as the publication found it.
+    let uncommitted_metadata = if dry_run {
+        Vec::new()
+    } else {
+        read_metadata(&repo, &pointers)?
+    };
     let mut s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
     if !dry_run {
-        // Background writers may have changed outputs since the gate; the
-        // committed metadata is exactly what the upload would send.
-        usage.recheck_storage(
+        // Background writers may have changed outputs since the preview and
+        // the gate; the committed metadata is exactly what the upload would
+        // send, so both judge it again before anything is uploaded.
+        let judged = check_committed_documentation(
             &repo,
-            &config,
-            &UsageInputs {
-                pointers: &pointers,
-                automatic_s3: &[],
-                inspect_outputs: false,
-                ..usage_inputs
-            },
-        )?;
-        usage.enforce()?;
+            &state_dir,
+            &base_oid,
+            &scopes,
+            &s3,
+            &publication_policy,
+        )
+        .and_then(|()| {
+            usage.recheck_storage(
+                &repo,
+                &config,
+                &UsageInputs {
+                    pointers: &pointers,
+                    automatic_s3: &[],
+                    inspect_outputs: false,
+                    ..usage_inputs
+                },
+            )
+        })
+        .and_then(|()| usage.enforce());
+        if let Err(error) = judged {
+            // Metadata left naming the refused content would make a retry
+            // judge that content again after it is gone.
+            return Err(
+                match restore_metadata(&repo, &uncommitted_metadata, &s3.committed) {
+                    Ok(()) => error,
+                    Err(restore) => Error::message(format!(
+                        "{error}; restoring the storage metadata the refused publication committed also failed: {restore}"
+                    )),
+                },
+            );
+        }
         dvc::push_outputs(&repo, &config, &mut s3)?;
     }
     let mut purge_preview = s3_purge::preview(&repo)?;
@@ -494,12 +560,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &base_oid,
         &scopes,
         &paths,
-        &PrivateIndexPolicy {
-            task: &task,
-            published_task_path: published_task_path.as_deref(),
-            large_file_threshold: AUTO_S3_ABOVE_BYTES,
-            automatic_s3: &automatic_s3,
-        },
+        &publication_policy,
     )?;
     // A plan applies no placement and writes nothing, so its final index is
     // built from the same inputs as the preview and the ignore listing taken
@@ -512,14 +573,28 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     };
     let mut warnings = Vec::new();
     if let Some(task_path) = deliverable_task_path(&task) {
-        if changes_task_content(task_path, &paths, &automatic_s3) {
+        // A plan leaves the S3 metadata of changed outputs as it is, and
+        // `publish` commits it, so the record advice counts that metadata in
+        // both.
+        let mut touched = paths.clone();
+        if dry_run {
+            touched.extend(pending_metadata_rewrites(&repo, &s3, task_path)?);
+            touched.sort();
+            touched.dedup();
+        }
+        if changes_task_content(task_path, &touched, &automatic_s3) {
             let projection = TaskProjection::resolve(&repo, &index, task_path)?;
-            warnings.extend(documentation_warning(
-                task_path,
-                &projection.documentation,
-                &paths,
-                &automatic_s3,
-            ));
+            warnings.extend(
+                documentation_warning(
+                    task_path,
+                    &projection.documentation,
+                    &touched,
+                    &automatic_s3,
+                )
+                .map(|warning| defer_record_past_the_limit(warning, usage.report())),
+            );
+        }
+        if changes_task_content(task_path, &paths, &automatic_s3) {
             let (files, bytes) =
                 bulk_publication_volume(&repo, &index, &base_oid, task_path, &automatic_s3)?;
             warnings.extend(bulk_publication_warning(files, bytes));
@@ -687,11 +762,24 @@ fn local_path_exists(path: &Path) -> Result<bool> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct PrivateIndexPolicy<'a> {
     task: &'a ResolvedTask,
     published_task_path: Option<&'a str>,
     large_file_threshold: u64,
     automatic_s3: &'a [String],
+    /// Boundaries whose placement record keeps their payload on this machine.
+    local_only: &'a BTreeSet<String>,
+    config: &'a Config,
+    /// In-scope S3 metadata whose outputs may hold changes the storage engine
+    /// has not committed yet. Only the preview passes it: its staged metadata
+    /// cannot show those changes, which `publish` commits after placement and
+    /// just before the upload, so the documentation guard asks the engine.
+    uncommitted: &'a [String],
+    /// Whether the placement record of a result kept local before it was ever
+    /// published counts as content for the documentation guard; see where
+    /// `execute` decides it after the cloud-usage measurement.
+    withheld_records_are_content: bool,
 }
 
 fn validate_private_index(
@@ -724,7 +812,7 @@ fn validate_private_index(
         None,
         true,
     )?;
-    check_task_documentation(repo, index, paths, policy)?;
+    check_task_documentation(repo, index, base_oid, paths, policy)?;
     Ok(())
 }
 
@@ -1171,6 +1259,8 @@ fn is_task_content(task_path: &str, path: &str) -> bool {
 struct TaskProjection {
     documentation: Vec<String>,
     tracked: BTreeSet<String>,
+    /// Staged blob of each S3 metadata file the projection tracks.
+    metadata_blobs: BTreeMap<String, String>,
 }
 
 impl TaskProjection {
@@ -1185,12 +1275,22 @@ impl TaskProjection {
         let mut projection = Self {
             documentation: Vec::new(),
             tracked: BTreeSet::new(),
+            metadata_blobs: BTreeMap::new(),
         };
         for entry in listed.stdout.split('\0').filter(|entry| !entry.is_empty()) {
             let Some((attributes, path)) = entry.split_once('\t') else {
                 continue;
             };
             projection.tracked.insert(path.to_owned());
+            let metadata_blob = attributes
+                .split_whitespace()
+                .nth(1)
+                .filter(|_| path.ends_with(".dvc"));
+            if let Some(oid) = metadata_blob {
+                projection
+                    .metadata_blobs
+                    .insert(path.to_owned(), oid.to_owned());
+            }
             if !is_markdown(path) {
                 continue;
             }
@@ -1253,6 +1353,279 @@ fn publishes_task_content(
             .any(|path| is_task_content(task_path, path) && tracked.contains(path.as_str()))
 }
 
+/// Changed paths the projection still tracks that retire content rather than
+/// publish it, so that a task that documents nothing can still carry out a
+/// cleanup the user chose, which a cloud-usage limit may leave as the only
+/// publication allowed:
+///
+/// - the placement record of a local-only boundary whose previously published
+///   payload or S3 metadata this publication takes out of Git, which is what
+///   `untrack` of published content writes (see [`retires_published_payload`]),
+///   and, while the task waits for the user's cloud-usage decision, the record
+///   of any local-only boundary;
+/// - S3 metadata rewritten to name only content its published version already
+///   names, which is what removing files from a directory boundary in S3
+///   leaves once the storage engine commits the boundary.
+fn retiring_paths(
+    repo: &GitRepo,
+    base_oid: &str,
+    task_path: &str,
+    paths: &[String],
+    projection: &TaskProjection,
+    policy: &PrivateIndexPolicy<'_>,
+) -> Result<BTreeSet<String>> {
+    let removed = paths
+        .iter()
+        .filter(|path| !projection.tracked.contains(path.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut retiring = BTreeSet::new();
+    let mut rewritten = Vec::new();
+    for path in paths.iter().filter(|path| {
+        is_task_content(task_path, path) && projection.tracked.contains(path.as_str())
+    }) {
+        if let Some(boundary) = path.strip_suffix(PLACEMENT_SUFFIX) {
+            let published = published_history_path(
+                boundary,
+                policy.task.task_path.as_deref(),
+                policy.published_task_path,
+            );
+            if policy.local_only.contains(boundary)
+                && (!policy.withheld_records_are_content
+                    || retires_published_payload(boundary, &published, &removed))
+            {
+                retiring.insert(path.clone());
+            }
+        } else if let Some(blob) = projection.metadata_blobs.get(path) {
+            rewritten.push((path.clone(), blob.clone()));
+        }
+    }
+    if rewritten.is_empty() {
+        return Ok(retiring);
+    }
+    let names = rewritten
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let published = blobs_at(repo, base_oid, &names)?;
+    let pairs = rewritten
+        .into_iter()
+        .filter_map(|(path, staged)| {
+            let old = published.get(&path)?.clone()?;
+            Some((path, old, staged))
+        })
+        .collect::<Vec<_>>();
+    let oids = pairs
+        .iter()
+        .flat_map(|(_, old, staged)| [old.clone(), staged.clone()])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut contents = BTreeMap::new();
+    read_blobs(repo, &oids, |oid, content| {
+        contents.insert(oid.to_owned(), content.to_vec());
+        Ok(())
+    })?;
+    for (path, old, staged) in pairs {
+        let (Some(old), Some(staged)) = (contents.get(&old), contents.get(&staged)) else {
+            continue;
+        };
+        if retires_content_only(repo, policy.config, &path, old, staged) {
+            retiring.insert(path);
+        }
+    }
+    Ok(retiring)
+}
+
+/// Whether the `removed` paths take a local-only boundary's previously
+/// published payload or S3 metadata out of Git, at its current path or, for a
+/// renamed task, at the path it was `published` under. That removal is what
+/// the boundary's placement record stands for. A result kept local before it
+/// was ever published retires nothing: its record is the only durable trace of
+/// it, so the record stays content the task has to document, unless the task
+/// waits for the user's cloud-usage decision.
+fn retires_published_payload(boundary: &str, published: &str, removed: &[&str]) -> bool {
+    removed.iter().any(|path| {
+        [boundary, published].into_iter().any(|candidate| {
+            *path == candidate
+                || inside(candidate, path)
+                || path.strip_suffix(".dvc") == Some(candidate)
+        })
+    })
+}
+
+/// Whether a changed path is the placement record that keeps a local-only
+/// boundary's payload on this machine.
+fn records_local_retention(path: &str, local_only: &BTreeSet<String>) -> bool {
+    path.strip_suffix(PLACEMENT_SUFFIX)
+        .is_some_and(|boundary| local_only.contains(boundary))
+}
+
+/// Judges the documentation guard on the S3 metadata that `publish` has just
+/// committed, before anything is uploaded. The preview asked the storage
+/// engine about uncommitted output changes, but a background writer may change
+/// a boundary's outputs between that answer and the commit; judging only the
+/// final index would upload such content and then refuse it. Metadata the
+/// engine did not commit is what the preflight already judged, so a
+/// publication that committed none inside the task directory builds no index.
+fn check_committed_documentation(
+    repo: &GitRepo,
+    state_dir: &Path,
+    base_oid: &str,
+    scopes: &[String],
+    s3: &dvc::DvcReport,
+    policy: &PrivateIndexPolicy<'_>,
+) -> Result<()> {
+    let Some(task_path) = deliverable_task_path(policy.task) else {
+        return Ok(());
+    };
+    if !s3
+        .committed
+        .iter()
+        .any(|pointer| is_task_content(task_path, pointer))
+    {
+        return Ok(());
+    }
+    let index = state_dir.join("committed-index");
+    if index.exists() {
+        fs::remove_file(&index).at(&index)?;
+    }
+    repo.run_with_index(&index, ["read-tree", base_oid], None, true)?;
+    remove_output_paths_from_index(repo, &index, policy.local_only.iter())?;
+    stage_scopes(repo, &index, scopes)?;
+    remove_stored_outputs_from_index(repo, &index, &s3.outputs)?;
+    remove_output_paths_from_index(repo, &index, policy.local_only.iter())?;
+    let paths = changed_paths(repo, &index, base_oid)?;
+    check_task_documentation(repo, &index, base_oid, &paths, policy)
+}
+
+fn read_metadata(repo: &GitRepo, pointers: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    pointers
+        .iter()
+        .map(|pointer| {
+            let path = resolved_under(&repo.root, pointer);
+            Ok((pointer.clone(), fs::read(&path).at(&path)?))
+        })
+        .collect()
+}
+
+/// Writes back the content that each `committed` metadata file had before the
+/// storage engine committed it.
+fn restore_metadata(
+    repo: &GitRepo,
+    original: &[(String, Vec<u8>)],
+    committed: &[String],
+) -> Result<()> {
+    for (pointer, content) in original
+        .iter()
+        .filter(|(pointer, _)| committed.contains(pointer))
+    {
+        let path = resolved_under(&repo.root, pointer);
+        if fs::read(&path).at(&path)? != *content {
+            storage::atomic_write_bytes(&path, content)?;
+        }
+    }
+    Ok(())
+}
+
+/// The S3 metadata inside the task directory that `publish` would rewrite
+/// when it commits: a dirty pointer whose outputs the storage engine reports
+/// files added to, changed in, removed from, or renamed in. A pointer that is
+/// dirty only because its objects are missing from the local cache is
+/// committed back to the same metadata, and a file the engine cannot compare
+/// because its directory's manifest is missing changes nothing on its own.
+fn pending_metadata_rewrites(
+    repo: &GitRepo,
+    s3: &dvc::DvcReport,
+    task_path: &str,
+) -> Result<Vec<String>> {
+    let dirty = s3
+        .dirty_files
+        .iter()
+        .filter(|pointer| is_task_content(task_path, pointer))
+        .collect::<Vec<_>>();
+    if dirty.is_empty() {
+        return Ok(Vec::new());
+    }
+    let outputs = dirty
+        .iter()
+        .flat_map(|pointer| s3.outputs.get(pointer.as_str()).into_iter().flatten())
+        .cloned()
+        .collect::<Vec<_>>();
+    let status = dvc::data_status(repo, &outputs)?;
+    let changes = &status.uncommitted;
+    let rows = changes
+        .added
+        .iter()
+        .chain(&changes.modified)
+        .chain(&changes.deleted)
+        .chain(
+            changes
+                .renamed
+                .iter()
+                .flat_map(|rename| [&rename.old, &rename.new]),
+        )
+        .collect::<Vec<_>>();
+    Ok(dirty
+        .into_iter()
+        .filter(|pointer| {
+            s3.outputs.get(pointer.as_str()).is_some_and(|outputs| {
+                outputs.iter().any(|output| {
+                    rows.iter().any(|row| {
+                        row.strip_prefix(output.as_str())
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                    })
+                })
+            })
+        })
+        .cloned()
+        .collect())
+}
+
+/// Whether the storage engine reports content added or changed, rather than
+/// only removed, inside the outputs of these S3 boundaries. Staged metadata
+/// shows such a change only once `publish` has committed it, after placement
+/// and just before the upload, so the preview asks the engine and the guard is
+/// decided where `plan` decides it.
+fn uncommitted_content(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<bool> {
+    if pointers.is_empty() {
+        return Ok(false);
+    }
+    dvc::ensure_ready(repo, config)?;
+    let outputs = pointers
+        .iter()
+        .filter_map(|pointer| pointer.strip_suffix(".dvc"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    Ok(adds_uncommitted_content(&dvc::data_status(repo, &outputs)?))
+}
+
+/// Directory rows are skipped: the engine reports a directory boundary as
+/// modified when a file inside it is only removed. A file the engine reports
+/// as unknown sits in a directory whose recorded listing it cannot load, so it
+/// cannot be compared on its own. It counts only when that directory's
+/// aggregate changed: an unchanged aggregate proves every file unchanged, while
+/// a changed one may hide an addition.
+fn adds_uncommitted_content(status: &DataStatus) -> bool {
+    let changes = &status.uncommitted;
+    let changed_directories = changes
+        .modified
+        .iter()
+        .filter(|path| path.ends_with('/'))
+        .collect::<Vec<_>>();
+    changes
+        .added
+        .iter()
+        .chain(&changes.modified)
+        .chain(changes.renamed.iter().map(|rename| &rename.new))
+        .any(|path| !path.ends_with('/'))
+        || changes.unknown.iter().any(|path| {
+            changed_directories
+                .iter()
+                .any(|directory| path.starts_with(directory.as_str()))
+        })
+}
+
 /// Whether this publication changes content inside the task directory in any
 /// direction, including retiring it. Retiring a result is a decision worth
 /// recording, so the advisory warning counts it; the refusal does not.
@@ -1276,22 +1649,44 @@ fn removes_task_documentation(
 fn check_task_documentation(
     repo: &GitRepo,
     index: &Path,
+    base_oid: &str,
     paths: &[String],
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     let Some(task_path) = deliverable_task_path(policy.task) else {
         return Ok(());
     };
-    // A transaction that touches nothing inside the task directory cannot fail
-    // this check, so it does not pay for the projection listing either.
-    if !changes_task_content(task_path, paths, policy.automatic_s3) {
+    let uncommitted = policy
+        .uncommitted
+        .iter()
+        .filter(|pointer| is_task_content(task_path, pointer))
+        .cloned()
+        .collect::<Vec<_>>();
+    // A transaction that touches nothing inside the task directory, and holds
+    // no S3 boundary there whose outputs may have changed, cannot fail this
+    // check, so it does not pay for the projection listing either.
+    if uncommitted.is_empty() && !changes_task_content(task_path, paths, policy.automatic_s3) {
         return Ok(());
     }
     let projection = TaskProjection::resolve(repo, index, task_path)?;
-    if !publishes_task_content(task_path, paths, policy.automatic_s3, &projection.tracked) {
+    if !projection.documentation.is_empty() {
         return Ok(());
     }
-    if !projection.documentation.is_empty() {
+    let retiring = retiring_paths(repo, base_oid, task_path, paths, &projection, policy)?;
+    let published = paths
+        .iter()
+        .filter(|path| !retiring.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    // The engine is asked last: only a task that documents nothing and
+    // publishes nothing else pays for it.
+    if !publishes_task_content(
+        task_path,
+        &published,
+        policy.automatic_s3,
+        &projection.tracked,
+    ) && !uncommitted_content(repo, policy.config, &uncommitted)?
+    {
         return Ok(());
     }
     if removes_task_documentation(task_path, paths, &projection.tracked) {
@@ -1325,6 +1720,22 @@ fn documentation_warning(
             "this publication changes task content but none of the task documentation in {task_path}; record the decision, tool, process step, or hard-to-reproduce result when the work produced one, and ignore this warning otherwise"
         ),
     })
+}
+
+/// While a task is over its cloud-usage limit, a publication is allowed only
+/// when it adds no content, so the record the warning asks for would turn the
+/// cleanup the user chose into growth the limit refuses. The warning then says
+/// where the record goes instead of inviting that refusal.
+fn defer_record_past_the_limit(
+    mut warning: TransactionWarning,
+    usage: &CloudUsageReport,
+) -> TransactionWarning {
+    if usage.approval_required() && usage.cleanup_only {
+        warning.message.push_str(
+            "; while the task is over its cloud-usage limit this publication is allowed only because it adds no content, so publish it as it is and record the decision in the first publication the limit allows",
+        );
+    }
+    warning
 }
 
 /// The new content this publication adds inside the task directory, as a file
@@ -3559,6 +3970,134 @@ mod curation_tests {
                 &owned(&["20260829-170100-task/expensive.bin"]),
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn a_local_placement_record_retires_only_content_that_was_published() {
+        let boundary = "20260829-170100-task/results.bin";
+        let directory = "20260829-170100-task/outputs";
+        // `untrack` of a result published in Git removes its payload, and of
+        // one published in S3 removes its metadata.
+        assert!(retires_published_payload(boundary, boundary, &[boundary]));
+        assert!(retires_published_payload(
+            boundary,
+            boundary,
+            &["20260829-170100-task/results.bin.dvc"]
+        ));
+        assert!(retires_published_payload(
+            directory,
+            directory,
+            &["20260829-170100-task/outputs/a.csv"]
+        ));
+        // A renamed task removes them where they were published.
+        assert!(retires_published_payload(
+            boundary,
+            "20260829-170000-old/results.bin",
+            &["20260829-170000-old/results.bin.dvc"]
+        ));
+        // A result kept local before it was ever published removes nothing,
+        // and neither does a removal of a neighbour that shares a prefix.
+        assert!(!retires_published_payload(boundary, boundary, &[]));
+        assert!(!retires_published_payload(
+            boundary,
+            boundary,
+            &[
+                "20260829-170100-task/results.bin.bak",
+                "20260829-170100-task/results.bin2.dvc",
+                "20260829-170100-task/other.bin.dvc",
+            ]
+        ));
+        assert!(!retires_published_payload(
+            directory,
+            directory,
+            &["20260829-170100-task/outputs-old/a.csv"]
+        ));
+    }
+
+    #[test]
+    fn only_added_or_changed_files_are_uncommitted_content() {
+        let status = |raw: &str| dvc::parse_data_status(raw).unwrap();
+        // Removing a file from a directory boundary also reports the directory.
+        let removed = status(
+            r#"{"committed": {"added": ["out/", "out/a.bin"]}, "uncommitted": {"modified": ["out/"], "deleted": ["out/b.bin"]}}"#,
+        );
+        assert!(!adds_uncommitted_content(&removed));
+        assert!(!adds_uncommitted_content(&status("{}")));
+        assert!(!adds_uncommitted_content(&status(
+            r#"{"not_in_cache": ["out/a.bin"]}"#
+        )));
+        // Without the directory's recorded listing, its files are unknown;
+        // an unchanged aggregate proves them unchanged.
+        assert!(!adds_uncommitted_content(&status(
+            r#"{"not_in_cache": ["out/"], "committed": {"added": ["out/"]}, "uncommitted": {"unknown": ["out/b.bin", "out/a.bin"]}}"#
+        )));
+        for raw in [
+            r#"{"uncommitted": {"modified": ["out/"], "added": ["out/c.bin"], "deleted": ["out/b.bin"]}}"#,
+            r#"{"uncommitted": {"modified": ["out/", "out/a.bin"]}}"#,
+            r#"{"uncommitted": {"modified": ["stored.bin"]}}"#,
+            // A changed aggregate over files the engine cannot compare may
+            // hide an addition, here `out/c.bin` next to a removal.
+            r#"{"not_in_cache": ["out/"], "uncommitted": {"modified": ["out/"], "unknown": ["out/a.bin", "out/c.bin"]}}"#,
+            r#"{"uncommitted": {"modified": ["out/"], "unknown": ["out/sub/a.bin"]}}"#,
+            r#"{"uncommitted": {"renamed": [{"old": "out/a.bin", "new": "out/b.bin"}]}}"#,
+        ] {
+            assert!(adds_uncommitted_content(&status(raw)), "{raw}");
+        }
+    }
+
+    fn usage(status: &str, cleanup_only: bool) -> CloudUsageReport {
+        CloudUsageReport {
+            status: status.to_owned(),
+            publish_allowed: status == "within_limit" || cleanup_only,
+            cleanup_only,
+            git_history_exceeds_limit: false,
+            threshold_bytes: 1_000,
+            limit_bytes: 1_000,
+            approval: None,
+            published: Default::default(),
+            projected: Default::default(),
+            git_measure: "uncompressed".to_owned(),
+            headroom_bytes: 0,
+            suggested_limit_bytes: 268_435_456,
+            contributors: Vec::new(),
+            message: None,
+        }
+    }
+
+    #[test]
+    fn the_record_warning_defers_the_record_only_for_a_cleanup_past_the_limit() {
+        let documentation = owned(&["20260829-170100-task/notes/process.md"]);
+        let warning = || {
+            documentation_warning(
+                TASK,
+                &documentation,
+                &owned(&["20260829-170100-task/results.bin.dvc"]),
+                &[],
+            )
+            .expect("a retirement without documentation warns")
+        };
+        let plain = warning().message;
+        for (status, cleanup_only) in [
+            ("within_limit", false),
+            ("within_limit", true),
+            ("approval_required", false),
+        ] {
+            assert_eq!(
+                defer_record_past_the_limit(warning(), &usage(status, cleanup_only)).message,
+                plain,
+                "{status} {cleanup_only}"
+            );
+        }
+        let deferred = defer_record_past_the_limit(warning(), &usage("approval_required", true));
+        assert_eq!(deferred.code, "task-record-unchanged");
+        assert!(deferred.message.starts_with(&plain), "{}", deferred.message);
+        assert!(
+            deferred
+                .message
+                .ends_with("record the decision in the first publication the limit allows"),
+            "{}",
+            deferred.message
         );
     }
 

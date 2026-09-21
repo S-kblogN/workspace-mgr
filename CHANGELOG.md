@@ -57,7 +57,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   waits for a cloud-usage decision, ask the user with concrete numbers and one
   proposed limit, record only the user's explicit answer, perform only the
   cleanup the user chooses, and never edit the approval table or
-  `minimum_cli_version` by hand.
+  `minimum_cli_version` by hand. The pause outranks the turn-end
+  reconciliation: until the user answers, the agent records nothing in the
+  task's files and curates nothing, and its turn-end report names the usage,
+  the question, the unpublished `changed_paths`, and any path that is neither
+  retained nor ignored. A cleanup the user chose is published on its own, with
+  its record following in the first publication the limit allows.
 - `init` owns the root `.gitignore` and generates it from the product's fixed
   rules for output that is regenerated rather than retained, this repository's
   own rules imported verbatim from the new optional
@@ -97,10 +102,22 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   itself with Markdown files of its own choosing inside its directory; a README
   still carrying only the creation scaffold's directory map does not count. A
   storage pointer counts as the content it addresses, so a result routed to S3
-  is judged like one kept in Git. A publication that only retires content is
-  allowed; one that removes the task's last record while publishing content is
-  refused by name. `plan` applies the same refusal, before it changes placement
-  or uploads anything.
+  is judged like one kept in Git, including a change inside a boundary that
+  the storage engine has not committed yet. A publication that only retires
+  content is allowed; one that removes the task's last record while publishing
+  content is refused by name. Removing files from a directory boundary in S3
+  retires content when the rewritten metadata adds no line beyond the entries
+  it keeps, and so does `untrack` of published content: the placement record
+  then stands for payload or metadata the publication takes out of Git and S3,
+  so a task that documents nothing can still publish the cleanup its user chose
+  while it is over its cloud-usage limit. A result kept local before it was
+  ever published retires nothing, and its placement record counts as content
+  once the task is within its limit; while the task waits for the user's
+  cloud-usage decision it does not, because a record added to that cleanup
+  would be refused as growth. `plan` applies the same refusal, before it
+  changes placement or uploads anything, and `publish` judges the metadata the
+  storage engine commits once more before the upload, restoring that metadata
+  when the refusal or the cloud-usage re-check stops the publication there.
 - Publication refuses a staged symbolic link whose target is outside the
   repository. The target is classified from the staged link alone, without
   reading the filesystem, so a link inside a boundary placed in S3 or kept local
@@ -108,7 +125,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - `plan` and `publish` report structured `warnings` when there is something to
   report. `task-record-unchanged` reports a publication that changes content
   inside the task directory while none of the task's own documentation changed
-  with it, and says when to ignore it.
+  with it, and says when to ignore it. When a task is over its cloud-usage
+  limit and the publication is allowed only as a cleanup, it says to publish
+  that cleanup as it is and record the decision in the first publication the
+  limit allows, because a record added to it would be refused as growth. `plan`
+  counts the S3 metadata of outputs that changed, which `publish` commits, and
+  not metadata whose objects are only missing from the local cache.
 - `plan` and `publish` report `ignored_paths` beside the existing
   `ignored_entries` count when any path inside the resolved scopes is ignored,
   so ignored content inside a task can be reviewed as reproducible output rather
@@ -159,6 +181,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   (1048576 bytes) of new workspace-mgr control-file content per publication,
   where metadata that only drops entries is free, remain allowed over the
   limit.
+- The documentation, escaping-link, and machine-local-ignore refusals come
+  before the cloud-usage gate in `plan`, `publish --dry-run`, and `publish`,
+  so the user is asked about usage only for a publication those guards accept,
+  and a refused transaction records no pending decision. `refresh` checks the
+  incoming `minimum_cli_version` before it inspects incoming storage metadata,
+  including boundaries the storage engine cannot address.
 - Existing unmerged tasks that already exceed 1 GiB report `approval_required`
   on their next plan, and their next growing publication is refused until the
   user approves a higher limit or chooses cleanup.
@@ -206,7 +234,10 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   its reply outgrows the operating system's pipe buffer. The input is written
   while the reply is read, rather than in full beforehand, so resolving the
   ignore rules of a task with thousands of ignored files, or validating the
-  ignore rules of a large `untrack` boundary, completes instead of hanging.
+  ignore rules of a large `untrack` boundary, completes instead of hanging. A
+  command that stops reading before its input ends, or that a signal ends, is
+  always an error rather than an exit code, so an ignore-rule check killed
+  partway through can no longer read as nothing ignored.
 - Repository paths keep backslashes as ordinary file-name characters instead of
   rewriting them to `/`, so storage metadata, user-typed paths, and Git paths
   compare exactly.

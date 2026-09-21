@@ -171,7 +171,6 @@ where
         source,
     })?;
     streamed?;
-    let code = status.code().unwrap_or(1);
     let stderr = match diagnostics {
         Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
         Ok(Err(source)) => {
@@ -182,22 +181,48 @@ where
         }
         Err(_) => return Err(Error::message("child error reader panicked")),
     };
+    // Callers that do not check read the exit code as an answer, such as
+    // `git check-ignore` reporting that nothing is ignored. A child that a
+    // signal ended has no exit code to read.
+    let Some(code) = status.code() else {
+        return Err(Error::Terminated {
+            command: program.to_owned(),
+            status: status.to_string(),
+            detail: diagnostic(&stderr, "no diagnostic output"),
+        });
+    };
     match written {
         Some(Err(_)) => return Err(Error::message("child input writer panicked")),
-        // A child that fails may stop reading early; its exit status is the
-        // actionable error rather than the resulting broken pipe.
-        Some(Ok(Err(source))) if code == 0 => {
-            return Err(Error::Io {
-                path: cwd.to_path_buf(),
-                source,
-            });
+        // The child stopped reading before its input ran out, so its exit
+        // code answers for part of the input at most, and no caller may read
+        // it, checked or not. A child that failed says why it stopped, which
+        // is more actionable than the resulting broken pipe.
+        Some(Ok(Err(source))) => {
+            if code == 0 {
+                return Err(Error::Io {
+                    path: cwd.to_path_buf(),
+                    source,
+                });
+            }
+            return Err(failure(
+                program,
+                code,
+                &diagnostic(&stderr, "exited before reading all of its input"),
+            ));
         }
-        _ => {}
+        Some(Ok(Ok(()))) | None => {}
     }
     if check && code != 0 {
         return Err(failure(program, code, stderr.trim()));
     }
     Ok(StreamOutput { code, stderr })
+}
+
+fn diagnostic(stderr: &str, fallback: &str) -> String {
+    match stderr.trim() {
+        "" => fallback.to_owned(),
+        detail => detail.to_owned(),
+    }
 }
 
 fn pump<F>(stdout: &mut impl Read, on_stdout: &mut F, cwd: &Path) -> Result<()>
@@ -368,7 +393,9 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-        let output = within_deadline(move || {
+        // An unchecked caller reads the exit code as an answer, which a child
+        // that stopped reading its input never gave.
+        let error = within_deadline(move || {
             run_bytes(
                 "sh",
                 ["-c", "exit 4"],
@@ -377,9 +404,96 @@ mod tests {
                 Some(&unchecked),
                 false,
             )
+            .unwrap_err()
+        });
+        match error {
+            Error::Command { code, detail, .. } => {
+                assert_eq!(code, 4);
+                assert_eq!(detail, "exited before reading all of its input");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_stopped_reading_is_never_an_unchecked_answer() {
+        // `git check-ignore --stdin` exits 1 when nothing is ignored, so an
+        // exit code of 1 after partial input would read as a silent pass.
+        let input = "path\n".repeat(400_000);
+        let output = within_deadline(move || {
+            run_with(
+                "sh",
+                ["-c", "echo refused >&2; exit 1"],
+                Path::new("."),
+                &BTreeMap::new(),
+                Some(&input),
+                false,
+            )
+        });
+        match output {
+            Err(Error::Command { code, detail, .. }) => {
+                assert_eq!(code, 1);
+                assert_eq!(detail, "refused");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        // A child that read everything still answers with its exit code.
+        let input = "path\n".repeat(400_000);
+        let output = within_deadline(move || {
+            run_with(
+                "sh",
+                ["-c", "cat >/dev/null; exit 1"],
+                Path::new("."),
+                &BTreeMap::new(),
+                Some(&input),
+                false,
+            )
             .unwrap()
         });
-        assert_eq!(output.code, 4);
+        assert_eq!(output.code, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_ended_by_a_signal_has_no_exit_code() {
+        for (input, check) in [
+            (None, false),
+            (None, true),
+            (Some("path\n".repeat(400_000)), false),
+            (Some("path\n".repeat(400_000)), true),
+        ] {
+            let error = within_deadline(move || {
+                run_with(
+                    "sh",
+                    ["-c", "echo stopping >&2; kill -KILL $$"],
+                    Path::new("."),
+                    &BTreeMap::new(),
+                    input.as_deref(),
+                    check,
+                )
+                .unwrap_err()
+            });
+            match error {
+                Error::Terminated {
+                    command,
+                    status,
+                    detail,
+                } => {
+                    assert_eq!(command, "sh");
+                    assert!(status.contains('9'), "{status}");
+                    assert_eq!(detail, "stopping");
+                }
+                other => panic!("unexpected error with check={check}: {other}"),
+            }
+        }
+        let silent = within_deadline(|| {
+            run_unchecked("sh", ["-c", "kill -TERM $$"], Path::new(".")).unwrap_err()
+        });
+        assert!(
+            silent.to_string().ends_with("): no diagnostic output"),
+            "{silent}"
+        );
     }
 
     #[cfg(unix)]

@@ -1825,7 +1825,7 @@ fn rollback_error(error: Error, rollback: Result<()>) -> Error {
     }
 }
 
-fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::message("storage metadata path has no parent"))?;

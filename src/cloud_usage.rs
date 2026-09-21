@@ -1372,21 +1372,124 @@ fn drops_entries_only(path: &str, old: &[u8], new: &[u8]) -> bool {
     new.iter().all(|entry| known.contains(&identity(entry)))
 }
 
-/// Bytes of the lines in `new` that `old` does not contain, counting repeated
-/// lines as often as they occur.
-fn unshared_line_bytes(old: &[u8], new: &[u8]) -> u64 {
+/// Whether storage metadata rewritten from `old` to `new` only retires
+/// content: every file it now names, the replaced metadata already names at
+/// the same path with the same content digest or stored version, and every
+/// line it adds records one of those entries. Removing files from a directory
+/// boundary in S3 rewrites its metadata this way. A directory recorded only by
+/// its aggregate gets a new aggregate when any file goes, so both versions are
+/// compared file by file through the manifests in the local object stores; a
+/// version those stores cannot resolve keeps its aggregate, which the other
+/// side does not name, so it counts as new content.
+pub(crate) fn retires_content_only(
+    repo: &GitRepo,
+    config: &Config,
+    path: &str,
+    old: &[u8],
+    new: &[u8],
+) -> bool {
+    if !adds_only_entry_lines(old, new) {
+        return false;
+    }
+    let listings = DirectoryListings::new(dvc::local_object_stores(repo, config));
+    let parse = |content: &[u8]| {
+        dvc::parse_pointer_document(&String::from_utf8_lossy(content), path)
+            .ok()
+            .map(|document| listings.expand(document.entries(path)))
+    };
+    let (Some(old), Some(new)) = (parse(old), parse(new)) else {
+        return false;
+    };
+    names_only_known_content(&old, &new)
+}
+
+fn names_only_known_content(old: &[PointerEntry], new: &[PointerEntry]) -> bool {
+    let digests = old
+        .iter()
+        .filter_map(|entry| Some((entry.key.as_str(), entry.md5.as_deref()?)))
+        .collect::<BTreeSet<_>>();
+    let versions = old
+        .iter()
+        .filter_map(|entry| Some((entry.key.as_str(), entry.version_id.as_deref()?)))
+        .collect::<BTreeSet<_>>();
+    new.iter()
+        .all(|entry| match (&entry.md5, &entry.version_id) {
+            (Some(md5), _) => digests.contains(&(entry.key.as_str(), md5.as_str())),
+            (None, Some(version)) => versions.contains(&(entry.key.as_str(), version.as_str())),
+            (None, None) => false,
+        })
+}
+
+/// Keys of the metadata lines that record an entry: its path, digest, size,
+/// file count, hash name, executable bit, and stored version, and the headers
+/// that nest them. The storage engine rewrites exactly these lines when a
+/// boundary loses files.
+const ENTRY_KEYS: [&str; 13] = [
+    "outs",
+    "path",
+    "md5",
+    "size",
+    "nfiles",
+    "hash",
+    "isexec",
+    "files",
+    "relpath",
+    "cloud",
+    dvc::INTERNAL_REMOTE,
+    "version_id",
+    "etag",
+];
+
+/// Whether every line that `new` adds to `old` records an entry, as one of
+/// [`ENTRY_KEYS`] holding at most one token. The entries themselves are judged
+/// separately; anything else, such as a description, `meta`, labels, or a
+/// comment, even one after an entry's value, is new text that the metadata
+/// publishes however few entries it names.
+fn adds_only_entry_lines(old: &[u8], new: &[u8]) -> bool {
+    unshared_lines(old, new).into_iter().all(is_entry_line)
+}
+
+fn is_entry_line(line: &[u8]) -> bool {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let line = line.trim();
+    if line.is_empty() {
+        return true;
+    }
+    let line = line.strip_prefix('-').map_or(line, str::trim_start);
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    let value = value.trim();
+    ENTRY_KEYS.contains(&key)
+        && (value.is_empty() || line[key.len() + 1..].starts_with(' '))
+        && !value.contains(|character: char| character.is_whitespace() || character == '#')
+}
+
+/// The lines in `new` that `old` does not contain, counting repeated lines as
+/// often as they occur.
+fn unshared_lines<'a>(old: &[u8], new: &'a [u8]) -> Vec<&'a [u8]> {
     let mut available: BTreeMap<&[u8], usize> = BTreeMap::new();
     for line in old.split_inclusive(|byte| *byte == b'\n') {
         *available.entry(line).or_default() += 1;
     }
-    let mut unshared = 0_u64;
+    let mut unshared = Vec::new();
     for line in new.split_inclusive(|byte| *byte == b'\n') {
         match available.get_mut(line) {
             Some(count) if *count > 0 => *count -= 1,
-            _ => unshared = unshared.saturating_add(line.len() as u64),
+            _ => unshared.push(line),
         }
     }
     unshared
+}
+
+/// Bytes of the lines in `new` that `old` does not contain, counting repeated
+/// lines as often as they occur.
+fn unshared_line_bytes(old: &[u8], new: &[u8]) -> u64 {
+    unshared_lines(old, new)
+        .into_iter()
+        .fold(0_u64, |total, line| total.saturating_add(line.len() as u64))
 }
 
 type EntryRow = (Vec<PointerEntry>, Vec<PointerEntry>);
@@ -1591,7 +1694,7 @@ fn measure_storage(
 }
 
 /// Resolves `<revision>:<path>` for each path to a blob ID, if present.
-fn blobs_at(
+pub(crate) fn blobs_at(
     repo: &GitRepo,
     revision: &str,
     paths: &[String],
@@ -1611,7 +1714,7 @@ fn blobs_at(
     let lines = text.lines().collect::<Vec<_>>();
     if lines.len() != paths.len() {
         return Err(Error::message(
-            "unexpected Git object lookup output while measuring cloud usage",
+            "unexpected Git object lookup output while reading storage metadata",
         ));
     }
     Ok(paths
@@ -2406,6 +2509,58 @@ mod tests {
         );
         assert_eq!(quiet.projected_bytes, 250);
         assert!(!quiet.pending_uploads);
+    }
+
+    /// `move` of a boundary whose payload is not materialized fetches it
+    /// through the old metadata, drops the old path's version, and checks the
+    /// payload out at the new path. The next publication uploads it there
+    /// once, even when the storage engine also reports the checked-out payload.
+    #[test]
+    fn a_boundary_moved_without_its_payload_is_one_pending_upload() {
+        let old = entry("T/old.bin", 400, Some("v1"));
+        let moved = content("T/new.bin", "md5-T/old.bin-v1", 400);
+        let history = vec![vec![row(&[], std::slice::from_ref(&old))]];
+        let projection = vec![
+            row(std::slice::from_ref(&old), &[]),
+            row(&[], std::slice::from_ref(&moved)),
+        ];
+        let sources = PendingSources {
+            worktree: vec![moved],
+            dirty: vec![("T/new.bin".to_owned(), 400)],
+            ..PendingSources::default()
+        };
+        let usage = versioned_storage(&history, &projection, &sources);
+        assert_eq!(usage.published_bytes, 400);
+        // The old path is retired by the publication, the new one uploaded once.
+        assert_eq!(usage.projected_bytes, 400);
+        assert!(usage.pending_uploads);
+        assert_eq!(
+            usage.contributors["T/new.bin"],
+            Tally {
+                bytes: 400,
+                versions: 1,
+                pending: true
+            }
+        );
+        assert!(!usage.contributors.contains_key("T/old.bin"));
+
+        // A content-addressed remote already holds the digest, so the same
+        // move uploads nothing at all.
+        let old = content("T/old.bin", "digest", 400);
+        let moved = content("T/new.bin", "digest", 400);
+        let history = vec![vec![row(&[], std::slice::from_ref(&old))]];
+        let projection = vec![
+            row(std::slice::from_ref(&old), &[]),
+            row(&[], std::slice::from_ref(&moved)),
+        ];
+        let sources = PendingSources {
+            worktree: vec![moved],
+            ..PendingSources::default()
+        };
+        let usage = content_storage(&history, &projection, &sources);
+        assert_eq!(usage.published_bytes, 400);
+        assert_eq!(usage.projected_bytes, 400);
+        assert!(!usage.pending_uploads);
     }
 
     #[test]
@@ -3997,5 +4152,107 @@ mod tests {
         let usage = measure_tree(&fixture.tree());
         assert_eq!(usage.totals().1.s3_bytes, 1_100 + 1_234);
         assert!(usage.pending_uploads());
+    }
+
+    /// The documentation guard reads a metadata rewrite that only names
+    /// content its published version names as a retirement, comparing a
+    /// directory recorded by its aggregate file by file.
+    #[test]
+    fn metadata_that_names_only_published_content_retires_it() {
+        let fixture = Fixture::new();
+        let config = Config {
+            s3: Some(S3Config {
+                url: fixture
+                    .repo
+                    .root
+                    .join("absent-remote")
+                    .display()
+                    .to_string(),
+                endpoint_url: None,
+            }),
+            ..Config::default()
+        };
+        let retires = |old: &str, new: &str| {
+            retires_content_only(
+                &fixture.repo,
+                &config,
+                "T/data.dvc",
+                old.as_bytes(),
+                new.as_bytes(),
+            )
+        };
+        let aggregate =
+            |md5: &str| format!("outs:\n- md5: {md5}\n  size: 1\n  hash: md5\n  path: data\n");
+        let published = cache_directory(
+            &fixture,
+            0xd1,
+            &[("a.bin", 0xa1, 5), ("b.bin", 0xb1, 5), ("c.bin", 0xc1, 1)],
+        );
+        let removed = cache_directory(&fixture, 0xd2, &[("a.bin", 0xa1, 5), ("c.bin", 0xc1, 1)]);
+        let changed = cache_directory(&fixture, 0xd3, &[("a.bin", 0xa2, 5), ("c.bin", 0xc1, 1)]);
+        let renamed = cache_directory(&fixture, 0xd4, &[("z.bin", 0xa1, 5), ("c.bin", 0xc1, 1)]);
+        let added = cache_directory(
+            &fixture,
+            0xd5,
+            &[
+                ("a.bin", 0xa1, 5),
+                ("b.bin", 0xb1, 5),
+                ("c.bin", 0xc1, 1),
+                ("d.bin", 0xd1, 1),
+            ],
+        );
+        assert!(retires(&aggregate(&published), &aggregate(&removed)));
+        assert!(retires(&aggregate(&published), &aggregate(&published)));
+        for new in [&changed, &renamed, &added] {
+            assert!(!retires(&aggregate(&published), &aggregate(new)), "{new}");
+        }
+        // A version the local stores cannot resolve counts as new content.
+        let absent = format!("{}.dir", digest(0xd6));
+        assert!(!retires(&aggregate(&published), &aggregate(&absent)));
+        assert!(!retires(&aggregate(&absent), &aggregate(&removed)));
+
+        // Version-aware metadata lists each file with its stored version.
+        let listed = |files: &[(&str, &str, Option<&str>)]| {
+            let mut raw = String::from("outs:\n- path: data\n  files:\n");
+            for (relpath, md5, version) in files {
+                raw.push_str(&format!(
+                    "  - relpath: {relpath}\n    md5: {md5}\n    size: 5\n"
+                ));
+                if let Some(version) = version {
+                    raw.push_str(&format!(
+                        "    cloud:\n      {}:\n        version_id: {version}\n",
+                        dvc::INTERNAL_REMOTE
+                    ));
+                }
+            }
+            raw
+        };
+        let before = listed(&[("a.bin", "m1", Some("v1")), ("b.bin", "m2", Some("v2"))]);
+        assert!(retires(&before, &listed(&[("a.bin", "m1", Some("v1"))])));
+        // The storage engine may drop the recorded version of an unchanged
+        // file; its digest still names published content.
+        assert!(retires(&before, &listed(&[("a.bin", "m1", None)])));
+        assert!(!retires(&before, &listed(&[("a.bin", "m3", None)])));
+        assert!(!retires(&before, &listed(&[("c.bin", "m1", Some("v1"))])));
+        assert!(!retires(&before, "not: [metadata"));
+
+        // Text the rewrite adds outside its entries is published content, at
+        // the top level, beside an output, in a comment, or after a value.
+        let kept = aggregate(&removed);
+        for padded in [
+            format!("{kept}desc: Final results of run 3, accuracy 0.93\n"),
+            format!("{kept}meta:\n  notes: |\n    accuracy 0.93\n"),
+            format!("{kept}  labels:\n  - accuracy-0.93\n"),
+            format!("{kept}  type: results\n"),
+            format!("# accuracy 0.93\n{kept}"),
+            kept.replace("hash: md5", "hash: md5 # accuracy 0.93"),
+            kept.replace("hash: md5", "hash: md5 accuracy"),
+        ] {
+            assert!(!retires(&aggregate(&published), &padded), "{padded}");
+        }
+        // Text the published metadata already carried is not new.
+        let described = |md5: &str| format!("{}desc: Evaluation outputs\n", aggregate(md5));
+        assert!(retires(&described(&published), &described(&removed)));
+        assert!(!retires(&aggregate(&published), &described(&removed)));
     }
 }

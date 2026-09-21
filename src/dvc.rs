@@ -1521,6 +1521,11 @@ fn private_engine_error(error: Error) -> Error {
             code,
             detail: sanitize_private_detail(&detail),
         },
+        Error::Terminated { status, detail, .. } => Error::Terminated {
+            command: "managed-storage".to_owned(),
+            status,
+            detail: sanitize_private_detail(&detail),
+        },
         Error::MissingCommand(_) => {
             Error::message("managed-storage runtime is unavailable; run `workspace-mgr setup`")
         }
@@ -1610,6 +1615,17 @@ mod tests {
         assert!(!detail.contains(&runtime.display().to_string()));
         assert!(!detail.contains("DVC"));
         assert!(!detail.contains("dvc"));
+
+        // An engine that a signal ended is named and sanitized the same way.
+        let error = private_engine_error(Error::Terminated {
+            command: runtime.join("bin/dvc").display().to_string(),
+            status: "signal: 9 (SIGKILL)".to_owned(),
+            detail: format!("DVC stopped in {}", runtime.display()),
+        });
+        assert_eq!(
+            error.to_string(),
+            "managed-storage did not exit normally (signal: 9 (SIGKILL)): internal engine stopped in <private-runtime>"
+        );
     }
 
     #[test]

@@ -436,7 +436,9 @@ remote branch, and pull-request head agree. A
 publication or provider blocker is reported with the exact unsynchronized state;
 the user never has to ask for routine turn-end synchronization. A task waiting
 for the user's cloud-usage decision is such a blocker: the reconciliation stops
-at the plan, as described in the next step.
+at the plan, without recording the turn, resolving unignored by-products, or
+publishing, and the agent reports the usage, its question, and the changes that
+remain unpublished, as described in the next step.
 Hosting failures are reported immediately. The agent must not merge, enable
 auto-merge, approve, close, or mark the pull request ready unless the user
 explicitly requests that exact transition. An explicit request to discard one
@@ -467,13 +469,26 @@ before it changes placement or uploads anything. A deliverable publication that
 would add or change content inside its own task directory while that directory
 documents nothing is refused until the task records something of its own. A
 publication that only retires content is not held to it, and one that removes
-the task's last record while publishing content is refused by name. Content
-placed in S3 is judged by its pointer, so routing a result out of Git does not
-exempt it. A staged symbolic link whose target is outside the repository is
-refused, because the link points at content no other checkout has; copy what
-the task must keep into the declared scope instead. The link check reads the
-staged tree only, so a link inside a boundary already placed in S3 or kept
-local with `untrack` is not classified: that content never reaches the index.
+the task's last record while publishing content is refused by name. Removing
+files from a directory boundary in S3 retires content: its rewritten metadata
+names nothing the published metadata did not, and adds no text beside those
+entries, such as a description or a comment. Untracking published content
+retires it as well, because the placement record `untrack` writes then takes the
+payload out of Git and S3. A result kept local before it was ever published
+retires nothing, so its placement record, the only durable trace of it, counts
+as content once the task is within its limit; while the task waits for the
+user's cloud-usage decision it does not, because a record added to that cleanup
+would be growth the limit refuses. Content placed in S3 is judged by its
+pointer, so routing a result out of Git does not exempt it, and a change inside
+a boundary that the storage engine has not committed yet is read from the
+engine, so `plan` refuses it rather than `publish` after the upload; `publish`
+judges the committed metadata once more before the upload, for a change that
+lands after the plan. A staged symbolic link whose target is outside the
+repository is refused, because the link points at content no other checkout has;
+copy what the task must keep into the declared scope instead. The link check
+reads the staged tree only, so a link inside a boundary already placed in S3 or
+kept local with `untrack` is not classified: that content never reaches the
+index.
 
 A third refusal covers the ignore layer. A path inside the task's scopes that
 only a machine-local rule hides — the user's global excludes, `.git/info/exclude`,
@@ -488,6 +503,11 @@ before the generated root file has been published. A directory whose entire
 content is ignored, which Git reports as one collapsed entry, is expanded to the
 files inside it so that a file-level rule such as `*.log` is resolved rather than
 missed. The refusal names at most the first five paths and counts the rest.
+
+All three refusals are decided before the cloud-usage measurement of the next
+step. Resolving one can change what the publication holds, so the agent
+resolves it first, and a plan measures cloud usage, and the user is asked, only
+for a publication that passes them.
 
 A plan or publication also reports `ignored_paths` beside `ignored_entries`
 when any path inside the resolved scopes is ignored. The count is exact and the
@@ -513,15 +533,16 @@ projected totals, the limit, and the largest contributors under `cloud_usage`.
 When the projected total exceeds the limit, `plan` reports
 `cloud_usage.status: approval_required` and `publish` refuses before it places,
 commits, or uploads anything. The task is then waiting for the user's decision.
-The agent stops all task work, including the routine turn-end publication, and
-asks in the chat. It reports the published and projected Git, S3, and total
-bytes, the limit, and the largest contributors, and proposes one specific new
-limit, normally the reported `suggested_limit_bytes`, alongside the cleanup
-alternatives. Task-scoped commands print a one-line reminder on stderr until a
-recorded approval covers the pending projection or a later `plan` or `publish`
-measures the task within its limit. The reminder repeats the last measurement,
-so after the user answers, the agent carries out exactly that answer, then
-runs `plan` and acts on its result.
+The agent stops all task work, including the routine turn-end publication and
+its recording and curation steps, and asks in the chat. It reports the
+published and projected Git, S3, and total bytes, the limit, and the largest
+contributors, and proposes one specific new limit, normally the reported
+`suggested_limit_bytes`, alongside the cleanup alternatives. Task-scoped
+commands print a one-line reminder on stderr until a recorded approval covers
+the pending projection or a later `plan` or `publish` measures the task within
+its limit. The reminder repeats the last measurement, so after the user
+answers, the agent carries out exactly that answer, then runs `plan` and acts
+on its result.
 
 If the user approves, the agent records exactly that answer, re-measures, and
 publishes:
@@ -563,14 +584,19 @@ branch's declaration on its next publication, so both merge cleanly.
 If the user declines, the agent performs only the cleanup the user chooses:
 `remove` or `untrack` of named content, `storage hydrate` only when that cleanup
 needs absent S3 content, or discarding the task. It then runs `plan` and
-publishes the reduction; a publication that only removes content, apart from
-at most 1 MiB (1048576 bytes) of new workspace-mgr control-file content per
+publishes the reduction; a publication that only removes content, apart from at
+most 1 MiB (1048576 bytes) of new workspace-mgr control-file content per
 publication, where metadata that only drops entries is free, remains allowed
-while the task is over its limit. The reduction takes effect when that
-publication permanently deletes the retired S3 versions. Published Git history
-cannot shrink: when it alone exceeds the limit, only an approval or discarding
-the task resolves the decision, and hosting providers may still retain
-pull-request refs.
+while the task is over its limit. The agent publishes that reduction on its own:
+while the task is over its limit, the documentation refusal does not apply to a
+publication that only removes or untracks content, and a task record added to it
+would be growth the limit refuses. Its `task-record-unchanged` warning says so,
+and the agent records the decision in the task's files in the first publication
+the limit allows, and in the pull-request description until then. The reduction
+takes effect when that publication permanently deletes the retired S3 versions.
+Published Git history cannot shrink: when it alone exceeds the limit, only an
+approval or discarding the task resolves the decision, and hosting providers may
+still retain pull-request refs.
 
 The threshold is fixed product policy with no repository setting. Moving
 content into another task, a shared path, or another storage service is not a

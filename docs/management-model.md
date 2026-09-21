@@ -197,7 +197,9 @@ agent can confirm that each one is reproducible output rather than work that
 should have been retained. It refuses content that only a machine-local
 ignore rule hides — the user's global excludes, `.git/info/exclude`, or an
 ignore file whose matching bytes the publication does not carry — because such
-a rule keeps the file out of every other clone and out of review. It reports
+a rule keeps the file out of every other clone and out of review. These
+refusals come before the cloud-usage measurement described below, so the user
+is asked about usage only for a publication that passes them. It reports
 `bulk-publication` when one publication adds more than two hundred new files or
 more than 256 MiB (268435456 bytes) of new content inside the task, as a check
 rather than a refusal. Content placed
@@ -309,9 +311,12 @@ task manifest; recording an approval documents the user's decision and never
 creates it. The next publication carries that manifest change, so the pull
 request shows the approved limit, and each publication commit also names it in
 a `Cloud-Usage-Approval` trailer. If the user declines, the agent performs only
-the cleanup the user chooses and publishes the reduction. Published Git history
-cannot shrink, so when it alone exceeds the limit, only an approval or
-discarding the task resolves the decision.
+the cleanup the user chooses and publishes the reduction on its own: while the
+task is over its limit, a task that documents nothing may still remove or
+untrack content, and a record added to that publication would be growth the
+limit refuses, so the record follows in the first publication the limit allows.
+Published Git history cannot shrink, so when it alone exceeds the limit, only an
+approval or discarding the task resolves the decision.
 
 Publishing makes the target branch ready for review; it does not merge it. The
 agent maintains the corresponding pull request through the repository's hosting
@@ -349,8 +354,10 @@ pull-request head already match. The user does not need to request this
 turn-ending synchronization. If publication or provider verification is
 blocked, the agent reports the exact unsynchronized state rather than claiming
 the task is current. A task waiting for the user's cloud-usage decision is such
-a blocker: reconciliation stops at the plan, and the agent reports the paused
-state and its question instead of publishing.
+a blocker: reconciliation stops at the plan, before the turn is recorded or
+any by-product is curated, and the agent reports the paused state, its
+question, and the changes that remain unpublished instead of publishing. The
+record of that turn follows once the user has answered.
 
 If Git publication fails after an S3 upload, an unreferenced S3 object version
 may remain, but no remote Git revision should point to missing content.

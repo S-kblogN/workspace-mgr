@@ -777,28 +777,60 @@ present only when they are not empty: `ignored_entries` is always exact, while
 rule cannot fill the report. For a deliverable task, `task-record-unchanged`
 reports a publication that changes content inside the task directory while none
 of the task's own documentation changed with it; ignore it when the work
-produced nothing worth recording. `bulk-publication` reports a publication that
-adds more than 200 new files, or more than 256 MiB (268435456 bytes), of new
-content inside the task directory; the thresholds are fixed product policy. New
-content routed to S3 by automatic placement is counted from the placement
-decision and measured on disk, because its payload never reaches the private
-index, and its pointer is not counted a second time once `publish` has written
-it; an explicitly selected boundary counts as the one pointer it adds. A file
-that only moved — every published file of a renamed task, for instance — is not
-new content and is not counted. Both are checks rather than refusals.
+produced nothing worth recording. `plan` counts the S3 metadata of outputs the
+storage engine reports files added to, changed in, or removed from, which
+`publish` rewrites when it commits them, so both give the same advice; metadata
+whose objects are only missing from the local cache is committed back unchanged
+and counts in neither. When the task is over its cloud-usage limit and the
+publication is allowed only because it is cleanup-only, the warning adds that
+the publication should go out as it is and the decision be recorded in the first
+publication the limit allows, because a record added to it would be content the
+limit refuses. `bulk-publication` reports a publication that adds more than
+200 new files, or more than 256 MiB (268435456 bytes), of new content inside the
+task directory; the thresholds are fixed product policy. New content routed to
+S3 by automatic placement is counted from the placement decision and measured on
+disk, because its payload never reaches the private index, and its pointer is
+not counted a second time once `publish` has written it; an explicitly selected
+boundary counts as the one pointer it adds. A file that only moved — every
+published file of a renamed task, for instance — is not new content and is not
+counted. Both are checks rather than refusals.
 
 Plan refuses, before it changes placement or uploads anything, a deliverable
-publication that would add or change content inside its own task directory
-while that directory documents nothing, and any staged symbolic link whose
-target is outside the repository. A task documents itself with Markdown files
-of its own choosing inside its directory; a README still carrying only the
-creation scaffold's directory map is not yet a record. A storage pointer or
-placement record counts as the content it addresses, so a result routed to S3
-is judged like one kept in Git. A publication that only retires content is not
-refused; one that removes the task's last record while publishing content is
-refused by name. The symbolic-link check reads the staged tree, so a link
-inside a boundary already placed in S3 or kept local with `untrack` is not
-classified.
+publication that would add or change content inside its own task directory while
+that directory documents nothing, and any staged symbolic link whose target is
+outside the repository. A task documents itself with Markdown files of its own
+choosing inside its directory; a README still carrying only the creation
+scaffold's directory map is not yet a record. A storage pointer or placement
+record counts as the content it addresses, so a result routed to S3 is judged
+like one kept in Git. The staged metadata of a boundary shows a change to its
+outputs only once `publish` commits it, after placement and just before the
+upload, so for a task that documents nothing the preview asks the storage engine
+whether any boundary in the task gained or changed files. A file the engine
+cannot compare because its directory's manifest is in neither the local cache
+nor the remote counts only when the directory's aggregate digest changed.
+`publish` judges the metadata the engine commits again before it uploads
+anything, because a background writer may change a boundary's outputs after the
+preview; when that check or the cloud-usage re-check refuses, the metadata the
+engine committed is restored, so a retry after the late content is gone is not
+judged by it. A publication that only retires content is not refused; one that
+removes the task's last record while publishing content is refused by name.
+Removing files from a directory boundary in S3 retires content, whether or not
+the storage engine has committed the boundary yet: the rewritten metadata names
+only files the published metadata names, with the same digest or stored
+version, and every line it adds records one of those entries. A description,
+`meta`, labels, or a comment added to the metadata is text it publishes, so such
+a rewrite counts as content. Untracking published content retires it too: the
+placement record `untrack` writes then takes the payload or metadata the task
+published out of Git and S3, so it does not count as publishing content, and a
+task that documents nothing can still publish the cleanup a user chose while the
+task is over its cloud-usage limit. A result kept local before it was ever
+published retires nothing, so its placement record, the only durable trace of
+it, counts as the content it addresses, except while the task waits for the
+user's cloud-usage decision: a record added to that cleanup would be growth the
+limit refuses, so the record of such a result is judged once the gate has
+measured, and counts as content only when the task is within its limit. The
+symbolic-link check reads the staged tree, so a link inside a boundary already
+placed in S3 or kept local with `untrack` is not classified.
 
 Plan also refuses, at the same point, a path inside the resolved scopes that
 only a machine-local ignore rule hides: the user's global excludes file,
@@ -830,6 +862,11 @@ covers stays collapsed and is never walked. The same rule applies to an
 infrastructure task over its declared scopes.
 
 `publish` applies the same refusals.
+
+All of these refusals are decided on the preview, before the cloud-usage
+measurement, so a refused plan or publication records no pending cloud-usage
+decision, and the usage `plan` reports afterwards describes the publication
+those guards accept.
 
 `--allow-non-shared-head` is an exceptional checkout override and requires a
 scope note. It still refuses when the target task branch is currently checked
@@ -886,7 +923,10 @@ waiting for the user's decision, and points to `plan` for the largest
 contributors. The gate is not the first refusal: placement is evaluated before
 usage is measured, so a publication that also holds an S3 boundary the storage
 engine cannot address is refused for that boundary, before any usage is
-measured or recorded.
+measured or recorded. The same holds for the refusals `plan` describes: a
+deliverable that documents nothing, a staged symbolic link that escapes the
+repository, and a path only a machine-local ignore rule hides are refused before
+usage is measured, because resolving them can change what the publication holds.
 
 A real publication checks again after local placement and S3 metadata are
 committed but before the upload, and again from the final Git tree before it
@@ -950,8 +990,11 @@ no remote.
 
 Before it changes anything, refresh reads `minimum_cli_version` from the
 incoming revision's `.workspace-mgr.toml` and refuses with status 2 when that
-revision requires a newer CLI, leaving the checkout untouched. After the user
-approves and completes the update, rerun refresh.
+revision requires a newer CLI, leaving the checkout untouched. This check comes
+first, before refresh inspects any incoming storage metadata, including the
+unaddressable boundaries described below, because a newer release may write
+metadata this one cannot read; `refresh --dry-run` applies it the same way.
+After the user approves and completes the update, rerun refresh.
 
 An incoming S3 boundary whose path contains a backslash is the one exception.
 The storage engine reads the backslash as a path separator in some commands,

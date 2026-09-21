@@ -228,14 +228,23 @@ For a task publication, the CLI:
    including a task manifest schema this build cannot declare, are decided on
    that preview, before the cloud-usage measurement and before any placement
    change or upload, because resolving them can change what the publication
-   holds;
+   holds. The preview's S3 metadata does not yet show output changes that step
+   6 commits, so for a task that documents nothing the documentation refusal
+   asks the storage engine whether a boundary in the task gained or changed
+   files, and reads metadata that only drops files, adding no line beyond the
+   entries it keeps, as retiring content;
 5. measures the task's cloud usage from the preview tree and refuses a
    publication that would exceed the task's limit, unless it only removes
    content apart from at most 1 MiB (1048576 bytes) of new control-file
    content per publication, where metadata that only drops entries is free,
-   before any local placement or upload;
-6. applies automatic placement, reconciles S3 metadata, re-measures S3 usage
-   from the committed metadata, then uploads all live in-scope objects and
+   before any local placement or upload. The placement record of a result kept
+   local before it was ever published is the one input to the documentation
+   refusal decided here rather than in step 4: it counts as content only when
+   the task is within its limit, because while the task waits for the user's
+   decision a record added to the cleanup would be growth this step refuses;
+6. applies automatic placement, reconciles S3 metadata, judges the documentation
+   refusal and re-measures S3 usage from the committed metadata, restoring that
+   metadata if either refuses, then uploads all live in-scope objects and
    verifies them;
 7. builds a private Git index from the target branch, or the base branch when no
    target exists;
@@ -364,20 +373,22 @@ Existing working-tree overlays are preserved. A failure after the ref update
 rolls back the ref, index, ordinary files, metadata, and outputs created by the
 refresh.
 
-Detection precedes every change, including the purge queue, so `--dry-run`
-reports the same condition an applied refresh does. An unaddressable boundary is
-excluded from prefetch, checkout, verification, and the unsafe-output scan,
-which resolve each pointer as an engine command target: the engine's `status`
-rewrites the backslash, reports the rewritten path missing, and fails, so
-verifying such a boundary would roll back the whole refresh. The purge adapter
-still enumerates it, because it collects pointers through the engine's Python
-API, which reads the path literally. Its metadata advances with the branch, and
-refresh places no payload for it. A payload this checkout already holds there is
-compared with the incoming metadata without the engine: an exact match is kept,
-and anything else, including a payload with no metadata beside it, refuses the
-refresh before any change, because refresh can neither replace nor verify it.
-Rollback therefore restores such a boundary from its metadata alone, because
-refresh never placed or removed an output for it.
+The requirement check precedes detection, so refresh never inspects incoming
+storage metadata that only a newer release can read, and `--dry-run` refuses
+where an applied refresh would. Detection precedes every change, including the
+purge queue, so `--dry-run` reports the same condition an applied refresh does.
+An unaddressable boundary is excluded from prefetch, checkout, verification, and
+the unsafe-output scan, which resolve each pointer as an engine command target:
+the engine's `status` rewrites the backslash, reports the rewritten path
+missing, and fails, so verifying such a boundary would roll back the whole
+refresh. The purge adapter still enumerates it, because it collects pointers
+through the engine's Python API, which reads the path literally. Its metadata
+advances with the branch, and refresh places no payload for it. A payload this
+checkout already holds there is compared with the incoming metadata without the
+engine: an exact match is kept, and anything else, including a payload with no
+metadata beside it, refuses the refresh before any change, because refresh can
+neither replace nor verify it. Rollback therefore restores such a boundary from
+its metadata alone, because refresh never placed or removed an output for it.
 
 A `move` whose source payload is not materialized fetches it through the source
 metadata before any change and checks it out at the destination, because the

@@ -28,9 +28,8 @@ failure ordering, successful and rolled-back
 ordinary Git/S3 shared-checkout refresh, fresh-clone hydration, missing exact S3
 versions, the per-task cloud-usage gate at the real 1 GiB threshold (version-aware
 usage accounting, refusal before any cloud write, an approval recorded in the
-task manifest, and, depending on the binary's version, either the refusal of a
-build older than 0.4.0 to publish it or its commit trailers and the raised
-repository minimum version),
+task manifest, a plan within the approved limit clearing the pending decision,
+and the publication's commit trailers and raised repository minimum version),
 the network minimum-version guard for refresh, plan, and publish, cross-process
 locks, alternate checkouts, and network non-fast-forwards.
 It checks that placement commands never write either remote, that S3 object
