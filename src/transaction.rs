@@ -31,7 +31,7 @@ use crate::policy::{
     REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
-use crate::scaffold::{PRODUCT_IGNORE_RULES, task_readme_directory_map};
+use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
 use crate::storage::{self, PLACEMENT_SUFFIX};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -1973,7 +1973,7 @@ fn machine_local_ignores<'a, 'b>(
 /// `.DS_Store` hidden by the product's own wildcard, and the remedies the
 /// refusal offers would all regenerate the same unpublished file.
 fn is_product_ignore_rule(rule: &IgnoreRule<'_>) -> bool {
-    rule.source == ROOT_IGNORE_NAME && PRODUCT_IGNORE_RULES.contains(&rule.pattern)
+    rule.source == ROOT_IGNORE_NAME && product_ignore_rules().any(|product| product == rule.pattern)
 }
 
 fn untracked_ignore_message(rules: &[&IgnoreRule<'_>], destination: &str) -> String {
@@ -4222,8 +4222,7 @@ mod curation_tests {
         // scaffold publication, and on macOS a `.DS_Store` appears in a browsed
         // directory on its own. Refusing there would block the bootstrap the
         // guide prescribes, with no remedy the task could apply.
-        let product = PRODUCT_IGNORE_RULES
-            .iter()
+        let product = product_ignore_rules()
             .map(|pattern| {
                 rule_record(
                     ROOT_IGNORE_NAME,
@@ -4234,7 +4233,7 @@ mod curation_tests {
             })
             .collect::<String>();
         let rules = parse_ignore_rules(&product);
-        assert_eq!(rules.len(), PRODUCT_IGNORE_RULES.len());
+        assert_eq!(rules.len(), product_ignore_rules().count());
         assert!(machine_local_ignores(&rules, &BTreeSet::new()).is_empty());
 
         // Only the product's own list, and only in the file the product owns.

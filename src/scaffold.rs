@@ -28,28 +28,136 @@ const STORAGE_GITIGNORE: &str = "/config.local\n/tmp\n/cache\n";
 const STORAGE_IGNORE: &str =
     "# Managed by workspace-mgr. Storage paths are selected through workspace-mgr.\n";
 
-/// The fixed ignore rules the product owns. The set is deliberately small and
-/// limited to output a tool regenerates under a name that cannot plausibly be
-/// retained content, so it never hides a result someone meant to keep.
-/// `target/`, `build/`, and `dist/` are absent for exactly that reason: they
-/// are ordinary names for retained data as often as for build output.
+/// The fixed ignore rules the product owns, in the groups the generated file
+/// renders. The set is deliberately curated rather than the union of the
+/// common ignore templates. It holds two kinds of rule. Most cover output a
+/// tool regenerates under a name that cannot plausibly be retained content,
+/// so they never hide a result someone meant to keep: `target/`, `build/`,
+/// `dist/`, `lib/`, `out/`, `docs/`, `*.log`, and `coverage` are absent for
+/// exactly that reason, being ordinary names for retained data as often as
+/// for build output, and so are `.RData`, knitr's `*_cache/`, and Julia's
+/// `Manifest.toml`, which can be the only or the reproducibility-critical copy
+/// of a result. The last group covers files that hold credentials or private
+/// runtime configuration, which never belong in the repository at all.
 ///
 /// Publication reads the same list: a path that one of these rules hides is
 /// hidden by a rule every initialized clone carries, so it never looks like a
 /// machine-local rule even before the generated file reaches the base branch.
-pub(crate) const PRODUCT_IGNORE_RULES: &[&str] = &[
-    ".DS_Store",
-    "__pycache__/",
-    "*.pyc",
-    "*.pyo",
-    ".ipynb_checkpoints/",
-    ".pytest_cache/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    ".venv/",
-    "venv/",
-    "node_modules/",
+pub(crate) const PRODUCT_IGNORE_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Operating-system metadata.",
+        &[
+            ".DS_Store",
+            "._*",
+            ".AppleDouble",
+            ".LSOverride",
+            "__MACOSX/",
+            "Thumbs.db",
+            "ehthumbs.db",
+            "[Dd]esktop.ini",
+            ".directory",
+            ".fuse_hidden*",
+            ".Trash-*",
+            ".nfs*",
+        ],
+    ),
+    (
+        "Editor swap, backup, and per-user state.",
+        &[
+            "[._]*.sw[a-p]",
+            "*~",
+            "\\#*\\#",
+            ".\\#*",
+            "*.iws",
+            ".idea/**/workspace.xml",
+            ".idea/**/shelf",
+        ],
+    ),
+    (
+        "Python bytecode, environments, and tool caches.",
+        &[
+            "__pycache__/",
+            "*.py[codz]",
+            "*$py.class",
+            "*.egg-info/",
+            ".eggs/",
+            ".venv/",
+            "venv/",
+            "__pypackages__/",
+            ".pdm-build/",
+            ".ipynb_checkpoints/",
+            ".pytest_cache/",
+            ".mypy_cache/",
+            ".dmypy.json",
+            ".ruff_cache/",
+            ".pytype/",
+            ".pyre/",
+            ".tox/",
+            ".nox/",
+            ".hypothesis/",
+            ".coverage",
+            ".coverage.*",
+            "htmlcov/",
+            "cython_debug/",
+            "__marimo__/",
+            ".ropeproject",
+        ],
+    ),
+    (
+        "JavaScript dependencies, caches, and framework output.",
+        &[
+            "node_modules/",
+            ".npm/",
+            ".pnpm-store/",
+            "npm-debug.log*",
+            "yarn-debug.log*",
+            "yarn-error.log*",
+            ".eslintcache",
+            ".stylelintcache",
+            "*.tsbuildinfo",
+            ".parcel-cache/",
+            ".next/",
+            ".nuxt/",
+            ".svelte-kit/",
+            ".vite/",
+            ".node_repl_history",
+        ],
+    ),
+    (
+        "R, Julia, and Rust session and tool by-products.",
+        &[
+            ".Rhistory",
+            ".Rapp.history",
+            ".RDataTmp",
+            ".Rproj.user/",
+            "*.jl.cov",
+            "*.jl.*.cov",
+            "*.jl.mem",
+            "*.jl.*.mem",
+            "**/*.rs.bk",
+            "rustc-ice-*.txt",
+        ],
+    ),
+    (
+        "Credentials and private runtime configuration.",
+        &[
+            ".env",
+            ".env.*",
+            "!.env.example",
+            ".Renviron",
+            ".httr-oauth",
+            ".pypirc",
+            ".streamlit/secrets.toml",
+        ],
+    ),
 ];
+
+/// Every product rule, in the order the generated file writes them.
+pub(crate) fn product_ignore_rules() -> impl Iterator<Item = &'static str> {
+    PRODUCT_IGNORE_GROUPS
+        .iter()
+        .flat_map(|(_, rules)| rules.iter().copied())
+}
 
 /// The first line of every root ignore file the product generated, and the
 /// record that it owns this one. The other whole-file scaffolds are identified
@@ -110,10 +218,12 @@ fn compose_root_gitignore(module: Option<&str>, existing: &str) -> ComposedRootI
     let mut rendered = format!(
         "{ROOT_IGNORE_HEADER}# This repository's own ignore rules belong in {REPOSITORY_IGNORE_MODULE};\n# `workspace-mgr init` regenerates this file from that module and the fixed rules below.\n# Rules that apply to one task belong in that task's own {ROOT_IGNORE_NAME}.\n"
     );
-    rendered.push_str("\n# Product rules for output that is regenerated rather than retained.\n");
-    for rule in PRODUCT_IGNORE_RULES {
-        rendered.push_str(rule);
-        rendered.push('\n');
+    for (title, rules) in PRODUCT_IGNORE_GROUPS {
+        rendered.push_str(&format!("\n# Product rules: {title}\n"));
+        for rule in *rules {
+            rendered.push_str(rule);
+            rendered.push('\n');
+        }
     }
     if let Some(module) = module {
         rendered.push_str(&format!(
@@ -1216,17 +1326,33 @@ mod tests {
         assert!(rendered.contains("\n.DS_Store\n"));
         assert!(rendered.contains("\nnode_modules/\n"));
         // Names that are as plausibly retained data as build output stay out.
-        for ambiguous in ["\ntarget/\n", "\nbuild/\n", "\ndist/\n"] {
+        for ambiguous in [
+            "\ntarget/\n",
+            "\nbuild/\n",
+            "\ndist/\n",
+            "\nlib/\n",
+            "\nout/\n",
+            "\ndocs/\n",
+            "\n*.log\n",
+            "\ncoverage\n",
+            "\n.RData\n",
+            "\n*_cache/\n",
+            "\nManifest*.toml\n",
+        ] {
             assert!(!rendered.contains(ambiguous), "{ambiguous:?} is too broad");
         }
         assert!(
             !rendered.contains("# Repository rules imported"),
             "an absent module must not leave an empty import section"
         );
-        assert!(rendered.ends_with("\nnode_modules/\n"));
+        assert!(rendered.ends_with("\n.streamlit/secrets.toml\n"));
+        // The template kept for sharing follows the rule that would hide it.
+        let env = rendered.find("\n.env.*\n").unwrap();
+        let example = rendered.find("\n!.env.example\n").unwrap();
+        assert!(env < example);
         // Publication classifies a rule by the same list the file is built
         // from, so the two cannot drift apart.
-        for rule in PRODUCT_IGNORE_RULES {
+        for rule in product_ignore_rules() {
             assert!(rendered.contains(&format!("\n{rule}\n")), "{rule}");
         }
     }

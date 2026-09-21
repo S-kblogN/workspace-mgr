@@ -114,13 +114,42 @@ migration once; see the upgrade note in the guide. Below the generated header
 the file is product-owned like the others, so a hand edit there is drift that
 `init` repairs.
 
-The generated root `.gitignore` is the product's fixed rules for output that is
-regenerated rather than retained — `.DS_Store`, `__pycache__/`, `*.pyc`,
-`*.pyo`, `.ipynb_checkpoints/`, `.pytest_cache/`, `.mypy_cache/`,
-`.ruff_cache/`, `.venv/`, `venv/`, and `node_modules/` — followed by this
+The generated root `.gitignore` is the product's fixed rules, followed by this
 repository's own rules imported verbatim from
 `.workspace-mgr/repository.gitignore`, followed by any
-`# workspace-mgr local begin` blocks the root file already holds.
+`# workspace-mgr local begin` blocks the root file already holds. The fixed
+rules are written in these groups:
+
+- operating-system metadata: `.DS_Store`, `._*`, `.AppleDouble`,
+  `.LSOverride`, `__MACOSX/`, `Thumbs.db`, `ehthumbs.db`, `[Dd]esktop.ini`,
+  `.directory`, `.fuse_hidden*`, `.Trash-*`, `.nfs*`;
+- editor swap, backup, and per-user state: `[._]*.sw[a-p]`, `*~`, `\#*\#`,
+  `.\#*`, `*.iws`, `.idea/**/workspace.xml`, `.idea/**/shelf`;
+- Python bytecode, environments, and tool caches: `__pycache__/`,
+  `*.py[codz]`, `*$py.class`, `*.egg-info/`, `.eggs/`, `.venv/`, `venv/`,
+  `__pypackages__/`, `.pdm-build/`, `.ipynb_checkpoints/`, `.pytest_cache/`,
+  `.mypy_cache/`, `.dmypy.json`, `.ruff_cache/`, `.pytype/`, `.pyre/`,
+  `.tox/`, `.nox/`, `.hypothesis/`, `.coverage`, `.coverage.*`, `htmlcov/`,
+  `cython_debug/`, `__marimo__/`, `.ropeproject`;
+- JavaScript dependencies, caches, and framework output: `node_modules/`,
+  `.npm/`, `.pnpm-store/`, `npm-debug.log*`, `yarn-debug.log*`,
+  `yarn-error.log*`, `.eslintcache`, `.stylelintcache`, `*.tsbuildinfo`,
+  `.parcel-cache/`, `.next/`, `.nuxt/`, `.svelte-kit/`, `.vite/`,
+  `.node_repl_history`;
+- R, Julia, and Rust session and tool by-products: `.Rhistory`,
+  `.Rapp.history`, `.RDataTmp`, `.Rproj.user/`, `*.jl.cov`, `*.jl.*.cov`,
+  `*.jl.mem`, `*.jl.*.mem`, `**/*.rs.bk`, `rustc-ice-*.txt`;
+- credentials and private runtime configuration: `.env`, `.env.*`,
+  `!.env.example`, `.Renviron`, `.httr-oauth`, `.pypirc`,
+  `.streamlit/secrets.toml`.
+
+The set draws on GitHub's common ignore templates but is curated rather than
+their union. Apart from the credentials group, a fixed rule covers output a
+tool regenerates under a name that cannot plausibly be retained content. Names
+that are as often retained data as build output — `target/`, `build/`,
+`dist/`, `lib/`, `out/`, `docs/`, `*.log`, `coverage`, `.RData`, knitr's
+`*_cache/`, and Julia's `Manifest.toml` — are left to a task's own
+`.gitignore` or to `.workspace-mgr/repository.gitignore`.
 The module is optional, repository-owned, and limited to 64 KiB of UTF-8; an
 absent or empty module produces no import section. It carries ignore patterns
 only: those two block markers belong to `untrack`, and a module containing one

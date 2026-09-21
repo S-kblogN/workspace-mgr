@@ -5,6 +5,24 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- The generated root `.gitignore` carries a broader, grouped set of fixed
+  rules drawn from GitHub's common ignore templates: operating-system metadata
+  for macOS, Windows, and Linux, editor swap and backup files, more Python and
+  JavaScript tool caches, R, Julia, and Rust by-products, and files that hold
+  credentials or private runtime configuration, such as `.env` (with
+  `!.env.example` kept publishable). The set remains curated rather than the
+  templates' union: names that are as often retained data as build output,
+  such as `build/`, `dist/`, `target/`, `docs/`, and `*.log`, stay out.
+
+### Upgrading
+
+- Run `workspace-mgr init` after upgrading to regenerate the root `.gitignore`,
+  and publish the result like any other repository-wide change. Upgrade every
+  clone that runs `init`: an earlier release treats the new generated file as
+  drift and regenerates it without the new rules.
+
 ## [0.4.0] - 2026-09-20
 
 ### Added
