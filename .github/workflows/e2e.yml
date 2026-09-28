@@ -52,6 +52,8 @@ jobs:
           git --version
           dvc version
           docker version
+      - name: Test exact-version transport and request counts
+        run: python -m unittest discover -s scripts/tests -p 'test_dvc_version*.py'
       - name: Start versioned S3-compatible service
         run: |
           docker run --detach --rm \

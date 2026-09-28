@@ -1735,7 +1735,7 @@ impl MetadataSnapshot {
 /// payload is not into the local cache, through that metadata.
 fn fetch_unmaterialized_source(repo: &GitRepo, config: &Config, boundary: &str) -> Result<()> {
     dvc::ensure_ready(repo, config)?;
-    dvc::execute_engine(&repo.root, ["fetch", "--", &format!("{boundary}.dvc")]).map_err(
+    dvc::fetch(repo, config, &[format!("{boundary}.dvc")]).map_err(
         |error| {
             Error::message(format!(
                 "move could not fetch the payload of {boundary}, which is not materialized here, so it left the boundary unchanged: {error}"
