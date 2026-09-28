@@ -51,18 +51,23 @@ jobs:
         run: |
           git --version
           dvc version
-          docker version
       - name: Test exact-version transport and request counts
         run: python -m unittest discover -s scripts/tests -p 'test_dvc_version*.py'
       - name: Start versioned S3-compatible service
         run: |
-          docker run --detach --rm \
-            --name workspace-mgr-e2e-minio \
-            --publish 127.0.0.1:9000:9000 \
-            --env MINIO_ROOT_USER \
-            --env MINIO_ROOT_PASSWORD \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
-            server /data --address :9000
+          # The official container registry no longer serves this release.
+          # Keep the same MinIO version using its checksum-pinned official binary.
+          curl --fail --location --retry 3 \
+            https://github.com/minio/minio/releases/download/RELEASE.2025-09-07T16-13-09Z/minio.linux-amd64.RELEASE.2025-09-07T16-13-09Z \
+            --output "${RUNNER_TEMP}/minio"
+          printf '%s  %s\n' \
+            7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f \
+            "${RUNNER_TEMP}/minio" | sha256sum --check
+          chmod +x "${RUNNER_TEMP}/minio"
+          mkdir -p "${RUNNER_TEMP}/minio-data"
+          nohup "${RUNNER_TEMP}/minio" server "${RUNNER_TEMP}/minio-data" \
+            --address 127.0.0.1:9000 >"${RUNNER_TEMP}/minio.log" 2>&1 &
+          echo "$!" >"${RUNNER_TEMP}/minio.pid"
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
               exit 0
@@ -70,7 +75,7 @@ jobs:
             echo "Waiting for MinIO (${attempt}/60)"
             sleep 1
           done
-          docker logs workspace-mgr-e2e-minio
+          cat "${RUNNER_TEMP}/minio.log"
           exit 1
       - name: Build workspace-mgr
         run: cargo build --locked
@@ -84,7 +89,7 @@ jobs:
         run: |
           evidence_root="${RUNNER_TEMP}/workspace-mgr-e2e"
           mkdir -p "${evidence_root}"
-          docker logs workspace-mgr-e2e-minio >"${evidence_root}/minio.log" 2>&1 || true
+          cp "${RUNNER_TEMP}/minio.log" "${evidence_root}/minio.log" || true
       - name: Upload E2E evidence
         if: always()
         uses: actions/upload-artifact@v7.0.1
@@ -95,4 +100,7 @@ jobs:
           retention-days: 14
       - name: Stop virtual S3 service
         if: always()
-        run: docker rm --force workspace-mgr-e2e-minio >/dev/null 2>&1 || true
+        run: |
+          if test -f "${RUNNER_TEMP}/minio.pid"; then
+            kill "$(cat "${RUNNER_TEMP}/minio.pid")" || true
+          fi

@@ -48,7 +48,7 @@ would make the network lifecycle slower without proving another boundary.
   head verification, and the rule that it must not merge.
 - The service-backed lifecycle runs once on Linux. Apple Silicon and Linux ARM64
   run the complete isolated Rust/integration suite and native packaging checks;
-  duplicating the Docker-backed MinIO lifecycle on every architecture would not
+  duplicating the MinIO service lifecycle on every architecture would not
   cross a new product boundary.
 
 When a public command, state transition, or remote failure point is added, this
