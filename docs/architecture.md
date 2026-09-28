@@ -355,6 +355,31 @@ public command or repository concept. A filesystem remote is compiled only by
 the `test-storage` feature for isolated tests and uses remote-presence
 verification. Release builds reject it in the public S3 schema.
 
+Versioned reads use a private adapter instead of the engine's generic fetch
+path. It requires a complete file/version manifest, checks existing cache bytes
+against the recorded content hash, and fetches missing bytes with exact-version
+GETs. GET responses supply the version, full object length, and ETag checks;
+downloaded bytes are hashed locally before cache insertion. Temporary downloads
+stay on their destination cache filesystem and are removed on success or failure.
+Cache writes and
+directory-tree construction run on the owning thread. Checkout and local
+conflict/content validation remain with the engine. A hydrate or refresh reuses
+only the remote verification performed in that same operation; it never persists
+a remote-existence receipt for a future command.
+
+For cache hits and publication verification, groups of at least eight entries
+under the same non-root parent prefix share at most two ListObjectVersions pages
+of up to 1,000 results each. Matching uses both key and exact version ID, including
+historical versions under a current delete marker. A page proves only the
+versions it contains; unresolved entries fall back to exact HEAD requests,
+including after a denied/unsupported listing or a non-advancing pagination
+marker. Listing metadata does not prove object-read permission, which GET checks
+for downloads. Both listing groups and individual HEAD/GET requests use bounded
+concurrency of sixteen, with at most sixteen submitted futures at once. This
+limits historical traversal without weakening recorded version/size/ETag or
+downloaded-content checks. The immutable version manifest and the local content
+hash remain separate from ETags, which are not assumed to be content MD5s.
+
 Moving an S3 boundary clears path-bound cloud metadata before upload so the new
 object path receives and records its own version ID. After Git publication,
 every version at the old object path is permanently deleted unless protected by

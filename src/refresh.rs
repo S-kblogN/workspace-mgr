@@ -326,7 +326,13 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
                     .chain(addressable_new_dvc.iter().cloned())
                     .collect::<Vec<_>>();
                 dvc::execute_engine(&repo.root, args)?;
-                dvc::verify(&repo, &config, &addressable_new_dvc)?;
+                if config.requires_object_versioning() {
+                    // prepare_revision already validated the exact remote
+                    // versions, including cache hits, in this refresh.
+                    dvc::verify_local(&repo, &addressable_new_dvc)?;
+                } else {
+                    dvc::verify(&repo, &config, &addressable_new_dvc)?;
+                }
             }
         }
         if repo.optional_oid(&local_ref)?.as_deref() != Some(&new_oid) {

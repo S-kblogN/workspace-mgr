@@ -37,7 +37,8 @@ versions exist before the corresponding Git ref, and that remote failure cannot
 produce a Git commit pointing to missing content. Every command and assertion is
 recorded in `evidence.jsonl`.
 
-GitHub Actions owns the MinIO container and installs the exact private storage
+GitHub Actions owns the MinIO process, verifies its pinned official binary's
+SHA-256 checksum, and installs the exact private storage
 runtime. The test owns only newly created repositories, buckets, caches, and
 refs under its runner directory. It never reads developer configuration or
 credentials.

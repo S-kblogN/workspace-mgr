@@ -5,6 +5,29 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-27
+
+### Fixed
+
+- Hydrating versioned S3 data, refreshing stored outputs, and moving an absent
+  stored boundary download each needed object directly at its recorded version.
+  The adapter verifies the GET response's version, size, and ETag, hashes the
+  downloaded bytes locally, and only then populates the storage cache. It no
+  longer serially rereads remote objects to compute hashes before downloading,
+  or repeats remote HEAD checks after a verified download.
+- Cached objects and published outputs use bounded batch metadata checks: groups
+  of at least eight objects in one parent prefix share up to two version-list
+  pages, then unresolved versions use exact HEAD requests. Network work has at
+  most sixteen concurrent requests and bounded queued work. Listings stop as
+  soon as all requested versions are found, never scan the bucket root, and
+  fall back to HEAD if listing is unavailable or pagination cannot advance.
+- Missing directory file/version manifests fail explicitly before the storage
+  engine can fall back to an unbounded remote history scan. Corrupt cached bytes
+  are fetched again; missing versions, invalid downloaded bytes, response
+  mismatches, and truncated downloads remain errors. Downloads are staged on
+  the cache filesystem; local output conflict checks and refresh rollback are
+  preserved.
+
 ### Changed
 
 - The generated root `.gitignore` carries a broader, grouped set of fixed

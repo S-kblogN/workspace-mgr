@@ -850,47 +850,10 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
     if pointers.is_empty() {
         return Ok(serde_json::json!({"mode": "no-files"}));
     }
-    let local_args = std::iter::once("status".to_owned())
-        .chain(["--quiet".to_owned(), "--".to_owned()])
-        .chain(pointers.iter().cloned())
-        .collect::<Vec<_>>();
-    let local = inspect_engine(&repo.root, local_args)?;
-    if !local.success() {
-        return Err(Error::message(format!(
-            "managed-storage metadata does not match local data for: {}",
-            pointers.join(", ")
-        )));
-    }
-
+    verify_local(repo, pointers)?;
     ensure_ready(repo, config)?;
-    let exact = config.requires_object_versioning();
-    if exact {
-        let python = storage_python();
-        let serialized = serde_json::to_string(pointers).map_err(|error| {
-            Error::message(format!("failed to encode storage metadata files: {error}"))
-        })?;
-        let output = run_process_unchecked(
-            &python,
-            [
-                "-c",
-                VERSION_VERIFY_SCRIPT,
-                &repo.root.to_string_lossy(),
-                &serialized,
-            ],
-            &repo.root,
-        )
-        .map_err(private_engine_error)?;
-        if !output.success() {
-            return Err(Error::message(format!(
-                "failed to verify versioned storage content: {}",
-                private_detail(&output)
-            )));
-        }
-        return serde_json::from_str(output.stdout.trim()).map_err(|error| {
-            Error::message(format!(
-                "version-aware verifier returned invalid JSON: {error}"
-            ))
-        });
+    if config.requires_object_versioning() {
+        return version_read_adapter(repo, pointers, "--verify");
     }
 
     let cloud_args = std::iter::once("status".to_owned())
@@ -905,6 +868,79 @@ pub fn verify(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<se
         )));
     }
     Ok(serde_json::json!({"mode": "remote-status"}))
+}
+
+/// Verify materialized bytes after a fetch that already checked exact remote
+/// versions. This does not reuse remote evidence across separate commands.
+pub fn verify_local(repo: &GitRepo, pointers: &[String]) -> Result<()> {
+    if pointers.is_empty() {
+        return Ok(());
+    }
+    let local_args = std::iter::once("status".to_owned())
+        .chain(["--quiet".to_owned(), "--".to_owned()])
+        .chain(pointers.iter().cloned())
+        .collect::<Vec<_>>();
+    let local = inspect_engine(&repo.root, local_args)?;
+    if !local.success() {
+        return Err(Error::message(format!(
+            "managed-storage metadata does not match local data for: {}",
+            pointers.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn version_read_adapter(
+    repo: &GitRepo,
+    pointers: &[String],
+    operation: &str,
+) -> Result<serde_json::Value> {
+    let python = storage_python();
+    let serialized = serde_json::to_string(pointers).map_err(|error| {
+        Error::message(format!("failed to encode storage metadata files: {error}"))
+    })?;
+    let output = run_process_unchecked(
+        &python,
+        [
+            "-c",
+            VERSION_VERIFY_SCRIPT,
+            &repo.root.to_string_lossy(),
+            &serialized,
+            operation,
+        ],
+        &repo.root,
+    )
+    .map_err(private_engine_error)?;
+    if !output.success() {
+        return Err(Error::message(format!(
+            "failed to read or verify versioned storage content: {}",
+            private_detail(&output)
+        )));
+    }
+    serde_json::from_str(output.stdout.trim()).map_err(|error| {
+        Error::message(format!(
+            "version-aware verifier returned invalid JSON: {error}"
+        ))
+    })
+}
+
+/// Populate the local cache. Versioned S3 reads validate GET metadata and local
+/// content hashes, and batch-check remote versions for valid cache hits.
+pub fn fetch(
+    repo: &GitRepo,
+    config: &Config,
+    pointers: &[String],
+) -> Result<Option<serde_json::Value>> {
+    if config.requires_object_versioning() {
+        return version_read_adapter(repo, pointers, "--fetch").map(Some);
+    }
+    let args = ["fetch".to_owned(), "--".to_owned()]
+        .into_iter()
+        .chain(pointers.iter().cloned())
+        .collect::<Vec<_>>();
+    execute_engine(&repo.root, args)?;
+    Ok(None)
 }
 
 pub fn version_purge_adapter(
@@ -999,11 +1035,7 @@ pub fn hydrate(
     if dry_run {
         return Ok(report);
     }
-    let fetch = ["fetch".to_owned(), "--".to_owned()]
-        .into_iter()
-        .chain(pointers.iter().cloned())
-        .collect::<Vec<_>>();
-    execute_engine(&repo.root, fetch)?;
+    let remote_verification = fetch(repo, config, &pointers)?;
     // DVC reports an exact local output as "not in cache" when the cache was
     // cleared. Fetching first restores the comparison object without touching
     // the worktree, allowing the conflict check to distinguish identical
@@ -1014,7 +1046,12 @@ pub fn hydrate(
         .chain(pointers.iter().cloned())
         .collect::<Vec<_>>();
     execute_engine(&repo.root, checkout)?;
-    report.verification = Some(verify(repo, config, &pointers)?);
+    report.verification = Some(if let Some(verification) = remote_verification {
+        verify_local(repo, &pointers)?;
+        verification
+    } else {
+        verify(repo, config, &pointers)?
+    });
     report.status = "hydrated".to_owned();
     Ok(report)
 }
@@ -1335,11 +1372,7 @@ pub fn prepare_revision(
         };
         link_private_worktree_state(repo, &checkout_repo)?;
         let outputs = output_paths(&checkout_repo, pointers)?;
-        let args = ["fetch".to_owned(), "--".to_owned()]
-            .into_iter()
-            .chain(pointers.iter().cloned())
-            .collect::<Vec<_>>();
-        execute_engine(&checkout, args).map_err(|source| prefetch_error(oid, source))?;
+        fetch(&checkout_repo, config, pointers).map_err(|source| prefetch_error(oid, source))?;
         Ok(PreparedRevision {
             prepared_files: pointers.to_vec(),
             outputs,
