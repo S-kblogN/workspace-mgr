@@ -764,18 +764,20 @@ the published tree, as the
 [configuration reference](configuration.md#minimum-workspace-mgr-version)
 describes: a task that needs no newer release keeps the configuration of the
 point where its branch left the base branch, a schema 3 manifest that records
-a cloud-usage approval raises the declaration to at least 0.4.0, a branch
+a cloud-usage approval raises the declaration to at least 0.4.0, a nested
+archived task manifest of any supported schema requires at least 0.4.2, a branch
 whose manifests no longer need its earlier raise withdraws it but never below
 the fetched base branch's declaration, and a branch whose configuration
 carries a user-authorized change keeps it and only raises its declaration,
 also to follow the base branch. When a task manifest needs a newer release
 than the installed CLI, plan and publish refuse with status 2 because this
-build cannot publish that schema. The refusal offers recording the default
-limit to remove the approval only when that manifest is the task's own; for
-another task's manifest in the publication, such as one merged on the base
-branch, it names the manifest and asks only for an update. The
-reconciliation rewrites `.workspace-mgr.toml` in the private preview index
-only and lists it in `changed_paths` although it is outside the declared
+build cannot publish that task state. The refusal offers recording the default
+limit only when removing the task's own approval clears its schema requirement;
+an archived-path requirement needs an update. For another task's manifest in
+the publication, such as one merged on the base branch, it names the manifest
+and asks only for an update. The reconciliation rewrites `.workspace-mgr.toml`
+in the private preview index only and lists it in `changed_paths` although it
+is outside the declared
 scopes. When the published declaration differs from the task branch's, plan
 reports `repository_requirement` directly after `changed_paths`:
 
@@ -790,8 +792,10 @@ reports `repository_requirement` directly after `changed_paths`:
   withdrawal removes it;
 - `previous_minimum_cli_version` is the declaration in the publication's
   `.workspace-mgr.toml` before the reconciliation, or `null`;
-- `task_manifest_schema` is the manifest schema that needs the newer release,
-  or `null` when no manifest drives the change.
+- `task_manifest_schema` is the actual schema of the manifest that drives the
+  newer requirement, or `null` when no manifest drives the change. The path
+  may drive that requirement, so an archived schema 2 manifest reports `2`
+  while requiring 0.4.2.
 
 The field is omitted when the published declaration equals the task branch's.
 Plan and publish never change the shared checkout's `.workspace-mgr.toml`; it
@@ -985,6 +989,8 @@ raise to <version>; no task manifest in this publication needs it)`, with
 `minimum_cli_version removed` in place of the first value when neither the
 task's starting point nor the base branch declares anything. Both trailers are written for reviewers only.
 The report includes `repository_requirement` as described for `plan`.
+The trailer retains the requiring manifest's actual schema even when its
+archived path, rather than its schema, requires the newer release.
 
 `publish --dry-run` performs the same non-publishing behavior as `plan` while
 still requiring a message argument, and also rehearses the cloud-usage gate:

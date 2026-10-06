@@ -5,6 +5,26 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-06
+
+### Changed
+
+- Active deliverable task directories stay at the repository's top level.
+  Completed task directories whose pull requests are confirmed merged may be
+  organized under flexible time folders, such as `YYYY/`, `YYYYMM/`, or
+  `YYYY/MM/`. Organization happens only when the user requests it, through a
+  repository-infrastructure task; merge and turn-end synchronization never
+  trigger it automatically. When the user chooses no structure, use
+  `YYYY/MM/<task-dir>` based on each task directory's timestamp.
+
+### Fixed
+
+- Task manifests can be read from completed-task archive folders while still
+  validating the task directory's basename, identity, and declared location.
+  Archived task manifests participate in publication's minimum CLI version
+  checks and require workspace-mgr 0.4.2 or newer, so reorganizing old tasks
+  does not hide their compatibility requirements.
+
 ## [0.4.1] - 2026-09-27
 
 ### Fixed

@@ -525,6 +525,21 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("they do not create authorization"));
     assert!(task_rules.contains("outside the repository is outside the task directory too"));
     assert!(task_rules.contains("own files are its durable record"));
+    for organization_rule in [
+        "Active deliverable task directories must remain at the repository top level",
+        "Only completed tasks whose pull requests are confirmed merged",
+        "`YYYY/<task-dir>`, `YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>`",
+        "only when the user explicitly requests it",
+        "through a repository-infrastructure task",
+        "Never organize tasks automatically after merge or during turn-end synchronization",
+        "without specifying a structure, use `YYYY/MM/<task-dir>`",
+        "based on each task directory's timestamp",
+    ] {
+        assert!(
+            task_rules.contains(organization_rule),
+            "task instructions are missing {organization_rule:?}"
+        );
+    }
     // A record added to a cleanup would make it growth the limit refuses, so
     // the lifecycle and hygiene rules defer it to the same publication.
     assert!(

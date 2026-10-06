@@ -167,15 +167,10 @@ impl ResolvedTask {
                     .as_deref()
                     .ok_or_else(|| Error::message("deliverable task manifest requires path"))?;
                 let task_path = repo_path(raw_path, "task path")?;
-                if task_path.contains('/') {
-                    return Err(Error::message(
-                        "task path must be a directory directly below the repository root",
-                    ));
-                }
-                let expected_path = build_task_path(&identity, &slug);
-                if task_path != expected_path {
+                let expected_directory = build_task_path(&identity, &slug);
+                if task_path.rsplit('/').next() != Some(expected_directory.as_str()) {
                     return Err(Error::message(format!(
-                        "deliverable task path must be {expected_path:?} for slug {slug:?}; got {task_path:?}"
+                        "deliverable task directory must be {expected_directory:?} for slug {slug:?}; got {task_path:?}"
                     )));
                 }
                 let expected = repo.root.join(&task_path).join(TASK_MANIFEST_NAME);
@@ -622,20 +617,52 @@ mod tests {
     }
 
     fn load_manifest(raw: &str) -> Result<ResolvedTask> {
+        load_manifest_at(raw, "20260918-120000-demo")
+    }
+
+    fn load_manifest_at(raw: &str, directory: &str) -> Result<ResolvedTask> {
         let temp = tempfile::tempdir().unwrap();
         let repo = GitRepo {
             root: temp.path().canonicalize().unwrap(),
         };
-        let path = repo
-            .root
-            .join("20260918-120000-demo")
-            .join(TASK_MANIFEST_NAME);
+        let path = repo.root.join(directory).join(TASK_MANIFEST_NAME);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, raw).unwrap();
         ResolvedTask::load(&repo, &Config::default(), &path)
     }
 
     const APPROVAL_TABLE: &str = "\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \"The user approved 2 GiB for the training checkpoints\"\n";
+
+    #[test]
+    fn archived_manifest_paths_preserve_directory_identity_and_exact_location() {
+        let original = deliverable_manifest(3, APPROVAL_TABLE);
+        for grouping in ["2026", "202609", "2026/09"] {
+            let directory = format!("{grouping}/20260918-120000-demo");
+            let raw = original.replace(
+                "path = \"20260918-120000-demo\"",
+                &format!("path = \"{directory}\""),
+            );
+            let task = load_manifest_at(&raw, &directory).unwrap();
+            assert_eq!(task.task_path.as_deref(), Some(directory.as_str()));
+            assert_eq!(task.task_id, "20260918-120000-demo");
+            assert_eq!(task.branch, "codex/demo");
+            assert!(task.cloud_usage_approval.is_some());
+            assert_eq!(task.manifest().render().unwrap(), raw);
+
+            let error = load_manifest_at(&original, &directory)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("manifest must be located at"), "{error}");
+
+            let wrong_name = format!("{grouping}/20260918-120000-other");
+            let raw = raw.replace(&directory, &wrong_name);
+            let error = load_manifest_at(&raw, &wrong_name).unwrap_err().to_string();
+            assert!(
+                error.contains("deliverable task directory must be"),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn schema_3_manifests_carry_the_cloud_usage_approval() {

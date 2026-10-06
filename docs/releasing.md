@@ -39,7 +39,9 @@ an error rather than an instruction to overwrite state.
    0.4.0. The unit test
    `production_build_package_version_meets_every_task_schema_minimum` reads
    the package version and fails CI when it is below any schema's assigned
-   minimum.
+   minimum. Archive layout has its own compatibility minimum: nested task
+   manifests first become readable in 0.4.2, so publishing them requires at
+   least that release even when their schemas need an older release.
 2. Move the release notes out of `[Unreleased]` into a dated
    `## [<version>] - YYYY-MM-DD` section.
 3. Review the package with `cargo publish --dry-run --locked` and merge the

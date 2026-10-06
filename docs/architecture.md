@@ -83,12 +83,15 @@ release, a repository declares the oldest compatible release in
   its own release, so a release candidate can operate on the repositories it
   raises.
 - Product policy maps each task manifest schema to the oldest release that
-  reads it: schemas 1 and 2 need no declaration, and schema 3 needs 0.4.0.
+  reads it: top-level manifests with schemas 1 and 2 need no declaration, and
+  schema 3 needs 0.4.0. A nested archive task manifest needs 0.4.2 regardless
+  of its schema; publication uses the higher schema or path requirement.
   Writers use the lowest schema that represents a manifest, so only a task that
   records a cloud-usage approval produces schema 3.
 - Publication reconciles the declaration. Each private publication index (the
   preview, the pre-upload validation, and the final index) is scanned for task
-  manifests one directory below the root. When `.workspace-mgr.toml` is outside
+  manifests at the top level and in nested archived task directories, excluding
+  ordinary nested copies. When `.workspace-mgr.toml` is outside
   the publication's scopes and the task branch's copy is exactly what
   `workspace-mgr` writes there, meaning the blob at the task's fork point with
   the fetched base branch or that configuration rendered canonically with the
@@ -102,11 +105,11 @@ release, a repository declares the oldest compatible release in
   the base tip declares no more, and otherwise to the fork point's
   configuration rendered with the base tip's declaration. So a branch that
   never needs a newer release never touches the file, branches raised for the
-  same schema produce the same content, a branch raised earlier follows a base
-  branch raised further, and a branch whose manifests no longer need its raise
-  withdraws it without ever lowering a declaration the base branch carries,
-  which a rebase merge would otherwise replay onto the base branch; hosting
-  merges stay clean as long as every raised branch is published after the base
+  same requirements produce the same content, a branch raised earlier follows
+  a base branch raised further, and a branch whose manifests no longer need
+  its raise withdraws it without ever lowering a declaration the base branch
+  carries, which a rebase merge would otherwise replay onto the base branch;
+  hosting merges stay clean as long as every raised branch is published after the base
   branch's last raise. When the configuration is inside the scopes, or the
   branch's copy differs from the fork point in anything else, even comments or
   formatting only, the staged file is the user's: its declaration is only ever
@@ -119,11 +122,11 @@ release, a repository declares the oldest compatible release in
   declaration is never lowered. A build refuses to publish a raise that it does not meet
   itself, before placement or upload, and a tree without `.workspace-mgr.toml`
   cannot be raised, so such a publication is refused. The refusal offers
-  removing the approval only when the task's own manifest needs the newer
-  release; another task's manifest, such as one merged on the base branch, is
-  named with update advice only. Infrastructure manifests are private and
-  never trigger a raise, but an infrastructure publication raises the
-  declaration when base content it publishes needs one, and its isolated
+  removing the approval only when it clears the task's own schema requirement;
+  archived-path requirements and another task's requirements, such as one
+  merged on the base branch, need an update. Infrastructure manifests are
+  private and never trigger a raise, but an infrastructure publication raises
+  the declaration when base content it publishes needs one, and its isolated
   worktree then receives the published configuration.
 - Releases up to 0.3.0 do not know the key. Once a raised configuration is
   merged, they reject it as an unknown field, which also fails closed.

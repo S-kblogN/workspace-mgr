@@ -75,6 +75,17 @@ user approved. An infrastructure task instead has an isolated worktree and a
 private manifest because its content belongs at shared repository paths rather
 than inside a timestamped deliverable directory.
 
+Active deliverable task directories stay at the repository's top level. A
+completed task directory may be grouped under time folders only after its pull
+request is confirmed merged. The structure is flexible: `YYYY/<task-dir>`,
+`YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>` are all allowed. Organize old
+tasks only on the user's explicit request, through a repository-infrastructure
+task with the affected paths in scope. Merge and turn-end synchronization never
+trigger this organization automatically. When the user requests organization
+without specifying a structure, use `YYYY/MM/<task-dir>` from each directory's
+timestamp, unless the user specifies another date basis. Preserve the task
+directory's basename, retained contents, immutable task ID, and target branch.
+
 Reading and ownership are separate. Any chat may inspect any repository path
 when useful for context, including another chat's task directory. Reading a
 path does not transfer ownership or authorize mutation.
@@ -439,10 +450,11 @@ state.
 The repository also records the oldest `workspace-mgr` release that can read its
 task state. `workspace-mgr` maintains that declaration itself: when a
 publication introduces task state that older releases cannot read, such as a
-manifest that records a cloud-usage approval, the publication raises it, and
-nothing lowers it once it is merged. An older release refuses the repository
-instead of misreading it, and the agent tells the user both versions and asks
-before updating, just as it does for an update notice.
+manifest that records a cloud-usage approval or uses a nested archive path,
+the publication raises it, and nothing lowers it once it is merged. An older
+release refuses the repository instead of misreading it, and the agent tells
+the user both versions and asks before updating, just as it does for an update
+notice.
 
 The intended division of responsibility is simple: the user asks for outcomes,
 the agent performs the work inside one task, and `workspace-mgr` preserves the

@@ -181,12 +181,13 @@ workspace-mgr task create model-report \
   --purpose "Produce the reviewable model report"
 ```
 
-This fetches the configured base branch, then creates a timestamped directory,
-a concise README, a task manifest, and a local target-branch ref. It does not
-itself create a remote branch or call a hosting provider. Immediately after the
-command succeeds, the agent runs `plan`, publishes the initial scaffold, and
-creates and verifies the matching draft pull request before substantial task
-work. That checkpoint is automatic and does not require another user prompt.
+This fetches the configured base branch, then creates a timestamped top-level
+directory, a concise README, a task manifest, and a local target-branch ref. It
+does not itself create a remote branch or call a hosting provider. Immediately
+after the command succeeds, the agent runs `plan`, publishes the initial
+scaffold, and creates and verifies the matching draft pull request before
+substantial task work. That checkpoint is automatic and does not require
+another user prompt.
 
 The task directory is where the work happens, not only where finished results
 are filed. Scripts written to do the work, the materials they read, and the
@@ -574,11 +575,12 @@ task is refreshed. The agent notes the raised requirement in the pull-request
 description, because after the merge every clone needs a release that meets it.
 A build older than that release refuses to publish the approval at all, so the
 agent reports both versions and asks the user how to continue. If the user
-later resets the approval, the next publication withdraws the raise and reports
-it with `change: withdraw`, and the agent drops the note from the pull-request
-description; a withdrawal never goes below what the base branch already
-declares, so the branch keeps a raise that other merged approvals need. A
-branch raised before the base branch was raised further follows the base
+later resets the approval and no manifest still needs the raise, the next
+publication withdraws it and reports `change: withdraw`, and the agent drops
+the note from the pull-request description; a withdrawal never goes below
+what the base branch already declares, so the branch keeps a raise that other
+merged task state needs. A branch raised before the base branch was raised
+further follows the base
 branch's declaration on its next publication, so both merge cleanly.
 
 If the user declines, the agent performs only the cleanup the user chooses:
@@ -663,6 +665,28 @@ Before it changes anything, refresh checks the incoming `minimum_cli_version`.
 If the merged work requires a newer release than the installed one, refresh
 refuses and leaves the checkout untouched; after the user approves and
 completes the update, run it again.
+
+Active deliverable task directories remain at the repository's top level.
+After a task is done and its pull request is confirmed merged, the user may
+explicitly request that old task directories be organized under time folders.
+Handle that request through a repository-infrastructure task with the affected
+paths in scope; do not organize them automatically after merge or as part of
+turn-end synchronization.
+
+The user may choose a structure such as `YYYY/<task-dir>`,
+`YYYYMM/<task-dir>`, or `YYYY/MM/<task-dir>`. If the request does not specify a
+structure, use `YYYY/MM/<task-dir>` based on each task directory's timestamp,
+unless the user specifies another date basis. Keep active tasks at the top
+level and preserve each completed task's basename, retained contents, immutable
+task ID, and target branch. The organizing infrastructure task must
+keep the relocated manifest's `path`, storage metadata, and references
+consistent with the new location, and verify that retained stored content is
+still addressable. A nested completed-task manifest is readable when its path
+matches its location and its directory basename matches its timestamp and
+current slug. Publishing a nested archived task manifest raises
+`minimum_cli_version` to at least 0.4.2 for any supported manifest schema.
+Removing a cloud-usage approval does not clear this path requirement; an older
+CLI needs an update. This does not add an archive command.
 
 ## Git versus S3
 

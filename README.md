@@ -64,6 +64,16 @@ filed: the tools the agent writes, the materials they use, and the task's own
 record of decisions, process, and hard-to-reproduce results all live inside it,
 listed in its README directory map.
 
+Active deliverable task directories stay at the repository's top level. After
+the task is done and its pull request is confirmed merged, the user may request
+that its directory be grouped under a time folder, such as `2026/`, `202607/`,
+or `2026/07/`. Organizing completed tasks is an explicitly requested
+infrastructure task, never an automatic action after merge or at turn end. If
+the user requests organization without choosing a structure, use
+`YYYY/MM/<task-dir>` based on each task directory's timestamp, unless the user
+specifies another date basis. Preserve each task's basename, retained contents,
+immutable task ID, and target branch.
+
 What leaves the task directory is curated. Every file under a task is either
 selected for publication or ignored by a rule this repository tracks, so the
 by-products of a run are not published by accident. Rules for one task belong

@@ -21,14 +21,15 @@ use crate::git::GitRepo;
 use crate::hex::encode_lower;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    AdditionalScope, CloudUsageApproval, ResolvedTask, TaskKind, one_line, published_history_path,
-    published_task_paths, validate_additional_scopes,
+    AdditionalScope, CloudUsageApproval, ResolvedTask, TaskKind, one_line, parse_task_identity,
+    published_history_path, published_task_paths, validate_additional_scopes,
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
-    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
-    REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
-    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
+    ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES,
+    BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB, REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE,
+    REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME,
+    TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
@@ -110,8 +111,8 @@ pub struct RepositoryRequirement {
     /// The declaration the publication's `.workspace-mgr.toml` carried before
     /// workspace-mgr reconciled it.
     pub previous_minimum_cli_version: Option<String>,
-    /// The task manifest schema that needs the newer release; `None` when the
-    /// change is not driven by a manifest.
+    /// The schema of the task manifest driving the newer requirement, whether
+    /// through its schema or archived path; `None` without a manifest trigger.
     pub task_manifest_schema: Option<u32>,
 }
 
@@ -2320,7 +2321,7 @@ fn reconcile_from_fork_point(
         }
         (Some((version, schema)), None) => {
             require_publishable(inputs.installed, needs, version)?;
-            return Err(missing_configuration(version, *schema));
+            return Err(missing_configuration(version, *schema, needs));
         }
         (None, Some((entry, raw))) => {
             let untouched = staged.is_some_and(|staged| staged.oid == entry.oid);
@@ -2375,7 +2376,7 @@ fn raise_staged_requirement(
     let Some(entry) = staged else {
         if let Some((version, schema)) = &required {
             require_publishable(inputs.installed, needs, version)?;
-            return Err(missing_configuration(version, *schema));
+            return Err(missing_configuration(version, *schema, needs));
         }
         return Ok(None);
     };
@@ -2488,6 +2489,12 @@ fn require_publishable(
 ) -> Result<()> {
     if let Some(other) = &needs.others {
         if !cli_version_satisfies(installed, &other.version) {
+            if other.archived {
+                return Err(Error::message(format!(
+                    "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                    other.path, other.version
+                )));
+            }
             return Err(Error::message(format!(
                 "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because its schema {} requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
                 other.path, other.schema, other.version
@@ -2496,6 +2503,12 @@ fn require_publishable(
     }
     if let Some(own) = &needs.own {
         if !cli_version_satisfies(installed, &own.version) {
+            if own.archived {
+                return Err(Error::message(format!(
+                    "this build (workspace-mgr {installed}) cannot publish {}, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                    own.path, own.version
+                )));
+            }
             return Err(Error::message(format!(
                 "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval.",
                 own.schema, own.version
@@ -2511,19 +2524,25 @@ fn require_publishable(
     Ok(())
 }
 
-fn missing_configuration(required: &Version, schema: u32) -> Error {
+fn missing_configuration(required: &Version, schema: u32, needs: &ManifestNeeds) -> Error {
+    if let Some(need) = needs.highest_need().filter(|need| need.archived) {
+        return Error::message(format!(
+            "reading archived task manifest {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
+            need.path
+        ));
+    }
     Error::message(format!(
         "task manifest schema {schema} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first"
     ))
 }
 
-/// A task manifest that needs a newer workspace-mgr than schemas without a
-/// requirement.
+/// A task manifest needing a newer workspace-mgr through its schema or path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestNeed {
     version: Version,
     schema: u32,
     path: String,
+    archived: bool,
 }
 
 /// What the task manifests in a private index need, split by whether the
@@ -2538,26 +2557,40 @@ struct ManifestNeeds {
 }
 
 impl ManifestNeeds {
-    /// The newest workspace-mgr any manifest needs, with the schema that
-    /// needs it.
+    /// The newest workspace-mgr any manifest needs, with that manifest
+    /// instance's schema.
     fn highest(&self) -> Option<(Version, u32)> {
+        self.highest_need()
+            .map(|need| (need.version.clone(), need.schema))
+    }
+
+    fn highest_need(&self) -> Option<&ManifestNeed> {
         [&self.own, &self.others]
             .into_iter()
             .flatten()
             .max_by(|left, right| left.version.cmp_precedence(&right.version))
-            .map(|need| (need.version.clone(), need.schema))
     }
 }
 
-/// What the task manifests one directory below the root of the index need.
+/// What top-level and archived task manifests in the index need. Nested copies
+/// of a manifest under ordinary output directories are not task directories.
 fn manifest_requirement(
     repo: &GitRepo,
     index: &Path,
     own_manifest: Option<&str>,
 ) -> Result<ManifestNeeds> {
-    let manifests = index_entries(repo, index, &format!(":(glob)*/{TASK_MANIFEST_NAME}"))?
+    let manifests = index_entries(repo, index, &format!(":(glob)**/{TASK_MANIFEST_NAME}"))?
         .into_iter()
         .filter(IndexEntry::is_regular_file)
+        .filter(|entry| {
+            let Some(directory) = entry.path.strip_suffix(&format!("/{TASK_MANIFEST_NAME}")) else {
+                return false;
+            };
+            match directory.rsplit_once('/') {
+                None => true,
+                Some((_, name)) => parse_task_identity(TaskKind::Deliverable, name).is_ok(),
+            }
+        })
         .collect::<Vec<_>>();
     let oids = manifests
         .iter()
@@ -2577,8 +2610,15 @@ fn manifest_requirement(
         let Some(schema) = schemas.get(&entry.oid).copied() else {
             continue;
         };
-        let Some(version) = minimum_cli_version_for_task_schema(schema) else {
-            continue;
+        let archived = entry.path.split('/').count() > 2;
+        let schema_minimum = minimum_cli_version_for_task_schema(schema);
+        let version = match (schema_minimum, archived) {
+            (Some(version), true) => {
+                highest(&ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, Some(&version))
+            }
+            (None, true) => ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION,
+            (Some(version), false) => version,
+            (None, false) => continue,
         };
         let slot = if own_manifest == Some(entry.path.as_str()) {
             &mut needs.own
@@ -2593,6 +2633,7 @@ fn manifest_requirement(
                 version,
                 schema,
                 path: entry.path,
+                archived,
             });
         }
     }
@@ -3121,6 +3162,112 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.oid)
         }
+    }
+
+    #[test]
+    fn task_status_resolves_archived_tasks_from_descendants_and_explicit_manifests() {
+        for grouping in ["2026", "202609", "2026/09"] {
+            let fixture = Fixture::new(Some(PLAIN_CONFIG));
+            let task_id = "20260918-120000-completed";
+            let directory = format!("{grouping}/{task_id}");
+            let manifest = format!("{directory}/{TASK_MANIFEST_NAME}");
+            fixture.write(
+                &manifest,
+                &format!(
+                    "schema_version = 3\nkind = \"deliverable\"\nid = \"{task_id}\"\nslug = \"completed\"\npath = \"{directory}\"\nbranch = \"codex/completed\"\ntitle = \"Completed\"\npurpose = \"Retain the completed task.\"\nadditional_scopes = []\n\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \"The user approved 2 GiB\"\n"
+                ),
+            );
+            fixture.write(&format!("{directory}/outputs/result.txt"), "retained\n");
+            fixture.commit();
+
+            let descendant = fixture.repo.root.join(&directory).join("outputs");
+            let status = task_status(&descendant, None).unwrap();
+            assert_eq!(status.task_id, task_id);
+            assert_eq!(status.branch, "codex/completed");
+            assert_eq!(status.scopes, vec![directory.clone()]);
+            assert_eq!(status.cloud_usage.limit_bytes, 2_147_483_648);
+            assert!(status.working_changes.is_empty());
+
+            fixture.write(&format!("{directory}/outputs/result.txt"), "changed\n");
+            let status =
+                task_status(&fixture.repo.root, Some(&fixture.repo.root.join(&manifest))).unwrap();
+            assert_eq!(status.task_id, task_id);
+            assert_eq!(status.working_changes.len(), 1);
+            assert!(status.working_changes[0].contains(&format!("{directory}/outputs/result.txt")));
+        }
+    }
+
+    #[test]
+    fn archived_tasks_require_a_release_that_reads_nested_paths() {
+        for grouping in ["2026", "202609", "2026/09"] {
+            for schema in [2, 3] {
+                let fixture = Fixture::new(Some(PLAIN_CONFIG));
+                let main = fixture.main.clone();
+                let directory = format!("{grouping}/20260918-120000-completed");
+                let manifest = format!("{directory}/{TASK_MANIFEST_NAME}");
+                fixture.manifest(&directory, schema);
+                fixture.manifest("20260918-120000-old/copy", 3);
+                fixture.stage(&main, &[&directory, "20260918-120000-old"]);
+
+                let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+                assert!(needs.own.is_none());
+                let other = needs.others.unwrap();
+                assert_eq!(other.path, manifest);
+                assert_eq!(other.schema, schema);
+                assert_eq!(other.version, Version::new(0, 4, 2));
+                assert!(other.archived);
+
+                let error = fixture
+                    .reconcile(&main, &main, None, false, "0.4.1")
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(&manifest), "{error}");
+                assert!(error.contains("archived task manifest requires workspace-mgr 0.4.2"));
+                assert!(!error.contains("remove the approval"));
+                assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+
+                let own =
+                    manifest_requirement(&fixture.repo, &fixture.index, Some(&manifest)).unwrap();
+                let error =
+                    require_publishable(&Version::new(0, 4, 1), &own, &Version::new(0, 4, 2))
+                        .unwrap_err()
+                        .to_string();
+                assert!(error.contains(&manifest), "{error}");
+                assert!(error.contains("archived task manifest requires workspace-mgr 0.4.2"));
+                assert!(!error.contains("remove the approval"));
+
+                assert_eq!(
+                    fixture
+                        .reconcile(&main, &main, None, false, "0.4.2")
+                        .unwrap(),
+                    Some(requirement(
+                        RequirementChange::Raise,
+                        Some("0.4.2"),
+                        None,
+                        Some(schema)
+                    ))
+                );
+                assert_eq!(
+                    fixture.staged_config().unwrap(),
+                    declaring("0.4.2", PLAIN_CONFIG)
+                );
+            }
+        }
+
+        let fixture = Fixture::new(None);
+        let main = fixture.main.clone();
+        fixture.manifest("2026/09/20260918-120000-completed", 2);
+        fixture.stage(&main, &["2026"]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.4.2")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reading archived task manifest"), "{error}");
+        assert!(error.contains("requires workspace-mgr 0.4.2"), "{error}");
+        assert!(
+            error.contains("publication has no .workspace-mgr.toml"),
+            "{error}"
+        );
     }
 
     #[test]
