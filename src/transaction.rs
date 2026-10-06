@@ -7,6 +7,8 @@ use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::archive_migration;
+
 use crate::cloud_usage::{
     CloudUsageReport, LocalUsageStatus, UsageGate, UsageInputs, blobs_at, read_blobs,
     retires_content_only,
@@ -446,6 +448,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         ..preview_policy
     };
     let pointers = dvc::discover(&repo, &scopes)?;
+    let archived_pointers = archive_migration::pointer_set(&repo, &scopes)?;
+    let ordinary_pointers = pointers
+        .iter()
+        .filter(|pointer| !archived_pointers.contains(*pointer))
+        .cloned()
+        .collect::<Vec<_>>();
     if !dry_run {
         let preflight_outputs = dvc::output_paths(&repo, &pointers)?;
         let preflight_index = state_dir.join("preflight-index");
@@ -470,13 +478,33 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     }
     // The metadata as the storage engine finds it, so that a refusal before
     // the upload leaves the worktree as the publication found it.
+    let archive_receipts = if dry_run {
+        archive_migration::receipts(&repo, &scopes)?
+            .into_iter()
+            .map(|(_, receipt)| receipt)
+            .collect()
+    } else {
+        archive_migration::prepare(&repo, &config, &scopes, &base_oid)?
+    };
     let uncommitted_metadata = if dry_run {
         Vec::new()
     } else {
         read_metadata(&repo, &pointers)?
     };
-    let mut s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
+    let mut s3 = dvc::reconcile(&repo, &config, &ordinary_pointers, dry_run)?;
     if !dry_run {
+        stage_scopes(&repo, &preview_index, &scopes)?;
+        remove_stored_outputs_from_index(
+            &repo,
+            &preview_index,
+            &dvc::output_paths(&repo, &pointers)?,
+        )?;
+        remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
+        let committed_tree = repo
+            .run_with_index(&preview_index, ["write-tree"], None, true)?
+            .stdout
+            .trim()
+            .to_owned();
         // Background writers may have changed outputs since the preview and
         // the gate; the committed metadata is exactly what the upload would
         // send, so both judge it again before anything is uploaded.
@@ -493,6 +521,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
                 &repo,
                 &config,
                 &UsageInputs {
+                    projected_tree_oid: &committed_tree,
                     pointers: &pointers,
                     automatic_s3: &[],
                     inspect_outputs: false,
@@ -514,6 +543,14 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             );
         }
         dvc::push_outputs(&repo, &config, &mut s3)?;
+    }
+    // Copied archive versions already exist remotely and may be deliberately
+    // unmaterialized. Never let native DVC push manufacture replacement versions.
+    let archived = archived_pointers.into_iter().collect::<Vec<_>>();
+    s3.outputs.extend(dvc::output_paths(&repo, &archived)?);
+    s3.files.extend(archived.iter().cloned());
+    if !dry_run {
+        s3.pushed.extend(archived);
     }
     let mut purge_preview = s3_purge::preview(&repo)?;
     if !local_only.is_empty() {
@@ -541,6 +578,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         "local_only": local_only,
         "s3": s3,
         "purge": purge_preview,
+        "archive": archive_receipts,
     });
 
     let index = state_dir.join("index");
@@ -701,8 +739,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .stdout
         .trim()
         .to_owned();
-    let purge_candidates =
+    let mut purge_candidates =
         s3_purge::candidates_between(&repo, &config, &base_oid, &commit_oid, &scopes)?;
+    purge_candidates.extend(archive_migration::purge_candidates(&archive_receipts)?);
+    purge_candidates.sort();
+    purge_candidates.dedup();
     s3_purge::queue(&repo, &purge_candidates)?;
     let local_ref = format!("refs/heads/{}", task.branch);
     let old_local_oid = repo.optional_oid(&local_ref)?;
@@ -1219,7 +1260,10 @@ fn deliverable_task_path(task: &ResolvedTask) -> Option<&str> {
 /// rules. Every other path inside the task directory is content the task
 /// produced.
 fn is_housekeeping_name(name: &str) -> bool {
-    name == "README.md" || name == TASK_MANIFEST_NAME || name == ".gitignore"
+    name == "README.md"
+        || name == TASK_MANIFEST_NAME
+        || name == ".gitignore"
+        || name == crate::archive_migration::RECEIPT_NAME
 }
 
 fn is_markdown(path: &str) -> bool {
@@ -1836,6 +1880,9 @@ fn check_large_files(
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     for relative in repo.visible_paths(scopes)? {
+        if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)) {
+            continue;
+        }
         if storage::is_local(repo, &relative)? {
             continue;
         }
@@ -3214,7 +3261,7 @@ mod tests {
                 let other = needs.others.unwrap();
                 assert_eq!(other.path, manifest);
                 assert_eq!(other.schema, schema);
-                assert_eq!(other.version, Version::new(0, 4, 2));
+                assert_eq!(other.version, Version::new(0, 5, 0));
                 assert!(other.archived);
 
                 let error = fixture
@@ -3222,34 +3269,34 @@ mod tests {
                     .unwrap_err()
                     .to_string();
                 assert!(error.contains(&manifest), "{error}");
-                assert!(error.contains("archived task manifest requires workspace-mgr 0.4.2"));
+                assert!(error.contains("archived task manifest requires workspace-mgr 0.5.0"));
                 assert!(!error.contains("remove the approval"));
                 assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
 
                 let own =
                     manifest_requirement(&fixture.repo, &fixture.index, Some(&manifest)).unwrap();
                 let error =
-                    require_publishable(&Version::new(0, 4, 1), &own, &Version::new(0, 4, 2))
+                    require_publishable(&Version::new(0, 4, 1), &own, &Version::new(0, 5, 0))
                         .unwrap_err()
                         .to_string();
                 assert!(error.contains(&manifest), "{error}");
-                assert!(error.contains("archived task manifest requires workspace-mgr 0.4.2"));
+                assert!(error.contains("archived task manifest requires workspace-mgr 0.5.0"));
                 assert!(!error.contains("remove the approval"));
 
                 assert_eq!(
                     fixture
-                        .reconcile(&main, &main, None, false, "0.4.2")
+                        .reconcile(&main, &main, None, false, "0.5.0")
                         .unwrap(),
                     Some(requirement(
                         RequirementChange::Raise,
-                        Some("0.4.2"),
+                        Some("0.5.0"),
                         None,
                         Some(schema)
                     ))
                 );
                 assert_eq!(
                     fixture.staged_config().unwrap(),
-                    declaring("0.4.2", PLAIN_CONFIG)
+                    declaring("0.5.0", PLAIN_CONFIG)
                 );
             }
         }
@@ -3259,11 +3306,11 @@ mod tests {
         fixture.manifest("2026/09/20260918-120000-completed", 2);
         fixture.stage(&main, &["2026"]);
         let error = fixture
-            .reconcile(&main, &main, None, false, "0.4.2")
+            .reconcile(&main, &main, None, false, "0.5.0")
             .unwrap_err()
             .to_string();
         assert!(error.contains("reading archived task manifest"), "{error}");
-        assert!(error.contains("requires workspace-mgr 0.4.2"), "{error}");
+        assert!(error.contains("requires workspace-mgr 0.5.0"), "{error}");
         assert!(
             error.contains("publication has no .workspace-mgr.toml"),
             "{error}"

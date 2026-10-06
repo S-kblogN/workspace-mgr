@@ -17,7 +17,7 @@ pub const INSTRUCTION_POLICY_VERSION: u32 = 12;
 /// adds the optional `[cloud_usage_approval]` table.
 pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 0);
 /// The first release that reads task manifests below date-grouping directories.
-pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 2);
+pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 
 pub const REVIEW_PULL_REQUEST: &str = "required";
 pub const REVIEW_INITIAL_STATE: &str = "draft";

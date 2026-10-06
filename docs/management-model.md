@@ -85,6 +85,13 @@ trigger this organization automatically. When the user requests organization
 without specifying a structure, use `YYYY/MM/<task-dir>` from each directory's
 timestamp, unless the user specifies another date basis. Preserve the task
 directory's basename, retained contents, immutable task ID, and target branch.
+Use `workspace-mgr archive --dry-run` for the candidate and scope preview,
+then `workspace-mgr archive` in the scoped infrastructure worktree and the
+normal plan/publish flow. The CLI moves the directories and migrates complete
+S3 version histories with new storage bindings and durable historical mappings;
+agents do not perform those moves manually. After verified Git publication,
+cleanup retires only mapped source versions once live references release the
+original task. Concurrent source additions remain untouched.
 
 Reading and ownership are separate. Any chat may inspect any repository path
 when useful for context, including another chat's task directory. Reading a

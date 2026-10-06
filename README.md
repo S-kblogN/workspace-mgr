@@ -74,6 +74,14 @@ the user requests organization without choosing a structure, use
 specifies another date basis. Preserve each task's basename, retained contents,
 immutable task ID, and target branch.
 
+Use `archive --dry-run` to inspect eligible tasks and the required source
+and destination scopes, then apply `archive` in that infrastructure task.
+The command moves local directories; normal publication copies and verifies
+their complete retained S3 history, rewrites storage metadata, and records
+durable exact-version mappings before obsolete source objects are purged.
+Historical Git snapshots remain readable through `workspace-mgr storage
+hydrate`, including after their original S3 versions have moved.
+
 What leaves the task directory is curated. Every file under a task is either
 selected for publication or ignored by a rule this repository tracks, so the
 by-products of a run are not published by accident. Rules for one task belong

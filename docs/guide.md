@@ -678,15 +678,37 @@ The user may choose a structure such as `YYYY/<task-dir>`,
 structure, use `YYYY/MM/<task-dir>` based on each task directory's timestamp,
 unless the user specifies another date basis. Keep active tasks at the top
 level and preserve each completed task's basename, retained contents, immutable
-task ID, and target branch. The organizing infrastructure task must
-keep the relocated manifest's `path`, storage metadata, and references
-consistent with the new location, and verify that retained stored content is
-still addressable. A nested completed-task manifest is readable when its path
-matches its location and its directory basename matches its timestamp and
-current slug. Publishing a nested archived task manifest raises
-`minimum_cli_version` to at least 0.4.2 for any supported manifest schema.
-Removing a cloud-usage approval does not clear this path requirement; an older
-CLI needs an update. This does not add an archive command.
+task ID, and target branch. Inspect the request first:
+
+```sh
+workspace-mgr archive --dry-run
+```
+
+With no paths, the command scans top-level deliverable tasks and skips active
+or unverified tasks. Naming an active task explicitly refuses the operation.
+The preview reports merged-task evidence, proposed destinations, complete S3
+history, and the source and destination paths to declare in an infrastructure
+task. It changes no repository content or remote. From that task's isolated
+worktree, run `archive`, then the normal `plan` and `publish` flow.
+`--layout '{year}'` and `--layout '{year}{month}'` select the other example
+structures; the default `{year}/{month}` uses each task's creation timestamp.
+
+Archive moves the local directory and manifest together. Publication copies
+the complete retained S3 history, including old versions, delete markers, and
+retired paths, verifies it, and rewrites storage metadata automatically. Its
+receipt records original and destination keys, version IDs, and timestamps;
+the S3 registry makes those mappings available to older Git snapshots. Source
+history is purged only after Git publication and while no live remote branch
+or tag protects it. The copied history counts toward the infrastructure task's
+cloud-usage limit. Materialized local-only content must be preserved or
+returned to tracked storage before organization.
+
+To hydrate a historical Git checkout after source cleanup, use
+`workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
+the archive registry. Publishing nested archived task state raises the minimum
+CLI requirement to 0.5.0 for any supported manifest schema. Removing a
+cloud-usage approval does not clear this path requirement; an older CLI needs
+an update.
 
 ## Git versus S3
 
@@ -721,6 +743,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
+| `archive` | Moves completed directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads GitHub merge evidence, Git refs, and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
 | `task approve-cloud-usage` | Rewrites the task manifest with the user's approval | None | None |

@@ -55,6 +55,7 @@ class S3Transport:
     def __init__(self, latency=0.003):
         self.latency = latency
         self.versions = []
+        self.archive_registries = {}
         self.overrides = {}
         self.deny_listing = False
         self.allow_legacy_probe = False
@@ -107,6 +108,10 @@ class S3Transport:
                 return {"KeyCount": len(current), "Contents": [{"Key": entry["Key"], "Size": entry["Size"]} for entry in current[:params.get("MaxKeys", 1000)]]}
             if method not in ("head_object", "get_object"):
                 raise AssertionError(f"unexpected S3 operation: {method}")
+            if method == "get_object" and params["Key"].startswith("storage/.workspace-mgr/archive/"):
+                if params["Key"] not in self.archive_registries:
+                    raise FileNotFoundError(params["Key"])
+                return {"Body": ResponseBody(self.archive_registries[params["Key"]])}
             # A successful current-object fallback would conceal a serious bug.
             if not params.get("VersionId"):
                 if self.allow_legacy_probe and method == "head_object" and params["Key"] == "storage":
@@ -170,6 +175,10 @@ class S3Transport:
     def count(self, method):
         return sum(name == method for name, _ in self.calls)
 
+    def payload_gets(self):
+        return [params for method, params in self.calls
+                if method == "get_object" and params.get("VersionId")]
+
 
 @unittest.skipUnless(HAS_STORAGE_RUNTIME, "requires the pinned DVC + s3fs storage runtime")
 class DvcVersionStoreIntegrationTests(unittest.TestCase):
@@ -204,6 +213,7 @@ class DvcVersionStoreIntegrationTests(unittest.TestCase):
             )
         )
         self.transport = S3Transport()
+        self.pending_receipts = []
         transport = self.transport
 
         async def session(_raw_fs, *args, **kwargs):
@@ -282,9 +292,8 @@ class DvcVersionStoreIntegrationTests(unittest.TestCase):
 
     def run_store(self, fetch=True):
         output = io.StringIO()
-        argv = [str(self.repo_path), json.dumps([self.pointer.name])]
-        if fetch:
-            argv.append("--fetch")
+        argv = [str(self.repo_path), json.dumps([str(self.pointer.relative_to(self.repo_path))]),
+                "--fetch" if fetch else "--verify", json.dumps(self.pending_receipts)]
         with redirect_stdout(output):
             result = self.store.main(argv)
         self.assertIsInstance(result, dict)
@@ -296,6 +305,114 @@ class DvcVersionStoreIntegrationTests(unittest.TestCase):
         for relative, expected in self.expected.items():
             actual = (self.payload / relative) if relative else self.payload
             self.assertEqual(actual.read_bytes(), expected)
+
+    def archive_recorded_versions(self):
+        """Keep the old Git pointer, but expose its exact versions only at new keys."""
+        source = self.payload.name
+        destination = f"2026/07/{source}"
+        rows = []
+        for original in tuple(self.object_entries):
+            new_key = "storage/" + destination + original["Key"][len("storage/" + source):]
+            copied = self.transport.add(new_key, "archived-" + original["VersionId"], original["body"])
+            # Copying an encrypted/multipart object may change its native ETag.
+            copied["ETag"] = '"copied-etag-' + original["VersionId"] + '"'
+            rows.append({
+                "source_object": original["Key"][len("storage/"):],
+                "destination_object": new_key[len("storage/"):],
+                "source_version_id": original["VersionId"],
+                "destination_version_id": copied["VersionId"],
+                "source_etag": original["ETag"].strip('"'),
+                "destination_etag": copied["ETag"].strip('"'),
+                "size": original["Size"], "delete_marker": False,
+            })
+            self.transport.versions.remove(original)
+        value = {
+            "schema_version": 1, "status": "copied", "source": source,
+            "destination": destination, "remote": "workspace-mgr",
+            "bucket": "test-bucket", "remote_prefix": "storage", "versions": rows,
+        }
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        self.transport.archive_registries[f"storage/.workspace-mgr/archive/{digest}.json"] = json.dumps(value).encode()
+        return rows
+
+    def test_old_git_cold_directory_hydrates_archived_exact_versions(self):
+        self.make_repo(2)
+        original_pointer = self.pointer.read_bytes()
+        rows = self.archive_recorded_versions()
+        self.run_store()
+        self.checkout_and_assert()
+        self.assertEqual(self.pointer.read_bytes(), original_pointer)
+        retrieved = {(params["Key"], params["VersionId"]) for params in self.transport.payload_gets()}
+        for row in rows:
+            self.assertIn(("storage/" + row["destination_object"], row["destination_version_id"]), retrieved)
+
+    def test_pending_local_archive_hydrates_original_versions_before_publication(self):
+        self.make_repo(2)
+        source = self.repo_path / "task"
+        source.mkdir()
+        shutil.move(self.pointer, source / self.pointer.name)
+        rows = []
+        for original in self.object_entries:
+            original["Key"] = "storage/task/" + original["Key"][len("storage/"):]
+            object_name = original["Key"][len("storage/"):]
+            rows.append({
+                "source_object": object_name,
+                "destination_object": "2026/07/" + object_name,
+                "source_version_id": original["VersionId"],
+                "source_etag": original["ETag"].strip('"'),
+                "size": original["Size"], "delete_marker": False,
+            })
+        destination = self.repo_path / "2026/07/task"
+        destination.parent.mkdir(parents=True)
+        shutil.move(source, destination)
+        self.pointer = destination / self.pointer.name
+        self.payload = destination / "data"
+        self.pending_receipts = [{
+            "schema_version": 1, "status": "planned", "source": "task",
+            "destination": "2026/07/task", "remote": "workspace-mgr",
+            "bucket": "test-bucket", "remote_prefix": "storage", "versions": rows,
+        }]
+        before_pointer = self.pointer.read_bytes()
+        self.run_store()
+        self.checkout_and_assert()
+        self.assertEqual(self.pointer.read_bytes(), before_pointer)
+        self.assertEqual(self.transport.archive_registries, {})
+        self.assertEqual(
+            {(params["Key"], params["VersionId"]) for params in self.transport.payload_gets()},
+            {("storage/" + row["source_object"], row["source_version_id"]) for row in rows},
+        )
+
+    def test_old_git_warm_directory_verifies_archive_despite_existing_cache(self):
+        self.make_repo(2, warm=True)
+        self.archive_recorded_versions()
+        self.run_store()
+        self.assertEqual(self.transport.payload_gets(), [])
+        self.assertEqual(self.transport.count("head_object"), 4)
+        self.checkout_and_assert()
+
+    def test_archived_destination_corrupt_bytes_never_enter_historical_cache(self):
+        self.make_repo(1)
+        rows = self.archive_recorded_versions()
+        row = rows[0]
+        self.transport.overrides[("storage/" + row["destination_object"], row["destination_version_id"])] = {
+            "Body": ResponseBody(b"X" * row["size"]),
+        }
+        with self.assertRaisesRegex(RuntimeError, "downloaded content hash mismatch"):
+            self.run_store()
+        self.assertFalse(self.cache_files[0].exists())
+        self.assertFalse(self.payload.exists())
+
+    def test_archived_destination_wrong_size_never_enters_historical_cache(self):
+        self.make_repo(1)
+        rows = self.archive_recorded_versions()
+        row = rows[0]
+        self.transport.overrides[("storage/" + row["destination_object"], row["destination_version_id"])] = {
+            "ContentLength": row["size"] + 1,
+        }
+        with self.assertRaisesRegex(RuntimeError, "mismatched size"):
+            self.run_store()
+        self.assertFalse(self.cache_files[0].exists())
+        self.assertFalse(self.payload.exists())
 
     def test_cold_single_file_uses_one_exact_get_and_checks_out(self):
         self.make_repo(directory=False)
@@ -375,6 +492,22 @@ class DvcVersionStoreIntegrationTests(unittest.TestCase):
         self.assert_staging_cleaned(cache_root, staged)
         self.assertFalse(self.payload.exists())
 
+    def test_local_staging_failure_does_not_trigger_archive_lookup(self):
+        self.make_repo(1)
+
+        def missing_destination(path, mode="r", *args, **kwargs):
+            if mode == "wb":
+                raise FileNotFoundError("local staging directory disappeared")
+            return builtins.open(path, mode, *args, **kwargs)
+
+        self.stack.enter_context(mock.patch.object(self.store, "open", missing_destination, create=True))
+        with self.assertRaisesRegex(FileNotFoundError, "local staging directory"):
+            self.run_store()
+        self.assertEqual(self.transport.count("get_object"), 1)
+        self.assertTrue(all(params.get("VersionId") for method, params in self.transport.calls
+                            if method == "get_object"))
+        self.assertFalse(self.cache_files[0].exists())
+
     def test_warm_directory_verifies_historical_versions_with_one_listing(self):
         self.make_repo(16, warm=True)
         for entry in tuple(self.object_entries):
@@ -411,7 +544,7 @@ class DvcVersionStoreIntegrationTests(unittest.TestCase):
         self.transport.versions.remove(self.object_entries[0])
         with self.assertRaises(RuntimeError):
             self.run_store()
-        self.assertEqual(self.transport.count("get_object"), 0)
+        self.assertEqual(self.transport.payload_gets(), [])
         self.assertFalse(self.payload.exists())
 
     def test_requested_delete_marker_is_not_accepted_as_object_data(self):
@@ -419,7 +552,7 @@ class DvcVersionStoreIntegrationTests(unittest.TestCase):
         self.object_entries[0]["delete_marker"] = True
         with self.assertRaises(RuntimeError):
             self.run_store()
-        self.assertEqual(self.transport.count("get_object"), 0)
+        self.assertEqual(self.transport.payload_gets(), [])
         self.assertFalse(self.payload.exists())
 
     def test_cold_missing_version_preserves_existing_payload(self):

@@ -84,7 +84,7 @@ release, a repository declares the oldest compatible release in
   raises.
 - Product policy maps each task manifest schema to the oldest release that
   reads it: top-level manifests with schemas 1 and 2 need no declaration, and
-  schema 3 needs 0.4.0. A nested archive task manifest needs 0.4.2 regardless
+  schema 3 needs 0.4.0. A nested archive task manifest needs 0.5.0 regardless
   of its schema; publication uses the higher schema or path requirement.
   Writers use the lowest schema that represents a manifest, so only a task that
   records a cloud-usage approval produces schema 3.
@@ -203,6 +203,35 @@ S3 below 1 MiB remains valid but reports an efficiency warning based on the
 aggregate materialized boundary size.
 
 ## Scoped publication
+
+`archive` is a separate transition for completed deliverable tasks. It checks
+merged GitHub pull-request evidence against the fetched shared branch, retains
+task identity, and prepares a date-grouped directory with an immutable source
+inventory in `.workspace-mgr-archive.json`. It requires an explicitly requested
+infrastructure task and both source and destination scopes. The default layout
+is `{year}/{month}` from the original task timestamp; active tasks stay at the
+top level. No merge or synchronization hook invokes it automatically.
+
+Publication measures the full inventory before copying any S3 version. The
+transport copies all payload versions and recreates delete markers, including
+objects absent from current DVC pointers, with a durable private retry journal.
+It preserves literal S3 keys and records original timestamps plus the new exact
+VersionIds and ETags. DVC file and directory entries are rewritten without
+changing their content hashes. The complete receipt remains in Git even when
+large; it is storage control metadata and may not be untracked or placed in S3.
+An identical canonical receipt under the remote's
+`.workspace-mgr/archive/<source-prefix-sha256>.json` makes old Git revisions
+addressable independently of their checked-out files. Historical hydration
+follows bounded mappings only after an exact original version is missing,
+preserving hash and size checks. Planned local pointers can read their original
+exact versions before publication.
+
+Only after Git push verification are mapped source versions queued for cleanup.
+A live branch or tag containing the original task manifest protects the whole
+source prefix. Cleanup deletes only the exact copied versions; concurrent
+unmapped additions remain and are reported. Native DVC does not interpret the
+canonical archive mappings, so old revisions use workspace-mgr hydration after
+their original versions have been retired.
 
 `task rename` is a local identity-preserving transition. It moves an ordinary
 task directory as one filesystem unit and atomically rewrites manifest schema

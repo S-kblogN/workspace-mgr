@@ -5,7 +5,7 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-10-06
+## [0.5.0] - 2026-10-06
 
 ### Changed
 
@@ -22,8 +22,19 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Task manifests can be read from completed-task archive folders while still
   validating the task directory's basename, identity, and declared location.
   Archived task manifests participate in publication's minimum CLI version
-  checks and require workspace-mgr 0.4.2 or newer, so reorganizing old tasks
+  checks and require workspace-mgr 0.5.0 or newer, so reorganizing old tasks
   does not hide their compatibility requirements.
+
+### Added
+
+- `archive` previews eligible merged tasks and organizes their directories
+  through a user-requested infrastructure task, with flexible time layouts and
+  a default of `YYYY/MM/<task-dir>`. Active tasks remain at the top level.
+- Archive publication copies complete retained S3 history, including delete
+  markers and retired paths, verifies destination versions, and rewrites DVC
+  metadata automatically. Durable exact-version mappings let `storage hydrate`
+  recover historical Git snapshots after protected source cleanup; receipts
+  retain original and destination identities and timestamps.
 
 ## [0.4.1] - 2026-09-27
 

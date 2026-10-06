@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import json
 from pathlib import Path, PurePosixPath
@@ -20,9 +20,14 @@ import tempfile
 VERIFY_WORKERS = 16
 LIST_MIN_ENTRIES = 8
 LIST_PAGE_LIMIT = 2
+MAX_ARCHIVE_HOPS = 32
 
 
 class VersionMismatch(RuntimeError):
+    pass
+
+
+class MissingObjectVersion(RuntimeError):
     pass
 
 
@@ -93,7 +98,101 @@ def listing_unavailable(error):
     )
 
 
-def verify_entries(raw_fs, bucket, entries):
+def missing_object(error):
+    code = (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
+    if code is not None:
+        return code in ("NoSuchKey", "NoSuchVersion", "NotFound", "404")
+    return isinstance(error, FileNotFoundError)
+
+
+def archive_destination(entry, registry, seen):
+    """Resolve only a proven missing exact version; retain its content hash."""
+    identity = (entry.key, entry.version_id)
+    if identity in seen or len(seen) >= MAX_ARCHIVE_HOPS:
+        raise RuntimeError("historical archive mapping is cyclic or exceeds its hop limit")
+    seen.add(identity)
+    mapping = registry.lookup(entry.key, entry.version_id)
+    if mapping is None:
+        return None
+    if entry.size is not None and mapping["size"] != entry.size:
+        raise VersionMismatch("historical archive mapping has mismatched size")
+    if entry.etag and mapping.get("source_etag") and (
+        normalized_etag(entry.etag) != normalized_etag(mapping["source_etag"])
+    ):
+        raise VersionMismatch("historical archive mapping has mismatched source etag")
+    return replace(
+        entry, key=mapping["destination_key"],
+        version_id=mapping["destination_version_id"],
+        etag=normalized_etag(mapping["destination_etag"]),
+    )
+
+
+def pending_archive_entries(entries, receipts, bucket, remote_prefix):
+    """Read moved, unpublished outputs from their original pinned objects."""
+    from dvc_archive_registry import full_key, relative_object, relative_path
+
+    if not isinstance(receipts, list):
+        raise RuntimeError("pending archive context must be a list of receipts")
+    aliases = {}
+    remote_prefix = remote_prefix.rstrip("/")
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            raise RuntimeError("invalid pending archive receipt")
+        if receipt.get("status") == "copied":
+            continue
+        if receipt.get("status") != "planned" or receipt.get("schema_version") != 1:
+            raise RuntimeError("invalid pending archive receipt state")
+        if (receipt.get("bucket"), receipt.get("remote_prefix"), receipt.get("remote")) != (
+            bucket, remote_prefix, "workspace-mgr",
+        ):
+            raise RuntimeError("pending archive receipt selects another storage location")
+        source = relative_path(receipt.get("source"), "source")
+        destination = relative_path(receipt.get("destination"), "destination")
+        if (source == destination or source.startswith(destination + "/")
+                or destination.startswith(source + "/")
+                or source.rsplit("/", 1)[-1] != destination.rsplit("/", 1)[-1]):
+            raise RuntimeError("invalid pending archive task prefixes")
+        versions = receipt.get("versions")
+        if not isinstance(versions, list):
+            raise RuntimeError("pending archive receipt has no version snapshot")
+        for row in versions:
+            if not isinstance(row, dict) or not isinstance(row.get("delete_marker"), bool):
+                raise RuntimeError("invalid pending archive version")
+            old = relative_object(row.get("source_object"), "source object")
+            new = relative_object(row.get("destination_object"), "destination object")
+            if not old.startswith(source + "/") or new != destination + old[len(source):]:
+                raise RuntimeError("pending archive version escapes its task prefixes")
+            version = row.get("source_version_id")
+            if not isinstance(version, str) or not version:
+                raise RuntimeError("pending archive version has no exact source version")
+            if row["delete_marker"]:
+                continue
+            size, etag = row.get("size"), row.get("source_etag")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise RuntimeError("pending archive version has no valid size")
+            if not isinstance(etag, str) or not etag:
+                raise RuntimeError("pending archive version has no source etag")
+            identity = (full_key(remote_prefix, new), version)
+            alias = (full_key(remote_prefix, old), size, normalized_etag(etag))
+            if identity in aliases and aliases[identity] != alias:
+                raise RuntimeError("conflicting pending archive version aliases")
+            aliases[identity] = alias
+    result = []
+    for entry in entries:
+        alias = aliases.get((entry.key, entry.version_id))
+        if alias is None:
+            result.append(entry)
+            continue
+        key, size, etag = alias
+        if entry.size is not None and entry.size != size:
+            raise VersionMismatch("pending archive alias has mismatched size")
+        if entry.etag and normalized_etag(entry.etag) != etag:
+            raise VersionMismatch("pending archive alias has mismatched etag")
+        result.append(replace(entry, key=key, etag=etag))
+    return result
+
+
+def verify_entries(raw_fs, bucket, entries, registry=None):
     """Read at most two pages per dense parent prefix, then exact HEADs.
 
     Listings establish metadata presence, not object-read permission. Downloads
@@ -150,17 +249,31 @@ def verify_entries(raw_fs, bucket, entries):
         failures.extend(mismatches)
 
     def head(entry):
-        try:
-            info = raw_fs.call_s3(
-                "head_object", Bucket=bucket, Key=entry.key, VersionId=entry.version_id
-            )
-        except FileNotFoundError:
-            return f"missing version: {entry.object_name}"
-        try:
-            validate_info(entry, info)
-        except VersionMismatch as error:
-            return str(error)
-        return None
+        current = entry
+        seen = set()
+        while True:
+            try:
+                info = raw_fs.call_s3(
+                    "head_object", Bucket=bucket, Key=current.key,
+                    VersionId=current.version_id,
+                )
+            except Exception as error:
+                if not missing_object(error):
+                    raise
+                if registry is None:
+                    return f"missing version: {entry.object_name}"
+                try:
+                    current = archive_destination(current, registry, seen)
+                except VersionMismatch as mismatch:
+                    return str(mismatch)
+                if current is None:
+                    return f"missing version: {entry.object_name}"
+                continue
+            try:
+                validate_info(current, info)
+            except VersionMismatch as error:
+                return str(error)
+            return None
 
     failures.extend(error for error in bounded_map(head, remaining) if error)
     if failures:
@@ -246,7 +359,7 @@ def content_matches(entry, path):
     return digest.value == entry.md5 and (entry.size is None or meta.size == entry.size)
 
 
-def fetch_entries(raw_fs, bucket, entries, trees):
+def fetch_entries(raw_fs, bucket, entries, trees, registry=None):
     from fsspec.asyn import sync
     from dvc_objects.fs import localfs
     from dvc_data.hashfile.db import add_update_tree
@@ -256,7 +369,7 @@ def fetch_entries(raw_fs, bucket, entries, trees):
     for entry in entries:
         (cached if content_matches(entry, entry.cache_path) else missing).append(entry)
     # Cached bytes alone do not prove that their published remote version exists.
-    verify_entries(raw_fs, bucket, cached)
+    verify_entries(raw_fs, bucket, cached, registry=registry)
 
     with ExitStack() as cleanup:
         scratch = {}
@@ -277,7 +390,12 @@ def fetch_entries(raw_fs, bucket, entries, trees):
             for attempt in range(3):
                 body = None
                 try:
-                    response = await raw_fs._call_s3("get_object", **kwargs)
+                    try:
+                        response = await raw_fs._call_s3("get_object", **kwargs)
+                    except Exception as error:
+                        if missing_object(error):
+                            raise MissingObjectVersion(entry.object_name) from error
+                        raise
                     body = response["Body"]
                     validate_info(entry, response)
                     count = 0
@@ -298,10 +416,23 @@ def fetch_entries(raw_fs, bucket, entries, trees):
         def download(item):
             index, entry = item
             destination = str(Path(scratch[entry.cache.path]) / str(index))
-            try:
-                sync(raw_fs.loop, read, entry, destination)
-            except FileNotFoundError as error:
-                raise RuntimeError(f"version-aware object version is missing: {entry.object_name}") from error
+            current = entry
+            seen = set()
+            while True:
+                try:
+                    sync(raw_fs.loop, read, current, destination)
+                except MissingObjectVersion as error:
+                    if registry is None:
+                        raise RuntimeError(
+                            f"version-aware object version is missing: {entry.object_name}"
+                        ) from error
+                    current = archive_destination(current, registry, seen)
+                    if current is None:
+                        raise RuntimeError(
+                            f"version-aware object version is missing: {entry.object_name}"
+                        ) from error
+                    continue
+                break
             if not content_matches(entry, destination):
                 raise RuntimeError(f"downloaded content hash mismatch: {entry.object_name}")
             return entry, destination
@@ -323,6 +454,7 @@ def main(argv=None):
     repo_path = Path(argv[0])
     pointers = json.loads(argv[1])
     operation = argv[2] if len(argv) > 2 else "--verify"
+    pending_receipts = json.loads(argv[3]) if len(argv) > 3 else []
     if operation not in ("--verify", "--fetch", "--check-versioning-only"):
         raise RuntimeError(f"unknown version adapter operation: {operation}")
     with DvcRepo(str(repo_path)) as repo:
@@ -330,7 +462,7 @@ def main(argv=None):
         if not remote.fs.version_aware:
             raise RuntimeError(f"configured remote {remote.name!r} is not version-aware")
         raw_fs = remote.fs.fs
-        bucket, _, _ = raw_fs.split_path(remote.path)
+        bucket, remote_prefix, _ = raw_fs.split_path(remote.path)
         if not bucket:
             raise RuntimeError("configured S3 remote does not name a bucket")
         if not raw_fs.is_bucket_versioned(bucket):
@@ -339,11 +471,34 @@ def main(argv=None):
             result = {"mode": "bucket-versioning", "remote": remote.name,
                       "bucket": bucket, "status": "enabled"}
         else:
+            try:
+                from dvc_archive_registry import ArchiveRegistry
+            except ModuleNotFoundError as error:
+                if error.name != "dvc_archive_registry" or "__file__" not in globals():
+                    raise
+                # Standalone/importlib tests load this asset without putting
+                # its directory on sys.path. Embedded Rust adapters preload it.
+                import importlib.util
+
+                registry_path = Path(__file__).with_name("dvc_archive_registry.py")
+                spec = importlib.util.spec_from_file_location(
+                    "dvc_archive_registry", registry_path,
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("historical archive registry adapter is unavailable")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                ArchiveRegistry = module.ArchiveRegistry
             bucket, entries, trees = collect_entries(repo, remote, pointers)
+            entries = pending_archive_entries(
+                entries, pending_receipts, bucket, remote_prefix,
+            )
+            registry = ArchiveRegistry(raw_fs, bucket, remote_prefix)
             if operation == "--fetch":
-                fetch_entries(raw_fs, bucket, entries, trees)
+                fetch_entries(raw_fs, bucket, entries, trees, registry=registry)
             else:
-                verify_entries(raw_fs, bucket, entries)
+                verify_entries(raw_fs, bucket, entries, registry=registry)
             result = {"mode": "version-aware", "remote": remote.name,
                       "checked_objects": sorted({entry.object_name for entry in entries})}
         print(json.dumps(result, sort_keys=True))

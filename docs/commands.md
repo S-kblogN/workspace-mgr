@@ -329,6 +329,68 @@ workspace-mgr plan
 workspace-mgr publish -m "Rename the task for its current topic"
 ```
 
+## `workspace-mgr archive`
+
+Organize completed deliverable task directories through a user-requested
+repository-infrastructure task.
+
+```text
+workspace-mgr archive [<task-path> ...]
+  [--layout <template>] [--repo <path>] [--manifest <path>] [--dry-run]
+```
+
+With no paths, inspect top-level deliverable directories and skip tasks without
+a verified merged pull request. An explicitly named active or unverified task
+is refused. Verification uses GitHub pull-request evidence for the task's
+branch, immutable identity, configured base branch, and reachable merge commit;
+`gh` must be installed and able to read the repository. Active task directories
+stay at the top level, and merge or turn-end synchronization never runs archive
+automatically.
+
+`--layout` uses `{year}` and `{month}` from each task directory's creation
+timestamp. The default is `{year}/{month}`; `{year}` and `{year}{month}` also
+work. The rendered relative path must include the year and must not target
+hidden repository-control directories. The task directory's basename, retained
+contents, immutable ID, and target branch are preserved.
+
+Run `--dry-run` from the shared checkout or an infrastructure task to inspect
+`tasks`, `skipped`, and `required_scopes`. It fetches Git evidence and reads
+versioned S3 history but changes no repository content or remote. Applying
+archive requires an infrastructure task with both source and destination paths
+declared. The command moves complete local directories, updates manifest paths,
+and writes `.workspace-mgr-archive.json` migration receipts. It writes neither
+Git nor S3 remotes. It refuses destination collisions, source state that differs
+from the shared branch, staged or untracked overlays, changed materialized S3
+payloads, and materialized local-only content that must first be preserved or
+returned to tracked storage.
+
+The normal `plan` and `publish` flow handles the migration. Publication copies
+every retained data version and delete marker under the source task prefix,
+including superseded versions and retired paths absent from current storage
+pointers. It verifies destination versions, rewrites standalone and directory
+managed-storage cloud metadata automatically, and publishes the archive
+registry before publishing Git. Content hashes and file sizes stay fixed;
+copied versions and recreated markers receive new native IDs and timestamps,
+which the receipt maps to their originals. Copying history is charged to the
+infrastructure task's cloud-usage projection, so its full retained history must
+fit that task's approved limit before migration starts.
+
+Only after Git publication may source history be purged, and current remote
+branch or tag references defer that cleanup. A failed publication preserves
+source history and retry journals. Historical Git checkouts use
+`workspace-mgr storage hydrate` to resolve the durable registry and verify their
+original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
+resolve the changed keys and version IDs.
+
+```sh
+workspace-mgr archive --dry-run
+workspace-mgr archive --layout '{year}{month}' --dry-run
+# Apply from the infrastructure worktree after declaring the reported scopes.
+workspace-mgr archive
+workspace-mgr plan
+workspace-mgr publish -m "Organize completed task directories"
+```
+
 ## `workspace-mgr task status`
 
 Show the immutable task identity, current slug, manifest, branch, remote, base
@@ -765,7 +827,7 @@ the published tree, as the
 describes: a task that needs no newer release keeps the configuration of the
 point where its branch left the base branch, a schema 3 manifest that records
 a cloud-usage approval raises the declaration to at least 0.4.0, a nested
-archived task manifest of any supported schema requires at least 0.4.2, a branch
+archived task manifest of any supported schema requires at least 0.5.0, a branch
 whose manifests no longer need its earlier raise withdraws it but never below
 the fetched base branch's declaration, and a branch whose configuration
 carries a user-authorized change keeps it and only raises its declaration,
@@ -795,7 +857,7 @@ reports `repository_requirement` directly after `changed_paths`:
 - `task_manifest_schema` is the actual schema of the manifest that drives the
   newer requirement, or `null` when no manifest drives the change. The path
   may drive that requirement, so an archived schema 2 manifest reports `2`
-  while requiring 0.4.2.
+  while requiring 0.5.0.
 
 The field is omitted when the published declaration equals the task branch's.
 Plan and publish never change the shared checkout's `.workspace-mgr.toml`; it

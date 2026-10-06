@@ -73,7 +73,7 @@ A pre-release also meets a declaration of its own release, so 0.4.0-rc.1 meets
 Publication maintains the declaration. Task manifest schema 3, which records a
 cloud-usage approval, needs `workspace-mgr` 0.4.0. Top-level manifests with
 schemas 1 and 2 need no declaration. A nested archive task manifest needs
-0.4.2 regardless of whether its schema is 1, 2, or 3. Unless the task is
+0.5.0 regardless of whether its schema is 1, 2, or 3. Unless the task is
 authorized to change `.workspace-mgr.toml` itself, and as long as the task
 branch's copy of the file is exactly what `workspace-mgr` wrote there, each
 publication reconciles the file in its own private Git index, never in the
@@ -254,7 +254,7 @@ line. Both are required and no other field is accepted; Git history records when
 the approval was made. Schema 1 and 2 manifests must not contain the table.
 `workspace-mgr` writes the lowest schema that represents a manifest: schema 2
 without an approval and schema 3 with one. A manifest without an approval needs
-no newer release for its schema, but a nested archive path still needs 0.4.2.
+no newer release for its schema, but a nested archive path still needs 0.5.0.
 Running `task approve-cloud-usage` with a limit equal to the threshold removes
 the table and returns the manifest to schema 2;
 publishing that change also withdraws the task branch's `minimum_cli_version`

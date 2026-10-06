@@ -37,6 +37,15 @@ versions exist before the corresponding Git ref, and that remote failure cannot
 produce a Git commit pointing to missing content. Every command and assertion is
 recorded in `evidence.jsonl`.
 
+`scripts/test_archive_s3.py` adds a separate complete-history archive scenario.
+It uses the same real Git/MinIO services and a feature-gated synthetic GitHub
+merge response. It checks a fresh unmaterialized clone, standalone and directory
+version bindings, superseded payloads, retired keys, delete markers, failed Git
+push and repaired metadata retry, prefix protection through merge, exact mapped
+source cleanup with concurrent additions retained and reported, and historical
+Git hydration through the durable registry. CI runs it after the production
+lifecycle using a `test-storage` binary and its own bucket and evidence directory.
+
 GitHub Actions owns the MinIO process, verifies its pinned official binary's
 SHA-256 checksum, and installs the exact private storage
 runtime. The test owns only newly created repositories, buckets, caches, and
