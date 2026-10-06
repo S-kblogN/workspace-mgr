@@ -38,128 +38,231 @@ impl GitRepo {
     }
 
     pub fn discover_for_manifest(path: &Path) -> Result<Self> {
-        // Resolve relative selections before deriving a Git directory or
-        // changing the command's working directory. The manifest must exist
-        // for both ordinary and private task resolution.
-        let absolute = path.canonicalize().map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let path = absolute.as_path();
-        let parent = path
+        let absolute = crate::local_state::absolute_path(path)?;
+        let parent = absolute
             .parent()
             .ok_or_else(|| Error::message("manifest path has no parent"))?;
-        if let Ok(repo) = Self::discover(parent) {
-            return Ok(repo);
-        }
-        if path.file_name().and_then(|name| name.to_str())
+        let infrastructure = absolute.file_name().and_then(|name| name.to_str())
             == Some(crate::manifest::INFRASTRUCTURE_TASK_MANIFEST_FILE)
-        {
-            let common = parent
-                .parent()
-                .filter(|directory| {
-                    directory.file_name().and_then(|name| name.to_str())
-                        == Some("infrastructure-tasks")
-                })
-                .and_then(Path::parent)
-                .filter(|directory| {
-                    directory.file_name().and_then(|name| name.to_str()) == Some("workspace-mgr")
-                })
-                .and_then(Path::parent)
-                .ok_or_else(|| {
-                    Error::message("infrastructure manifest is outside private task state")
-                })?;
-            let output = run_bytes(
-                "git",
-                [
-                    "--git-dir",
-                    &common.to_string_lossy(),
-                    "worktree",
-                    "list",
-                    "--porcelain",
-                    "-z",
-                ],
-                common,
-                &BTreeMap::new(),
-                None,
-                true,
-            )?;
-            let listing = String::from_utf8(output.stdout)
-                .map_err(|_| Error::message("shared checkout paths are not UTF-8"))?;
-            let mut shared = Vec::new();
-            let mut unavailable = Vec::new();
-            for block in listing.split("\0\0") {
-                let fields = block.split('\0').collect::<Vec<_>>();
-                let Some(checkout) = fields
-                    .iter()
+            || (absolute.file_name().and_then(|name| name.to_str()) == Some("task.toml")
+                && parent.file_name().and_then(|name| name.to_str()) == Some("workspace-mgr"));
+        let repo = match Self::discover(parent) {
+            Ok(repo) => repo,
+            Err(error) if infrastructure => {
+                let git_directory =
+                    if absolute.file_name().and_then(|name| name.to_str()) == Some("task.toml") {
+                        parent.parent()
+                    } else {
+                        parent
+                            .parent()
+                            .filter(|directory| {
+                                directory.file_name().and_then(|name| name.to_str())
+                                    == Some("infrastructure-tasks")
+                            })
+                            .and_then(Path::parent)
+                            .filter(|directory| {
+                                directory.file_name().and_then(|name| name.to_str())
+                                    == Some("workspace-mgr")
+                            })
+                            .and_then(Path::parent)
+                    }
+                    .ok_or_else(|| {
+                        Error::message(format!(
+                            "infrastructure manifest is outside private task state: {error}"
+                        ))
+                    })?;
+                let output = run_bytes(
+                    "git",
+                    [
+                        "--git-dir",
+                        &git_directory.to_string_lossy(),
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                        "-z",
+                    ],
+                    git_directory,
+                    &BTreeMap::new(),
+                    None,
+                    true,
+                )?;
+                let listing = String::from_utf8(output.stdout)
+                    .map_err(|_| Error::message("primary checkout path is not UTF-8"))?;
+                let root = listing
+                    .split('\0')
                     .find_map(|field| field.strip_prefix("worktree "))
-                else {
-                    continue;
-                };
-                let Some(branch) = fields
-                    .iter()
-                    .find_map(|field| field.strip_prefix("branch refs/heads/"))
-                else {
-                    continue;
-                };
-                // Unrelated stale worktrees are retained, but do not prevent
-                // finding the one usable shared checkout. A broken shared
-                // checkout still produces a clear error when none remains.
-                let repo = match Self::discover(Path::new(checkout)) {
+                    .ok_or_else(|| {
+                        Error::message("infrastructure manifest requires a primary checkout")
+                    })?;
+                match Self::discover(Path::new(root)) {
                     Ok(repo) => repo,
-                    Err(error) => {
-                        unavailable.push(error.to_string());
-                        continue;
+                    Err(_) => {
+                        let configured = run_unchecked(
+                            "git",
+                            [
+                                "--git-dir",
+                                &git_directory.to_string_lossy(),
+                                "config",
+                                "--path",
+                                "--get",
+                                "core.worktree",
+                            ],
+                            git_directory,
+                        )?;
+                        if !configured.success() || configured.stdout.trim().is_empty() {
+                            return Err(Error::message(
+                                "workspace-mgr cannot locate the primary checkout of a separate Git directory; configure Git core.worktree with the absolute primary checkout path",
+                            ));
+                        }
+                        let configured = PathBuf::from(configured.stdout.trim());
+                        let root = if configured.is_absolute() {
+                            configured
+                        } else {
+                            git_directory.join(configured)
+                        };
+                        Self::discover(&root)?
                     }
-                };
-                let config = match crate::config::Config::load_compatible(&repo) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        unavailable.push(error.to_string());
-                        continue;
-                    }
-                };
-                let actual_common = match repo.common_dir().and_then(|directory| {
-                    directory.canonicalize().map_err(|source| Error::Io {
-                        path: directory,
-                        source,
-                    })
-                }) {
-                    Ok(directory) => directory,
-                    Err(error) => {
-                        unavailable.push(error.to_string());
-                        continue;
-                    }
-                };
-                if branch == config.git.branch && actual_common == common {
-                    shared.push(repo);
                 }
             }
-            if shared.len() != 1 {
-                let details = if shared.is_empty() && !unavailable.is_empty() {
-                    format!("; unavailable checkouts: {}", unavailable.join("; "))
-                } else {
-                    String::new()
-                };
-                return Err(Error::message(format!(
-                    "infrastructure manifest requires exactly one valid shared checkout on the configured base branch{details}"
-                )));
+            Err(error) => return Err(error),
+        };
+        let repo = if infrastructure {
+            repo.infrastructure_checkout()?
+        } else {
+            repo
+        };
+        repo.resolve_manifest_path(&absolute)?;
+        Ok(repo)
+    }
+
+    /// Select the unique usable configured base checkout for infrastructure
+    /// operations, even when the private manifest lives in the primary checkout.
+    fn infrastructure_checkout(&self) -> Result<Self> {
+        let common = self
+            .common_dir()?
+            .canonicalize()
+            .map_err(|source| Error::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+        let output = self.run_bytes(["worktree", "list", "--porcelain", "-z"], None)?;
+        let listing = String::from_utf8(output.stdout)
+            .map_err(|_| Error::message("shared checkout paths are not UTF-8"))?;
+        let mut shared = Vec::new();
+        let mut unavailable = Vec::new();
+        for block in listing.split("\0\0") {
+            let fields = block.split('\0').collect::<Vec<_>>();
+            let Some(checkout) = fields
+                .iter()
+                .find_map(|field| field.strip_prefix("worktree "))
+            else {
+                continue;
+            };
+            let Some(branch) = fields
+                .iter()
+                .find_map(|field| field.strip_prefix("branch refs/heads/"))
+            else {
+                continue;
+            };
+            let checkout = if Path::new(checkout).canonicalize().ok().as_ref() == Some(&common) {
+                crate::local_state::directory_unmigrated(self)?
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| Error::message("local state has no primary checkout"))?
+                    .to_path_buf()
+            } else {
+                PathBuf::from(checkout)
+            };
+            let repo = match Self::discover(&checkout) {
+                Ok(repo) => repo,
+                Err(error) => {
+                    unavailable.push(error.to_string());
+                    continue;
+                }
+            };
+            let config = match crate::config::Config::load_compatible(&repo) {
+                Ok(config) => config,
+                Err(error) => {
+                    unavailable.push(error.to_string());
+                    continue;
+                }
+            };
+            let actual_common = match repo.common_dir().and_then(|directory| {
+                directory.canonicalize().map_err(|source| Error::Io {
+                    path: directory,
+                    source,
+                })
+            }) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    unavailable.push(error.to_string());
+                    continue;
+                }
+            };
+            if branch == config.git.branch && actual_common == common {
+                shared.push(repo);
             }
-            return Ok(shared.remove(0));
         }
-        let worktree_git_dir = parent
-            .parent()
-            .ok_or_else(|| Error::message("private manifest has no worktree Git directory"))?;
-        let pointer = worktree_git_dir.join("gitdir");
-        let git_file = fs::read_to_string(&pointer).map_err(|source| crate::error::Error::Io {
-            path: pointer.clone(),
+        if shared.len() != 1 {
+            let details = if shared.is_empty() && !unavailable.is_empty() {
+                format!("; unavailable checkouts: {}", unavailable.join("; "))
+            } else {
+                String::new()
+            };
+            return Err(Error::message(format!(
+                "infrastructure manifest requires exactly one valid shared checkout on the configured base branch{details}"
+            )));
+        }
+        Ok(shared.remove(0))
+    }
+
+    pub fn local_state_dir(&self) -> Result<PathBuf> {
+        crate::local_state::directory(self)
+    }
+
+    pub fn resolve_manifest_path(&self, path: &Path) -> Result<PathBuf> {
+        let absolute = crate::local_state::absolute_path(path)?;
+        let private_manifest = absolute.file_name().and_then(|name| name.to_str())
+            == Some(crate::manifest::INFRASTRUCTURE_TASK_MANIFEST_FILE)
+            || (absolute.file_name().and_then(|name| name.to_str()) == Some("task.toml")
+                && absolute
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some("workspace-mgr"));
+        if !private_manifest {
+            return absolute.canonicalize().map_err(|source| Error::Io {
+                path: absolute,
+                source,
+            });
+        }
+        let common = self
+            .common_dir()?
+            .canonicalize()
+            .map_err(|source| Error::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+        let old_root = common.join("workspace-mgr");
+        let legacy_task = absolute.file_name().and_then(|name| name.to_str()) == Some("task.toml")
+            && absolute
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some("workspace-mgr")
+            && absolute.starts_with(&common);
+        let resolved = if legacy_task {
+            let local = self.local_state_dir()?;
+            crate::local_state::legacy_manifest_target(&local, &common, &absolute)?
+        } else if let Ok(relative) = absolute.strip_prefix(&old_root) {
+            self.local_state_dir()?.join(relative)
+        } else {
+            absolute
+        };
+        resolved.canonicalize().map_err(|source| Error::Io {
+            path: resolved,
             source,
-        })?;
-        let checkout = PathBuf::from(git_file.trim())
-            .parent()
-            .ok_or_else(|| Error::message("worktree Git pointer has no checkout parent"))?
-            .to_path_buf();
-        Self::discover(&checkout)
+        })
     }
 
     pub fn run<I, S>(&self, args: I) -> Result<CommandOutput>
@@ -253,6 +356,11 @@ impl GitRepo {
             .split('\0')
             .filter(|path| !path.is_empty())
         {
+            // Private state stays outside content discovery even before an
+            // upgraded checkout regenerates the root ignore rules.
+            if Path::new(path).starts_with(crate::local_state::LOCAL_STATE_PATH) {
+                continue;
+            }
             match fs::symlink_metadata(self.root.join(path)) {
                 Ok(_) => paths.push(path.to_owned()),
                 Err(error)

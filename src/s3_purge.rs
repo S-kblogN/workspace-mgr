@@ -346,7 +346,7 @@ fn fetch_current_remote_tips(repo: &GitRepo, remote: &str) -> Result<Vec<String>
 }
 
 fn state_path(repo: &GitRepo) -> Result<PathBuf> {
-    Ok(repo.common_dir()?.join("workspace-mgr").join(STATE_NAME))
+    Ok(repo.local_state_dir()?.join(STATE_NAME))
 }
 
 fn read_state(repo: &GitRepo) -> Result<PurgeState> {

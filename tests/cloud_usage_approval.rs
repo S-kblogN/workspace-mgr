@@ -118,7 +118,7 @@ fn show(repo: &Path, object: &str) -> String {
 
 /// The private per-task state directories plan and publish create.
 fn task_state_dirs(repo: &Path) -> Vec<PathBuf> {
-    let root = repo.join(".git/workspace-mgr/state");
+    let root = repo.join(".workspace-mgr/local/state");
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -129,7 +129,7 @@ fn task_state_dirs(repo: &Path) -> Vec<PathBuf> {
 }
 
 fn cloud_usage_state(repo: &Path) -> Vec<PathBuf> {
-    let root = repo.join(".git/workspace-mgr/state");
+    let root = repo.join(".workspace-mgr/local/state");
     if !root.exists() {
         return Vec::new();
     }

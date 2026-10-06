@@ -706,19 +706,7 @@ fn repository_mutations_share_one_cross_command_lock() {
         ],
     );
     let task = fixture.shared.join("20260829-170850-operation-lock");
-    let common_dir =
-        String::from_utf8_lossy(&git(&fixture.shared, ["rev-parse", "--git-common-dir"]).stdout)
-            .trim()
-            .to_owned();
-    let common_dir = {
-        let path = std::path::PathBuf::from(common_dir);
-        if path.is_absolute() {
-            path
-        } else {
-            fixture.shared.join(path)
-        }
-    };
-    let lock_path = common_dir.join("workspace-mgr/repository.lock");
+    let lock_path = fixture.shared.join(".workspace-mgr/local/repository.lock");
     std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
     let lock = std::fs::OpenOptions::new()
         .create(true)

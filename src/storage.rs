@@ -124,7 +124,7 @@ pub fn set(
             "use `workspace-mgr untrack <path>` to keep content local only",
         ));
     }
-    let paths = validate_targets(repo, scopes, paths, true)?;
+    let paths = validate_mutation_targets(repo, scopes, paths, true)?;
     if target == StorageTarget::S3
         && paths
             .iter()
@@ -210,7 +210,7 @@ pub fn untrack(
     paths: &[String],
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
-    let paths = validate_targets(repo, scopes, paths, false)?;
+    let paths = validate_mutation_targets(repo, scopes, paths, false)?;
     if paths.is_empty() {
         return Err(Error::message(
             "untrack requires at least one file or complete storage boundary",
@@ -335,7 +335,7 @@ pub fn reset(
     paths: &[String],
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
-    let paths = validate_targets(repo, scopes, paths, true)?;
+    let paths = validate_mutation_targets(repo, scopes, paths, true)?;
     validate_boundary_targets(repo, scopes, &paths)?;
     for path in &paths {
         if is_local(repo, path)? {
@@ -406,6 +406,7 @@ pub fn move_path(
         }
         reject_symlink_traversal(&repo.root, path, "move path")?;
     }
+    reject_private_state_mutations(repo, &[old_path.clone(), new_path.clone()])?;
     let old = resolved_under(&repo.root, &old_path);
     let new = resolved_under(&repo.root, &new_path);
     // A storage boundary exists once its metadata does, whether or not its
@@ -513,7 +514,7 @@ pub fn remove_paths(
     paths: &[String],
     dry_run: bool,
 ) -> Result<StorageOperationReport> {
-    let paths = validate_targets(repo, scopes, paths, true)?;
+    let paths = validate_mutation_targets(repo, scopes, paths, true)?;
     let local = local_boundaries(repo, scopes)?;
     for path in &paths {
         if local
@@ -1216,6 +1217,33 @@ fn validate_targets(
     Ok(result)
 }
 
+fn validate_mutation_targets(
+    repo: &GitRepo,
+    scopes: &[String],
+    paths: &[String],
+    require_output: bool,
+) -> Result<Vec<String>> {
+    let paths = validate_targets(repo, scopes, paths, require_output)?;
+    reject_private_state_mutations(repo, &paths)?;
+    Ok(paths)
+}
+
+fn reject_private_state_mutations(repo: &GitRepo, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let state = repo.local_state_dir()?;
+    for path in paths {
+        let target = crate::local_state::absolute_path(&resolved_under(&repo.root, path))?;
+        if target.starts_with(&state) || state.starts_with(&target) {
+            return Err(Error::message(format!(
+                "storage mutation may not target workspace-mgr private local state or a directory containing it: {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_status_paths(
     repo: &GitRepo,
     scopes: &[String],
@@ -1856,6 +1884,120 @@ pub(crate) fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_state_fixture() -> (tempfile::TempDir, GitRepo) {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temporary.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        fs::create_dir_all(repo.root.join(".workspace-mgr/local/state")).unwrap();
+        fs::write(
+            repo.root.join(".workspace-mgr/local/state/usage.json"),
+            b"retained pending decision",
+        )
+        .unwrap();
+        fs::write(
+            repo.root.join(".workspace-mgr/repository.gitignore"),
+            b"build/\n",
+        )
+        .unwrap();
+        (temporary, repo)
+    }
+
+    #[test]
+    fn explicit_storage_mutations_preserve_private_state_and_its_parent() {
+        let (_temporary, repo) = private_state_fixture();
+        let config = Config::default();
+        let scopes = [".workspace-mgr".to_owned()];
+        for path in [
+            ".workspace-mgr",
+            ".workspace-mgr/local",
+            ".workspace-mgr/local/state/usage.json",
+        ] {
+            let paths = vec![path.to_owned()];
+            for result in [
+                set(
+                    &repo,
+                    &config,
+                    &scopes,
+                    &paths,
+                    StorageTarget::Git,
+                    "keep in Git",
+                    false,
+                ),
+                reset(&repo, &config, &scopes, &paths, false),
+                untrack(&repo, &config, &scopes, &paths, false),
+                remove_paths(&repo, &config, &scopes, &paths, false),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("private local state"), "{path}: {error}");
+            }
+        }
+        assert_eq!(
+            fs::read(repo.root.join(".workspace-mgr/local/state/usage.json")).unwrap(),
+            b"retained pending decision"
+        );
+        assert_eq!(
+            fs::read(repo.root.join(".workspace-mgr/repository.gitignore")).unwrap(),
+            b"build/\n"
+        );
+        // The shared policy scope and its tracked-content targets stay usable.
+        assert!(
+            validate_mutation_targets(
+                &repo,
+                &scopes,
+                &[".workspace-mgr/repository.gitignore".to_owned()],
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_targets(
+                &repo,
+                &scopes,
+                &[".workspace-mgr/local/state/usage.json".to_owned()],
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn moving_into_or_out_of_private_state_is_refused_before_any_file_moves() {
+        let (_temporary, repo) = private_state_fixture();
+        let scopes = [".workspace-mgr".to_owned()];
+        for (source, destination) in [
+            (".workspace-mgr/local", ".workspace-mgr/retired"),
+            (
+                ".workspace-mgr/repository.gitignore",
+                ".workspace-mgr/local/imported.txt",
+            ),
+            (".workspace-mgr", ".workspace-mgr-renamed"),
+        ] {
+            let scopes = scopes
+                .iter()
+                .cloned()
+                .chain(std::iter::once(".workspace-mgr-renamed".to_owned()))
+                .collect::<Vec<_>>();
+            let error = move_path(
+                &repo,
+                &Config::default(),
+                &scopes,
+                source,
+                destination,
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("private local state"), "{error}");
+            assert!(!repo.root.join(destination).exists());
+        }
+        assert_eq!(
+            fs::read(repo.root.join(".workspace-mgr/local/state/usage.json")).unwrap(),
+            b"retained pending decision"
+        );
+    }
 
     fn metrics(bytes: u64) -> Option<PayloadMetrics> {
         Some(PayloadMetrics { bytes, files: 1 })

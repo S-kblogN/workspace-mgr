@@ -78,7 +78,7 @@ pub fn approve(options: &CloudUsageApprovalOptions) -> Result<CloudUsageApproval
     };
     let task = ResolvedTask::load(&repo, &config, &manifest_path)?;
     validate_approval_checkout(&repo, &task, options)?;
-    let state_dir = task_state_dir(&repo.common_dir()?, &task);
+    let state_dir = task_state_dir(&repo.local_state_dir()?, &task);
     let state = cloud_usage::load_state(&state_dir, &task.task_id, &task.branch)?;
     let previous_limit_bytes = effective_limit(threshold_bytes, task.cloud_usage_approval.as_ref());
     let mut manifest = task.manifest();

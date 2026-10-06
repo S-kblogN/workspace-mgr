@@ -121,6 +121,7 @@ repository's own rules imported verbatim from
 `# workspace-mgr local begin` blocks the root file already holds. The fixed
 rules are written in these groups:
 
+- private workspace-mgr state: `/.workspace-mgr/local/`;
 - operating-system metadata: `.DS_Store`, `._*`, `.AppleDouble`,
   `.LSOverride`, `__MACOSX/`, `Thumbs.db`, `ehthumbs.db`, `[Dd]esktop.ini`,
   `.directory`, `.fuse_hidden*`, `.Trash-*`, `.nfs*`;
@@ -145,8 +146,12 @@ rules are written in these groups:
   `.streamlit/secrets.toml`.
 
 The set draws on GitHub's common ignore templates but is curated rather than
-their union. Apart from the credentials group, a fixed rule covers output a
-tool regenerates under a name that cannot plausibly be retained content. Names
+their union. The private product-state rule keeps locks, private manifests,
+indexes, and pending transaction records out of Git while leaving
+`.workspace-mgr/repository.gitignore` and
+`.workspace-mgr/instructions/repository.md` trackable. Apart from that rule and
+the credentials group, a fixed rule covers output a tool regenerates under a
+name that cannot plausibly be retained content. Names
 that are as often retained data as build output — `target/`, `build/`,
 `dist/`, `lib/`, `out/`, `docs/`, `*.log`, `coverage`, `.RData`, knitr's
 `*_cache/`, and Julia's `Manifest.toml` — are left to a task's own
@@ -255,9 +260,9 @@ task to keep its tools, process, decisions, and hard-to-reproduce results in
 that directory and to list them there; which files carry them is the agent's
 choice. The `infrastructure` kind requires at least one `--scope` plus a
 `--scope-note`; it creates the unmounted branch `codex/infra-<slug>` and a
-private manifest below Git common state, with no repository task directory or
-separate worktree. Both kinds work in the shared checkout on the configured
-main branch. Infrastructure creation reports `path` as the repository root and
+private manifest below the primary checkout's `.workspace-mgr/local/`, with no
+repository task directory or separate worktree. Both kinds work in the shared
+checkout on the configured main branch. Infrastructure creation reports `path` as the repository root and
 `manifest` as an absolute path; pass that path using `--manifest` to subsequent
 task-scoped commands. The shared HEAD must equal the fetched base revision;
 run `refresh` before creation if it is behind. Infrastructure planning and

@@ -183,8 +183,8 @@ fn build_context(task_repo: GitRepo, task: ResolvedTask, config: Config) -> Resu
     task_repo.validate_branch(&task.branch)?;
     task_repo.validate_remote_name(&task.remote)?;
     let admin_repo = administrative_repo(&task_repo, &task)?;
-    let common_dir = admin_repo.common_dir()?;
-    let state_dir = task_state_dir(&common_dir, &task);
+    let local_state_dir = admin_repo.local_state_dir()?;
+    let state_dir = task_state_dir(&local_state_dir, &task);
     let snapshot = snapshot(&admin_repo, &task)?;
     reject_merged_task(&admin_repo, &task, &snapshot)?;
     let working_changes = working_changes(&task_repo, &task)?;
@@ -485,7 +485,7 @@ fn discard_scopes(context: &mut DiscardContext) -> Result<Vec<String>> {
 }
 
 fn create_quarantine(repo: &GitRepo, task_id: &str) -> Result<PathBuf> {
-    let parent = repo.common_dir()?.join("workspace-mgr/discard-quarantine");
+    let parent = repo.local_state_dir()?.join("discard-quarantine");
     fs::create_dir_all(&parent).at(&parent)?;
     let directory = tempfile::Builder::new()
         .prefix(&format!("{task_id}-"))

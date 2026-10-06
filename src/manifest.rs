@@ -18,21 +18,18 @@ pub const CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION: u32 = 3;
 const LEGACY_TASK_SCHEMA_VERSION: u32 = 1;
 
 /// Infrastructure tasks share the main checkout. Their explicit manifests
-/// live in per-task common Git state, allowing concurrent tasks without an
+/// live in per-task shared local state, allowing concurrent tasks without an
 /// implicit active-task selector or a branch-mounted workplace.
 pub fn infrastructure_manifest_path(repo: &GitRepo, task_id: &str) -> Result<PathBuf> {
     parse_task_identity(TaskKind::Infrastructure, task_id)?;
-    let common = repo
-        .common_dir()?
-        .canonicalize()
-        .map_err(|source| Error::Io {
-            path: repo.root.clone(),
-            source,
-        })?;
-    let relative =
-        format!("workspace-mgr/infrastructure-tasks/{task_id}/{INFRASTRUCTURE_TASK_MANIFEST_FILE}");
-    reject_symlink_traversal(&common, &relative, "private infrastructure manifest")?;
-    Ok(common.join(relative))
+    let local_state_dir = repo.local_state_dir()?;
+    let relative = format!("infrastructure-tasks/{task_id}/{INFRASTRUCTURE_TASK_MANIFEST_FILE}");
+    reject_symlink_traversal(
+        &local_state_dir,
+        &relative,
+        "private infrastructure manifest",
+    )?;
+    Ok(local_state_dir.join(relative))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
@@ -126,10 +123,7 @@ impl TaskManifest {
 
 impl ResolvedTask {
     pub fn load(repo: &GitRepo, config: &Config, path: &Path) -> Result<Self> {
-        let absolute = path.canonicalize().map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let absolute = repo.resolve_manifest_path(path)?;
         let raw = fs::read_to_string(&absolute).at(&absolute)?;
         let manifest: TaskManifest = toml::from_str(&raw).map_err(|source| Error::Toml {
             path: absolute.clone(),
@@ -212,7 +206,7 @@ impl ResolvedTask {
                 let legacy = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
                 if absolute != expected && legacy.canonicalize().ok().as_ref() != Some(&absolute) {
                     return Err(Error::message(format!(
-                        "infrastructure task manifest must be private per-task Git state at {}; got {}",
+                        "infrastructure task manifest must be private per-task local state at {}; got {}",
                         expected.display(),
                         absolute.display()
                     )));
@@ -674,7 +668,7 @@ mod tests {
         let error = ResolvedTask::load(&repo, &Config::default(), &second)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("private per-task Git state"), "{error}");
+        assert!(error.contains("private per-task local state"), "{error}");
 
         // A singular legacy manifest remains explicitly readable, but never
         // chooses an infrastructure task implicitly from the shared root.

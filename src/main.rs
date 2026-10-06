@@ -13,6 +13,7 @@ mod error;
 mod git;
 mod hex;
 mod instructions;
+mod local_state;
 mod lock;
 mod manifest;
 mod output;

@@ -229,8 +229,8 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         }
     }
     let dry_run = options.operation.dry_run(options.dry_run);
-    let common_dir = repo.common_dir()?;
-    let state_dir = task_state_dir(&common_dir, &task);
+    let local_state_dir = repo.local_state_dir()?;
+    let state_dir = task_state_dir(&local_state_dir, &task);
     fs::create_dir_all(&state_dir).at(&state_dir)?;
     let _task_lock = LockGuard::acquire(
         &state_dir.join("transaction.lock"),
@@ -380,7 +380,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .collect::<Vec<_>>();
     lock_names.sort();
     lock_names.dedup();
-    let _dvc_locks = acquire_dvc_locks(&common_dir, &lock_names)?;
+    let _dvc_locks = acquire_dvc_locks(&local_state_dir, &lock_names)?;
     if config.requires_object_versioning()
         && (!initial_dvc.is_empty() || !preview_automatic_s3.is_empty())
     {
@@ -891,6 +891,9 @@ fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
     }
     let mut add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
     add.extend(present);
+    // An upgraded repository may still have its older root ignore file.
+    // Scope-wide staging must exclude product state independently of it.
+    add.extend(crate::local_state::LOCAL_STATE_EXCLUDE_PATHSPECS.map(str::to_owned));
     repo.run_with_index(index, add, None, true)?;
     Ok(())
 }
@@ -1000,13 +1003,13 @@ fn resolve_scopes(
     Ok((scopes, additional))
 }
 
-pub(crate) fn task_state_dir(common_dir: &Path, task: &ResolvedTask) -> PathBuf {
+pub(crate) fn task_state_dir(local_state_dir: &Path, task: &ResolvedTask) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(task.task_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(task.branch.as_bytes());
-    common_dir
-        .join("workspace-mgr/state")
+    local_state_dir
+        .join("state")
         .join(encode_lower(hasher.finalize()))
 }
 
@@ -1033,11 +1036,11 @@ impl LockGuard {
     }
 }
 
-fn acquire_dvc_locks(common_dir: &Path, names: &[String]) -> Result<Vec<LockGuard>> {
+fn acquire_dvc_locks(local_state_dir: &Path, names: &[String]) -> Result<Vec<LockGuard>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let lock_dir = common_dir.join("workspace-mgr/dvc-locks");
+    let lock_dir = local_state_dir.join("dvc-locks");
     let mut guards = vec![LockGuard::acquire(
         &lock_dir.join("transaction.lock"),
         "another repository transaction is running",

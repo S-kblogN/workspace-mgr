@@ -669,7 +669,7 @@ pub struct LocalUsageStatus {
 }
 
 pub(crate) fn local_status(repo: &GitRepo, task: &ResolvedTask) -> Result<LocalUsageStatus> {
-    let state_dir = task_state_dir(&repo.common_dir()?, task);
+    let state_dir = task_state_dir(&repo.local_state_dir()?, task);
     let state = load_state(&state_dir, &task.task_id, &task.branch)?;
     let threshold_bytes = effective_threshold();
     Ok(LocalUsageStatus {
@@ -682,10 +682,10 @@ pub(crate) fn local_status(repo: &GitRepo, task: &ResolvedTask) -> Result<LocalU
 
 /// Prints the pending-decision reminder, if any. Never fails the command.
 pub(crate) fn remind(repo: &GitRepo, task: &ResolvedTask) {
-    let Ok(common_dir) = repo.common_dir() else {
+    let Ok(local_state_dir) = repo.local_state_dir() else {
         return;
     };
-    let state_dir = task_state_dir(&common_dir, task);
+    let state_dir = task_state_dir(&local_state_dir, task);
     if let Some(line) = reminder(&state_dir, task) {
         eprintln!("{line}");
     }

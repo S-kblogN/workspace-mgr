@@ -10,20 +10,59 @@ contain identity, purpose, current slug, scope, and branch state and, from
 schema 3, the user's cloud-usage approval. The task ID and review branch are
 immutable; the slug and deliverable path may change together. Deliverable
 manifests are tracked inside their task directories; infrastructure manifests
-live below the Git common directory and are selected explicitly with
-`--manifest`. Both kinds work in the shared checkout on the configured base
-branch and publish to unmounted task refs. Private indexes and
-locks also live there. All mutating repository, placement, publication,
-hydration, and refresh operations share a repository lock; task and
-storage-boundary locks add narrower diagnostics.
+live below the primary checkout's `.workspace-mgr/local/` and are selected
+explicitly with `--manifest`. Both kinds work in the shared checkout on the
+configured base branch and publish to unmounted task refs. Private indexes and
+locks also live in `.workspace-mgr/local/`. All linked worktrees resolve that
+same directory in the primary checkout rather than each keeping an independent
+copy, so repository locks still exclude operations across worktrees.
+All mutating repository, placement, publication, hydration, and refresh
+operations share `.workspace-mgr/local/repository.lock`; task locks under
+`state/<hash>/` and storage-boundary locks under `dvc-locks/` add narrower
+diagnostics.
 
 An infrastructure manifest is stored at
-`<git-common-dir>/workspace-mgr/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`.
+`<primary-checkout>/.workspace-mgr/local/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`.
 Creation returns the shared repository root as `path` and the absolute manifest
 path as `manifest`. It creates no worktree or checkout transition. Existing
 legacy infrastructure worktrees are not migrated automatically.
 Creation requires the shared HEAD to equal the fetched base revision; a behind
 checkout must refresh first.
+
+The generated root `.gitignore` includes `/.workspace-mgr/local/`; it does not
+ignore all of `.workspace-mgr/`, because repository-owned configuration and
+instruction modules remain tracked. The private directory also holds archive
+retry journals, pending S3 cleanup, discard confirmation and backup state,
+and caches. This state is not all disposable: deleting it can lose an
+infrastructure task or the records needed to finish a pending transaction.
+
+The primary checkout is the original checkout identified by Git's worktree
+metadata, independent of which branch it currently has checked out. It is
+usually the shared main checkout. A linked worktree never anchors private
+state in its own root. For repositories created with `git init --separate-git-dir`,
+Git's common directory does not identify the original
+checkout; set Git's `core.worktree` to that checkout's absolute path:
+
+```sh
+git config core.worktree /absolute/path/to/primary-checkout
+```
+
+This setting records a Git checkout location, not a configurable product-state
+directory. Without it, a separate Git directory is refused rather than resolved
+from whichever worktree invoked the command. A bare repository or an unavailable
+primary checkout is also refused rather than assigned a second private state
+directory.
+
+On access, the CLI automatically migrates existing private state from
+`<git-common-dir>/workspace-mgr` into the primary checkout's
+`.workspace-mgr/local/`, preserving its contents. Old infrastructure manifest
+paths supplied with `--manifest` continue to select the migrated manifest.
+Migration refuses a lock held by an older process or a conflicting destination
+path instead of combining divergent state. It does not leave a symlink at the
+old location. Upgrade the CLI used by every linked worktree and stop older
+processes before migration. Older binaries still use the previous directory
+and cannot share the new repository lock; running old and new CLIs in parallel
+is unsupported.
 
 The user's cloud-usage approval is task state. `task approve-cloud-usage`
 writes it into the task manifest's `[cloud_usage_approval]` table, which makes

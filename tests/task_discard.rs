@@ -432,7 +432,9 @@ fn rejected_remote_deletion_restores_the_local_task() {
         .status
         .success()
     );
-    let quarantine = fixture.shared.join(".git/workspace-mgr/discard-quarantine");
+    let quarantine = fixture
+        .shared
+        .join(".workspace-mgr/local/discard-quarantine");
     assert!(
         !quarantine.exists() || std::fs::read_dir(quarantine).unwrap().next().is_none(),
         "successful rollback must not leave a private quarantine"

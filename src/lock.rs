@@ -1,31 +1,23 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 
-use fs2::FileExt;
-
-use crate::error::{Error, IoContext, Result};
+use crate::error::{IoContext, Result};
 use crate::git::GitRepo;
+use crate::local_state;
 
 pub struct RepositoryLock {
     _file: File,
+    _legacy_files: Vec<File>,
 }
 
 impl RepositoryLock {
     pub fn acquire(repo: &GitRepo) -> Result<Self> {
-        let common_dir = repo.common_dir()?;
-        let path = common_dir.join("workspace-mgr/repository.lock");
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::message("repository lock has no parent"))?;
-        fs::create_dir_all(parent).at(parent)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .at(&path)?;
-        file.try_lock_exclusive()
-            .map_err(|_| Error::message("another workspace-mgr repository operation is running"))?;
-        Ok(Self { _file: file })
+        let directory = local_state::directory_unmigrated(repo)?;
+        fs::create_dir_all(&directory).at(&directory)?;
+        let file = local_state::open_lock(&directory.join("repository.lock"), true)?;
+        let legacy_files = local_state::migrate(repo, &directory)?;
+        Ok(Self {
+            _file: file,
+            _legacy_files: legacy_files,
+        })
     }
 }
