@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-06
+
 ### Changed
 
 - Private product state now lives in the primary checkout's ignored
