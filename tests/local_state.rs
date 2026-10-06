@@ -226,6 +226,137 @@ fn publication_excludes_private_state_before_the_legacy_ignore_rules_are_upgrade
 }
 
 #[test]
+fn ignored_private_state_does_not_break_task_or_repository_scoped_publication() {
+    for infrastructure in [false, true] {
+        let fixture = GitFixture::new();
+        workspace(&fixture.seed, ["init"]);
+        let policy = ".workspace-mgr/shared-policy.md";
+        let obsolete_policy = ".workspace-mgr/obsolete-policy.md";
+        // The E2E failure requires tracked shared configuration underneath
+        // .workspace-mgr; a fixture containing only its ignored local state
+        // does not exercise the same Git pathspec behavior.
+        write(&fixture.seed.join(policy), b"original shared policy\n");
+        write(
+            &fixture.seed.join(obsolete_policy),
+            b"obsolete shared policy\n",
+        );
+        fixture.commit_seed("Add shared workspace policy");
+        fixture.clone_shared();
+        let mut create = vec![
+            "task",
+            "create",
+            "ignored-state",
+            "--title",
+            "Ignored private state",
+            "--purpose",
+            "Stage scoped changes while keeping ignored private state intact.",
+        ];
+        if infrastructure {
+            create.extend([
+                "--kind",
+                "infrastructure",
+                "--scope",
+                ".workspace-mgr",
+                "--scope-note",
+                "The user requested these shared workspace policy updates.",
+            ]);
+        } else {
+            create.extend(["--timestamp", "20261006-160000"]);
+        }
+        let created = json(&workspace(&fixture.shared, create));
+        let manifest = PathBuf::from(created["manifest"].as_str().unwrap());
+        let private = fixture
+            .shared
+            .join(LOCAL_STATE)
+            .join("state/retained-private.bin");
+        write(&private, b"ignored private state\0must remain local\n");
+        assert!(
+            git_unchecked(
+                &fixture.shared,
+                [
+                    "check-ignore",
+                    ".workspace-mgr/local/state/retained-private.bin"
+                ],
+            )
+            .status
+            .success()
+        );
+        let mut plan_args = vec!["plan", "--manifest", manifest.to_str().unwrap()];
+        let mut publish_args = vec![
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Publish scoped changes with ignored private state",
+        ];
+        if infrastructure {
+            write(&fixture.shared.join(policy), b"updated shared policy\n");
+            fs::remove_file(fixture.shared.join(obsolete_policy)).unwrap();
+        } else {
+            git(&fixture.shared, ["switch", "-c", "alternate-checkout"]);
+            for args in [&mut plan_args, &mut publish_args] {
+                args.extend([
+                    "--allow-non-shared-head",
+                    "--scope-note",
+                    "The user authorized this alternate checkout workflow.",
+                ]);
+            }
+        }
+        let plan = json(&workspace(&fixture.shared, plan_args));
+        if infrastructure {
+            assert_eq!(
+                plan["changed_paths"],
+                serde_json::json!([obsolete_policy, policy])
+            );
+        } else {
+            assert!(
+                plan["changed_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|path| {
+                        path.as_str()
+                            .unwrap()
+                            .starts_with("20261006-160000-ignored-state/")
+                    })
+            );
+        }
+        let published = json(&workspace(&fixture.shared, publish_args));
+        assert_eq!(published["status"], "pushed");
+        assert_eq!(published["changed_paths"], plan["changed_paths"]);
+        let commit = published["commit_oid"].as_str().unwrap();
+        assert!(
+            git(
+                &fixture.remote,
+                ["ls-tree", "-r", "--name-only", commit, "--", LOCAL_STATE],
+            )
+            .stdout
+            .is_empty()
+        );
+        if infrastructure {
+            assert_eq!(
+                git(&fixture.remote, ["show", &format!("{commit}:{policy}")]).stdout,
+                b"updated shared policy\n"
+            );
+            assert!(
+                !git_unchecked(
+                    &fixture.remote,
+                    ["cat-file", "-e", &format!("{commit}:{obsolete_policy}")],
+                )
+                .status
+                .success(),
+                "staging must also retain the deletion of a tracked scope file"
+            );
+        }
+        assert_eq!(
+            fs::read(&private).unwrap(),
+            b"ignored private state\0must remain local\n"
+        );
+        assert!(manifest.is_file());
+    }
+}
+
+#[test]
 fn migration_preserves_private_state_and_accepts_the_legacy_manifest_path() {
     let fixture = managed_fixture();
     let manifest = create_infrastructure_task(&fixture);

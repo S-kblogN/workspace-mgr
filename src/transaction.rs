@@ -893,10 +893,7 @@ fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
     add.extend(present);
     // An upgraded repository may still have its older root ignore file.
     // Scope-wide staging must exclude product state independently of it.
-    add.push(format!(
-        ":(top,exclude,literal){}",
-        crate::local_state::LOCAL_STATE_PATH
-    ));
+    add.extend(crate::local_state::LOCAL_STATE_EXCLUDE_PATHSPECS.map(str::to_owned));
     repo.run_with_index(index, add, None, true)?;
     Ok(())
 }

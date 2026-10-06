@@ -10,6 +10,13 @@ use crate::manifest::{INFRASTRUCTURE_TASK_MANIFEST_FILE, TaskKind, parse_task_id
 use crate::path::reject_symlink_traversal;
 
 pub const LOCAL_STATE_PATH: &str = ".workspace-mgr/local";
+/// `[l]` matches only `l`, keeping these exclusions specific to `local`.
+/// A nonliteral prefix prevents Git from treating the excluded directory as
+/// an explicitly requested ignored path. Cover both the entry and its files.
+pub const LOCAL_STATE_EXCLUDE_PATHSPECS: [&str; 2] = [
+    ":(top,exclude,glob).workspace-mgr/[l]ocal",
+    ":(top,exclude,glob).workspace-mgr/[l]ocal/**",
+];
 pub const BUSY_MESSAGE: &str = "another workspace-mgr repository operation is running";
 const MANIFEST_ALIASES: &str = "legacy-manifest-paths.json";
 
