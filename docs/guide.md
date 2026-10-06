@@ -82,8 +82,8 @@ Initialization creates:
 - `.workspace-mgr.toml`, the public Git and optional S3 facts;
 - a thin `AGENTS.md` bootstrap;
 - the root `.gitignore`, generated from the product's fixed rules for
-  regenerated output and from this repository's own rules in
-  `.workspace-mgr/repository.gitignore`;
+  regenerated output and private product state, and from this repository's own
+  rules in `.workspace-mgr/repository.gitignore`;
 - internal storage scaffolding when S3 is configured.
 
 On first initialization, `AGENTS.md`, the root `.gitignore`, and the private
@@ -92,7 +92,7 @@ reports the complete collision before writing anything; it does not inspect
 content to guess whether the path is managed. A repository that already keeps
 its own root `.gitignore` moves those rules into
 `.workspace-mgr/repository.gitignore`, removes the root file, and runs `init`
-again; nothing is migrated silently and nothing is discarded. After
+again; that file is never migrated silently or discarded. After
 `.workspace-mgr.toml` establishes the repository as initialized, `AGENTS.md`,
 the root `.gitignore`, generated internal storage configuration, and the
 private engine's ignore files are product-owned. Every `init` deterministically
@@ -101,6 +101,51 @@ Git/S3 facts. This is also the scaffold-upgrade operation after installing a
 newer CLI. In an initialized repository, an agent performs this reconciliation
 inside an infrastructure task so the generated repository-wide diff is
 reviewed like any other shared change.
+
+### Upgrading private product state
+
+Private product state now lives in the primary checkout's `.workspace-mgr/local/`.
+The generated root `.gitignore` includes `/.workspace-mgr/local/`, leaving
+`.workspace-mgr/repository.gitignore` and
+`.workspace-mgr/instructions/repository.md` available as tracked
+repository-owned modules. All linked worktrees use the same private directory
+in the primary checkout, including the repository lock, so operations in
+different worktrees still exclude one another.
+The primary checkout is the repository's original checkout, usually the shared
+main checkout, and remains the state location even when its branch changes.
+If that checkout is unavailable or the repository is bare, the CLI refuses to
+create separate state elsewhere.
+
+If the repository was created with `git init --separate-git-dir`, Git does not
+record a reverse path from the common directory to its primary checkout. Set
+Git's `core.worktree` to the absolute path of the original checkout before
+running `workspace-mgr`:
+
+```sh
+git config core.worktree /absolute/path/to/primary-checkout
+```
+
+This is Git's checkout-location setting, not a workspace-mgr state-directory
+option. Without it, the CLI refuses the repository so different linked
+worktrees cannot create independent state and locks.
+
+The CLI automatically migrates existing state from
+`<git-common-dir>/workspace-mgr` when it accesses private product state.
+Infrastructure manifests, private indexes, pending S3 cleanup, archive retry
+journals, discard confirmation and backup state, and caches retain their
+contents. An old infrastructure manifest path passed to `--manifest` continues
+to select the migrated manifest. This directory is not all disposable cache:
+preserve private manifests and pending transaction records until their task or
+operation completes.
+
+Upgrade the CLI used by every linked worktree and stop older processes before
+running the new version. Migration refuses a lock held by an older process or
+a conflicting destination path; resolve the reported conflict before retrying.
+Older binaries keep using the previous directory and cannot participate in the
+new repository lock. Running old and new CLIs in parallel is unsupported.
+Run `workspace-mgr init` in an infrastructure task to
+regenerate the root `.gitignore`, then publish that scaffold change so other
+clones receive the new rule.
 
 ### Upgrading a repository that predates the generated root `.gitignore`
 

@@ -210,7 +210,7 @@ mod test_storage {
     }
 
     pub fn cloud_usage_state(repo: &Path) -> Vec<PathBuf> {
-        let root = repo.join(".git/workspace-mgr/state");
+        let root = repo.join(".workspace-mgr/local/state");
         if !root.exists() {
             return Vec::new();
         }

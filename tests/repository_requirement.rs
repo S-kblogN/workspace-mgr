@@ -401,7 +401,7 @@ fn plan_and_publish_refuse_when_only_the_shared_branch_requires_a_newer_cli() {
     assert!(
         !fixture
             .shared
-            .join(".git/workspace-mgr/checkouts/infra-tools")
+            .join(".workspace-mgr/local/checkouts/infra-tools")
             .exists()
     );
 
@@ -447,7 +447,7 @@ fn plan_and_publish_refuse_when_only_the_shared_branch_requires_a_newer_cli() {
         &remote,
     );
     assert!(
-        walkdir::WalkDir::new(fixture.shared.join(".git/workspace-mgr"))
+        walkdir::WalkDir::new(fixture.shared.join(".workspace-mgr/local"))
             .into_iter()
             .map(Result::unwrap)
             .all(|entry| entry.file_name() != "discard-plan.json")

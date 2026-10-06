@@ -159,7 +159,7 @@ pub fn prepare(
                 let digest = crate::hex::encode_lower(
                     Sha256::digest(format!("{source}\0{destination}").as_bytes()).as_slice(),
                 );
-                let journal_dir = repo.common_dir()?.join("workspace-mgr/archive");
+                let journal_dir = repo.local_state_dir()?.join("archive");
                 fs::create_dir_all(&journal_dir).at(&journal_dir)?;
                 let journal = journal_dir.join(format!("{digest}.json"));
                 let copied = dvc::version_archive_adapter(
@@ -211,8 +211,8 @@ fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
         Sha256::digest(format!("{source}\0{destination}").as_bytes()).as_slice(),
     );
     let path = repo
-        .common_dir()?
-        .join("workspace-mgr/archive")
+        .local_state_dir()?
+        .join("archive")
         .join(format!("{digest}.json"));
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,

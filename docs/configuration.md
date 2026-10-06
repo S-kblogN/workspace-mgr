@@ -203,12 +203,17 @@ reason = "The user explicitly requested this shared documentation change"
 ```
 
 An infrastructure manifest uses `kind = "infrastructure"`, omits `path`, and
-requires at least one `additional_scopes` entry. It is stored in private Git
-common state rather than committed to the repository. Task creation reports
-an absolute `manifest` path below
-`<git-common-dir>/workspace-mgr/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`
+requires at least one `additional_scopes` entry. It is stored in the primary
+checkout's ignored `.workspace-mgr/local/` rather than committed to the
+repository. All linked worktrees use that same private state directory.
+Task creation reports an absolute `manifest` path below
+`<primary-checkout>/.workspace-mgr/local/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`
 for subsequent `--manifest <path>` selection. Infrastructure work
 stays in the shared checkout on `git.branch`; no task worktree is created.
+Existing state under `<git-common-dir>/workspace-mgr` migrates automatically;
+old `--manifest` paths continue to work. See the
+[upgrade guide](guide.md#upgrading-private-product-state) before using the new
+CLI alongside an older installation.
 The manifest schema version describes serialized task state; it is not a
 strategy selector.
 

@@ -30,7 +30,8 @@ const STORAGE_IGNORE: &str =
 
 /// The fixed ignore rules the product owns, in the groups the generated file
 /// renders. The set is deliberately curated rather than the union of the
-/// common ignore templates. It holds two kinds of rule. Most cover output a
+/// common ignore templates. Private product state has one anchored rule that
+/// leaves tracked repository modules visible. Most other rules cover output a
 /// tool regenerates under a name that cannot plausibly be retained content,
 /// so they never hide a result someone meant to keep: `target/`, `build/`,
 /// `dist/`, `lib/`, `out/`, `docs/`, `*.log`, and `coverage` are absent for
@@ -44,6 +45,13 @@ const STORAGE_IGNORE: &str =
 /// hidden by a rule every initialized clone carries, so it never looks like a
 /// machine-local rule even before the generated file reaches the base branch.
 pub(crate) const PRODUCT_IGNORE_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Private workspace-mgr state.",
+        &[
+            // Keep repository-owned instruction and ignore modules trackable.
+            "/.workspace-mgr/local/",
+        ],
+    ),
     (
         "Operating-system metadata.",
         &[

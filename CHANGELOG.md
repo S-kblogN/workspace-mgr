@@ -5,6 +5,23 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Private product state now lives in the primary checkout's ignored
+  `.workspace-mgr/local/` instead of `<git-common-dir>/workspace-mgr`.
+  Linked worktrees share this state and its repository lock. Existing state
+  migrates automatically, and old infrastructure `--manifest` paths remain
+  usable. Migration refuses active legacy locks and conflicting destination
+  paths without overwriting state.
+
+### Upgrading
+
+- Upgrade the CLI used by every linked worktree and stop older processes before
+  migration; running old and new CLIs in parallel is unsupported. Run
+  `workspace-mgr init` in an infrastructure task and publish the generated root
+  `.gitignore` rule `/.workspace-mgr/local/`. Repository-owned modules elsewhere
+  in `.workspace-mgr/` remain trackable.
+
 ## [0.5.0] - 2026-10-06
 
 ### Changed

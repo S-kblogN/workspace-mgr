@@ -178,7 +178,38 @@ fn user_documentation_covers_the_complete_public_model() {
         );
     }
     assert!(commands.contains("Infrastructure creation reports `path` as the repository root"));
-    assert!(configuration.contains("workspace-mgr/infrastructure-tasks/<id>"));
+    assert!(configuration.contains(".workspace-mgr/local/infrastructure-tasks/<id>"));
+    for (name, document) in [
+        ("README.md", readme),
+        ("guide.md", guide),
+        ("commands.md", commands),
+        ("management-model.md", model),
+        ("configuration.md", configuration),
+        ("architecture.md", architecture),
+    ] {
+        assert!(
+            document.contains(".workspace-mgr/local/"),
+            "{name} omits the private product-state directory"
+        );
+    }
+    let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    for fact in [
+        "Upgrading private product state",
+        "All linked worktrees use the same private directory",
+        "automatically migrates existing state",
+        "An old infrastructure manifest path passed to `--manifest` continues",
+        "not all disposable cache",
+        "Upgrade the CLI used by every linked worktree",
+        "refuses a lock held by an older process",
+        "conflicting destination path",
+        "git config core.worktree /absolute/path/to/primary-checkout",
+        "not a workspace-mgr state-directory option",
+    ] {
+        assert!(
+            normalized_guide.contains(fact),
+            "guide omits private-state migration fact {fact:?}"
+        );
+    }
     assert!(guide.contains("ignored_paths"));
     assert!(guide.contains(".workspace-mgr/repository.gitignore"));
     assert!(guide.contains(".git/info/exclude"));

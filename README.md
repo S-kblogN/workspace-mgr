@@ -51,6 +51,15 @@ configured main branch. Creation returns a private manifest path; pass it as
 `--manifest <path>` to task-scoped commands such as `plan` and `publish`.
 Both task kinds publish to their own unmounted branch through a private index.
 
+Private product state lives in the primary checkout's `.workspace-mgr/local/`,
+which the generated root `.gitignore` ignores. All linked worktrees use that
+same directory for locks, private indexes, infrastructure manifests, and
+pending transaction state. Repository-owned modules such as
+`.workspace-mgr/repository.gitignore` and
+`.workspace-mgr/instructions/repository.md` remain trackable. Existing state
+under `<git-common-dir>/workspace-mgr` migrates automatically; see the
+[upgrade guide](docs/guide.md#upgrading-private-product-state).
+
 Inside a task:
 
 ```sh

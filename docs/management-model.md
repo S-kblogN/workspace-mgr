@@ -203,14 +203,22 @@ visible in its review, and stay inside the task's own write boundary. This
 repository's own rules live in `.workspace-mgr/repository.gitignore`. Git has
 no include directive, so `workspace-mgr` owns the root `.gitignore` as a whole
 and generates it from that module plus a small fixed set of product rules for
-output that is regenerated rather than retained; the root file is never
-hand-edited, and `init` reconciles it like any other product-owned path. That
+output that is regenerated rather than retained and for private product state;
+the root file is never hand-edited, and `init` reconciles it like any other
+product-owned path. That
 second layer is a pair of shared root paths, so reaching for it costs what any
 change outside the task directory costs: the user's explicit authorization,
 normally an infrastructure task, and a publication of its own before the rule
 means anything in another clone. Routing bulk by-products to S3 is not a
 substitute for either layer: S3 keeps Git small, it does not keep the workspace
 curated.
+
+Private product state lives in the primary checkout's `.workspace-mgr/local/`,
+ignored by the fixed `/.workspace-mgr/local/` rule. All linked worktrees share
+its repository lock, infrastructure manifests, private indexes, and pending
+transaction records. The rest of `.workspace-mgr/` remains available for the
+repository's tracked modules. Pending journals and private manifests are
+working state to preserve, not merely caches that can all be deleted.
 
 Because no command can observe an agent writing to a temporary directory,
 publication enforces only what reaches the index. It refuses a deliverable

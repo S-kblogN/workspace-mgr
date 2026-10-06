@@ -21,7 +21,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
     assert!(
         !fixture
             .shared
-            .join(".git/workspace-mgr/repository.lock")
+            .join(".workspace-mgr/local/repository.lock")
             .exists()
     );
 
@@ -1223,7 +1223,18 @@ fn an_already_initialized_repository_keeps_its_own_root_ignore_rules() {
     let root_ignore = fixture.shared.join(".gitignore");
     let repository_rules = "/secrets.env\n/vendor/\n*.log\n!keep.log\n";
     std::fs::write(&root_ignore, repository_rules).unwrap();
-    git(&fixture.shared, ["add", "-A"]);
+    // Simulate the old repository's shared scaffold without accidentally
+    // tracking current private state after replacing its generated ignore rule.
+    git(
+        &fixture.shared,
+        [
+            "add",
+            "--",
+            ".workspace-mgr.toml",
+            "AGENTS.md",
+            ".gitignore",
+        ],
+    );
     git(
         &fixture.shared,
         ["commit", "-m", "Initialize managed workspace"],
