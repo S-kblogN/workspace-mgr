@@ -1258,12 +1258,23 @@ fn infrastructure_publication_is_not_held_to_the_task_record() {
             "The user requested this repository-wide change.",
         ],
     );
-    let worktree = std::path::PathBuf::from(json(&created)["path"].as_str().unwrap());
+    let created = json(&created);
+    let worktree = std::path::PathBuf::from(created["path"].as_str().unwrap());
+    let manifest = created["manifest"].as_str().unwrap();
 
     // An infrastructure task has no repository task directory, so neither the
     // refusal nor the warning applies to it.
     std::fs::write(worktree.join("shared-tool.py"), "print('shared')\n").unwrap();
-    let published = workspace(&worktree, ["publish", "-m", "Publish the shared tool"]);
+    let published = workspace(
+        &worktree,
+        [
+            "publish",
+            "--manifest",
+            manifest,
+            "-m",
+            "Publish the shared tool",
+        ],
+    );
     let published = json(&published);
     assert_eq!(published["status"], "pushed");
     assert_eq!(
@@ -1295,7 +1306,9 @@ fn an_escaping_symlink_refusal_names_the_workplace_each_task_kind_has() {
             "The user requested this repository-wide change.",
         ],
     );
-    let worktree = std::path::PathBuf::from(json(&created)["path"].as_str().unwrap());
+    let created = json(&created);
+    let worktree = std::path::PathBuf::from(created["path"].as_str().unwrap());
+    let manifest = created["manifest"].as_str().unwrap();
     std::fs::create_dir(worktree.join("shared-area")).unwrap();
     std::fs::write(worktree.join("shared-area/config.yaml"), "v1\n").unwrap();
     std::os::unix::fs::symlink(
@@ -1304,7 +1317,7 @@ fn an_escaping_symlink_refusal_names_the_workplace_each_task_kind_has() {
     )
     .unwrap();
 
-    let refused = workspace_unchecked(&worktree, ["plan"]);
+    let refused = workspace_unchecked(&worktree, ["plan", "--manifest", manifest]);
     assert_eq!(refused.status.code(), Some(2));
     let message = String::from_utf8_lossy(&refused.stderr).into_owned();
     assert!(message.contains("outside the repository"), "{message}");

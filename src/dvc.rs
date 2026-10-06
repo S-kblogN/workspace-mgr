@@ -16,6 +16,8 @@ use crate::process::{CommandOutput, run as run_process, run_unchecked as run_pro
 
 const VERSION_VERIFY_SCRIPT: &str = include_str!("../assets/dvc_version_verify.py");
 const VERSION_PURGE_SCRIPT: &str = include_str!("../assets/dvc_version_purge.py");
+const VERSION_ARCHIVE_SCRIPT: &str = include_str!("../assets/dvc_version_archive.py");
+const ARCHIVE_REGISTRY_SCRIPT: &str = include_str!("../assets/dvc_archive_registry.py");
 const INTERNAL_CONFIG_HEADER: &str =
     "# Managed by workspace-mgr. Edit .workspace-mgr.toml and rerun workspace-mgr init.\n";
 pub const REQUIRED_DVC_VERSION: &str = "3.67.1";
@@ -897,17 +899,32 @@ fn version_read_adapter(
     operation: &str,
 ) -> Result<serde_json::Value> {
     let python = storage_python();
+    let script = format!(
+        "import sys, types\n_archive = types.ModuleType('dvc_archive_registry')\nexec({}, _archive.__dict__)\nsys.modules['dvc_archive_registry'] = _archive\nexec({}, globals())",
+        serde_json::to_string(ARCHIVE_REGISTRY_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?,
+        serde_json::to_string(VERSION_VERIFY_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?
+    );
     let serialized = serde_json::to_string(pointers).map_err(|error| {
         Error::message(format!("failed to encode storage metadata files: {error}"))
     })?;
+    let receipts = crate::archive_migration::receipts(repo, &[])?
+        .into_iter()
+        .map(|(_, receipt)| receipt)
+        .filter(|receipt| receipt["status"] == "planned")
+        .collect::<Vec<_>>();
+    let serialized_receipts =
+        serde_json::to_string(&receipts).map_err(|error| Error::message(error.to_string()))?;
     let output = run_process_unchecked(
         &python,
         [
             "-c",
-            VERSION_VERIFY_SCRIPT,
+            &script,
             &repo.root.to_string_lossy(),
             &serialized,
             operation,
+            &serialized_receipts,
         ],
         &repo.root,
     )
@@ -977,6 +994,71 @@ pub fn version_purge_adapter(
             "managed-storage purge adapter returned invalid JSON: {error}"
         ))
     })
+}
+
+pub(crate) fn version_archive_adapter(
+    repo: &GitRepo,
+    operation: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let serialized = serde_json::to_string(payload)
+        .map_err(|error| Error::message(format!("failed to encode archive request: {error}")))?;
+    let output = run_process_unchecked(
+        &storage_python(),
+        [
+            "-c",
+            VERSION_ARCHIVE_SCRIPT,
+            &repo.root.to_string_lossy(),
+            operation,
+            &serialized,
+        ],
+        &repo.root,
+    )
+    .map_err(private_engine_error)?;
+    if !output.success() {
+        return Err(Error::message(format!(
+            "storage history archive failed: {}",
+            private_detail(&output)
+        )));
+    }
+    serde_json::from_str(output.stdout.trim())
+        .map_err(|error| Error::message(format!("archive adapter returned invalid JSON: {error}")))
+}
+
+pub(crate) fn archive_registry_adapter(
+    repo: &GitRepo,
+    operation: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let serialized =
+        serde_json::to_string(payload).map_err(|error| Error::message(error.to_string()))?;
+    let output = run_process_unchecked(
+        &storage_python(),
+        [
+            "-c",
+            ARCHIVE_REGISTRY_SCRIPT,
+            &repo.root.to_string_lossy(),
+            operation,
+            &serialized,
+        ],
+        &repo.root,
+    )
+    .map_err(private_engine_error)?;
+    if !output.success() {
+        return Err(Error::message(format!(
+            "archive registry failed: {}",
+            private_detail(&output)
+        )));
+    }
+    serde_json::from_str(output.stdout.trim())
+        .map_err(|error| Error::message(format!("invalid archive registry response: {error}")))
+}
+
+pub(crate) fn verify_archived(repo: &GitRepo, pointers: &[String]) -> Result<serde_json::Value> {
+    if pointers.is_empty() {
+        return Ok(serde_json::json!({"mode":"no-files"}));
+    }
+    version_read_adapter(repo, pointers, "--verify")
 }
 
 pub fn hydrate(

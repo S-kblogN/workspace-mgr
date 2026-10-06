@@ -18,9 +18,11 @@ S3 hydration, aggregate boundary sizing, tiny-S3 warnings, the semantic review
 band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
 content-independent first-init collisions and whole-file scaffold reconciliation,
-isolated infrastructure task scaffolding, scoped publication, and stable
+infrastructure task scaffolding with an explicit private manifest in the shared
+`main` checkout, scoped publication without shared-index changes, and stable
 publication of a deleted infrastructure file scope,
-deliverable and infrastructure task discard with branch/worktree cleanup and
+deliverable and infrastructure task discard with branch/private-state cleanup,
+declared shared-scope restoration without deleting the shared repository, and
 permanent unreferenced S3-path deletion,
 fixed policy with a minimal Git/S3-only public configuration,
 Git-to-S3 and S3-to-Git transitions, explicit remove, delete/move/rename purge,
@@ -36,6 +38,15 @@ It checks that placement commands never write either remote, that S3 object
 versions exist before the corresponding Git ref, and that remote failure cannot
 produce a Git commit pointing to missing content. Every command and assertion is
 recorded in `evidence.jsonl`.
+
+`scripts/test_archive_s3.py` adds a separate complete-history archive scenario.
+It uses the same real Git/MinIO services and a feature-gated synthetic GitHub
+merge response. It checks a fresh unmaterialized clone, standalone and directory
+version bindings, superseded payloads, retired keys, delete markers, failed Git
+push and repaired metadata retry, prefix protection through merge, exact mapped
+source cleanup with concurrent additions retained and reported, and historical
+Git hydration through the durable registry. CI runs it after the production
+lifecycle using a `test-storage` binary and its own bucket and evidence directory.
 
 GitHub Actions owns the MinIO process, verifies its pinned official binary's
 SHA-256 checksum, and installs the exact private storage

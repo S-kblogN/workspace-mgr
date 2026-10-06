@@ -1088,7 +1088,7 @@ class Harness:
 
     def create_and_publish_infrastructure_task(self) -> None:
         assert self.shared is not None
-        self.section("isolated infrastructure task and review handoff")
+        self.section("infrastructure task on shared main and review handoff")
         branch = "codex/infra-e2e-policy"
         private_config = self.shared / ".dvc" / "config.local"
         private_config.write_text("# Virtual private storage state.\n", encoding="utf-8")
@@ -1102,7 +1102,7 @@ class Harness:
             "--title",
             "E2E shared policy",
             "--purpose",
-            "Exercise isolated repository-wide publication.",
+            "Exercise scoped repository-wide publication on main.",
             "--scope",
             "e2e-shared-policy.md",
             "--scope",
@@ -1124,7 +1124,7 @@ class Harness:
             "--title",
             "E2E shared policy",
             "--purpose",
-            "Exercise isolated repository-wide publication.",
+            "Exercise scoped repository-wide publication on main.",
             "--scope",
             "e2e-shared-policy.md",
             "--scope",
@@ -1133,33 +1133,28 @@ class Harness:
             "The E2E scenario authorizes this repository-wide policy file.",
         )
         worktree = Path(created["path"])
+        manifest = str(created["manifest"])
+        main_before = self.git(worktree, "rev-parse", "HEAD").stdout
+        index_before = self.git(worktree, "ls-files", "--stage").stdout
         self.check(created["kind"] == "infrastructure", "infrastructure kind is explicit")
         self.check(
             created["review"]["creation_timing"] == "after-first-scoped-publication"
             and created["review"]["synchronization_cadence"] == "before-every-turn-end",
             "infrastructure creation reports first-publication review and turn-end synchronization",
         )
-        self.check(worktree.is_dir(), "infrastructure worktree exists")
+        self.check(worktree == self.shared, "infrastructure uses the shared main checkout")
         self.check(Path(created["manifest"]).is_file(), "infrastructure manifest is private state")
         self.check(
             not (self.shared / "infra-e2e-policy").exists(),
             "infrastructure task creates no repository task directory",
         )
         self.check(
-            self.git(worktree, "branch", "--show-current").stdout.strip() == branch,
-            "infrastructure branch is mounted only in its worktree",
+            self.git(worktree, "branch", "--show-current").stdout.strip() == "main",
+            "infrastructure creation leaves the shared checkout on main",
         )
-        self.check(
-            worktree.joinpath(".dvc", "cache").is_symlink(),
-            "infrastructure worktree reuses the repository-private storage cache",
-        )
-        self.check(
-            worktree.joinpath(".dvc", "config.local").is_symlink()
-            and worktree.joinpath(".dvc", "config.local").resolve()
-            == private_config.resolve(),
-            "infrastructure worktree reuses private storage configuration",
-        )
-        status = self.wm(worktree, "task", "status")
+        self.check(private_config.read_text(encoding="utf-8") == "# Virtual private storage state.\n",
+                   "infrastructure creation preserves private storage configuration")
+        status = self.wm(worktree, "task", "status", "--manifest", manifest)
         self.check(
             status["scopes"] == ["e2e-infra-assets", "e2e-shared-policy.md"],
             "infrastructure scopes are exact",
@@ -1171,21 +1166,20 @@ class Harness:
         infra_payload = b"infrastructure managed payload\n"
         (infra_assets / "data.bin").write_bytes(infra_payload)
         (worktree / "outside-scope.txt").write_text("must not publish\n", encoding="utf-8")
-        rejected = self.wm(worktree, "plan", expected=2)
-        self.check(
-            "outside its declared scope" in rejected["stderr"],
-            "infrastructure worktree rejects undeclared changes",
-        )
-        (worktree / "outside-scope.txt").unlink()
+        scoped = self.wm(worktree, "plan", "--manifest", manifest)
+        self.check("outside-scope.txt" not in scoped["changed_paths"],
+                   "infrastructure plan excludes another task's overlay")
         infra_placement = self.wm(
             worktree,
             "storage",
             "set",
+            "--manifest",
+            manifest,
             "e2e-infra-assets/data.bin",
             "--to",
             "s3",
             "--reason",
-            "Exercise private managed storage from an infrastructure worktree.",
+            "Exercise private managed storage from shared main.",
         )
         self.check(infra_placement["status"] == "updated", "infrastructure content can select S3")
         self.check(infra_placement["remote_writes"] is False, "infrastructure placement is local-only")
@@ -1193,6 +1187,8 @@ class Harness:
             worktree,
             "storage",
             "status",
+            "--manifest",
+            manifest,
             "e2e-infra-assets/data.bin",
         )
         self.check(
@@ -1200,7 +1196,7 @@ class Harness:
             and infra_status["placements"][0]["basis"] == "explicit",
             "infrastructure storage status resolves its private task identity",
         )
-        plan = self.wm(worktree, "plan")
+        plan = self.wm(worktree, "plan", "--manifest", manifest)
         self.check(
             all(
                 path == "e2e-shared-policy.md" or path.startswith("e2e-infra-assets/")
@@ -1212,7 +1208,7 @@ class Harness:
             "e2e-infra-assets/data.bin.dvc" in plan["changed_paths"],
             "infrastructure plan includes managed-storage metadata",
         )
-        published = self.wm(worktree, "publish", "-m", "Publish E2E shared policy")
+        published = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Publish E2E shared policy")
         oid = published["commit_oid"]
         self.check(self.remote_ref(branch) == oid, "infrastructure branch is published")
         self.check(
@@ -1230,12 +1226,14 @@ class Harness:
         self.check(published["review"]["managed_by"] == "agent", "review handoff assigns the agent")
         self.check(published["review"]["merge_authority"] == "user", "review handoff reserves merge for user")
         self.check(
-            self.git(worktree, "status", "--short").stdout == "",
-            "published infrastructure worktree is clean",
+            self.git(worktree, "rev-parse", "HEAD").stdout == main_before
+            and self.git(worktree, "ls-files", "--stage").stdout == index_before
+            and (worktree / "outside-scope.txt").read_text() == "must not publish\n",
+            "infrastructure publication preserves main, its index, and unrelated overlays",
         )
-        self.check(self.wm(worktree, "plan")["status"] == "no_changes", "infrastructure plan ends clean")
+        self.check(self.wm(worktree, "plan", "--manifest", manifest)["status"] == "no_changes", "infrastructure plan ends clean")
         (worktree / "e2e-shared-policy.md").unlink()
-        removed = self.wm(worktree, "publish", "-m", "Remove E2E shared policy")
+        removed = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Remove E2E shared policy")
         removed_oid = removed["commit_oid"]
         self.check(
             removed["changed_paths"] == ["e2e-shared-policy.md"],
@@ -1246,15 +1244,16 @@ class Harness:
             "published infrastructure deletion removes the remote path",
         )
         self.check(
-            self.git(worktree, "status", "--short").stdout == "",
-            "deleted infrastructure scope leaves a clean worktree",
+            self.git(worktree, "rev-parse", "HEAD").stdout == main_before
+            and self.git(worktree, "ls-files", "--stage").stdout == index_before,
+            "infrastructure scope deletion preserves shared main and index",
         )
         self.check(
-            self.wm(worktree, "plan")["status"] == "no_changes",
+            self.wm(worktree, "plan", "--manifest", manifest)["status"] == "no_changes",
             "missing published infrastructure scope remains a clean plan",
         )
         infra_discarded_key = self.s3_version_for_body(infra_payload)["key"]
-        discard_preview = self.wm(worktree, "task", "discard", "--dry-run")
+        discard_preview = self.wm(worktree, "task", "discard", "--manifest", manifest, "--dry-run")
         self.check(discard_preview["status"] == "dry_run", "infrastructure discard previews cleanup")
         self.check(
             discard_preview["review"]["provider_state_verified_by_cli"] is False
@@ -1262,8 +1261,8 @@ class Harness:
             "infrastructure discard hands PR closure to the agent",
         )
         self.check(
-            discard_preview["local_actions"][0]["action"] == "delete-worktree",
-            "infrastructure discard names the managed worktree deletion",
+            all(row["action"] == "restore" for row in discard_preview["local_actions"]),
+            "infrastructure discard restores only declared shared scopes",
         )
         self.check(
             any(
@@ -1286,7 +1285,11 @@ class Harness:
             discarded.get("cleanup_warnings", []) == [],
             "infrastructure discard completes without cleanup warnings",
         )
-        self.check(not worktree.exists(), "infrastructure discard removes its worktree")
+        self.check(worktree.is_dir() and not Path(manifest).exists(),
+                   "infrastructure discard preserves shared main and removes private task state")
+        self.check((worktree / "outside-scope.txt").read_text() == "must not publish\n",
+                   "infrastructure discard preserves another task's overlay")
+        (worktree / "outside-scope.txt").unlink()
         self.check(self.remote_ref(branch) is None, "infrastructure discard deletes its network branch")
         local_branch = self.git(
             self.shared,
@@ -2951,7 +2954,7 @@ class Harness:
         )
 
         created = self.wm(
-            self.shared,
+            consumer,
             "task",
             "create",
             "e2e-recover-boundary",
@@ -2967,11 +2970,12 @@ class Harness:
             "The E2E scenario authorizes renaming this boundary.",
         )
         worktree = Path(created["path"])
+        manifest = str(created["manifest"])
         self.check(
             (worktree / f"{boundary}.dvc").is_file() and not (worktree / boundary).exists(),
             "the recovery task starts from the fetched base without the payload",
         )
-        moved = self.wm(worktree, "move", boundary, destination)
+        moved = self.wm(worktree, "move", boundary, destination, "--manifest", manifest)
         self.check(moved["status"] == "updated", "move renames an un-hydrated unaddressable boundary")
         self.check(
             (worktree / destination).read_bytes() == unaddressable,
@@ -2989,11 +2993,13 @@ class Harness:
             worktree,
             "storage",
             "hydrate",
+            "--manifest",
+            manifest,
             f"{task_id}/first.bin",
             f"{task_id}/second.bin",
         )
         self.check(hydrated["status"] == "hydrated", "the other boundaries hydrate by name before publication")
-        usage = self.wm(worktree, "plan")["cloud_usage"]
+        usage = self.wm(worktree, "plan", "--manifest", manifest)["cloud_usage"]
         self.check(
             usage["status"] == "within_limit"
             and usage["published"]["s3_bytes"] == 0
@@ -3011,7 +3017,7 @@ class Harness:
             "the moved boundary is charged once, as one pending upload at its new path",
             cloud_usage=usage,
         )
-        recovered = self.wm(worktree, "publish", "-m", "Recover the unaddressable boundary")
+        recovered = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Recover the unaddressable boundary")
         self.check(recovered["status"] == "pushed", "the recovery task publishes")
         self.check(
             "version_id" in (worktree / f"{destination}.dvc").read_text(encoding="utf-8"),

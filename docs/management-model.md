@@ -71,9 +71,29 @@ wrote, and the results that would be expensive or impossible to reproduce. The
 product does not prescribe their names or layout, only that they are Markdown
 files the README's directory map names. Its manifest records the task
 identity, declared scope, target branch, and any higher cloud-usage limit the
-user approved. An infrastructure task instead has an isolated worktree and a
-private manifest because its content belongs at shared repository paths rather
-than inside a timestamped deliverable directory.
+user approved. An infrastructure task has a private manifest because its
+content belongs at shared repository paths rather than inside a timestamped
+deliverable directory. Both kinds work in the same shared checkout, which stays
+on the configured main branch, and publish to an unmounted task branch.
+
+Active deliverable task directories stay at the repository's top level. A
+completed task directory may be grouped under time folders only after its pull
+request is confirmed merged. The structure is flexible: `YYYY/<task-dir>`,
+`YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>` are all allowed. Organize old
+tasks only on the user's explicit request, through a repository-infrastructure
+task with the affected paths in scope. Merge and turn-end synchronization never
+trigger this organization automatically. When the user requests organization
+without specifying a structure, use `YYYY/MM/<task-dir>` from each directory's
+timestamp, unless the user specifies another date basis. Preserve the task
+directory's basename, retained contents, immutable task ID, and target branch.
+Use `workspace-mgr archive --dry-run` for the candidate and scope preview,
+then `workspace-mgr archive --manifest <path>` in the shared checkout, selecting
+the scoped infrastructure task, and the normal plan/publish flow. The CLI moves
+the directories and migrates complete
+S3 version histories with new storage bindings and durable historical mappings;
+agents do not perform those moves manually. After verified Git publication,
+cleanup retires only mapped source versions once live references release the
+original task. Concurrent source additions remain untouched.
 
 Reading and ownership are separate. Any chat may inspect any repository path
 when useful for context, including another chat's task directory. Reading a
@@ -106,7 +126,7 @@ conversation's topic evolves. For a deliverable it moves the complete task
 directory, including Git and S3 placement metadata, while preserving the
 immutable task ID and target branch. The next normal publication removes the
 old remote tree and publishes the new path. For infrastructure it updates the
-current slug in private task metadata while its identity-owned worktree remains
+current slug in private task metadata while its manifest location remains
 stable. `task discard` is the explicit opposite endpoint: after the user
 decides that an unmerged task should not be retained and the agent closes or
 verifies absence of its pull request, it removes that task's branch and local
@@ -125,9 +145,13 @@ updates its title and living description instead of replacing it.
 
 A repository-infrastructure change follows the same relationship. It is still
 one task with one branch and one pull request, but `task create --kind
-infrastructure` gives it an isolated worktree, private task metadata, no
-timestamped repository task directory, and an explicitly declared scope of
-shared policy, root entrypoints, CI, or other repository-wide mechanisms.
+infrastructure` gives it private task metadata, no timestamped repository task
+directory, and an explicitly declared scope of shared policy, root entrypoints,
+CI, or other repository-wide mechanisms.
+It works in the shared checkout on the configured main branch. Creation reports
+the private manifest path; pass that path with `--manifest` to task-scoped
+commands. Publication uses a private index without switching branches or
+staging another chat's paths in the shared index.
 Infrastructure is a kind of task, not a bypass around task ownership.
 
 The draft-pull-request relationship is the review model for every managed
@@ -371,8 +395,8 @@ the observed local task ref, remote task ref, and shared-branch revisions in
 private confirmation state and reports every local action plus the current S3
 version references. Confirmation from the shared checkout is accepted only for
 the exact task ID and unchanged revisions. The CLI then deletes the remote task
-branch with an exact lease, deletes the local task ref, removes the deliverable
-directory or infrastructure worktree, and restores any declared shared paths to
+branch with an exact lease, deletes the local task ref, removes a deliverable
+directory when present, and restores declared shared paths to
 the local shared-branch tree. A remote failure restores quarantined local state.
 Merged tasks are refused. Versioned S3 object paths are queued before branch
 deletion, then permanently purged when no current remote branch or tag protects
@@ -398,6 +422,20 @@ advances the branch, hydrates everything else, and names the boundary it left
 unhydrated together with the rename that recovers it, because refusing inbound
 synchronization for every checkout is the larger harm. Refresh is inbound
 synchronization; it does not publish a task.
+
+After successful synchronization, including when the shared branch was already
+current, refresh automatically cleans local and configured-remote branch refs
+whose heads still match verified merged same-repository GitHub pull requests.
+Protected branches, new local commits, and branches checked out in any legacy
+or custom worktree are preserved. A dry-run reports planned cleanup.
+Unavailable merge evidence
+or cleanup failures produce a report without undoing synchronization.
+
+Removing an obsolete branch ref leaves task and worktree directories, every
+file, and retained payloads intact. Directory
+organization remains a user-requested infrastructure
+task; an existing pending purge may run after a removed ref releases its last
+protection of a queued S3 path.
 
 ## The workspace lifecycle
 
@@ -428,7 +466,8 @@ The complete story is:
 10. The matching draft pull request carries review, and the user or maintainer
     decides whether to merge it or explicitly abandon the task.
 11. After merge, `refresh` brings the result into the shared workspace without
-    disturbing other active chats. After abandonment, the agent closes the
+    disturbing other active chats and cleans verified obsolete branch refs.
+    After abandonment, the agent closes the
     unmerged pull request and `task discard` removes the task workspace and
     branch, permanently purging its unreferenced S3 object paths.
 
@@ -439,10 +478,11 @@ state.
 The repository also records the oldest `workspace-mgr` release that can read its
 task state. `workspace-mgr` maintains that declaration itself: when a
 publication introduces task state that older releases cannot read, such as a
-manifest that records a cloud-usage approval, the publication raises it, and
-nothing lowers it once it is merged. An older release refuses the repository
-instead of misreading it, and the agent tells the user both versions and asks
-before updating, just as it does for an update notice.
+manifest that records a cloud-usage approval or uses a nested archive path,
+the publication raises it, and nothing lowers it once it is merged. An older
+release refuses the repository instead of misreading it, and the agent tells
+the user both versions and asks before updating, just as it does for an update
+notice.
 
 The intended division of responsibility is simple: the user asks for outcomes,
 the agent performs the work inside one task, and `workspace-mgr` preserves the

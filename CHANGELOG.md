@@ -5,6 +5,50 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-06
+
+### Changed
+
+- Infrastructure tasks now work in the shared checkout on the configured main
+  branch, with a private manifest selected through `--manifest`. They publish
+  through a private index to an unmounted task branch, like deliverable tasks,
+  without creating or switching to an infrastructure worktree.
+  Legacy infrastructure worktrees are not migrated automatically.
+- Active deliverable task directories stay at the repository's top level.
+  Completed task directories whose pull requests are confirmed merged may be
+  organized under flexible time folders, such as `YYYY/`, `YYYYMM/`, or
+  `YYYY/MM/`. Organization happens only when the user requests it, through a
+  repository-infrastructure task; merge and turn-end synchronization never
+  trigger it automatically. When the user chooses no structure, use
+  `YYYY/MM/<task-dir>` based on each task directory's timestamp.
+
+### Fixed
+
+- Task manifests can be read from completed-task archive folders while still
+  validating the task directory's basename, identity, and declared location.
+  Archived task manifests participate in publication's minimum CLI version
+  checks and require workspace-mgr 0.5.0 or newer, so reorganizing old tasks
+  does not hide their compatibility requirements.
+
+### Added
+
+- `archive` previews eligible merged tasks and organizes their directories
+  through a user-requested infrastructure task, with flexible time layouts and
+  a default of `YYYY/MM/<task-dir>`. Active tasks remain at the top level.
+- Archive publication copies complete retained S3 history, including delete
+  markers and retired paths, verifies destination versions, and rewrites DVC
+  metadata automatically. Durable exact-version mappings let `storage hydrate`
+  recover historical Git snapshots after protected source cleanup; receipts
+  retain original and destination identities and timestamps.
+- After successful shared-branch synchronization, `refresh` automatically
+  cleans local and configured-remote branches whose exact heads match verified
+  merged same-repository GitHub pull requests, including squash merges. It
+  preserves protected refs, active or resumed branches, and new local commits.
+  Branches checked out in any legacy or custom worktree are retained. Dry-run
+  reports the proposal. Missing GitHub evidence or
+  cleanup failures leave synchronization successful and report the retained
+  refs without removing task directories or retained payloads.
+
 ## [0.4.1] - 2026-09-27
 
 ### Fixed

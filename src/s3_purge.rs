@@ -35,6 +35,7 @@ pub struct PurgeReport {
     pub deleted: Vec<ObjectVersion>,
     pub protected: Vec<ObjectVersion>,
     pub pending: Vec<ObjectVersion>,
+    pub retained_unmapped: Vec<ObjectVersion>,
 }
 
 pub fn candidates_between(
@@ -147,11 +148,17 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
         .filter(|candidate| !protected_set.contains(*candidate))
         .cloned()
         .collect::<Vec<_>>();
+    let mut retained_unmapped = Vec::new();
     if !deleted.is_empty() {
         let payload = serde_json::to_value(&deleted).map_err(|error| {
             Error::message(format!("failed to encode S3 purge candidates: {error}"))
         })?;
-        dvc::version_purge_adapter(repo, "delete", &payload)?;
+        let response = dvc::version_purge_adapter(repo, "delete", &payload)?;
+        if let Some(retained) = response.get("retained_unmapped") {
+            retained_unmapped = serde_json::from_value(retained.clone()).map_err(|error| {
+                Error::message(format!("invalid unmapped archive version report: {error}"))
+            })?;
+        }
     }
     let next = PurgeState {
         schema_version: STATE_SCHEMA,
@@ -169,6 +176,7 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
         deleted,
         protected: protected_objects.clone(),
         pending: protected_objects,
+        retained_unmapped,
     })
 }
 
@@ -240,9 +248,28 @@ fn referenced_objects(
         .map(|candidate| candidate.pointer.clone())
         .collect::<BTreeSet<_>>();
     let mut requests = Vec::new();
+    let mut archive_protected = BTreeSet::new();
     for revision in revisions {
         let mut pointers = Vec::new();
         for pointer in &candidate_pointers {
+            if let Some(source) =
+                pointer.strip_suffix(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
+            {
+                // An archive retires the entire prefix, including historical
+                // files no current pointer names. Keep that complete snapshot
+                // while any live branch or tag still contains the source task.
+                if repo
+                    .run_unchecked([
+                        "cat-file",
+                        "-e",
+                        &format!("{revision}:{source}/{}", crate::policy::TASK_MANIFEST_NAME),
+                    ])?
+                    .success()
+                {
+                    archive_protected.insert(pointer.clone());
+                }
+                continue;
+            }
             if repo
                 .run_unchecked(["cat-file", "-e", &format!("{revision}:{pointer}")])?
                 .success()
@@ -273,7 +300,9 @@ fn referenced_objects(
         .collect::<BTreeSet<_>>();
     Ok(candidates
         .iter()
-        .filter(|candidate| referenced.contains(&candidate.object))
+        .filter(|candidate| {
+            referenced.contains(&candidate.object) || archive_protected.contains(&candidate.pointer)
+        })
         .cloned()
         .collect())
 }

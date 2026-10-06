@@ -125,6 +125,15 @@ pub fn set(
         ));
     }
     let paths = validate_targets(repo, scopes, paths, true)?;
+    if target == StorageTarget::S3
+        && paths
+            .iter()
+            .any(|path| path.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)))
+    {
+        return Err(Error::message(
+            "archive migration receipts must remain in Git",
+        ));
+    }
     validate_boundary_targets(repo, scopes, &paths)?;
     let local = paths
         .iter()
@@ -630,7 +639,10 @@ pub fn apply_automatic(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
+        if path.ends_with(".dvc")
+            || path.ends_with(PLACEMENT_SUFFIX)
+            || path.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
+        {
             continue;
         }
         if matches!(
@@ -1396,6 +1408,7 @@ fn reject_control_path(repo: &GitRepo, path: &str) -> Result<()> {
     if name == ".gitignore"
         || task_readme
         || name == TASK_MANIFEST_NAME
+        || name == crate::archive_migration::RECEIPT_NAME
         || name == crate::config::CONFIG_NAME
         || name.ends_with(PLACEMENT_SUFFIX)
         || name.ends_with(".dvc")

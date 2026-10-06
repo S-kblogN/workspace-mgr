@@ -7,6 +7,8 @@ use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::archive_migration;
+
 use crate::cloud_usage::{
     CloudUsageReport, LocalUsageStatus, UsageGate, UsageInputs, blobs_at, read_blobs,
     retires_content_only,
@@ -21,14 +23,15 @@ use crate::git::GitRepo;
 use crate::hex::encode_lower;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    AdditionalScope, CloudUsageApproval, ResolvedTask, TaskKind, one_line, published_history_path,
-    published_task_paths, validate_additional_scopes,
+    AdditionalScope, CloudUsageApproval, ResolvedTask, TaskKind, one_line, parse_task_identity,
+    published_history_path, published_task_paths, validate_additional_scopes,
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
-    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
-    REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
-    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
+    ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES,
+    BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB, REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE,
+    REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME,
+    TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
@@ -110,8 +113,8 @@ pub struct RepositoryRequirement {
     /// The declaration the publication's `.workspace-mgr.toml` carried before
     /// workspace-mgr reconciled it.
     pub previous_minimum_cli_version: Option<String>,
-    /// The task manifest schema that needs the newer release; `None` when the
-    /// change is not driven by a manifest.
+    /// The schema of the task manifest driving the newer requirement, whether
+    /// through its schema or archived path; `None` without a manifest trigger.
     pub task_manifest_schema: Option<u32>,
 }
 
@@ -245,6 +248,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &remote_base_oid,
         &format!("{}/{}", task.remote, task.base_branch),
     )?;
+    if task.kind == TaskKind::Infrastructure
+        && repo.optional_oid("HEAD")?.as_deref() != Some(&remote_base_oid)
+    {
+        return Err(Error::message(
+            "infrastructure publication requires the shared checkout to match the fetched base branch; run workspace-mgr refresh first, preserving task overlays, then retry with the task's --manifest",
+        ));
+    }
     let remote_target_oid = repo.remote_branch_oid(&task.remote, &task.branch)?;
     let has_remote_target = remote_target_oid.is_some();
     let (base_ref, base_oid) = if let Some(remote_target_oid) = remote_target_oid {
@@ -445,6 +455,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         ..preview_policy
     };
     let pointers = dvc::discover(&repo, &scopes)?;
+    let archived_pointers = archive_migration::pointer_set(&repo, &scopes)?;
+    let ordinary_pointers = pointers
+        .iter()
+        .filter(|pointer| !archived_pointers.contains(*pointer))
+        .cloned()
+        .collect::<Vec<_>>();
     if !dry_run {
         let preflight_outputs = dvc::output_paths(&repo, &pointers)?;
         let preflight_index = state_dir.join("preflight-index");
@@ -469,13 +485,33 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     }
     // The metadata as the storage engine finds it, so that a refusal before
     // the upload leaves the worktree as the publication found it.
+    let archive_receipts = if dry_run {
+        archive_migration::receipts(&repo, &scopes)?
+            .into_iter()
+            .map(|(_, receipt)| receipt)
+            .collect()
+    } else {
+        archive_migration::prepare(&repo, &config, &scopes, &base_oid)?
+    };
     let uncommitted_metadata = if dry_run {
         Vec::new()
     } else {
         read_metadata(&repo, &pointers)?
     };
-    let mut s3 = dvc::reconcile(&repo, &config, &pointers, dry_run)?;
+    let mut s3 = dvc::reconcile(&repo, &config, &ordinary_pointers, dry_run)?;
     if !dry_run {
+        stage_scopes(&repo, &preview_index, &scopes)?;
+        remove_stored_outputs_from_index(
+            &repo,
+            &preview_index,
+            &dvc::output_paths(&repo, &pointers)?,
+        )?;
+        remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
+        let committed_tree = repo
+            .run_with_index(&preview_index, ["write-tree"], None, true)?
+            .stdout
+            .trim()
+            .to_owned();
         // Background writers may have changed outputs since the preview and
         // the gate; the committed metadata is exactly what the upload would
         // send, so both judge it again before anything is uploaded.
@@ -492,6 +528,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
                 &repo,
                 &config,
                 &UsageInputs {
+                    projected_tree_oid: &committed_tree,
                     pointers: &pointers,
                     automatic_s3: &[],
                     inspect_outputs: false,
@@ -513,6 +550,14 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             );
         }
         dvc::push_outputs(&repo, &config, &mut s3)?;
+    }
+    // Copied archive versions already exist remotely and may be deliberately
+    // unmaterialized. Never let native DVC push manufacture replacement versions.
+    let archived = archived_pointers.into_iter().collect::<Vec<_>>();
+    s3.outputs.extend(dvc::output_paths(&repo, &archived)?);
+    s3.files.extend(archived.iter().cloned());
+    if !dry_run {
+        s3.pushed.extend(archived);
     }
     let mut purge_preview = s3_purge::preview(&repo)?;
     if !local_only.is_empty() {
@@ -540,6 +585,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         "local_only": local_only,
         "s3": s3,
         "purge": purge_preview,
+        "archive": archive_receipts,
     });
 
     let index = state_dir.join("index");
@@ -700,8 +746,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .stdout
         .trim()
         .to_owned();
-    let purge_candidates =
+    let mut purge_candidates =
         s3_purge::candidates_between(&repo, &config, &base_oid, &commit_oid, &scopes)?;
+    purge_candidates.extend(archive_migration::purge_candidates(&archive_receipts)?);
+    purge_candidates.sort();
+    purge_candidates.dedup();
     s3_purge::queue(&repo, &purge_candidates)?;
     let local_ref = format!("refs/heads/{}", task.branch);
     let old_local_oid = repo.optional_oid(&local_ref)?;
@@ -713,16 +762,6 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &commit_oid,
         old_local_oid.as_deref().unwrap_or(ZERO_OID),
     ])?;
-    if task.kind == TaskKind::Infrastructure {
-        repo.run(["read-tree", &commit_oid])?;
-        if requirement.is_some()
-            || (!requirement_inputs.config_in_scope && paths.iter().any(|path| path == CONFIG_NAME))
-        {
-            // The isolated worktree checks out the task branch, so it must
-            // match the configuration the branch now carries.
-            sync_worktree_config(&repo, &commit_oid)?;
-        }
-    }
     let refspec = format!("{commit_oid}:refs/heads/{}", task.branch);
     repo.run(["push", "--porcelain", &task.remote, &refspec])?;
     let observed = repo
@@ -895,61 +934,19 @@ fn remove_output_paths_from_index<'a>(
 fn validate_checkout(
     repo: &GitRepo,
     task: &ResolvedTask,
-    scopes: &[String],
+    _scopes: &[String],
     options: &TransactionOptions,
 ) -> Result<()> {
     let head = repo.current_branch()?;
     if task.kind == TaskKind::Infrastructure {
-        if head.as_deref() != Some(&task.branch) {
+        if head.as_deref() != Some(&task.shared_head) {
             return Err(Error::message(format!(
-                "infrastructure task must run in its isolated worktree on {:?}; current branch is {:?}",
-                task.branch,
+                "infrastructure task must run from the shared checkout on {:?}; current branch is {:?}",
+                task.shared_head,
                 head.as_deref().unwrap_or("detached HEAD")
             )));
         }
-        let root = repo.root.canonicalize().map_err(|source| Error::Io {
-            path: repo.root.clone(),
-            source,
-        })?;
-        let worktrees = repo.branch_worktrees(&task.branch)?;
-        if worktrees.len() != 1
-            || worktrees[0].canonicalize().map_err(|source| Error::Io {
-                path: worktrees[0].clone(),
-                source,
-            })? != root
-        {
-            return Err(Error::message(
-                "infrastructure branch is not mounted only in the current isolated worktree",
-            ));
-        }
-        let staged = repo.run_unchecked(["diff", "--cached", "--quiet", "--"])?;
-        if staged.code != 0 && staged.code != 1 {
-            return Err(Error::message(
-                "failed to inspect the infrastructure worktree index",
-            ));
-        }
-        if staged.code == 1 {
-            return Err(Error::message(
-                "infrastructure worktree index has staged changes; unstage them before workspace-mgr publication",
-            ));
-        }
-        let tracked = repo.run(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])?;
-        let untracked = repo.run(["ls-files", "--others", "--exclude-standard", "-z", "--"])?;
-        let mut escaped = tracked
-            .stdout
-            .split('\0')
-            .chain(untracked.stdout.split('\0'))
-            .filter(|path| !path.is_empty() && !allowed(path, scopes))
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        escaped.sort();
-        escaped.dedup();
-        if !escaped.is_empty() {
-            return Err(Error::message(format!(
-                "infrastructure worktree has changes outside its declared scope: {}",
-                escaped.join(", ")
-            )));
-        }
+        repo.ensure_branch_not_checked_out(&task.branch)?;
         return Ok(());
     }
     if head.as_deref() != Some(&task.shared_head) {
@@ -1218,7 +1215,10 @@ fn deliverable_task_path(task: &ResolvedTask) -> Option<&str> {
 /// rules. Every other path inside the task directory is content the task
 /// produced.
 fn is_housekeeping_name(name: &str) -> bool {
-    name == "README.md" || name == TASK_MANIFEST_NAME || name == ".gitignore"
+    name == "README.md"
+        || name == TASK_MANIFEST_NAME
+        || name == ".gitignore"
+        || name == crate::archive_migration::RECEIPT_NAME
 }
 
 fn is_markdown(path: &str) -> bool {
@@ -1835,6 +1835,9 @@ fn check_large_files(
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     for relative in repo.visible_paths(scopes)? {
+        if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)) {
+            continue;
+        }
         if storage::is_local(repo, &relative)? {
             continue;
         }
@@ -2320,7 +2323,7 @@ fn reconcile_from_fork_point(
         }
         (Some((version, schema)), None) => {
             require_publishable(inputs.installed, needs, version)?;
-            return Err(missing_configuration(version, *schema));
+            return Err(missing_configuration(version, *schema, needs));
         }
         (None, Some((entry, raw))) => {
             let untouched = staged.is_some_and(|staged| staged.oid == entry.oid);
@@ -2375,7 +2378,7 @@ fn raise_staged_requirement(
     let Some(entry) = staged else {
         if let Some((version, schema)) = &required {
             require_publishable(inputs.installed, needs, version)?;
-            return Err(missing_configuration(version, *schema));
+            return Err(missing_configuration(version, *schema, needs));
         }
         return Ok(None);
     };
@@ -2488,6 +2491,12 @@ fn require_publishable(
 ) -> Result<()> {
     if let Some(other) = &needs.others {
         if !cli_version_satisfies(installed, &other.version) {
+            if other.archived {
+                return Err(Error::message(format!(
+                    "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                    other.path, other.version
+                )));
+            }
             return Err(Error::message(format!(
                 "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because its schema {} requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
                 other.path, other.schema, other.version
@@ -2496,6 +2505,12 @@ fn require_publishable(
     }
     if let Some(own) = &needs.own {
         if !cli_version_satisfies(installed, &own.version) {
+            if own.archived {
+                return Err(Error::message(format!(
+                    "this build (workspace-mgr {installed}) cannot publish {}, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                    own.path, own.version
+                )));
+            }
             return Err(Error::message(format!(
                 "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval.",
                 own.schema, own.version
@@ -2511,19 +2526,25 @@ fn require_publishable(
     Ok(())
 }
 
-fn missing_configuration(required: &Version, schema: u32) -> Error {
+fn missing_configuration(required: &Version, schema: u32, needs: &ManifestNeeds) -> Error {
+    if let Some(need) = needs.highest_need().filter(|need| need.archived) {
+        return Error::message(format!(
+            "reading archived task manifest {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
+            need.path
+        ));
+    }
     Error::message(format!(
         "task manifest schema {schema} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first"
     ))
 }
 
-/// A task manifest that needs a newer workspace-mgr than schemas without a
-/// requirement.
+/// A task manifest needing a newer workspace-mgr through its schema or path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestNeed {
     version: Version,
     schema: u32,
     path: String,
+    archived: bool,
 }
 
 /// What the task manifests in a private index need, split by whether the
@@ -2538,26 +2559,40 @@ struct ManifestNeeds {
 }
 
 impl ManifestNeeds {
-    /// The newest workspace-mgr any manifest needs, with the schema that
-    /// needs it.
+    /// The newest workspace-mgr any manifest needs, with that manifest
+    /// instance's schema.
     fn highest(&self) -> Option<(Version, u32)> {
+        self.highest_need()
+            .map(|need| (need.version.clone(), need.schema))
+    }
+
+    fn highest_need(&self) -> Option<&ManifestNeed> {
         [&self.own, &self.others]
             .into_iter()
             .flatten()
             .max_by(|left, right| left.version.cmp_precedence(&right.version))
-            .map(|need| (need.version.clone(), need.schema))
     }
 }
 
-/// What the task manifests one directory below the root of the index need.
+/// What top-level and archived task manifests in the index need. Nested copies
+/// of a manifest under ordinary output directories are not task directories.
 fn manifest_requirement(
     repo: &GitRepo,
     index: &Path,
     own_manifest: Option<&str>,
 ) -> Result<ManifestNeeds> {
-    let manifests = index_entries(repo, index, &format!(":(glob)*/{TASK_MANIFEST_NAME}"))?
+    let manifests = index_entries(repo, index, &format!(":(glob)**/{TASK_MANIFEST_NAME}"))?
         .into_iter()
         .filter(IndexEntry::is_regular_file)
+        .filter(|entry| {
+            let Some(directory) = entry.path.strip_suffix(&format!("/{TASK_MANIFEST_NAME}")) else {
+                return false;
+            };
+            match directory.rsplit_once('/') {
+                None => true,
+                Some((_, name)) => parse_task_identity(TaskKind::Deliverable, name).is_ok(),
+            }
+        })
         .collect::<Vec<_>>();
     let oids = manifests
         .iter()
@@ -2577,8 +2612,15 @@ fn manifest_requirement(
         let Some(schema) = schemas.get(&entry.oid).copied() else {
             continue;
         };
-        let Some(version) = minimum_cli_version_for_task_schema(schema) else {
-            continue;
+        let archived = entry.path.split('/').count() > 2;
+        let schema_minimum = minimum_cli_version_for_task_schema(schema);
+        let version = match (schema_minimum, archived) {
+            (Some(version), true) => {
+                highest(&ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, Some(&version))
+            }
+            (None, true) => ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION,
+            (Some(version), false) => version,
+            (None, false) => continue,
         };
         let slot = if own_manifest == Some(entry.path.as_str()) {
             &mut needs.own
@@ -2593,6 +2635,7 @@ fn manifest_requirement(
                 version,
                 schema,
                 path: entry.path,
+                archived,
             });
         }
     }
@@ -2721,22 +2764,6 @@ fn stage_config_entry(repo: &GitRepo, index: &Path, mode: &str, oid: &str) -> Re
         true,
     )?;
     Ok(())
-}
-
-/// Brings an isolated infrastructure worktree's configuration to the
-/// published commit, whose index `read-tree` has already loaded.
-fn sync_worktree_config(repo: &GitRepo, commit_oid: &str) -> Result<()> {
-    let object = format!("{commit_oid}:{CONFIG_NAME}");
-    if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
-        repo.run(["checkout-index", "--force", "--", CONFIG_NAME])?;
-        return Ok(());
-    }
-    let path = repo.root.join(CONFIG_NAME);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::Io { path, source }),
-    }
 }
 
 /// The schema a task manifest declares, read without validating the rest.
@@ -3121,6 +3148,112 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.oid)
         }
+    }
+
+    #[test]
+    fn task_status_resolves_archived_tasks_from_descendants_and_explicit_manifests() {
+        for grouping in ["2026", "202609", "2026/09"] {
+            let fixture = Fixture::new(Some(PLAIN_CONFIG));
+            let task_id = "20260918-120000-completed";
+            let directory = format!("{grouping}/{task_id}");
+            let manifest = format!("{directory}/{TASK_MANIFEST_NAME}");
+            fixture.write(
+                &manifest,
+                &format!(
+                    "schema_version = 3\nkind = \"deliverable\"\nid = \"{task_id}\"\nslug = \"completed\"\npath = \"{directory}\"\nbranch = \"codex/completed\"\ntitle = \"Completed\"\npurpose = \"Retain the completed task.\"\nadditional_scopes = []\n\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \"The user approved 2 GiB\"\n"
+                ),
+            );
+            fixture.write(&format!("{directory}/outputs/result.txt"), "retained\n");
+            fixture.commit();
+
+            let descendant = fixture.repo.root.join(&directory).join("outputs");
+            let status = task_status(&descendant, None).unwrap();
+            assert_eq!(status.task_id, task_id);
+            assert_eq!(status.branch, "codex/completed");
+            assert_eq!(status.scopes, vec![directory.clone()]);
+            assert_eq!(status.cloud_usage.limit_bytes, 2_147_483_648);
+            assert!(status.working_changes.is_empty());
+
+            fixture.write(&format!("{directory}/outputs/result.txt"), "changed\n");
+            let status =
+                task_status(&fixture.repo.root, Some(&fixture.repo.root.join(&manifest))).unwrap();
+            assert_eq!(status.task_id, task_id);
+            assert_eq!(status.working_changes.len(), 1);
+            assert!(status.working_changes[0].contains(&format!("{directory}/outputs/result.txt")));
+        }
+    }
+
+    #[test]
+    fn archived_tasks_require_a_release_that_reads_nested_paths() {
+        for grouping in ["2026", "202609", "2026/09"] {
+            for schema in [2, 3] {
+                let fixture = Fixture::new(Some(PLAIN_CONFIG));
+                let main = fixture.main.clone();
+                let directory = format!("{grouping}/20260918-120000-completed");
+                let manifest = format!("{directory}/{TASK_MANIFEST_NAME}");
+                fixture.manifest(&directory, schema);
+                fixture.manifest("20260918-120000-old/copy", 3);
+                fixture.stage(&main, &[&directory, "20260918-120000-old"]);
+
+                let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+                assert!(needs.own.is_none());
+                let other = needs.others.unwrap();
+                assert_eq!(other.path, manifest);
+                assert_eq!(other.schema, schema);
+                assert_eq!(other.version, Version::new(0, 5, 0));
+                assert!(other.archived);
+
+                let error = fixture
+                    .reconcile(&main, &main, None, false, "0.4.1")
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(&manifest), "{error}");
+                assert!(error.contains("archived task manifest requires workspace-mgr 0.5.0"));
+                assert!(!error.contains("remove the approval"));
+                assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+
+                let own =
+                    manifest_requirement(&fixture.repo, &fixture.index, Some(&manifest)).unwrap();
+                let error =
+                    require_publishable(&Version::new(0, 4, 1), &own, &Version::new(0, 5, 0))
+                        .unwrap_err()
+                        .to_string();
+                assert!(error.contains(&manifest), "{error}");
+                assert!(error.contains("archived task manifest requires workspace-mgr 0.5.0"));
+                assert!(!error.contains("remove the approval"));
+
+                assert_eq!(
+                    fixture
+                        .reconcile(&main, &main, None, false, "0.5.0")
+                        .unwrap(),
+                    Some(requirement(
+                        RequirementChange::Raise,
+                        Some("0.5.0"),
+                        None,
+                        Some(schema)
+                    ))
+                );
+                assert_eq!(
+                    fixture.staged_config().unwrap(),
+                    declaring("0.5.0", PLAIN_CONFIG)
+                );
+            }
+        }
+
+        let fixture = Fixture::new(None);
+        let main = fixture.main.clone();
+        fixture.manifest("2026/09/20260918-120000-completed", 2);
+        fixture.stage(&main, &["2026"]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.5.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reading archived task manifest"), "{error}");
+        assert!(error.contains("requires workspace-mgr 0.5.0"), "{error}");
+        assert!(
+            error.contains("publication has no .workspace-mgr.toml"),
+            "{error}"
+        );
     }
 
     #[test]

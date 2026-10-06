@@ -7,14 +7,33 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
-use crate::path::repo_path;
+use crate::path::{reject_symlink_traversal, repo_path};
 use crate::policy::{TASK_BRANCH_PREFIX, TASK_MANIFEST_NAME};
 
 pub const INFRASTRUCTURE_MANIFEST_NAME: &str = "workspace-mgr/task.toml";
+pub const INFRASTRUCTURE_TASK_MANIFEST_FILE: &str = ".workspace-mgr-infrastructure.toml";
 pub const TASK_SCHEMA_VERSION: u32 = 2;
 /// Schema 2 plus the optional `[cloud_usage_approval]` table.
 pub const CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION: u32 = 3;
 const LEGACY_TASK_SCHEMA_VERSION: u32 = 1;
+
+/// Infrastructure tasks share the main checkout. Their explicit manifests
+/// live in per-task common Git state, allowing concurrent tasks without an
+/// implicit active-task selector or a branch-mounted workplace.
+pub fn infrastructure_manifest_path(repo: &GitRepo, task_id: &str) -> Result<PathBuf> {
+    parse_task_identity(TaskKind::Infrastructure, task_id)?;
+    let common = repo
+        .common_dir()?
+        .canonicalize()
+        .map_err(|source| Error::Io {
+            path: repo.root.clone(),
+            source,
+        })?;
+    let relative =
+        format!("workspace-mgr/infrastructure-tasks/{task_id}/{INFRASTRUCTURE_TASK_MANIFEST_FILE}");
+    reject_symlink_traversal(&common, &relative, "private infrastructure manifest")?;
+    Ok(common.join(relative))
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -167,15 +186,10 @@ impl ResolvedTask {
                     .as_deref()
                     .ok_or_else(|| Error::message("deliverable task manifest requires path"))?;
                 let task_path = repo_path(raw_path, "task path")?;
-                if task_path.contains('/') {
-                    return Err(Error::message(
-                        "task path must be a directory directly below the repository root",
-                    ));
-                }
-                let expected_path = build_task_path(&identity, &slug);
-                if task_path != expected_path {
+                let expected_directory = build_task_path(&identity, &slug);
+                if task_path.rsplit('/').next() != Some(expected_directory.as_str()) {
                     return Err(Error::message(format!(
-                        "deliverable task path must be {expected_path:?} for slug {slug:?}; got {task_path:?}"
+                        "deliverable task directory must be {expected_directory:?} for slug {slug:?}; got {task_path:?}"
                     )));
                 }
                 let expected = repo.root.join(&task_path).join(TASK_MANIFEST_NAME);
@@ -194,10 +208,11 @@ impl ResolvedTask {
                         "infrastructure task manifest must not declare a task path",
                     ));
                 }
-                let expected = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
-                if absolute != expected {
+                let expected = infrastructure_manifest_path(repo, &task_id)?;
+                let legacy = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
+                if absolute != expected && legacy.canonicalize().ok().as_ref() != Some(&absolute) {
                     return Err(Error::message(format!(
-                        "infrastructure task manifest must be private worktree state at {}; got {}",
+                        "infrastructure task manifest must be private per-task Git state at {}; got {}",
                         expected.display(),
                         absolute.display()
                     )));
@@ -284,12 +299,8 @@ impl ResolvedTask {
                 break;
             }
         }
-        let infrastructure = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
-        if infrastructure.is_file() {
-            return Ok(infrastructure);
-        }
         Err(Error::message(format!(
-            "no task manifest found from {} to {}",
+            "no task manifest found from {} to {}; infrastructure tasks require explicit --manifest selection",
             start.display(),
             repo.root.display()
         )))
@@ -622,20 +633,93 @@ mod tests {
     }
 
     fn load_manifest(raw: &str) -> Result<ResolvedTask> {
+        load_manifest_at(raw, "20260918-120000-demo")
+    }
+
+    fn load_manifest_at(raw: &str, directory: &str) -> Result<ResolvedTask> {
         let temp = tempfile::tempdir().unwrap();
         let repo = GitRepo {
             root: temp.path().canonicalize().unwrap(),
         };
-        let path = repo
-            .root
-            .join("20260918-120000-demo")
-            .join(TASK_MANIFEST_NAME);
+        let path = repo.root.join(directory).join(TASK_MANIFEST_NAME);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, raw).unwrap();
         ResolvedTask::load(&repo, &Config::default(), &path)
     }
 
+    #[test]
+    fn infrastructure_manifests_are_per_task_and_require_explicit_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        let raw = |slug: &str| {
+            format!(
+                "schema_version = 2\nkind = \"infrastructure\"\nid = \"infra-{slug}\"\nslug = \"{slug}\"\nbranch = \"codex/infra-{slug}\"\ntitle = \"Repository update\"\npurpose = \"Keep shared infrastructure current\"\n\n[[additional_scopes]]\npath = \".github\"\nreason = \"The user requested this shared scope\"\n"
+            )
+        };
+        let first = infrastructure_manifest_path(&repo, "infra-first").unwrap();
+        let second = infrastructure_manifest_path(&repo, "infra-second").unwrap();
+        for (slug, path) in [("first", &first), ("second", &second)] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, raw(slug)).unwrap();
+            let task = ResolvedTask::load(&repo, &Config::default(), path).unwrap();
+            assert_eq!(task.task_id, format!("infra-{slug}"));
+            assert_eq!(task.task_path, None);
+            assert_eq!(task.scopes(), vec![".github"]);
+        }
+        assert_ne!(first, second);
+        fs::write(&second, raw("first")).unwrap();
+        let error = ResolvedTask::load(&repo, &Config::default(), &second)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("private per-task Git state"), "{error}");
+
+        // A singular legacy manifest remains explicitly readable, but never
+        // chooses an infrastructure task implicitly from the shared root.
+        let legacy = repo.git_dir().unwrap().join(INFRASTRUCTURE_MANIFEST_NAME);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, raw("first")).unwrap();
+        ResolvedTask::load(&repo, &Config::default(), &legacy).unwrap();
+        let error = ResolvedTask::discover(&repo, &repo.root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit --manifest"), "{error}");
+    }
+
     const APPROVAL_TABLE: &str = "\n[cloud_usage_approval]\nlimit_bytes = 2147483648\nnote = \"The user approved 2 GiB for the training checkpoints\"\n";
+
+    #[test]
+    fn archived_manifest_paths_preserve_directory_identity_and_exact_location() {
+        let original = deliverable_manifest(3, APPROVAL_TABLE);
+        for grouping in ["2026", "202609", "2026/09"] {
+            let directory = format!("{grouping}/20260918-120000-demo");
+            let raw = original.replace(
+                "path = \"20260918-120000-demo\"",
+                &format!("path = \"{directory}\""),
+            );
+            let task = load_manifest_at(&raw, &directory).unwrap();
+            assert_eq!(task.task_path.as_deref(), Some(directory.as_str()));
+            assert_eq!(task.task_id, "20260918-120000-demo");
+            assert_eq!(task.branch, "codex/demo");
+            assert!(task.cloud_usage_approval.is_some());
+            assert_eq!(task.manifest().render().unwrap(), raw);
+
+            let error = load_manifest_at(&original, &directory)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("manifest must be located at"), "{error}");
+
+            let wrong_name = format!("{grouping}/20260918-120000-other");
+            let raw = raw.replace(&directory, &wrong_name);
+            let error = load_manifest_at(&raw, &wrong_name).unwrap_err().to_string();
+            assert!(
+                error.contains("deliverable task directory must be"),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn schema_3_manifests_carry_the_cloud_usage_approval() {

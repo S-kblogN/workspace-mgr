@@ -277,7 +277,7 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
     assert!(warning.contains("infrastructure task"), "{warning}");
     assert!(warning.contains(&format!("(`{TASK_ID}`)")), "{warning}");
     let created = json(&workspace(
-        shared,
+        &consumer,
         [
             "task",
             "create",
@@ -295,12 +295,16 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
         ],
     ));
     let worktree = PathBuf::from(created["path"].as_str().unwrap());
+    let manifest = created["manifest"].as_str().unwrap();
     // The task starts from the fetched base, so it holds the metadata but, like
     // every checkout, no payload for the boundary.
     assert!(worktree.join(format!("{boundary}.dvc")).is_file());
     assert!(!worktree.join(&boundary).exists());
 
-    let moved = json(&workspace(&worktree, ["move", &boundary, &destination]));
+    let moved = json(&workspace(
+        &worktree,
+        ["move", &boundary, &destination, "--manifest", manifest],
+    ));
     assert_eq!(moved["status"], "updated");
     assert!(!worktree.join(format!("{boundary}.dvc")).exists());
     assert!(worktree.join(format!("{destination}.dvc")).is_file());
@@ -316,7 +320,16 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
     // Publication requires every boundary in its scope to be present, and a
     // scope-wide hydrate would refuse before the rename, so the warning says
     // to name the others.
-    let early = workspace_unchecked(&worktree, ["publish", "-m", "Publish before hydrating"]);
+    let early = workspace_unchecked(
+        &worktree,
+        [
+            "publish",
+            "--manifest",
+            manifest,
+            "-m",
+            "Publish before hydrating",
+        ],
+    );
     assert_eq!(early.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&early.stderr).contains("hydrate them before publishing"),
@@ -328,6 +341,8 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
         [
             "storage",
             "hydrate",
+            "--manifest",
+            manifest,
             &format!("{TASK_ID}/first.bin"),
             &format!("{TASK_ID}/second.bin"),
         ],
@@ -336,7 +351,13 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
 
     let published = json(&workspace(
         &worktree,
-        ["publish", "-m", "Recover the unaddressable boundary"],
+        [
+            "publish",
+            "--manifest",
+            manifest,
+            "-m",
+            "Recover the unaddressable boundary",
+        ],
     ));
     assert_eq!(published["status"], "pushed");
     let oid = published["commit_oid"].as_str().unwrap().to_owned();

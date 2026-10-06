@@ -71,12 +71,14 @@ A pre-release also meets a declaration of its own release, so 0.4.0-rc.1 meets
 `"0.4.0"`, while it does not meet `"0.4.1"`.
 
 Publication maintains the declaration. Task manifest schema 3, which records a
-cloud-usage approval, needs `workspace-mgr` 0.4.0; schemas 1 and 2 need no
-declaration. Unless the task is authorized to change `.workspace-mgr.toml`
-itself, and as long as the task branch's copy of the file is exactly what
-`workspace-mgr` wrote there, each publication reconciles the file in its own
-private Git index, never in the shared checkout, against the configuration at
-the point where the task branch left the base branch:
+cloud-usage approval, needs `workspace-mgr` 0.4.0. Top-level manifests with
+schemas 1 and 2 need no declaration. A nested archive task manifest needs
+0.5.0 regardless of whether its schema is 1, 2, or 3. Unless the task is
+authorized to change `.workspace-mgr.toml` itself, and as long as the task
+branch's copy of the file is exactly what `workspace-mgr` wrote there, each
+publication reconciles the file in its own private Git index, never in the
+shared checkout, against the configuration at the point where the task branch
+left the base branch:
 
 - When the branch never changed the file and no task manifest in the published
   tree needs more than that starting point declares, the publication carries
@@ -85,7 +87,7 @@ the point where the task branch left the base branch:
 - When a task manifest needs a newer release, the publication carries the
   starting point's configuration in its canonical form with the higher of that
   requirement and the fetched base branch's declaration. Task branches raised
-  for the same schema write the same content, and a branch raised earlier
+  for the same requirements write the same content, and a branch raised earlier
   follows a base branch that a later release raised further on its next
   publication, so both merge cleanly.
 - When no task manifest needs the branch's earlier raise any more, for example
@@ -116,10 +118,11 @@ canonical form, so comments in it are not preserved then.
 A build never publishes a declaration that it does not meet itself: when a
 task manifest needs a newer release than the installed one, `plan` and
 `publish`, including `publish --dry-run`, refuse before anything is placed or
-uploaded. When that manifest is the task's own, the refusal also offers
-recording the default limit, which removes the approval; when it is another
-task's manifest in the published tree, such as one merged on the base branch,
-the refusal names it and only an update helps.
+uploaded. The refusal offers recording the default limit only when removing
+the task's own approval clears its schema requirement. An archived-path
+requirement, or another task's requirement in the published tree, needs an
+update; removing an approval does not make an archived path readable by an
+older release.
 
 A release older than the declaration refuses the repository before it reads
 anything else from this file, so a declaration written next to fields that only
@@ -141,10 +144,14 @@ The following behavior is deliberately not configurable:
 
 - one writable conversation maps to one task, one `codex/` branch, and one
   draft pull request;
-- deliverable tasks use timestamped top-level directories, a README, and
-  `.workspace-mgr-task.toml`;
-- shared repository changes use an infrastructure task in an isolated
-  worktree;
+- active deliverable tasks use timestamped top-level directories, a README,
+  and `.workspace-mgr-task.toml`;
+- completed deliverable task directories whose pull requests are confirmed
+  merged may be grouped under time folders only in a user-requested
+  infrastructure task; merge and turn-end synchronization never organize them
+  automatically;
+- shared repository changes use an infrastructure task in the same shared
+  checkout, with a private manifest selected explicitly;
 - the shared checkout remains on `git.branch` and preserves unrelated overlays;
 - Git is the collaboration/control plane and S3 is the artifact/data plane;
   agents record clear semantic choices, while unclassified new files use the
@@ -168,6 +175,14 @@ scope, approve a higher cloud-usage limit for one task, or request a narrow
 exceptional action. Those are task-level decisions, not alternate repository
 strategies.
 
+Completed-task folder structure is flexible, for example `YYYY/<task-dir>`,
+`YYYYMM/<task-dir>`, or `YYYY/MM/<task-dir>`. If the user requests organization
+without choosing a structure, use `YYYY/MM/<task-dir>` based on each directory's
+timestamp, unless the user specifies another date basis. Preserve each task's
+basename, retained contents, immutable task ID, and target branch. This is a
+choice for the requested organization task, not a repository configuration
+option.
+
 ## Task manifests
 
 Task manifests contain task-specific state rather than repository policy:
@@ -188,9 +203,14 @@ reason = "The user explicitly requested this shared documentation change"
 ```
 
 An infrastructure manifest uses `kind = "infrastructure"`, omits `path`, and
-requires at least one `additional_scopes` entry. It is stored in private
-worktree Git state rather than committed to the repository. The manifest schema
-version describes serialized task state; it is not a strategy selector.
+requires at least one `additional_scopes` entry. It is stored in private Git
+common state rather than committed to the repository. Task creation reports
+an absolute `manifest` path below
+`<git-common-dir>/workspace-mgr/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`
+for subsequent `--manifest <path>` selection. Infrastructure work
+stays in the shared checkout on `git.branch`; no task worktree is created.
+The manifest schema version describes serialized task state; it is not a
+strategy selector.
 
 Every field shown above except `additional_scopes` is required; the schema 3
 `cloud_usage_approval` table described below is optional. The ID is the
@@ -198,13 +218,18 @@ immutable creation identity: a deliverable uses
 `YYYYMMDD-HHMMSS-<original-slug>` and an infrastructure task uses
 `infra-<original-slug>`. The branch is derived from that immutable identity and
 does not change. `slug` is the current lowercase ASCII kebab-case topic label.
-A deliverable path uses the ID's original timestamp plus the current slug, so
-`task rename` can move it without replacing the task or review branch. An
-infrastructure task has no `path`; its private worktree remains keyed by the
-stable ID. Declared scopes must be distinct and non-overlapping. Schema 1
-manifests are still readable with their original slug; `task rename` and
-`task approve-cloud-usage` rewrite them as schema 2, or as schema 3 when they
-record an approval. These constraints are validated whenever a manifest is
+A deliverable directory's basename uses the ID's original timestamp plus the
+current slug. Active tasks stay at the top level; after user-requested
+organization, a completed task's full `path` may include time-folder parents.
+The manifest's `path` must match its actual repository-relative directory, and
+the directory basename must still match the timestamp and current slug.
+Organization preserves the immutable task ID and target branch. `task rename`
+changes an active task's current slug without replacing the task or review
+branch. An infrastructure task has no `path`; its private manifest remains
+keyed by the stable ID. Declared scopes must be distinct and non-overlapping.
+Schema 1 manifests are still readable with their original slug; `task rename`
+and `task approve-cloud-usage` rewrite them as schema 2, or as schema 3 when
+they record an approval. These constraints are validated whenever a manifest is
 loaded, so hand-editing task state cannot select another repository-management
 strategy.
 
@@ -233,9 +258,10 @@ most 9223372036854775807, and `note` is the user's decision on one non-empty
 line. Both are required and no other field is accepted; Git history records when
 the approval was made. Schema 1 and 2 manifests must not contain the table.
 `workspace-mgr` writes the lowest schema that represents a manifest: schema 2
-without an approval and schema 3 with one, so a task without an approval never
-requires a newer release. Running `task approve-cloud-usage` with a limit equal
-to the threshold removes the table and returns the manifest to schema 2;
+without an approval and schema 3 with one. A manifest without an approval needs
+no newer release for its schema, but a nested archive path still needs 0.5.0.
+Running `task approve-cloud-usage` with a limit equal to the threshold removes
+the table and returns the manifest to schema 2;
 publishing that change also withdraws the task branch's `minimum_cli_version`
 raise unless another task manifest still needs it, but never below the base
 branch's declaration. Reading schema 3 needs

@@ -11,8 +11,8 @@ use crate::git::GitRepo;
 use crate::instructions::BOOTSTRAP;
 use crate::lock::RepositoryLock;
 use crate::manifest::{
-    AdditionalScope, INFRASTRUCTURE_MANIFEST_NAME, TASK_SCHEMA_VERSION, TaskKind, TaskManifest,
-    build_task_branch, build_task_id, one_line, validate_additional_scopes,
+    AdditionalScope, TASK_SCHEMA_VERSION, TaskKind, TaskManifest, build_task_branch, build_task_id,
+    infrastructure_manifest_path, one_line, validate_additional_scopes,
 };
 use crate::path::{reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::{
@@ -943,17 +943,19 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
                     "infrastructure task creation requires --scope and --scope-note",
                 ));
             }
-            let checkout = repo
-                .common_dir()?
-                .join("workspace-mgr/checkouts")
-                .join(&task_id);
-            if checkout.exists() {
+            if repo.current_branch()?.as_deref() != Some(&config.git.branch) {
+                return Err(Error::message(
+                    "infrastructure task creation requires the shared checkout on its configured main branch",
+                ));
+            }
+            let private_manifest = infrastructure_manifest_path(&repo, &task_id)?;
+            if private_manifest.parent().is_some_and(Path::exists) {
                 return Err(Error::message(format!(
-                    "infrastructure worktree already exists: {}",
-                    checkout.display()
+                    "infrastructure task private state already exists: {}",
+                    private_manifest.display()
                 )));
             }
-            (task_id, checkout)
+            (task_id, repo.root.clone())
         }
     };
     additional_scopes = validate_additional_scopes(
@@ -994,6 +996,13 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         &base_oid,
         &format!("{}/{}", config.git.remote, config.git.branch),
     )?;
+    if options.kind == TaskKind::Infrastructure
+        && repo.optional_oid("HEAD")?.as_deref() != Some(&base_oid)
+    {
+        return Err(Error::message(
+            "shared main checkout is behind or differs from the fetched base; run workspace-mgr refresh before creating an infrastructure task",
+        ));
+    }
     let manifest = TaskManifest {
         schema_version: TASK_SCHEMA_VERSION,
         kind: options.kind,
@@ -1007,9 +1016,9 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         cloud_usage_approval: None,
     };
     let readme = task_readme(&title, &purpose);
-    let mut manifest_path = match options.kind {
+    let manifest_path = match options.kind {
         TaskKind::Deliverable => task_dir.join(TASK_MANIFEST_NAME),
-        TaskKind::Infrastructure => task_dir.join("<private-git-state>/task.toml"),
+        TaskKind::Infrastructure => infrastructure_manifest_path(&repo, &task_id)?,
     };
     let files = match options.kind {
         TaskKind::Deliverable => vec![
@@ -1017,6 +1026,11 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             format!("{task_id}/{TASK_MANIFEST_NAME}"),
         ],
         TaskKind::Infrastructure => Vec::new(),
+    };
+    let private_manifest = if options.kind == TaskKind::Infrastructure {
+        Some(manifest.render()?)
+    } else {
+        None
     };
     if !options.dry_run {
         repo.run([
@@ -1031,9 +1045,12 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
             TaskKind::Deliverable => {
                 write_task_files(&task_dir, TASK_MANIFEST_NAME, &readme, &manifest)
             }
-            TaskKind::Infrastructure => {
-                create_infrastructure_worktree(&repo, &task_dir, &branch, &manifest)
-            }
+            TaskKind::Infrastructure => atomic_write(
+                &manifest_path,
+                private_manifest
+                    .as_deref()
+                    .expect("infrastructure manifest rendered before ref creation"),
+            ),
         };
         if let Err(error) = created {
             let rollback = repo.run_unchecked([
@@ -1050,11 +1067,6 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
                     rollback.stderr.trim()
                 )))
             };
-        }
-        if options.kind == TaskKind::Infrastructure {
-            manifest_path = GitRepo::discover(&task_dir)?
-                .git_dir()?
-                .join(INFRASTRUCTURE_MANIFEST_NAME);
         }
     }
     Ok(TaskCreateReport {
@@ -1113,50 +1125,6 @@ fn create_scopes(options: &TaskCreateOptions) -> Result<Vec<AdditionalScope>> {
             reason: reason.clone(),
         })
         .collect())
-}
-
-fn create_infrastructure_worktree(
-    repo: &GitRepo,
-    checkout: &Path,
-    branch: &str,
-    manifest: &TaskManifest,
-) -> Result<()> {
-    let parent = checkout
-        .parent()
-        .ok_or_else(|| Error::message("infrastructure worktree has no parent"))?;
-    fs::create_dir_all(parent).at(parent)?;
-    let added = repo.run_unchecked([
-        "worktree",
-        "add",
-        "--quiet",
-        &checkout.to_string_lossy(),
-        branch,
-    ])?;
-    if !added.success() {
-        return Err(Error::message(format!(
-            "failed to create infrastructure worktree: {}",
-            added.stderr.trim()
-        )));
-    }
-    let result = (|| {
-        let worktree = GitRepo::discover(checkout)?;
-        dvc::link_private_worktree_state(repo, &worktree)?;
-        let path = worktree.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
-        atomic_write(&path, &manifest.render()?)
-    })();
-    if let Err(error) = result {
-        let cleanup =
-            repo.run_unchecked(["worktree", "remove", "--force", &checkout.to_string_lossy()])?;
-        return if cleanup.success() {
-            Err(error)
-        } else {
-            Err(Error::message(format!(
-                "infrastructure task creation failed: {error}; worktree cleanup also failed: {}",
-                cleanup.stderr.trim()
-            )))
-        };
-    }
-    Ok(())
 }
 
 fn write_task_files(

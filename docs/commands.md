@@ -22,7 +22,8 @@ The [user guide](guide.md) explains how the commands form one workflow.
 - `--repo <path>` selects the starting repository or task path and defaults to
   the current directory.
 - Task-scoped commands discover `.workspace-mgr-task.toml` from the starting
-  path. `--manifest <path>` selects one explicitly.
+  path for deliverable tasks. Infrastructure tasks always require their private
+  manifest selected explicitly with `--manifest <path>`.
 - `--include <path>` records a user-authorized one-invocation scope and requires
   a one-line `--scope-note <reason>`. It does not create authorization. Repeat
   `--include` for multiple paths.
@@ -253,12 +254,21 @@ target branch `codex/<slug>`. The scaffolded README's directory map tells the
 task to keep its tools, process, decisions, and hard-to-reproduce results in
 that directory and to list them there; which files carry them is the agent's
 choice. The `infrastructure` kind requires at least one `--scope` plus a
-`--scope-note`; it creates `codex/infra-<slug>` and an isolated worktree below
-private Git common state, with no repository task directory. Its manifest is
-private worktree state and every scope is explicit. Both kinds fetch the
-configured base branch, reject an existing directory or local/remote branch, and
-publish nothing. Before creating a branch, directory, or worktree, they refuse
-a base branch whose `minimum_cli_version` the installed CLI does not meet. `--dry-run` reads the remote base branch without moving any ref and
+`--scope-note`; it creates the unmounted branch `codex/infra-<slug>` and a
+private manifest below Git common state, with no repository task directory or
+separate worktree. Both kinds work in the shared checkout on the configured
+main branch. Infrastructure creation reports `path` as the repository root and
+`manifest` as an absolute path; pass that path using `--manifest` to subsequent
+task-scoped commands. The shared HEAD must equal the fetched base revision;
+run `refresh` before creation if it is behind. Infrastructure planning and
+publication also require shared HEAD to match the fetched base, so an upstream
+change cannot be overwritten from stale local files; refresh before retrying.
+Every infrastructure scope is
+explicit. Both kinds fetch the configured base branch, reject an existing
+directory or local/remote branch, and publish nothing. Before creating a branch,
+directory, or manifest, they refuse a base branch whose `minimum_cli_version`
+the installed CLI does not meet. `--dry-run` reads the remote base branch without
+moving any ref and
 fetches its commit only when it is not available locally.
 
 The report contains a structured `review` handoff. Deliverable creation reports
@@ -280,6 +290,9 @@ workspace-mgr task create shared-policy --kind infrastructure \
   --title "Shared policy" --purpose "Update repository-wide policy" \
   --scope AGENTS.md --scope .github/workflows/ci.yml \
   --scope-note "The user requested this infrastructure change"
+task_manifest=/absolute/path/reported/by/task-create
+workspace-mgr plan --manifest "$task_manifest"
+workspace-mgr publish --manifest "$task_manifest" -m "Publish shared policy"
 ```
 
 ## `workspace-mgr task rename`
@@ -300,7 +313,7 @@ sidecars, and manifest move together. The manifest is atomically rewritten with
 the new current slug and path; it keeps every other field, including a
 cloud-usage approval, and uses schema 2, or schema 3 when it records an
 approval. Infrastructure tasks keep
-their identity-owned private worktree path and update only the private current
+their identity-owned private manifest path and update only the private current
 slug metadata.
 
 The task ID and target branch are immutable. Keeping the branch stable lets the
@@ -327,6 +340,69 @@ workspace-mgr task rename current-research-question --dry-run
 workspace-mgr task rename current-research-question
 workspace-mgr plan
 workspace-mgr publish -m "Rename the task for its current topic"
+```
+
+## `workspace-mgr archive`
+
+Organize completed deliverable task directories through a user-requested
+repository-infrastructure task.
+
+```text
+workspace-mgr archive [<task-path> ...]
+  [--layout <template>] [--repo <path>] [--manifest <path>] [--dry-run]
+```
+
+With no paths, inspect top-level deliverable directories and skip tasks without
+a verified merged pull request. An explicitly named active or unverified task
+is refused. Verification uses GitHub pull-request evidence for the task's
+branch, immutable identity, configured base branch, and reachable merge commit;
+`gh` must be installed and able to read the repository. Active task directories
+stay at the top level, and merge or turn-end synchronization never runs archive
+automatically.
+
+`--layout` uses `{year}` and `{month}` from each task directory's creation
+timestamp. The default is `{year}/{month}`; `{year}` and `{year}{month}` also
+work. The rendered relative path must include the year and must not target
+hidden repository-control directories. The task directory's basename, retained
+contents, immutable ID, and target branch are preserved.
+
+Run `--dry-run` from the shared checkout or an infrastructure task to inspect
+`tasks`, `skipped`, and `required_scopes`. It fetches Git evidence and reads
+versioned S3 history but changes no repository content or remote. Applying
+archive requires an infrastructure task with both source and destination paths
+declared. The command moves complete local directories, updates manifest paths,
+and writes `.workspace-mgr-archive.json` migration receipts. It writes neither
+Git nor S3 remotes. It refuses destination collisions, source state that differs
+from the shared branch, staged or untracked overlays, changed materialized S3
+payloads, and materialized local-only content that must first be preserved or
+returned to tracked storage.
+
+The normal `plan` and `publish` flow handles the migration. Publication copies
+every retained data version and delete marker under the source task prefix,
+including superseded versions and retired paths absent from current storage
+pointers. It verifies destination versions, rewrites standalone and directory
+managed-storage cloud metadata automatically, and publishes the archive
+registry before publishing Git. Content hashes and file sizes stay fixed;
+copied versions and recreated markers receive new native IDs and timestamps,
+which the receipt maps to their originals. Copying history is charged to the
+infrastructure task's cloud-usage projection, so its full retained history must
+fit that task's approved limit before migration starts.
+
+Only after Git publication may source history be purged, and current remote
+branch or tag references defer that cleanup. A failed publication preserves
+source history and retry journals. Historical Git checkouts use
+`workspace-mgr storage hydrate` to resolve the durable registry and verify their
+original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
+resolve the changed keys and version IDs.
+
+```sh
+workspace-mgr archive --dry-run
+workspace-mgr archive --layout '{year}{month}' --dry-run
+# Apply in the shared checkout after declaring the reported scopes.
+task_manifest=/absolute/path/reported/by/task-create
+workspace-mgr archive --manifest "$task_manifest"
+workspace-mgr plan --manifest "$task_manifest"
+workspace-mgr publish --manifest "$task_manifest" -m "Organize completed tasks"
 ```
 
 ## `workspace-mgr task status`
@@ -361,9 +437,9 @@ but writes a private `discard-plan.json` containing the observed task identity,
 local and remote task refs, and local and remote shared refs. Its structured
 report includes:
 
-- every working change in the deliverable scopes or infrastructure worktree;
-- the task directory or worktree to delete;
-- each additional deliverable scope to restore from the local shared branch;
+- every working change in the task's declared scopes;
+- the deliverable task directory to delete, when present;
+- each shared scope to restore from the local shared branch;
 - whether the agent must close a pull request or verify that none exists;
 - current local or published managed S3 object paths and recorded exact version
   IDs queued for permanent deletion after the branch is removed.
@@ -386,17 +462,18 @@ deleting a ref, or purging anything, when the installed CLI does not meet its
 
 Confirmation requires the exact task ID and an unchanged private plan. It
 refuses changed refs, a branch with another task identity, a task already
-contained in the shared branch, an unmanaged infrastructure worktree, or an
+contained in the shared branch, a target branch checked out anywhere, or an
 invocation whose current directory would be deleted. It deletes an existing
 remote task branch with `force-with-lease`, verifies absence, deletes local and
 remote-tracking refs, then removes the local workspace and private task state.
 Deliverable scopes are first moved into private quarantine; additional scopes
 and their shared-index entries are restored from the local shared branch. A
 remote failure restores quarantined paths and their prior index state.
-Infrastructure confirmation removes the entire managed worktree.
+Infrastructure confirmation restores its declared scopes, removes its private
+manifest and task state, and never deletes the shared repository directory.
 
-The CLI is provider-neutral and cannot verify pull-request state itself; the
-report makes that agent responsibility explicit. Before branch deletion,
+`task discard` does not verify pull-request state itself; its report makes that
+agent responsibility explicit. Before branch deletion,
 discard queues every versioned S3 object path owned by the task. After the Git
 branch is removed, it permanently deletes every version of paths that no
 current remote branch or tag still references. Protected paths remain pending
@@ -415,17 +492,17 @@ workspace-mgr task approve-cloud-usage --limit <size> --note <decision>
 The command records a decision the user already made in the task's chat. It does
 not create authorization; agents run it only after the user explicitly approves
 that limit. It writes only the manifest copy that the task's publications
-carry, so it applies the checkout rules of `plan` and `publish`: a deliverable
-approval runs from the shared checkout on the base branch while the task branch
-is not checked out anywhere, and an infrastructure approval runs from the
-task's managed worktree. In an explicitly authorized alternate workflow, where
+carry, so it applies the checkout rules of `plan` and `publish`: both kinds run
+from the shared checkout on the base branch while their task branch is not
+checked out anywhere. Infrastructure approval requires its explicit private
+`--manifest` path. In an explicitly authorized alternate workflow, where
 the deliverable is published from another checkout head with
 `--allow-non-shared-head --scope-note <reason>`, the approval takes the same
 override, with the same one-line scope note, and the task branch must still not
-be the checkout's head. Any other checkout, such as an infrastructure
-worktree's copy of a merged deliverable without that override, is refused
-before anything is written, also with `--dry-run`. Every task's default limit
-is the fixed 1 GiB (1073741824 bytes) threshold. `--limit` is a byte count
+be the checkout's head. This override is deliverable-only; infrastructure tasks
+always use the configured shared branch. Any other unauthorized checkout is
+refused before anything is written, also with `--dry-run`. Every task's default
+limit is the fixed 1 GiB (1073741824 bytes) threshold. `--limit` is a byte count
 or a number with a decimal unit (`B`, `KB`, `MB`, `GB`, `TB`) or binary unit
 (`KiB`, `MiB`, `GiB`, `TiB`), case-insensitive, with or without a space. A
 fraction needs a unit and must come to a whole number of bytes; bare `K`, `M`,
@@ -764,18 +841,20 @@ the published tree, as the
 [configuration reference](configuration.md#minimum-workspace-mgr-version)
 describes: a task that needs no newer release keeps the configuration of the
 point where its branch left the base branch, a schema 3 manifest that records
-a cloud-usage approval raises the declaration to at least 0.4.0, a branch
+a cloud-usage approval raises the declaration to at least 0.4.0, a nested
+archived task manifest of any supported schema requires at least 0.5.0, a branch
 whose manifests no longer need its earlier raise withdraws it but never below
 the fetched base branch's declaration, and a branch whose configuration
 carries a user-authorized change keeps it and only raises its declaration,
 also to follow the base branch. When a task manifest needs a newer release
 than the installed CLI, plan and publish refuse with status 2 because this
-build cannot publish that schema. The refusal offers recording the default
-limit to remove the approval only when that manifest is the task's own; for
-another task's manifest in the publication, such as one merged on the base
-branch, it names the manifest and asks only for an update. The
-reconciliation rewrites `.workspace-mgr.toml` in the private preview index
-only and lists it in `changed_paths` although it is outside the declared
+build cannot publish that task state. The refusal offers recording the default
+limit only when removing the task's own approval clears its schema requirement;
+an archived-path requirement needs an update. For another task's manifest in
+the publication, such as one merged on the base branch, it names the manifest
+and asks only for an update. The reconciliation rewrites `.workspace-mgr.toml`
+in the private preview index only and lists it in `changed_paths` although it
+is outside the declared
 scopes. When the published declaration differs from the task branch's, plan
 reports `repository_requirement` directly after `changed_paths`:
 
@@ -790,8 +869,10 @@ reports `repository_requirement` directly after `changed_paths`:
   withdrawal removes it;
 - `previous_minimum_cli_version` is the declaration in the publication's
   `.workspace-mgr.toml` before the reconciliation, or `null`;
-- `task_manifest_schema` is the manifest schema that needs the newer release,
-  or `null` when no manifest drives the change.
+- `task_manifest_schema` is the actual schema of the manifest that drives the
+  newer requirement, or `null` when no manifest drives the change. The path
+  may drive that requirement, so an archived schema 2 manifest reports `2`
+  while requiring 0.5.0.
 
 The field is omitted when the published declaration equals the task branch's.
 Plan and publish never change the shared checkout's `.workspace-mgr.toml`; it
@@ -897,7 +978,7 @@ measurement, so a refused plan or publication records no pending cloud-usage
 decision, and the usage `plan` reports afterwards describes the publication
 those guards accept.
 
-`--allow-non-shared-head` is an exceptional checkout override and requires a
+`--allow-non-shared-head` is a deliverable-only checkout override and requires a
 scope note. It still refuses when the target task branch is currently checked
 out.
 
@@ -924,10 +1005,10 @@ Git tree is based on the existing remote task branch, or the configured base
 branch for its first publication, and includes only resolved scopes plus the
 reconciled `.workspace-mgr.toml` that `plan` describes. The remote branch
 object ID is verified after push. The checkout and shared Git index are not
-switched to the task branch. When an infrastructure publication changes
-`.workspace-mgr.toml`, publish also writes the published file into the task's
-isolated worktree, which has the task branch checked out, so that worktree
-stays consistent with its branch.
+switched to the task branch. Both kinds publish through a private index; an
+infrastructure task is selected by its private `--manifest` path. A
+`.workspace-mgr.toml` reconciled only for publication stays in the Git tree
+without overwriting the shared checkout's file.
 
 Before it places, commits, or uploads anything, publish evaluates the same
 `cloud_usage` report as `plan` and refuses with status 2 when
@@ -985,6 +1066,8 @@ raise to <version>; no task manifest in this publication needs it)`, with
 `minimum_cli_version removed` in place of the first value when neither the
 task's starting point nor the base branch declares anything. Both trailers are written for reviewers only.
 The report includes `repository_requirement` as described for `plan`.
+The trailer retains the requiring manifest's actual schema even when its
+archived path, rather than its schema, requires the newer release.
 
 `publish --dry-run` performs the same non-publishing behavior as `plan` while
 still requiring a message argument, and also rehearses the cloud-usage gate:
@@ -1014,8 +1097,10 @@ The remote and shared branch come from `[git]`. The checkout must be on that bra
 the shared index must have no staged or unresolved entries, and the remote
 revision must be a fast-forward. Refresh preserves unrelated working-tree
 overlays, materializes safe ordinary Git additions, modifications, and
-deletions, and hydrates incoming S3 boundaries. It reads Git and S3 but writes
-no remote.
+deletions, and hydrates incoming S3 boundaries. It reads Git, optional GitHub
+merge evidence, and S3. After synchronization succeeds, it can delete verified
+merged refs on the configured Git remote and retry already pending,
+unreferenced S3 purge paths.
 
 Before it changes anything, refresh reads `minimum_cli_version` from the
 incoming revision's `.workspace-mgr.toml` and refuses with status 2 when that
@@ -1024,6 +1109,57 @@ first, before refresh inspects any incoming storage metadata, including the
 unaddressable boundaries described below, because a newer release may write
 metadata this one cannot read; `refresh --dry-run` applies it the same way.
 After the user approves and completes the update, rerun refresh.
+
+After incoming materialization and storage verification succeed, refresh
+automatically checks local and configured-remote branches for cleanup, even
+when the shared branch was already current. `--dry-run` reports planned
+deletions without deleting refs.
+
+Cleanup uses the installed, authenticated GitHub CLI (`gh`) to verify a merged
+same-repository pull request against the configured base. Its merge commit must
+be reachable from the fetched base, and its recorded head must match every
+remaining local and remote ref for that branch. Squash merges qualify; new
+local commits, resumed branches, open or ambiguous pull requests, fork pull
+requests, and other-base pull requests do not. The configured base, current and
+default branches and protected remote branches are kept. Remote deletion uses
+an exact lease; local deletion checks the expected head again.
+
+Branches checked out in any legacy or custom worktree are skipped. Refresh
+never detaches a worktree or removes its directory or files.
+
+The `branch_cleanup` report contains:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `dry_run`, `complete`, `unavailable`, or `not_applicable`; `complete` may still have skips or errors |
+| `planned`, `deleted` | Entries name `branch`, `head_oid`, `pull_request`, and whether `local` or `remote` refs are involved |
+| `skipped` | Retained branches with a `reason` |
+| `errors` | Failed cleanup attempts with `branch`, `action`, and `error` |
+| `warnings` | Actionable cleanup warnings |
+| `remote_writes` | Whether cleanup confirmed a configured-remote branch deletion |
+
+For a non-GitHub remote, cleanup returns `not_applicable` without a warning.
+Unavailable GitHub CLI/authentication returns `unavailable`, keeps all refs,
+and reports a warning. Cleanup errors and warnings do not undo successful
+shared-branch synchronization. Top-level
+`warnings` use `branch-cleanup-unavailable` and `branch-cleanup-failed` codes;
+the detailed report names each branch and failure. Retained task
+directories and payloads are not deleted by branch cleanup. The normal pending
+S3 purge retry can proceed once a deleted branch no longer protects a queued
+path; moving completed task directories still requires an explicit user
+request and `archive` in an infrastructure task.
+
+When the shared branch was already current but refs were deleted, refresh's
+overall `status` is `branches_cleaned`.
+
+GitHub access is optional for synchronization. To diagnose unavailable cleanup,
+check the CLI and its authentication, then rerun refresh:
+
+```sh
+gh --version
+gh auth status
+workspace-mgr refresh --dry-run
+```
 
 An incoming S3 boundary whose path contains a backslash is the one exception.
 The storage engine reads the backslash as a path separator in some commands,
@@ -1046,12 +1182,13 @@ it. A payload that already matches is kept.
 Until such a boundary is renamed, `storage hydrate` refuses it, and a
 scope-wide `storage hydrate` refuses its whole scope; name the other boundaries
 to hydrate them. Recover each boundary with the user's authorization in an
-infrastructure task, which starts from the fetched base branch and so needs no
-refresh. Declare as its scope the directory that holds the boundary, and the
-directory that will hold the destination if that differs: the rename rewrites
-each directory's `.gitignore` and both metadata files. In the task's worktree,
-`move` the boundary to a path without backslashes, which fetches its payload
-and materializes it at the destination; hydrate the other boundaries in those
+infrastructure task in the shared checkout. Declare as its scope the directory
+that holds the boundary and the destination directory if that differs: the
+rename rewrites
+each directory's `.gitignore` and both metadata files. Select its private
+manifest with `--manifest` and `move` the boundary to a path without backslashes,
+which fetches its payload and materializes it at the destination; hydrate the
+other boundaries in those
 directories by naming them, because publication requires every boundary in its
 scope to be present; then publish the task and merge it. A later refresh
 hydrates the renamed boundary in every checkout.

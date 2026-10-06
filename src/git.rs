@@ -38,11 +38,114 @@ impl GitRepo {
     }
 
     pub fn discover_for_manifest(path: &Path) -> Result<Self> {
+        // Resolve relative selections before deriving a Git directory or
+        // changing the command's working directory. The manifest must exist
+        // for both ordinary and private task resolution.
+        let absolute = path.canonicalize().map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let path = absolute.as_path();
         let parent = path
             .parent()
             .ok_or_else(|| Error::message("manifest path has no parent"))?;
         if let Ok(repo) = Self::discover(parent) {
             return Ok(repo);
+        }
+        if path.file_name().and_then(|name| name.to_str())
+            == Some(crate::manifest::INFRASTRUCTURE_TASK_MANIFEST_FILE)
+        {
+            let common = parent
+                .parent()
+                .filter(|directory| {
+                    directory.file_name().and_then(|name| name.to_str())
+                        == Some("infrastructure-tasks")
+                })
+                .and_then(Path::parent)
+                .filter(|directory| {
+                    directory.file_name().and_then(|name| name.to_str()) == Some("workspace-mgr")
+                })
+                .and_then(Path::parent)
+                .ok_or_else(|| {
+                    Error::message("infrastructure manifest is outside private task state")
+                })?;
+            let output = run_bytes(
+                "git",
+                [
+                    "--git-dir",
+                    &common.to_string_lossy(),
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                    "-z",
+                ],
+                common,
+                &BTreeMap::new(),
+                None,
+                true,
+            )?;
+            let listing = String::from_utf8(output.stdout)
+                .map_err(|_| Error::message("shared checkout paths are not UTF-8"))?;
+            let mut shared = Vec::new();
+            let mut unavailable = Vec::new();
+            for block in listing.split("\0\0") {
+                let fields = block.split('\0').collect::<Vec<_>>();
+                let Some(checkout) = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("worktree "))
+                else {
+                    continue;
+                };
+                let Some(branch) = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("branch refs/heads/"))
+                else {
+                    continue;
+                };
+                // Unrelated stale worktrees are retained, but do not prevent
+                // finding the one usable shared checkout. A broken shared
+                // checkout still produces a clear error when none remains.
+                let repo = match Self::discover(Path::new(checkout)) {
+                    Ok(repo) => repo,
+                    Err(error) => {
+                        unavailable.push(error.to_string());
+                        continue;
+                    }
+                };
+                let config = match crate::config::Config::load_compatible(&repo) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        unavailable.push(error.to_string());
+                        continue;
+                    }
+                };
+                let actual_common = match repo.common_dir().and_then(|directory| {
+                    directory.canonicalize().map_err(|source| Error::Io {
+                        path: directory,
+                        source,
+                    })
+                }) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        unavailable.push(error.to_string());
+                        continue;
+                    }
+                };
+                if branch == config.git.branch && actual_common == common {
+                    shared.push(repo);
+                }
+            }
+            if shared.len() != 1 {
+                let details = if shared.is_empty() && !unavailable.is_empty() {
+                    format!("; unavailable checkouts: {}", unavailable.join("; "))
+                } else {
+                    String::new()
+                };
+                return Err(Error::message(format!(
+                    "infrastructure manifest requires exactly one valid shared checkout on the configured base branch{details}"
+                )));
+            }
+            return Ok(shared.remove(0));
         }
         let worktree_git_dir = parent
             .parent()

@@ -60,6 +60,9 @@ pub enum Command {
     /// Move a path while preserving its storage placement.
     Move(MoveArgs),
 
+    /// Organize merged task directories in a reviewed infrastructure task.
+    Archive(ArchiveArgs),
+
     /// Delete a path and permanently purge obsolete S3 versions after publication.
     Remove(RemoveArgs),
 
@@ -132,7 +135,7 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Create a deliverable workspace or isolated infrastructure worktree.
+    /// Create a deliverable directory or a private infrastructure manifest on the shared branch.
     Create(TaskCreateArgs),
     /// Change a task's current slug while preserving its identity and review branch.
     Rename(TaskRenameArgs),
@@ -154,6 +157,26 @@ pub struct TaskRenameArgs {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
 
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveArgs {
+    /// Tasks to organize; omitted to inspect top-level deliverable tasks.
+    pub paths: Vec<String>,
+
+    /// Date grouping using the task's creation year and month.
+    #[arg(long, default_value = "{year}/{month}")]
+    pub layout: String,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+
+    /// Inspect merged tasks and required scopes without moving content.
     #[arg(long)]
     pub dry_run: bool,
 }

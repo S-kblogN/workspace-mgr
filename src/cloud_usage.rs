@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::config::{CONFIG_NAME, Config};
@@ -1292,6 +1293,7 @@ fn is_control_file(path: &str) -> bool {
         || path.ends_with(PLACEMENT_SUFFIX)
         || name == ".gitignore"
         || name == TASK_MANIFEST_NAME
+        || name == crate::archive_migration::RECEIPT_NAME
         || path == CONFIG_NAME
 }
 
@@ -1676,21 +1678,158 @@ fn measure_storage(
         sources.automatic.push((path.clone(), size));
     }
     if inputs.inspect_outputs && config.s3_enabled() && !inputs.pointers.is_empty() {
+        let archived = crate::archive_migration::pointer_set(repo, &[])?;
         let outputs = inputs
             .pointers
             .iter()
+            .filter(|pointer| !archived.contains(*pointer))
             .filter_map(|pointer| pointer.strip_suffix(".dvc"))
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
-        let status = dvc::data_status(repo, &outputs)?;
-        (sources.dirty, sources.dirty_aggregates) =
-            dirty_uploads(&repo.root, &status, &sources.worktree, version_aware);
+        if !outputs.is_empty() {
+            let status = dvc::data_status(repo, &outputs)?;
+            (sources.dirty, sources.dirty_aggregates) =
+                dirty_uploads(&repo.root, &status, &sources.worktree, version_aware);
+        }
     }
-    Ok(if version_aware {
+    let mut usage = if version_aware {
         versioned_storage(&history_commits, &projection_rows, &sources)
     } else {
         content_storage(&history_commits, &projection_rows, &sources)
-    })
+    };
+    if version_aware {
+        // A copied prefix also retains superseded versions and files which
+        // disappeared before the current DVC pointers. Charge those bytes
+        // before the first copy, using the immutable source inventory.
+        let changed = repo.run([
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            base,
+            inputs.projected_tree_oid,
+            "--",
+            ":(glob)**/.workspace-mgr-archive.json",
+        ])?;
+        let selected = changed
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        let projected = archive_history_usage(
+            repo,
+            inputs.projected_tree_oid,
+            &sources.worktree,
+            &selected,
+            false,
+        )?;
+        let published = archive_history_usage(repo, base, &sources.worktree, &selected, true)?;
+        usage.published_bytes = usage
+            .published_bytes
+            .saturating_add(published.values().map(|tally| tally.bytes).sum::<u64>());
+        usage.projected_bytes = usage
+            .projected_bytes
+            .saturating_add(projected.values().map(|tally| tally.bytes).sum::<u64>());
+        usage.pending_uploads |= projected.values().any(|tally| tally.pending);
+        for (key, tally) in projected {
+            let current = usage.contributors.entry(key).or_default();
+            current.bytes = current.bytes.saturating_add(tally.bytes);
+            current.versions = current.versions.saturating_add(tally.versions);
+            current.pending |= tally.pending;
+        }
+    }
+    Ok(usage)
+}
+
+fn archive_history_usage(
+    repo: &GitRepo,
+    tree: &str,
+    current: &[PointerEntry],
+    selected: &BTreeSet<String>,
+    published: bool,
+) -> Result<BTreeMap<String, Tally>> {
+    let names = repo.run(["ls-tree", "-r", "-z", "--name-only", tree, "--"])?;
+    let mut totals = BTreeMap::<String, Tally>::new();
+    let mut seen = BTreeSet::new();
+    for path in names
+        .stdout
+        .split('\0')
+        .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
+    {
+        let raw = repo.run(["show", &format!("{tree}:{path}")])?;
+        let receipt: serde_json::Value = serde_json::from_str(&raw.stdout).map_err(|error| {
+            Error::message(format!("invalid archive usage receipt {path}: {error}"))
+        })?;
+        let destination = receipt["destination"]
+            .as_str()
+            .ok_or_else(|| Error::message("archive usage destination missing"))?;
+        if published && receipt["status"] != "copied" {
+            continue;
+        }
+        if !selected.contains(path)
+            && !current
+                .iter()
+                .any(|entry| entry.key.starts_with(&format!("{destination}/")))
+        {
+            continue;
+        }
+        if receipt["bucket"].is_string() {
+            let source = receipt["source"]
+                .as_str()
+                .ok_or_else(|| Error::message("archive usage source missing"))?;
+            let registry = format!(
+                ".workspace-mgr/archive/{}.json",
+                crate::hex::encode_lower(Sha256::digest(source.as_bytes()).as_slice())
+            );
+            let bytes = serde_json::to_vec(&receipt)
+                .map_err(|error| Error::message(error.to_string()))?
+                .len() as u64;
+            totals.insert(
+                registry,
+                Tally {
+                    bytes,
+                    versions: 1,
+                    pending: receipt["status"] == "planned",
+                },
+            );
+        }
+        for version in receipt["versions"]
+            .as_array()
+            .ok_or_else(|| Error::message("archive usage versions missing"))?
+        {
+            if version["delete_marker"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let key = version["destination_object"]
+                .as_str()
+                .ok_or_else(|| Error::message("archive usage object missing"))?;
+            let original = version["source_version_id"]
+                .as_str()
+                .ok_or_else(|| Error::message("archive usage version missing"))?;
+            let copied = version["destination_version_id"].as_str();
+            if current.iter().any(|entry| {
+                entry.key == key
+                    && entry
+                        .version_id
+                        .as_deref()
+                        .is_some_and(|id| id == original || Some(id) == copied)
+            }) {
+                continue;
+            }
+            if !seen.insert((key.to_owned(), original.to_owned())) {
+                continue;
+            }
+            let size = version["size"]
+                .as_u64()
+                .ok_or_else(|| Error::message("archive usage version size missing"))?;
+            let tally = totals.entry(key.to_owned()).or_default();
+            tally.bytes = tally.bytes.saturating_add(size);
+            tally.versions += 1;
+            tally.pending |= receipt["status"] == "planned";
+        }
+    }
+    Ok(totals)
 }
 
 /// Resolves `<revision>:<path>` for each path to a blob ID, if present.
@@ -3486,6 +3625,79 @@ mod tests {
             }),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn archive_inventory_counts_retired_history_and_keeps_copy_retries_stable() {
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"base\n");
+        let base = fixture.commit("base");
+        let destination = "2026/07/20260712-121000-history";
+        let pointer = format!("{destination}/data.bin.dvc");
+        let receipt_path = format!("{destination}/.workspace-mgr-archive.json");
+        let mut receipt = serde_json::json!({"status":"planned","destination":destination,"versions":[
+            {"destination_object":format!("{destination}/data.bin"),"source_version_id":"old","size":30,"delete_marker":false},
+            {"destination_object":format!("{destination}/data.bin"),"source_version_id":"head","size":100,"delete_marker":false},
+            {"destination_object":format!("{destination}/retired.bin"),"source_version_id":"retired","size":50,"delete_marker":false},
+            {"destination_object":format!("{destination}/retired.bin"),"source_version_id":"marker","delete_marker":true}
+        ]});
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        fixture.write(
+            &receipt_path,
+            serde_json::to_string(&receipt).unwrap().as_bytes(),
+        );
+        let pointers = vec![pointer.clone()];
+        let measure_tree = |tree: &str, pointers: &[String]| {
+            measure_storage(
+                &fixture.repo,
+                &versioned_config(),
+                &UsageInputs {
+                    state_dir: &fixture.state_dir,
+                    remote_base_oid: &base,
+                    remote_target_oid: None,
+                    projected_tree_oid: tree,
+                    pointers,
+                    automatic_s3: &[],
+                    inspect_outputs: false,
+                },
+                &mut UsageCache::default(),
+            )
+            .unwrap()
+        };
+        let planned = measure_tree(&fixture.tree(), &pointers);
+        assert_eq!(planned.projected_bytes, 180);
+        receipt["status"] = "copied".into();
+        for row in receipt["versions"].as_array_mut().unwrap() {
+            row["destination_version_id"] =
+                format!("copy-{}", row["source_version_id"].as_str().unwrap()).into();
+        }
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("copy-head")).as_bytes(),
+        );
+        fixture.write(
+            &receipt_path,
+            serde_json::to_string(&receipt).unwrap().as_bytes(),
+        );
+        assert_eq!(
+            measure_tree(&fixture.tree(), &pointers).projected_bytes,
+            180
+        );
+        fixture.remove(&pointer);
+        assert_eq!(measure_tree(&fixture.tree(), &[]).projected_bytes, 180);
+        receipt["bucket"] = "bucket".into();
+        receipt["source"] = "20260712-121000-history".into();
+        fixture.write(
+            &receipt_path,
+            serde_json::to_string(&receipt).unwrap().as_bytes(),
+        );
+        assert_eq!(
+            measure_tree(&fixture.tree(), &[]).projected_bytes,
+            180 + serde_json::to_vec(&receipt).unwrap().len() as u64
+        );
     }
 
     fn file_pointer(name: &str, size: u64, version: Option<&str>) -> String {

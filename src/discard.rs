@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{INFRASTRUCTURE_MANIFEST_NAME, ResolvedTask, TaskKind};
+use crate::manifest::{ResolvedTask, TaskKind};
 use crate::path::{repo_path, resolved_under};
 use crate::s3_purge::{self, ObjectVersion, PurgeReport};
 use crate::transaction::{task_state_dir, validate_remote_task_identity};
@@ -150,10 +150,7 @@ pub fn discard(options: &TaskDiscardOptions) -> Result<TaskDiscardReport> {
     }
 
     s3_purge::queue(&context.admin_repo, &context.purge_candidates)?;
-    let mut cleanup_warnings = match context.task.kind {
-        TaskKind::Deliverable => discard_deliverable(&mut context)?,
-        TaskKind::Infrastructure => discard_infrastructure(&mut context)?,
-    };
+    let mut cleanup_warnings = discard_scopes(&mut context)?;
     match s3_purge::purge_pending(&context.admin_repo, &context.config, &context.task.remote) {
         Ok(mut purge) => {
             purge.queued = context.purge_candidates.clone();
@@ -235,36 +232,12 @@ fn administrative_repo(task_repo: &GitRepo, task: &ResolvedTask) -> Result<GitRe
             "shared checkout branch changed during discovery",
         ));
     }
-    match task.kind {
-        TaskKind::Deliverable => {
-            if admin.root != task_repo.root {
-                return Err(Error::message(
-                    "deliverable task discard must resolve from the shared checkout",
-                ));
-            }
-            task_repo.ensure_branch_not_checked_out(&task.branch)?;
-        }
-        TaskKind::Infrastructure => {
-            let expected = task_repo
-                .common_dir()?
-                .join("workspace-mgr/checkouts")
-                .join(&task.task_id);
-            if task_repo.root != expected {
-                return Err(Error::message(format!(
-                    "infrastructure worktree must be the workspace-mgr-owned checkout {}; got {}",
-                    expected.display(),
-                    task_repo.root.display()
-                )));
-            }
-            let task_worktrees = task_repo.branch_worktrees(&task.branch)?;
-            if task_worktrees != vec![task_repo.root.clone()] {
-                return Err(Error::message(format!(
-                    "infrastructure branch {:?} must be checked out only in its managed worktree",
-                    task.branch
-                )));
-            }
-        }
+    if admin.root != task_repo.root {
+        return Err(Error::message(
+            "task discard must resolve from the shared checkout",
+        ));
     }
+    task_repo.ensure_branch_not_checked_out(&task.branch)?;
     Ok(admin)
 }
 
@@ -364,24 +337,15 @@ fn local_actions(
     task: &ResolvedTask,
     local_base_oid: &str,
 ) -> Result<Vec<LocalDiscardAction>> {
-    if task.kind == TaskKind::Infrastructure {
-        return Ok(vec![LocalDiscardAction {
-            path: repo.root.display().to_string(),
-            action: "delete-worktree".to_owned(),
-            currently_present: repo.root.is_dir(),
+    let mut actions = Vec::new();
+    if let Some(task_path) = &task.task_path {
+        actions.push(LocalDiscardAction {
+            path: task_path.clone(),
+            action: "delete".to_owned(),
+            currently_present: path_exists(&resolved_under(&repo.root, task_path))?,
             restored_from: None,
-        }]);
+        });
     }
-    let task_path = task
-        .task_path
-        .as_deref()
-        .ok_or_else(|| Error::message("deliverable task has no task path"))?;
-    let mut actions = vec![LocalDiscardAction {
-        path: task_path.to_owned(),
-        action: "delete".to_owned(),
-        currently_present: path_exists(&resolved_under(&repo.root, task_path))?,
-        restored_from: None,
-    }];
     for scope in &task.additional_scopes {
         actions.push(LocalDiscardAction {
             path: scope.path.clone(),
@@ -474,7 +438,7 @@ fn read_plan(path: &Path) -> Result<DiscardPlan> {
     Ok(plan)
 }
 
-fn discard_deliverable(context: &mut DiscardContext) -> Result<Vec<String>> {
+fn discard_scopes(context: &mut DiscardContext) -> Result<Vec<String>> {
     let quarantine = create_quarantine(&context.admin_repo, &context.task.task_id)?;
     let scopes = context.task.scopes();
     if let Err(error) = prepare_base_scopes(
@@ -516,54 +480,6 @@ fn discard_deliverable(context: &mut DiscardContext) -> Result<Vec<String>> {
         let remote = restore_remote_branch(context).err();
         let local = rollback_deliverable(context, &quarantine, error);
         return Err(combine_rollback(local, remote));
-    }
-    Ok(finish_cleanup(context, &quarantine))
-}
-
-fn discard_infrastructure(context: &mut DiscardContext) -> Result<Vec<String>> {
-    let quarantine = create_quarantine(&context.admin_repo, &context.task.task_id)?;
-    let manifest =
-        match fs::read_to_string(&context.task.manifest_path).at(&context.task.manifest_path) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&quarantine);
-                return Err(error);
-            }
-        };
-    if let Err(error) = quarantine_worktree(&context.task_repo.root, &quarantine) {
-        let rollback = restore_moved_worktree_entries(&context.task_repo.root, &quarantine).err();
-        if rollback.is_none() {
-            let _ = fs::remove_dir_all(&quarantine);
-        }
-        return Err(combine_rollback(error, rollback));
-    }
-    if let Err(error) = delete_remote_branch(context) {
-        let restore = restore_moved_worktree_entries(&context.task_repo.root, &quarantine).err();
-        let remote = restore_remote_branch(context).err();
-        let cleanup = cleanup_restored_quarantine(&quarantine, &restore, &remote).err();
-        return Err(combine_rollbacks(error, [restore, remote, cleanup]));
-    }
-    let removed = context.admin_repo.run_unchecked([
-        "worktree",
-        "remove",
-        "--force",
-        &context.task_repo.root.to_string_lossy(),
-    ])?;
-    if !removed.success() {
-        let error = Error::message(format!(
-            "failed to remove infrastructure worktree: {}",
-            removed.stderr.trim()
-        ));
-        let worktree = restore_infrastructure(context, &quarantine, &manifest).err();
-        let remote = restore_remote_branch(context).err();
-        let cleanup = cleanup_restored_quarantine(&quarantine, &worktree, &remote).err();
-        return Err(combine_rollbacks(error, [worktree, remote, cleanup]));
-    }
-    if let Err(error) = delete_local_branch(context) {
-        let worktree = restore_infrastructure(context, &quarantine, &manifest).err();
-        let remote = restore_remote_branch(context).err();
-        let cleanup = cleanup_restored_quarantine(&quarantine, &worktree, &remote).err();
-        return Err(combine_rollbacks(error, [worktree, remote, cleanup]));
     }
     Ok(finish_cleanup(context, &quarantine))
 }
@@ -740,87 +656,6 @@ fn rollback_deliverable(context: &DiscardContext, quarantine: &Path, cause: Erro
     }
 }
 
-fn quarantine_worktree(worktree: &Path, quarantine: &Path) -> Result<()> {
-    let git_file = worktree.join(".git");
-    let metadata = fs::symlink_metadata(&git_file).at(&git_file)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(Error::message(
-            "managed infrastructure checkout does not have a regular .git pointer",
-        ));
-    }
-    let current = quarantine.join("current-worktree");
-    fs::create_dir(&current).at(&current)?;
-    for entry in fs::read_dir(worktree).at(worktree)? {
-        let entry = entry.at(worktree)?;
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        fs::rename(entry.path(), current.join(entry.file_name())).at(entry.path())?;
-    }
-    Ok(())
-}
-
-fn restore_moved_worktree_entries(worktree: &Path, quarantine: &Path) -> Result<()> {
-    let current = quarantine.join("current-worktree");
-    if !current.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(&current).at(&current)? {
-        let entry = entry.at(&current)?;
-        let destination = worktree.join(entry.file_name());
-        if path_exists(&destination)? {
-            return Err(Error::message(format!(
-                "cannot restore quarantined worktree entry because its path reappeared: {}",
-                destination.display()
-            )));
-        }
-        fs::rename(entry.path(), destination).at(entry.path())?;
-    }
-    Ok(())
-}
-
-fn replace_worktree_entries(worktree: &Path, quarantine: &Path) -> Result<()> {
-    for entry in fs::read_dir(worktree).at(worktree)? {
-        let entry = entry.at(worktree)?;
-        if entry.file_name() != ".git" {
-            remove_path(&entry.path())?;
-        }
-    }
-    restore_moved_worktree_entries(worktree, quarantine)
-}
-
-fn restore_infrastructure(
-    context: &DiscardContext,
-    quarantine: &Path,
-    manifest: &str,
-) -> Result<()> {
-    let mut recreated = false;
-    if !context.task_repo.root.join(".git").exists() {
-        context.admin_repo.run([
-            "worktree",
-            "add",
-            "--quiet",
-            "--force",
-            &context.task_repo.root.to_string_lossy(),
-            &context.task.branch,
-        ])?;
-        recreated = true;
-    }
-    if recreated {
-        replace_worktree_entries(&context.task_repo.root, quarantine)?;
-    } else {
-        restore_moved_worktree_entries(&context.task_repo.root, quarantine)?;
-    }
-    let restored = GitRepo::discover(&context.task_repo.root)?;
-    let manifest_path = restored.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
-    let parent = manifest_path
-        .parent()
-        .ok_or_else(|| Error::message("restored manifest has no parent"))?;
-    fs::create_dir_all(parent).at(parent)?;
-    fs::write(&manifest_path, manifest).at(&manifest_path)?;
-    Ok(())
-}
-
 fn delete_remote_branch(context: &DiscardContext) -> Result<()> {
     let Some(expected) = &context.snapshot.remote_branch_oid else {
         return Ok(());
@@ -884,17 +719,6 @@ fn restore_remote_branch(context: &DiscardContext) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_restored_quarantine(
-    quarantine: &Path,
-    first: &Option<Error>,
-    second: &Option<Error>,
-) -> Result<()> {
-    if first.is_none() && second.is_none() {
-        fs::remove_dir_all(quarantine).at(quarantine)?;
-    }
-    Ok(())
-}
-
 fn delete_local_branch(context: &DiscardContext) -> Result<()> {
     if let Some(expected) = &context.snapshot.local_branch_oid {
         context.admin_repo.run([
@@ -949,6 +773,24 @@ fn finish_cleanup(context: &DiscardContext, quarantine: &Path) -> Vec<String> {
             ));
         }
     }
+    if context.task.kind == TaskKind::Infrastructure {
+        if let Err(error) = fs::remove_file(&context.task.manifest_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warnings.push(format!(
+                    "failed to remove private infrastructure manifest: {error}"
+                ));
+            }
+        }
+        if let Some(parent) = context.task.manifest_path.parent() {
+            if let Err(error) = fs::remove_dir(parent) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warnings.push(format!(
+                        "failed to remove private infrastructure task directory: {error}"
+                    ));
+                }
+            }
+        }
+    }
     if let Err(error) = fs::remove_dir_all(quarantine) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warnings.push(format!(
@@ -969,18 +811,11 @@ fn invocation_would_be_deleted(context: &DiscardContext) -> Result<bool> {
         path: current.clone(),
         source,
     })?;
-    let deleted_root = match context.task.kind {
-        TaskKind::Deliverable => {
-            let task_path = context
-                .task
-                .task_path
-                .as_deref()
-                .ok_or_else(|| Error::message("deliverable task has no task path"))?;
-            resolved_under(&context.task_repo.root, task_path)
-        }
-        TaskKind::Infrastructure => context.task_repo.root.clone(),
-    };
-    Ok(current.starts_with(deleted_root))
+    Ok(context
+        .task
+        .scopes()
+        .iter()
+        .any(|scope| current.starts_with(resolved_under(&context.task_repo.root, scope))))
 }
 
 fn ensure_safe_parent(root: &Path, relative: &str) -> Result<()> {
@@ -1046,72 +881,5 @@ fn combine_rollback(cause: Error, rollback: Option<Error>) -> Error {
             "{cause}; an additional rollback step failed: {rollback}"
         )),
         None => cause,
-    }
-}
-
-fn combine_rollbacks<const N: usize>(cause: Error, rollbacks: [Option<Error>; N]) -> Error {
-    let details = rollbacks
-        .into_iter()
-        .flatten()
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-    if details.is_empty() {
-        cause
-    } else {
-        Error::message(format!(
-            "{cause}; rollback also failed: {}",
-            details.join("; ")
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{replace_worktree_entries, restore_moved_worktree_entries};
-
-    #[test]
-    fn partial_worktree_restore_preserves_entries_that_never_moved() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let worktree = temporary.path().join("worktree");
-        let quarantine = temporary.path().join("quarantine");
-        let moved = quarantine.join("current-worktree");
-        std::fs::create_dir_all(&worktree).expect("worktree directory");
-        std::fs::create_dir_all(&moved).expect("quarantine directory");
-        std::fs::write(worktree.join("still-here.txt"), "original\n").expect("unmoved entry");
-        std::fs::write(moved.join("moved.txt"), "moved\n").expect("moved entry");
-
-        restore_moved_worktree_entries(&worktree, &quarantine).expect("restore moved entries");
-
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("still-here.txt"))
-                .expect("preserved unmoved entry"),
-            "original\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("moved.txt")).expect("restored moved entry"),
-            "moved\n"
-        );
-    }
-
-    #[test]
-    fn recreated_worktree_restore_replaces_checkout_materialization() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let worktree = temporary.path().join("worktree");
-        let quarantine = temporary.path().join("quarantine");
-        let moved = quarantine.join("current-worktree");
-        std::fs::create_dir_all(&worktree).expect("worktree directory");
-        std::fs::create_dir_all(&moved).expect("quarantine directory");
-        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").expect("git pointer");
-        std::fs::write(worktree.join("tracked.txt"), "checkout copy\n")
-            .expect("checkout materialization");
-        std::fs::write(moved.join("tracked.txt"), "local copy\n").expect("quarantined entry");
-
-        replace_worktree_entries(&worktree, &quarantine).expect("replace checkout entries");
-
-        assert!(worktree.join(".git").is_file());
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("tracked.txt")).expect("restored local entry"),
-            "local copy\n"
-        );
     }
 }

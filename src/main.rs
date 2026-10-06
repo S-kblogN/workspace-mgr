@@ -1,5 +1,8 @@
 use clap::Parser;
 
+mod archive;
+mod archive_migration;
+mod branch_cleanup;
 mod cli;
 mod cloud_usage;
 mod config;
@@ -26,6 +29,7 @@ mod task_rename;
 mod transaction;
 mod update;
 
+use crate::archive::{ArchiveOptions, archive};
 use crate::cli::{
     Cli, Command, ConfigCommand, PlanArgs, PublishCommandArgs, ScopedArgs, StorageCommand,
     TaskCommand,
@@ -214,6 +218,16 @@ fn run(cli: Cli) -> Result<()> {
                 cli.format,
             )
         }
+        Command::Archive(args) => emit(
+            &archive(&ArchiveOptions {
+                start: args.repo,
+                manifest: args.manifest,
+                paths: args.paths,
+                layout: args.layout,
+                dry_run: args.dry_run,
+            })?,
+            cli.format,
+        ),
         Command::Remove(args) => {
             let (repo, config, scopes, _lock) = scoped_context(&args.scoped, true)?;
             emit(

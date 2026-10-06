@@ -12,10 +12,12 @@ pub const BULK_PUBLICATION_BYTES: u64 = 268_435_456;
 /// in, derived from the threshold itself so the two cannot disagree.
 pub const BULK_PUBLICATION_MIB: u64 = BULK_PUBLICATION_BYTES / 1_048_576;
 pub const CLOUD_USAGE_APPROVAL_BYTES: u64 = 1_073_741_824;
-pub const INSTRUCTION_POLICY_VERSION: u32 = 11;
+pub const INSTRUCTION_POLICY_VERSION: u32 = 12;
 /// The first workspace-mgr release that reads task manifest schema 3, which
 /// adds the optional `[cloud_usage_approval]` table.
 pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 0);
+/// The first release that reads task manifests below date-grouping directories.
+pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 
 pub const REVIEW_PULL_REQUEST: &str = "required";
 pub const REVIEW_INITIAL_STATE: &str = "draft";
@@ -72,6 +74,10 @@ mod tests {
         assert!(
             mapped > 0,
             "no task manifest schema maps to a minimum release"
+        );
+        assert!(
+            crate::config::cli_version_satisfies(&package, &ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION),
+            "package version {package} is below the workspace-mgr {ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION} that archived task paths require"
         );
     }
 }

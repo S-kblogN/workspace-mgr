@@ -780,6 +780,8 @@ fn rename_preserves_the_cloud_usage_approval() {
         [
             "task",
             "approve-cloud-usage",
+            "--manifest",
+            private.to_str().unwrap(),
             "--limit",
             "2GiB",
             "--note",
@@ -787,7 +789,16 @@ fn rename_preserves_the_cloud_usage_approval() {
         ],
     ));
     assert_eq!(recorded["schema_version"], 3);
-    workspace(&worktree, ["task", "rename", "usage-archive"]);
+    workspace(
+        &worktree,
+        [
+            "task",
+            "rename",
+            "usage-archive",
+            "--manifest",
+            private.to_str().unwrap(),
+        ],
+    );
     let raw = std::fs::read_to_string(&private).unwrap();
     assert!(raw.starts_with("schema_version = 3\n"), "{raw}");
     assert!(raw.contains("slug = \"usage-archive\"\n"));
@@ -798,7 +809,10 @@ fn rename_preserves_the_cloud_usage_approval() {
         "{raw}"
     );
     assert_eq!(
-        json(&workspace(&worktree, ["task", "status"]))["cloud_usage"]["approval"],
+        json(&workspace(
+            &worktree,
+            ["task", "status", "--manifest", private.to_str().unwrap()]
+        ))["cloud_usage"]["approval"],
         approval
     );
 }
@@ -834,9 +848,22 @@ fn approvals_are_recorded_only_in_the_checkout_that_publishes_the_manifest() {
             "The user requested the tools update.",
         ],
     ));
-    let worktree = PathBuf::from(created["path"].as_str().unwrap());
-    // The infrastructure worktree holds its own copy of the merged
-    // deliverable, which no publication of the deliverable carries.
+    let worktree = fixture.root.join("other-checkout");
+    git(
+        &fixture.root,
+        [
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+        ],
+    );
+    configure_git(&worktree);
+    git(
+        &worktree,
+        ["switch", "-c", created["branch"].as_str().unwrap()],
+    );
+    // A separate checkout on another branch holds a copy the deliverable's
+    // normal publication does not carry.
     let copy = worktree.join(&task_id);
     let copy_manifest = copy.join(MANIFEST);
     let copy_before = std::fs::read_to_string(&copy_manifest).unwrap();
@@ -2635,10 +2662,15 @@ fn infrastructure_tasks_wait_for_approval_and_publish_the_trailer() {
         env,
     ));
     let worktree = PathBuf::from(created["path"].as_str().unwrap());
+    let manifest = created["manifest"].as_str().unwrap();
     std::fs::create_dir(worktree.join("assets")).unwrap();
     std::fs::write(worktree.join("assets/model.bin"), noise(400_000, 3)).unwrap();
 
-    let plan = json(&workspace_env(&worktree, ["plan"], env));
+    let plan = json(&workspace_env(
+        &worktree,
+        ["plan", "--manifest", manifest],
+        env,
+    ));
     assert_eq!(plan["cloud_usage"]["status"], "approval_required");
     assert_git_contributor(
         &plan["cloud_usage"]["contributors"][0],
@@ -2646,25 +2678,52 @@ fn infrastructure_tasks_wait_for_approval_and_publish_the_trailer() {
         "pending",
     );
     assert_refused(
-        &workspace_env_unchecked(&worktree, ["publish", "-m", "Publish assets"], env),
+        &workspace_env_unchecked(
+            &worktree,
+            ["publish", "--manifest", manifest, "-m", "Publish assets"],
+            env,
+        ),
         &["cloud usage for task infra-shared-assets needs the user's approval"],
     );
     assert_eq!(
         rev(&fixture.remote, "refs/heads/codex/infra-shared-assets"),
         None
     );
-    let waiting = workspace_env(&worktree, ["storage", "status", "assets/model.bin"], env);
+    let waiting = workspace_env(
+        &worktree,
+        [
+            "storage",
+            "status",
+            "assets/model.bin",
+            "--manifest",
+            manifest,
+        ],
+        env,
+    );
     assert!(stderr(&waiting).starts_with(&format!(
         "workspace-mgr: task infra-shared-assets {REMINDER}"
     )));
 
-    // Infrastructure worktrees share the repository's private task state.
-    let recorded = approve(&worktree, env, "1MB", "The user approved 1 MB of assets");
+    // Infrastructure uses the repository's private state while main stays mounted.
+    let recorded = json(&workspace_env(
+        &worktree,
+        [
+            "task",
+            "approve-cloud-usage",
+            "--manifest",
+            manifest,
+            "--limit",
+            "1MB",
+            "--note",
+            "The user approved 1 MB of assets",
+        ],
+        env,
+    ));
     assert_eq!(recorded["schema_version"], 3);
     assert_eq!(cloud_usage_state(&fixture.shared).len(), 1);
     let published = json(&workspace_env(
         &worktree,
-        ["publish", "-m", "Publish assets"],
+        ["publish", "--manifest", manifest, "-m", "Publish assets"],
         env,
     ));
     assert_eq!(published["status"], "pushed");

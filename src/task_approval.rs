@@ -133,7 +133,7 @@ pub fn approve(options: &CloudUsageApprovalOptions) -> Result<CloudUsageApproval
 }
 
 /// Only a checkout that publishes this manifest may record the decision, so a
-/// copy in another checkout, such as an infrastructure worktree's copy of a
+/// copy in another checkout, such as a separate clone's copy of a
 /// merged deliverable, is never written by accident. A deliverable follows
 /// publication's rules for its checkout head: the shared checkout on the
 /// shared branch, or another head in an explicitly authorized alternate

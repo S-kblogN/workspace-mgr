@@ -52,7 +52,7 @@ jobs:
           git --version
           dvc version
       - name: Test exact-version transport and request counts
-        run: python -m unittest discover -s scripts/tests -p 'test_dvc_version*.py'
+        run: python -m unittest discover -s scripts/tests -p 'test_dvc_*.py'
       - name: Start versioned S3-compatible service
         run: |
           # The official container registry no longer serves this release.
@@ -84,6 +84,13 @@ jobs:
           WORKSPACE_MGR_BIN: ${{ github.workspace }}/target/debug/workspace-mgr
           WORKSPACE_MGR_E2E_ROOT: ${{ runner.temp }}/workspace-mgr-e2e
         run: python tests/e2e/run.py
+      - name: Build archive test host adapter
+        run: cargo build --locked --features test-storage
+      - name: Verify complete archive migration and historical hydration
+        env:
+          WORKSPACE_MGR_BIN: ${{ github.workspace }}/target/debug/workspace-mgr
+          WORKSPACE_MGR_E2E_ROOT: ${{ runner.temp }}/workspace-mgr-archive-e2e
+        run: python scripts/test_archive_s3.py
       - name: Capture MinIO log
         if: always()
         run: |
@@ -95,7 +102,9 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: workspace-mgr-e2e-evidence
-          path: ${{ runner.temp }}/workspace-mgr-e2e/
+          path: |
+            ${{ runner.temp }}/workspace-mgr-e2e/
+            ${{ runner.temp }}/workspace-mgr-archive-e2e/
           if-no-files-found: warn
           retention-days: 14
       - name: Stop virtual S3 service
