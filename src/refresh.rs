@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::branch_cleanup::{self, BranchCleanupReport};
 use crate::config::Config;
 use crate::dvc::{self, PreparedRevision};
 use crate::error::{Error, IoContext, Result};
@@ -31,6 +32,7 @@ pub struct RefreshReport {
     pub working_changes_before: Vec<String>,
     pub working_changes_after: Vec<String>,
     pub materialized_git_paths: Vec<String>,
+    pub branch_cleanup: BranchCleanupReport,
     pub storage: RefreshStorageReport,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<RefreshWarning>,
@@ -207,6 +209,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         working_changes_before: working_before.clone(),
         working_changes_after: working_before,
         materialized_git_paths: materialized_git_paths.clone(),
+        branch_cleanup: BranchCleanupReport::default(),
         storage: RefreshStorageReport {
             mode: "hydrate".to_owned(),
             changed_files: incoming_dvc.clone(),
@@ -223,6 +226,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     };
     report.storage.purge.queued = purge_candidates.clone();
     if old_oid == new_oid {
+        cleanup_branches(&repo, &config, &new_oid, options.dry_run, &mut report);
         if !options.dry_run {
             report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
             if !report.storage.purge.deleted.is_empty() {
@@ -257,6 +261,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     };
     if options.dry_run {
         report.status = "dry_run".to_owned();
+        cleanup_branches(&repo, &config, &new_oid, true, &mut report);
         return Ok(report);
     }
 
@@ -370,9 +375,38 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         .to_owned(),
     );
     report.working_changes_after = working_changes(&repo)?;
+    cleanup_branches(&repo, &config, &new_oid, false, &mut report);
     report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
     report.storage.purge.queued = purge_candidates;
     Ok(report)
+}
+
+fn cleanup_branches(
+    repo: &GitRepo,
+    config: &Config,
+    base_oid: &str,
+    dry_run: bool,
+    report: &mut RefreshReport,
+) {
+    report.branch_cleanup = branch_cleanup::execute(repo, config, base_oid, dry_run);
+    for warning in &report.branch_cleanup.warnings {
+        report.warnings.push(RefreshWarning {
+            code: "branch-cleanup-unavailable".to_owned(),
+            message: warning.clone(),
+        });
+    }
+    for error in &report.branch_cleanup.errors {
+        report.warnings.push(RefreshWarning {
+            code: "branch-cleanup-failed".to_owned(),
+            message: format!(
+                "merged branch {:?}: {} failed: {}",
+                error.branch, error.action, error.error
+            ),
+        });
+    }
+    if report.status == "no_changes" && !report.branch_cleanup.deleted.is_empty() {
+        report.status = "branches_cleaned".to_owned();
+    }
 }
 
 /// Refresh cannot hydrate, replace, or verify the payload of a boundary the
@@ -566,7 +600,10 @@ fn capture_overlays(
                     checkout_output: false,
                 },
             );
-            if old_content.is_some() && !retired_local_pointers.contains(path) {
+            if old_content.is_some()
+                && new_content.is_some()
+                && !retired_local_pointers.contains(path)
+            {
                 conflicts.push(path.clone());
             }
             continue;

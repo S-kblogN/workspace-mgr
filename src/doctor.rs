@@ -11,7 +11,6 @@ use crate::config::{
 use crate::dvc;
 use crate::error::Result;
 use crate::git::GitRepo;
-use crate::manifest::{ResolvedTask, TaskKind};
 use crate::path::reject_symlink_traversal;
 use crate::process::command_exists;
 use crate::scaffold;
@@ -86,25 +85,11 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
             .current_branch()?
             .unwrap_or_else(|| "detached".to_owned());
         let expected = &config.git.branch;
-        let infrastructure_task = if head == *expected {
-            None
-        } else {
-            ResolvedTask::discover(&repo, &repo.root)
-                .and_then(|path| ResolvedTask::load(&repo, config, &path))
-                .ok()
-                .filter(|task| task.kind == TaskKind::Infrastructure && task.branch == head)
-        };
-        let branch_ok = head == *expected || infrastructure_task.is_some();
+        let branch_ok = head == *expected;
         checks.push(DoctorCheck {
             name: "checkout-branch".to_owned(),
             status: if branch_ok { "ok" } else { "error" }.to_owned(),
-            detail: match infrastructure_task {
-                Some(task) => format!(
-                    "current {head}, valid isolated infrastructure task {}",
-                    task.task_id
-                ),
-                None => format!("current {head}, configured shared branch {expected}"),
-            },
+            detail: format!("current {head}, configured shared branch {expected}"),
         });
         let identity = repo.run_unchecked(["var", "GIT_AUTHOR_IDENT"])?;
         checks.push(DoctorCheck {

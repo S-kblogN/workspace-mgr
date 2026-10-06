@@ -134,7 +134,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 }
 
 #[test]
-fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
+fn infrastructure_task_publishes_from_main_with_private_state_and_index() {
     let fixture = GitFixture::new();
     workspace(&fixture.seed, ["init"]);
     fixture.commit_seed("Add workspace policy");
@@ -172,15 +172,28 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
     );
     let worktree = std::path::PathBuf::from(created["path"].as_str().unwrap());
     let manifest = std::path::PathBuf::from(created["manifest"].as_str().unwrap());
+    assert_eq!(worktree, fixture.shared.canonicalize().unwrap());
     assert!(worktree.is_dir());
     assert!(manifest.is_file());
     assert!(!fixture.shared.join("infra-shared-policy").exists());
     assert_eq!(
         String::from_utf8_lossy(&git(&worktree, ["branch", "--show-current"]).stdout).trim(),
-        "codex/infra-shared-policy"
+        "main"
+    );
+    let main_before = git(&worktree, ["rev-parse", "HEAD"]).stdout;
+    let index_before = git(&worktree, ["ls-files", "--stage"]).stdout;
+    let worktrees_before = git(&worktree, ["worktree", "list", "--porcelain"]).stdout;
+    let unselected = workspace_unchecked(&worktree, ["task", "status"]);
+    assert_eq!(
+        unselected.status.code(),
+        Some(2),
+        "private infrastructure tasks require explicit selection"
     );
 
-    let status = workspace(&worktree, ["task", "status"]);
+    let status = workspace(
+        &worktree,
+        ["task", "status", "--manifest", manifest.to_str().unwrap()],
+    );
     assert_eq!(json(&status)["kind"], "infrastructure");
     assert_eq!(
         json(&status)["scopes"],
@@ -194,14 +207,33 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
     let doctor = workspace(&worktree, ["doctor"]);
     assert_eq!(json(&doctor)["status"], "ok");
     std::fs::write(worktree.join("shared-policy.md"), "shared policy\n").unwrap();
-    let published = workspace(&worktree, ["publish", "-m", "Publish shared policy"]);
+    std::fs::write(
+        worktree.join("unrelated-overlay.txt"),
+        "another task's unpublished bytes\n",
+    )
+    .unwrap();
+    let published = workspace(
+        &worktree,
+        [
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Publish shared policy",
+        ],
+    );
     let published = json(&published);
     assert_eq!(published["status"], "pushed");
-    assert_eq!(published["head"], "codex/infra-shared-policy");
+    assert_eq!(published["head"], "main");
     assert_eq!(published["review"]["pull_request"], "required");
     assert_eq!(published["review"]["managed_by"], "agent");
     assert_eq!(published["review"]["merge_authority"], "user");
-    assert!(git(&worktree, ["status", "--short"]).stdout.is_empty());
+    assert_eq!(git(&worktree, ["rev-parse", "HEAD"]).stdout, main_before);
+    assert_eq!(git(&worktree, ["ls-files", "--stage"]).stdout, index_before);
+    assert_eq!(
+        git(&worktree, ["worktree", "list", "--porcelain"]).stdout,
+        worktrees_before
+    );
     let commit = published["commit_oid"].as_str().unwrap();
     assert!(
         git_unchecked(
@@ -211,9 +243,30 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
         .status
         .success()
     );
+    assert!(
+        !git_unchecked(
+            &worktree,
+            ["cat-file", "-e", &format!("{commit}:unrelated-overlay.txt")]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("unrelated-overlay.txt")).unwrap(),
+        "another task's unpublished bytes\n"
+    );
 
     std::fs::remove_file(worktree.join("shared-policy.md")).unwrap();
-    let removed = workspace(&worktree, ["publish", "-m", "Remove shared policy"]);
+    let removed = workspace(
+        &worktree,
+        [
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Remove shared policy",
+        ],
+    );
     let removed = json(&removed);
     assert_eq!(removed["status"], "pushed");
     assert_eq!(
@@ -233,8 +286,90 @@ fn infrastructure_task_uses_private_state_and_an_isolated_worktree() {
         .status
         .success()
     );
-    let clean = workspace(&worktree, ["plan"]);
+    let clean = workspace(
+        &worktree,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+    );
     assert_eq!(json(&clean)["status"], "no_changes");
+}
+
+#[test]
+fn infrastructure_plan_and_publish_require_main_refresh_before_replacing_upstream_scopes() {
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["init"]);
+    std::fs::write(fixture.seed.join("policy.md"), "original upstream policy\n").unwrap();
+    fixture.commit_seed("Initialize shared policy");
+    fixture.clone_shared();
+    let created = json(&workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "change-policy",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "Change shared policy",
+            "--purpose",
+            "Protect concurrent shared-policy changes",
+            "--scope",
+            "policy.md",
+            "--scope-note",
+            "The user requested this shared policy change",
+        ],
+    ));
+    let manifest = created["manifest"].as_str().unwrap();
+    std::fs::write(fixture.shared.join("policy.md"), "local proposed policy\n").unwrap();
+    let main_before = git(&fixture.shared, ["rev-parse", "HEAD"]).stdout;
+    let index_before = git(&fixture.shared, ["ls-files", "--stage"]).stdout;
+    std::fs::write(
+        fixture.seed.join("policy.md"),
+        "concurrent upstream policy\n",
+    )
+    .unwrap();
+    fixture.commit_seed("Update policy before infrastructure publication");
+    for args in [
+        vec!["plan", "--manifest", manifest],
+        vec![
+            "publish",
+            "--manifest",
+            manifest,
+            "-m",
+            "Attempt to publish stale policy",
+        ],
+    ] {
+        let refused = workspace_unchecked(&fixture.shared, args);
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("refresh"));
+        assert_eq!(
+            git(&fixture.shared, ["rev-parse", "HEAD"]).stdout,
+            main_before
+        );
+        assert_eq!(
+            git(&fixture.shared, ["ls-files", "--stage"]).stdout,
+            index_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.shared.join("policy.md")).unwrap(),
+            "local proposed policy\n"
+        );
+        assert!(
+            !git_unchecked(
+                &fixture.remote,
+                [
+                    "show-ref",
+                    "--verify",
+                    "refs/heads/codex/infra-change-policy"
+                ]
+            )
+            .status
+            .success()
+        );
+        assert_eq!(
+            String::from_utf8(git(&fixture.remote, ["show", "main:policy.md"]).stdout).unwrap(),
+            "concurrent upstream policy\n"
+        );
+    }
 }
 
 #[test]
@@ -603,7 +738,8 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     let infrastructure_rules = String::from_utf8(infrastructure_rules.stdout).unwrap();
     assert!(infrastructure_rules.contains("write only the declared paths"));
     assert!(infrastructure_rules.contains("separate explicit user approval"));
-    assert!(infrastructure_rules.contains("Its worktree is the workplace"));
+    assert!(infrastructure_rules.contains("shared checkout"));
+    assert!(infrastructure_rules.contains("--manifest"));
 
     workspace(
         &fixture.shared,

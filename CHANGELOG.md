@@ -9,6 +9,11 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Changed
 
+- Infrastructure tasks now work in the shared checkout on the configured main
+  branch, with a private manifest selected through `--manifest`. They publish
+  through a private index to an unmounted task branch, like deliverable tasks,
+  without creating or switching to an infrastructure worktree.
+  Legacy infrastructure worktrees are not migrated automatically.
 - Active deliverable task directories stay at the repository's top level.
   Completed task directories whose pull requests are confirmed merged may be
   organized under flexible time folders, such as `YYYY/`, `YYYYMM/`, or
@@ -35,6 +40,14 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   metadata automatically. Durable exact-version mappings let `storage hydrate`
   recover historical Git snapshots after protected source cleanup; receipts
   retain original and destination identities and timestamps.
+- After successful shared-branch synchronization, `refresh` automatically
+  cleans local and configured-remote branches whose exact heads match verified
+  merged same-repository GitHub pull requests, including squash merges. It
+  preserves protected refs, active or resumed branches, and new local commits.
+  Branches checked out in any legacy or custom worktree are retained. Dry-run
+  reports the proposal. Missing GitHub evidence or
+  cleanup failures leave synchronization successful and report the retained
+  refs without removing task directories or retained payloads.
 
 ## [0.4.1] - 2026-09-27
 

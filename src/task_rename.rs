@@ -180,51 +180,23 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
     })
 }
 
-/// Requires the checkout that owns the task's manifest: the shared checkout
-/// on the base branch for a deliverable, and the task's managed worktree for
-/// an infrastructure task. `operation` names the command in refusals.
+/// Every writable task uses the shared checkout on the base branch.
+/// `operation` names the command in refusals.
 pub(crate) fn validate_checkout(
     repo: &GitRepo,
     task: &ResolvedTask,
     operation: &str,
 ) -> Result<()> {
     let current = repo.current_branch()?;
-    match task.kind {
-        TaskKind::Deliverable => {
-            if current.as_deref() != Some(&task.base_branch) {
-                return Err(Error::message(format!(
-                    "deliverable {operation} must run from the shared checkout on {:?}; current branch is {:?}",
-                    task.base_branch,
-                    current.as_deref().unwrap_or("detached HEAD")
-                )));
-            }
-            repo.ensure_branch_not_checked_out(&task.branch)?;
-        }
-        TaskKind::Infrastructure => {
-            if current.as_deref() != Some(&task.branch) {
-                return Err(Error::message(format!(
-                    "infrastructure {operation} must run from its isolated worktree on {:?}",
-                    task.branch
-                )));
-            }
-            let expected = repo
-                .common_dir()?
-                .join("workspace-mgr/checkouts")
-                .join(&task.task_id);
-            if repo.root != expected {
-                return Err(Error::message(format!(
-                    "infrastructure task is not in its managed worktree: expected {}, got {}",
-                    expected.display(),
-                    repo.root.display()
-                )));
-            }
-            if repo.branch_worktrees(&task.branch)? != vec![repo.root.clone()] {
-                return Err(Error::message(
-                    "infrastructure task branch must be checked out only in its managed worktree",
-                ));
-            }
-        }
+    if current.as_deref() != Some(&task.base_branch) {
+        return Err(Error::message(format!(
+            "{:?} {operation} must run from the shared checkout on {:?}; current branch is {:?}",
+            task.kind,
+            task.base_branch,
+            current.as_deref().unwrap_or("detached HEAD")
+        )));
     }
+    repo.ensure_branch_not_checked_out(&task.branch)?;
     Ok(())
 }
 

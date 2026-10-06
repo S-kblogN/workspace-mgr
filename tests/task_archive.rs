@@ -78,7 +78,6 @@ fn pr(state: &str, number: u64, branch: &str, merged: &str, head: &str) -> Value
 }
 
 fn fake_gh(fixture: &GitFixture, merged: &str, active: bool) -> PathBuf {
-    let path = fixture.root.join("fake-gh");
     let head =
         String::from_utf8(git(&fixture.remote, ["rev-parse", "refs/heads/codex/completed"]).stdout)
             .unwrap()
@@ -94,16 +93,50 @@ fn fake_gh(fixture: &GitFixture, merged: &str, active: bool) -> PathBuf {
             vec![pr("OPEN", 2, "codex/active", merged, &head)],
         );
     }
+    write_gh(fixture, &requests)
+}
+
+fn write_gh(fixture: &GitFixture, requests: &BTreeMap<&str, Vec<Value>>) -> PathBuf {
+    let path = fixture.root.join("fake-gh");
     let database = serde_json::to_string(&requests).unwrap();
     let literal = serde_json::to_string(&database).unwrap();
     std::fs::write(&path, format!(
-        "#!/usr/bin/env python3\nimport json, sys\nrequests = json.loads({literal})\nhead = sys.argv[sys.argv.index('--head') + 1]\nprint(json.dumps(requests.get(head, [])))\n"
+        "#!/usr/bin/env python3\nimport json, sys\nrequests = json.loads({literal})\nhead = sys.argv[sys.argv.index('--head') + 1]\nrows = requests.get(head, [])\nif '--base' in sys.argv:\n    base = sys.argv[sys.argv.index('--base') + 1]\n    rows = [row for row in rows if row['baseRefName'] == base]\nprint(json.dumps(rows))\n"
     )).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
-fn organizer(fixture: &GitFixture, scopes: &[&str]) -> PathBuf {
+#[test]
+fn archive_keeps_a_branch_with_an_open_pr_to_another_base_active() {
+    let (fixture, merged) = managed_fixture(false);
+    let head =
+        String::from_utf8(git(&fixture.remote, ["rev-parse", "refs/heads/codex/completed"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+    let mut open = pr("OPEN", 2, "codex/completed", &merged, &head);
+    open["baseRefName"] = value!("release");
+    let requests = BTreeMap::from([(
+        "codex/completed",
+        vec![pr("MERGED", 1, "codex/completed", &merged, &head), open],
+    )]);
+    let gh = write_gh(&fixture, &requests);
+    let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
+    assert!(preview["tasks"].as_array().unwrap().is_empty());
+    assert_eq!(preview["skipped"][0]["path"], DONE);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    rejected(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+        "refuses active or unverified task",
+    );
+    assert!(workplace.join(DONE).is_dir());
+    assert!(!workplace.join(DESTINATION).exists());
+}
+
+fn organizer(fixture: &GitFixture, scopes: &[&str]) -> (PathBuf, PathBuf) {
     let mut args = vec![
         "task",
         "create",
@@ -121,7 +154,10 @@ fn organizer(fixture: &GitFixture, scopes: &[&str]) -> PathBuf {
         args.extend(["--scope", scope]);
     }
     let created = json(&workspace(&fixture.shared, args));
-    PathBuf::from(created["path"].as_str().unwrap())
+    (
+        PathBuf::from(created["path"].as_str().unwrap()),
+        PathBuf::from(created["manifest"].as_str().unwrap()),
+    )
 }
 
 fn archive(cwd: &Path, gh: &Path, args: &[&str]) -> std::process::Output {
@@ -188,19 +224,35 @@ fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_
         "refuses active or unverified task",
     );
 
-    let worktree = organizer(&fixture, &[DONE, DESTINATION]);
+    let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE, DESTINATION]);
     let original: toml::Value =
         toml::from_str(&std::fs::read_to_string(worktree.join(DONE).join(MANIFEST)).unwrap())
             .unwrap();
     let before = git(&fixture.remote, ["rev-parse", "refs/heads/main"]).stdout;
-    let output = json(&archive(&worktree, &gh, &["archive"]));
+    let index_before = git(&worktree, ["ls-files", "--stage"]).stdout;
+    let head_before = git(&worktree, ["rev-parse", "HEAD"]).stdout;
+    let output = json(&archive(
+        &worktree,
+        &gh,
+        &[
+            "archive",
+            "--manifest",
+            infrastructure_manifest.to_str().unwrap(),
+        ],
+    ));
     assert_eq!(output["status"], "archived");
     assert_eq!(output["task_id"], "infra-archive-completed");
     assert_eq!(output["remote_writes"], false);
     assert!(!worktree.join(DONE).exists());
     assert!(worktree.join(DESTINATION).join("result.md").is_file());
     assert!(worktree.join(ACTIVE).is_dir());
-    assert!(fixture.shared.join(DONE).is_dir());
+    assert!(!fixture.shared.join(DONE).exists());
+    assert_eq!(git(&worktree, ["ls-files", "--stage"]).stdout, index_before);
+    assert_eq!(git(&worktree, ["rev-parse", "HEAD"]).stdout, head_before);
+    assert_eq!(
+        String::from_utf8_lossy(&git(&worktree, ["branch", "--show-current"]).stdout).trim(),
+        "main"
+    );
     assert_eq!(
         git(&fixture.remote, ["rev-parse", "refs/heads/main"]).stdout,
         before
@@ -253,11 +305,16 @@ fn archive_refuses_resumed_remote_branches_without_new_pull_requests() {
         &["archive", DONE, "--dry-run"],
         "refuses active or unverified task",
     );
-    let worktree = organizer(&fixture, &[DONE, DESTINATION]);
+    let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE, DESTINATION]);
     rejected(
         &worktree,
         &gh,
-        &["archive", DONE],
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            infrastructure_manifest.to_str().unwrap(),
+        ],
         "refuses active or unverified task",
     );
     assert!(worktree.join(DONE).join(MANIFEST).is_file());
@@ -278,6 +335,57 @@ fn archive_refuses_resumed_remote_branches_without_new_pull_requests() {
 }
 
 #[test]
+fn archive_keeps_an_unpublished_resumed_local_branch_active_without_file_overlays() {
+    let (fixture, merged) = managed_fixture(false);
+    let gh = fake_gh(&fixture, &merged, false);
+    let reference = "refs/heads/codex/completed";
+    let original =
+        String::from_utf8(git(&fixture.shared, ["rev-parse", "origin/codex/completed"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+    let tree =
+        String::from_utf8(git(&fixture.shared, ["show", "-s", "--format=%T", &original]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+    let resumed = String::from_utf8(
+        git(
+            &fixture.shared,
+            [
+                "commit-tree",
+                &tree,
+                "-p",
+                &original,
+                "-m",
+                "Resume unpublished local task review",
+            ],
+        )
+        .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    git(&fixture.shared, ["update-ref", reference, &resumed]);
+    assert!(
+        git(&fixture.shared, ["status", "--porcelain"])
+            .stdout
+            .is_empty()
+    );
+    let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
+    assert!(preview["tasks"].as_array().unwrap().is_empty());
+    assert_eq!(preview["skipped"][0]["path"], DONE);
+    assert_eq!(
+        String::from_utf8(git(&fixture.shared, ["rev-parse", reference]).stdout)
+            .unwrap()
+            .trim(),
+        resumed
+    );
+    assert!(fixture.shared.join(DONE).is_dir());
+    assert!(!fixture.shared.join(DESTINATION).exists());
+}
+
+#[test]
 fn archive_supports_year_and_compact_month_layouts() {
     for (layout, prefix) in [("{year}", "2026"), ("{year}{month}", "202607")] {
         let (fixture, merged) = managed_fixture(false);
@@ -289,8 +397,19 @@ fn archive_supports_year_and_compact_month_layouts() {
             &["archive", "--layout", layout, "--dry-run"],
         ));
         assert_eq!(preview["tasks"][0]["destination"], destination);
-        let worktree = organizer(&fixture, &[DONE, &destination]);
-        archive(&worktree, &gh, &["archive", DONE, "--layout", layout]);
+        let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE, &destination]);
+        archive(
+            &worktree,
+            &gh,
+            &[
+                "archive",
+                DONE,
+                "--layout",
+                layout,
+                "--manifest",
+                infrastructure_manifest.to_str().unwrap(),
+            ],
+        );
         assert!(worktree.join(&destination).join(MANIFEST).is_file());
         assert!(!worktree.join(DONE).exists());
     }
@@ -300,11 +419,16 @@ fn archive_supports_year_and_compact_month_layouts() {
 fn archive_refuses_scope_collisions_and_shared_overlays_before_moving() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
-    let worktree = organizer(&fixture, &[DONE]);
+    let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE]);
     rejected(
         &worktree,
         &gh,
-        &["archive", DONE],
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            infrastructure_manifest.to_str().unwrap(),
+        ],
         "escapes the infrastructure task's declared scopes",
     );
     assert!(worktree.join(DONE).is_dir());

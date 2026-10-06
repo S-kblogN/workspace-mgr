@@ -440,7 +440,7 @@ fn rejected_remote_deletion_restores_the_local_task() {
 }
 
 #[test]
-fn infrastructure_discard_removes_its_worktree_and_branches() {
+fn infrastructure_discard_restores_scopes_and_keeps_shared_main_checkout() {
     let fixture = GitFixture::new();
     workspace(&fixture.seed, ["init"]);
     fixture.commit_seed("Add workspace policy");
@@ -467,20 +467,36 @@ fn infrastructure_discard_removes_its_worktree_and_branches() {
     let worktree = std::path::PathBuf::from(created["path"].as_str().unwrap());
     let manifest = std::path::PathBuf::from(created["manifest"].as_str().unwrap());
     std::fs::write(worktree.join("policy.md"), "temporary policy\n").unwrap();
-    workspace(&worktree, ["publish", "-m", "Publish disposable policy"]);
-    let preview = workspace(&worktree, ["task", "discard", "--dry-run"]);
-    assert_eq!(
-        json(&preview)["local_actions"][0]["action"],
-        "delete-worktree"
-    );
-
-    let inside = workspace_unchecked(
+    assert_eq!(worktree, fixture.shared.canonicalize().unwrap());
+    let head_before = git(&worktree, ["rev-parse", "HEAD"]).stdout;
+    let index_before = git(&worktree, ["ls-files", "--stage"]).stdout;
+    let worktrees_before = git(&worktree, ["worktree", "list", "--porcelain"]).stdout;
+    std::fs::write(
+        worktree.join("unrelated-overlay.txt"),
+        "other work must remain\n",
+    )
+    .unwrap();
+    workspace(
         &worktree,
-        ["task", "discard", "--confirm", "infra-discard-policy"],
+        [
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Publish disposable policy",
+        ],
     );
-    assert_eq!(inside.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&inside.stderr).contains("shared checkout"));
-    assert!(worktree.exists());
+    let preview = workspace(
+        &worktree,
+        [
+            "task",
+            "discard",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert_eq!(json(&preview)["local_actions"][0]["action"], "restore");
 
     let discarded = workspace(
         &fixture.shared,
@@ -496,7 +512,19 @@ fn infrastructure_discard_removes_its_worktree_and_branches() {
     let discarded = json(&discarded);
     assert_eq!(discarded["status"], "discarded");
     assert!(discarded.get("cleanup_warnings").is_none());
-    assert!(!worktree.exists());
+    assert!(worktree.is_dir());
+    assert!(!worktree.join("policy.md").exists());
+    assert!(!manifest.exists());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("unrelated-overlay.txt")).unwrap(),
+        "other work must remain\n"
+    );
+    assert_eq!(git(&worktree, ["rev-parse", "HEAD"]).stdout, head_before);
+    assert_eq!(git(&worktree, ["ls-files", "--stage"]).stdout, index_before);
+    assert_eq!(
+        git(&worktree, ["worktree", "list", "--porcelain"]).stdout,
+        worktrees_before
+    );
     assert!(
         !git_unchecked(
             &fixture.shared,
@@ -517,11 +545,5 @@ fn infrastructure_discard_removes_its_worktree_and_branches() {
         )
         .status
         .success()
-    );
-    assert!(
-        !git(&fixture.shared, ["worktree", "list", "--porcelain"])
-            .stdout
-            .windows(worktree.as_os_str().len())
-            .any(|window| window == worktree.as_os_str().as_encoded_bytes())
     );
 }

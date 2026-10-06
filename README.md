@@ -1,7 +1,7 @@
 # workspace-mgr
 
 `workspace-mgr` is the repository interface for coding agents. It turns repository
-policy into executable instructions, creates isolated task scaffolding, chooses
+policy into executable instructions, creates scoped task scaffolding, chooses
 whether retained content lives in Git or S3, and publishes both as one verified
 transaction.
 
@@ -46,6 +46,11 @@ workspace-mgr task create shared-policy --kind infrastructure \
   --scope AGENTS.md --scope-note "The user requested this shared change"
 ```
 
+Infrastructure tasks work in the same shared checkout, which stays on the
+configured main branch. Creation returns a private manifest path; pass it as
+`--manifest <path>` to task-scoped commands such as `plan` and `publish`.
+Both task kinds publish to their own unmounted branch through a private index.
+
 Inside a task:
 
 ```sh
@@ -81,6 +86,16 @@ their complete retained S3 history, rewrites storage metadata, and records
 durable exact-version mappings before obsolete source objects are purged.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.
+
+After merge, `workspace-mgr refresh` brings the configured shared branch into the
+shared checkout and automatically cleans local and configured-remote branch
+refs that still match a verified merged GitHub pull request. Protected branches
+and branches with new commits are kept. A branch checked out in any legacy or
+custom worktree is also kept.
+`refresh --dry-run` reports the proposed cleanup. GitHub CLI access is optional:
+when merge evidence is unavailable, refresh preserves the refs and reports a
+warning. This cleanup leaves task directories, worktrees and payloads in place;
+organizing their directories still requires the user's request.
 
 What leaves the task directory is curated. Every file under a task is either
 selected for publication or ignored by a rule this repository tracks, so the

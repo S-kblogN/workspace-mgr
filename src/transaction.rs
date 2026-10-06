@@ -248,6 +248,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &remote_base_oid,
         &format!("{}/{}", task.remote, task.base_branch),
     )?;
+    if task.kind == TaskKind::Infrastructure
+        && repo.optional_oid("HEAD")?.as_deref() != Some(&remote_base_oid)
+    {
+        return Err(Error::message(
+            "infrastructure publication requires the shared checkout to match the fetched base branch; run workspace-mgr refresh first, preserving task overlays, then retry with the task's --manifest",
+        ));
+    }
     let remote_target_oid = repo.remote_branch_oid(&task.remote, &task.branch)?;
     let has_remote_target = remote_target_oid.is_some();
     let (base_ref, base_oid) = if let Some(remote_target_oid) = remote_target_oid {
@@ -755,16 +762,6 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         &commit_oid,
         old_local_oid.as_deref().unwrap_or(ZERO_OID),
     ])?;
-    if task.kind == TaskKind::Infrastructure {
-        repo.run(["read-tree", &commit_oid])?;
-        if requirement.is_some()
-            || (!requirement_inputs.config_in_scope && paths.iter().any(|path| path == CONFIG_NAME))
-        {
-            // The isolated worktree checks out the task branch, so it must
-            // match the configuration the branch now carries.
-            sync_worktree_config(&repo, &commit_oid)?;
-        }
-    }
     let refspec = format!("{commit_oid}:refs/heads/{}", task.branch);
     repo.run(["push", "--porcelain", &task.remote, &refspec])?;
     let observed = repo
@@ -937,61 +934,19 @@ fn remove_output_paths_from_index<'a>(
 fn validate_checkout(
     repo: &GitRepo,
     task: &ResolvedTask,
-    scopes: &[String],
+    _scopes: &[String],
     options: &TransactionOptions,
 ) -> Result<()> {
     let head = repo.current_branch()?;
     if task.kind == TaskKind::Infrastructure {
-        if head.as_deref() != Some(&task.branch) {
+        if head.as_deref() != Some(&task.shared_head) {
             return Err(Error::message(format!(
-                "infrastructure task must run in its isolated worktree on {:?}; current branch is {:?}",
-                task.branch,
+                "infrastructure task must run from the shared checkout on {:?}; current branch is {:?}",
+                task.shared_head,
                 head.as_deref().unwrap_or("detached HEAD")
             )));
         }
-        let root = repo.root.canonicalize().map_err(|source| Error::Io {
-            path: repo.root.clone(),
-            source,
-        })?;
-        let worktrees = repo.branch_worktrees(&task.branch)?;
-        if worktrees.len() != 1
-            || worktrees[0].canonicalize().map_err(|source| Error::Io {
-                path: worktrees[0].clone(),
-                source,
-            })? != root
-        {
-            return Err(Error::message(
-                "infrastructure branch is not mounted only in the current isolated worktree",
-            ));
-        }
-        let staged = repo.run_unchecked(["diff", "--cached", "--quiet", "--"])?;
-        if staged.code != 0 && staged.code != 1 {
-            return Err(Error::message(
-                "failed to inspect the infrastructure worktree index",
-            ));
-        }
-        if staged.code == 1 {
-            return Err(Error::message(
-                "infrastructure worktree index has staged changes; unstage them before workspace-mgr publication",
-            ));
-        }
-        let tracked = repo.run(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])?;
-        let untracked = repo.run(["ls-files", "--others", "--exclude-standard", "-z", "--"])?;
-        let mut escaped = tracked
-            .stdout
-            .split('\0')
-            .chain(untracked.stdout.split('\0'))
-            .filter(|path| !path.is_empty() && !allowed(path, scopes))
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        escaped.sort();
-        escaped.dedup();
-        if !escaped.is_empty() {
-            return Err(Error::message(format!(
-                "infrastructure worktree has changes outside its declared scope: {}",
-                escaped.join(", ")
-            )));
-        }
+        repo.ensure_branch_not_checked_out(&task.branch)?;
         return Ok(());
     }
     if head.as_deref() != Some(&task.shared_head) {
@@ -2809,22 +2764,6 @@ fn stage_config_entry(repo: &GitRepo, index: &Path, mode: &str, oid: &str) -> Re
         true,
     )?;
     Ok(())
-}
-
-/// Brings an isolated infrastructure worktree's configuration to the
-/// published commit, whose index `read-tree` has already loaded.
-fn sync_worktree_config(repo: &GitRepo, commit_oid: &str) -> Result<()> {
-    let object = format!("{commit_oid}:{CONFIG_NAME}");
-    if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
-        repo.run(["checkout-index", "--force", "--", CONFIG_NAME])?;
-        return Ok(());
-    }
-    let path = repo.root.join(CONFIG_NAME);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::Io { path, source }),
-    }
 }
 
 /// The schema a task manifest declares, read without validating the rest.

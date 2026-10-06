@@ -18,9 +18,11 @@ S3 hydration, aggregate boundary sizing, tiny-S3 warnings, the semantic review
 band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
 content-independent first-init collisions and whole-file scaffold reconciliation,
-isolated infrastructure task scaffolding, scoped publication, and stable
+infrastructure task scaffolding with an explicit private manifest in the shared
+`main` checkout, scoped publication without shared-index changes, and stable
 publication of a deleted infrastructure file scope,
-deliverable and infrastructure task discard with branch/worktree cleanup and
+deliverable and infrastructure task discard with branch/private-state cleanup,
+declared shared-scope restoration without deleting the shared repository, and
 permanent unreferenced S3-path deletion,
 fixed policy with a minimal Git/S3-only public configuration,
 Git-to-S3 and S3-to-Git transitions, explicit remove, delete/move/rename purge,

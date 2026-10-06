@@ -1018,7 +1018,7 @@ fn concurrent_raises_agree_and_follow_the_shared_branch() {
 
 /// Infrastructure manifests are private, so only a shared tree that already
 /// contains a schema 3 manifest without the declaration makes an
-/// infrastructure publication raise it; the isolated worktree follows.
+/// infrastructure publication raises it in its private commit from main.
 #[cfg(feature = "test-storage")]
 #[test]
 fn an_infrastructure_publication_restores_a_missing_requirement() {
@@ -1043,21 +1043,43 @@ fn an_infrastructure_publication_restores_a_missing_requirement() {
         ],
     ));
     let worktree = PathBuf::from(created["path"].as_str().unwrap());
-    approve(
+    let manifest = PathBuf::from(created["manifest"].as_str().unwrap());
+    let main_before = rev(&fixture.shared, "HEAD");
+    let index_before = git(&fixture.shared, ["ls-files", "--stage"]).stdout;
+    workspace_env(
         &worktree,
+        [
+            "task",
+            "approve-cloud-usage",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--limit",
+            "2GiB",
+            "--note",
+            "The user approved 2 GiB of shared notes",
+        ],
         &[],
-        "2GiB",
-        "The user approved 2 GiB of shared notes",
     );
     std::fs::create_dir(worktree.join("docs")).unwrap();
     std::fs::write(worktree.join("docs/notes.md"), "notes\n").unwrap();
     // A private manifest never needs a newer release, so any build publishes.
-    let published = json(&workspace(&worktree, ["publish", "-m", "Publish notes"]));
+    let published = json(&workspace(
+        &worktree,
+        [
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Publish notes",
+        ],
+    ));
     assert_eq!(published["status"], "pushed");
     assert!(published.get("repository_requirement").is_none());
     assert_eq!(published["changed_paths"], json!(["docs/notes.md"]));
     let tip = published["remote_oid"].as_str().unwrap();
     assert_eq!(show(&fixture.remote, &format!("{tip}:{CONFIG}")), plain);
+    assert_eq!(rev(&worktree, "HEAD"), main_before);
+    assert_eq!(git(&worktree, ["ls-files", "--stage"]).stdout, index_before);
 
     // Someone merges a deliverable's schema 3 manifest into main but drops
     // the declaration while resolving a conflict.
@@ -1069,7 +1091,10 @@ fn an_infrastructure_publication_restores_a_missing_requirement() {
     )
     .unwrap();
     fixture.commit_seed("Merge a task without its requirement");
-    let (_, next) = {
+    workspace(&fixture.shared, ["refresh"]);
+    let main_before = rev(&fixture.shared, "HEAD");
+    let index_before = git(&fixture.shared, ["ls-files", "--stage"]).stdout;
+    let (next_manifest, next) = {
         let created = json(&workspace(
             &fixture.shared,
             [
@@ -1089,7 +1114,7 @@ fn an_infrastructure_publication_restores_a_missing_requirement() {
             ],
         ));
         (
-            created["task_id"].as_str().unwrap().to_owned(),
+            PathBuf::from(created["manifest"].as_str().unwrap()),
             PathBuf::from(created["path"].as_str().unwrap()),
         )
     };
@@ -1107,7 +1132,13 @@ fn an_infrastructure_publication_restores_a_missing_requirement() {
     assert_refused_with(
         &workspace_env_unchecked(
             &next,
-            ["publish", "-m", "Publish usage guide"],
+            [
+                "publish",
+                "--manifest",
+                next_manifest.to_str().unwrap(),
+                "-m",
+                "Publish usage guide",
+            ],
             &[(CLI_VERSION_ENV, "0.3.0")],
         ),
         // The manifest belongs to another task, so only an update helps.
@@ -1115,7 +1146,13 @@ fn an_infrastructure_publication_restores_a_missing_requirement() {
     );
     let published = json(&workspace_env(
         &next,
-        ["publish", "-m", "Publish usage guide"],
+        [
+            "publish",
+            "--manifest",
+            next_manifest.to_str().unwrap(),
+            "-m",
+            "Publish usage guide",
+        ],
         &current,
     ));
     assert_eq!(published["repository_requirement"], requirement);
@@ -1128,15 +1165,24 @@ fn an_infrastructure_publication_restores_a_missing_requirement() {
         show(&fixture.remote, &format!("{tip}:{CONFIG}")),
         declaring("0.4.0", &plain)
     );
-    // The isolated worktree checks out the task branch, so it now carries the
-    // raised configuration and stays clean; the shared checkout is untouched.
-    assert_eq!(read(&next.join(CONFIG)), declaring("0.4.0", &plain));
-    assert_eq!(porcelain(&next), "");
+    // The scoped publication raises only its commit. Shared main, its index,
+    // and the other infrastructure task's working overlay remain untouched.
+    assert_eq!(read(&next.join(CONFIG)), plain);
+    assert_eq!(rev(&next, "HEAD"), main_before);
+    assert_eq!(git(&next, ["ls-files", "--stage"]).stdout, index_before);
+    assert!(porcelain(&next).contains("docs/notes.md"));
+    assert!(porcelain(&next).contains("guides/usage.md"));
     assert_eq!(read(&fixture.shared.join(CONFIG)), plain);
     std::fs::write(next.join("guides/usage.md"), "more usage\n").unwrap();
     let again = json(&workspace_env(
         &next,
-        ["publish", "-m", "Publish more usage"],
+        [
+            "publish",
+            "--manifest",
+            next_manifest.to_str().unwrap(),
+            "-m",
+            "Publish more usage",
+        ],
         &current,
     ));
     assert_eq!(again["status"], "pushed");

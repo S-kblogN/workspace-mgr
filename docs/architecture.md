@@ -10,10 +10,20 @@ contain identity, purpose, current slug, scope, and branch state and, from
 schema 3, the user's cloud-usage approval. The task ID and review branch are
 immutable; the slug and deliverable path may change together. Deliverable
 manifests are tracked inside their task directories; infrastructure manifests
-and isolated worktrees live below the Git common directory. Private indexes and
+live below the Git common directory and are selected explicitly with
+`--manifest`. Both kinds work in the shared checkout on the configured base
+branch and publish to unmounted task refs. Private indexes and
 locks also live there. All mutating repository, placement, publication,
 hydration, and refresh operations share a repository lock; task and
 storage-boundary locks add narrower diagnostics.
+
+An infrastructure manifest is stored at
+`<git-common-dir>/workspace-mgr/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`.
+Creation returns the shared repository root as `path` and the absolute manifest
+path as `manifest`. It creates no worktree or checkout transition. Existing
+legacy infrastructure worktrees are not migrated automatically.
+Creation requires the shared HEAD to equal the fetched base revision; a behind
+checkout must refresh first.
 
 The user's cloud-usage approval is task state. `task approve-cloud-usage`
 writes it into the task manifest's `[cloud_usage_approval]` table, which makes
@@ -126,8 +136,9 @@ release, a repository declares the oldest compatible release in
   archived-path requirements and another task's requirements, such as one
   merged on the base branch, need an update. Infrastructure manifests are
   private and never trigger a raise, but an infrastructure publication raises
-  the declaration when base content it publishes needs one, and its isolated
-  worktree then receives the published configuration.
+  the declaration when base content it publishes needs one. The reconciled
+  configuration exists only in the publication tree until merged refresh,
+  unless the task explicitly changes that shared path within its scopes.
 - Releases up to 0.3.0 do not know the key. Once a raised configuration is
   merged, they reject it as an unknown field, which also fails closed.
 - Another task's published manifest is read only for the identity fields that
@@ -295,13 +306,11 @@ For a task publication, the CLI:
 10. permanently deletes all versions at obsolete S3 object paths, deferring
     paths still referenced by a current remote branch or tag.
 
-Deliverable target refs remain unmounted, so publication never changes the
-shared checkout. An infrastructure target ref is mounted only in its dedicated
-worktree; after the ref update, the CLI synchronizes that worktree's index to
-the published tree without touching its files or any shared checkout. The one
-exception is a `.workspace-mgr.toml` that the publication reconciled, which is
-also written to that worktree so its files keep matching the branch it has
-checked out.
+Deliverable and infrastructure target refs remain unmounted. Publication uses
+a private Git index and commit-tree to advance the task ref without switching
+the shared checkout or resetting its index. A `.workspace-mgr.toml` reconciled
+only for publication stays in the published tree; it does not overwrite the
+shared checkout's file.
 
 The Git commit is the publication point for the combined transaction. A later
 Git error may leave an unreferenced S3 object version, but a published Git
@@ -429,6 +438,27 @@ whose prior working state was clean or absent, and hydrates stored content.
 Existing working-tree overlays are preserved. A failure after the ref update
 rolls back the ref, index, ordinary files, metadata, and outputs created by the
 refresh.
+
+Merged-branch cleanup follows successful materialization and storage
+verification, and also runs when synchronization finds the shared branch
+already current. Dry-run only reports the deletion plan. The cleanup checks
+same-repository GitHub pull requests through `gh`: the merged revision must be
+reachable from the fetched base, and the immutable pull-request head must
+match every live local and configured-remote head. This proves squash merges
+without treating Git ancestry of the original head as proof or discarding new
+local commits. Open, resumed, ambiguous, fork, and other-base refs are retained.
+Configured base, current, default and protected branches are excluded. Any
+branch checked out in a legacy or custom worktree is retained. Cleanup never
+detaches a worktree or removes its directory or files.
+
+Remote deletions use an exact head lease, and local deletions compare and swap
+the expected ref. The `branch_cleanup` report separates planned and deleted
+refs, skipped branches, errors, warnings, and unavailable GitHub evidence.
+Cleanup errors do not roll back a successful refresh transaction. It removes
+branch refs only; task directories and retained S3 payloads remain. A normal
+pending purge retry can delete previously queued S3 paths after a removed ref
+releases their last live protection. Completed-directory archive remains an
+explicit user-requested infrastructure operation.
 
 The requirement check precedes detection, so refresh never inspects incoming
 storage metadata that only a newer release can read, and `--dry-run` refuses

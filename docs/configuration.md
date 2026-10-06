@@ -150,8 +150,8 @@ The following behavior is deliberately not configurable:
   merged may be grouped under time folders only in a user-requested
   infrastructure task; merge and turn-end synchronization never organize them
   automatically;
-- shared repository changes use an infrastructure task in an isolated
-  worktree;
+- shared repository changes use an infrastructure task in the same shared
+  checkout, with a private manifest selected explicitly;
 - the shared checkout remains on `git.branch` and preserves unrelated overlays;
 - Git is the collaboration/control plane and S3 is the artifact/data plane;
   agents record clear semantic choices, while unclassified new files use the
@@ -203,9 +203,14 @@ reason = "The user explicitly requested this shared documentation change"
 ```
 
 An infrastructure manifest uses `kind = "infrastructure"`, omits `path`, and
-requires at least one `additional_scopes` entry. It is stored in private
-worktree Git state rather than committed to the repository. The manifest schema
-version describes serialized task state; it is not a strategy selector.
+requires at least one `additional_scopes` entry. It is stored in private Git
+common state rather than committed to the repository. Task creation reports
+an absolute `manifest` path below
+`<git-common-dir>/workspace-mgr/infrastructure-tasks/<id>/.workspace-mgr-infrastructure.toml`
+for subsequent `--manifest <path>` selection. Infrastructure work
+stays in the shared checkout on `git.branch`; no task worktree is created.
+The manifest schema version describes serialized task state; it is not a
+strategy selector.
 
 Every field shown above except `additional_scopes` is required; the schema 3
 `cloud_usage_approval` table described below is optional. The ID is the
@@ -220,7 +225,7 @@ The manifest's `path` must match its actual repository-relative directory, and
 the directory basename must still match the timestamp and current slug.
 Organization preserves the immutable task ID and target branch. `task rename`
 changes an active task's current slug without replacing the task or review
-branch. An infrastructure task has no `path`; its private worktree remains
+branch. An infrastructure task has no `path`; its private manifest remains
 keyed by the stable ID. Declared scopes must be distinct and non-overlapping.
 Schema 1 manifests are still readable with their original slug; `task rename`
 and `task approve-cloud-usage` rewrite them as schema 2, or as schema 3 when

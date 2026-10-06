@@ -11,10 +11,7 @@ use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{
-    INFRASTRUCTURE_MANIFEST_NAME, ResolvedTask, TaskKind, TaskManifest, build_task_path,
-    parse_task_identity,
-};
+use crate::manifest::{ResolvedTask, TaskKind, TaskManifest, build_task_path, parse_task_identity};
 use crate::path::{allowed, reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::process;
@@ -309,12 +306,7 @@ fn infrastructure_task(
     config: &Config,
     options: &ArchiveOptions,
 ) -> Result<Option<ResolvedTask>> {
-    let private = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
-    let path = options
-        .manifest
-        .as_ref()
-        .cloned()
-        .or_else(|| private.is_file().then_some(private));
+    let path = options.manifest.as_ref().cloned();
     if let Some(path) = path {
         let task = ResolvedTask::load(repo, config, &path)?;
         if task.kind != TaskKind::Infrastructure {
@@ -451,8 +443,6 @@ fn merged_pull_request(
             host,
             "--head",
             &task.branch,
-            "--base",
-            &task.base_branch,
             "--state",
             "all",
             "--limit",
@@ -475,11 +465,7 @@ fn merged_pull_request(
     }
     let requests: Vec<_> = requests
         .into_iter()
-        .filter(|pr| {
-            pr.head_ref_name == task.branch
-                && pr.base_ref_name == task.base_branch
-                && !pr.is_cross_repository
-        })
+        .filter(|pr| pr.head_ref_name == task.branch && !pr.is_cross_repository)
         .collect();
     if requests.iter().any(|pr| pr.state == "OPEN") {
         return Ok(None);
@@ -488,7 +474,7 @@ fn merged_pull_request(
     let expected = build_task_path(&identity, &task.slug);
     let mut merged = Vec::new();
     for request in requests {
-        if request.state != "MERGED" {
+        if request.state != "MERGED" || request.base_ref_name != task.base_branch {
             continue;
         }
         let (Some(merged_at), Some(commit)) = (request.merged_at, request.merge_commit) else {
@@ -558,6 +544,9 @@ fn merged_pull_request(
             if repo
                 .remote_branch_oid(remote, &task.branch)?
                 .is_some_and(|oid| oid != accepted.head_commit)
+                || repo
+                    .optional_oid(&format!("refs/heads/{}", task.branch))?
+                    .is_some_and(|oid| oid != accepted.head_commit)
             {
                 return Ok(None);
             }

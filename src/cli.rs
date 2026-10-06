@@ -135,7 +135,7 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Create a deliverable workspace or isolated infrastructure worktree.
+    /// Create a deliverable directory or a private infrastructure manifest on the shared branch.
     Create(TaskCreateArgs),
     /// Change a task's current slug while preserving its identity and review branch.
     Rename(TaskRenameArgs),

@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod archive;
 mod archive_migration;
+mod branch_cleanup;
 mod cli;
 mod cloud_usage;
 mod config;

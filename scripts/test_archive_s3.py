@@ -77,6 +77,9 @@ class ArchiveHarness(e2e.Harness):
         executable.write_text(
             "#!/usr/bin/env python3\nimport json, sys\n"
             f"database = json.loads({json.dumps(json.dumps(database))})\n"
+            "if sys.argv[1] == 'api':\n"
+            "    print(json.dumps({'protected': False}))\n"
+            "    sys.exit(0)\n"
             "head = sys.argv[sys.argv.index('--head') + 1]\n"
             "print(json.dumps(database.get(head, [])))\n",
             encoding="utf-8",
@@ -128,7 +131,6 @@ class ArchiveHarness(e2e.Harness):
         # A published pointer remains readable through its exact payload even
         # when S3's current state is a delete marker above it.
         self.s3.delete_object(Bucket=self.bucket, Key=f"dvc/{TASK}/single.txt")
-        self.git(self.shared, "push", "origin", "--delete", BRANCH)
         self.fake_gh(merged, second["remote_oid"])
         original = self.namespace_versions(TASK)
         self.check(sum(not row["delete_marker"] for row in original) == 7
@@ -137,7 +139,7 @@ class ArchiveHarness(e2e.Harness):
         return first_oid, original
 
     def organize_without_materialization(self, original):
-        self.section("archive in a fresh infrastructure worktree without stored outputs")
+        self.section("archive in a fresh main checkout without stored outputs")
         organizer = self.root / "organizing-shared"
         self.run(["git", "clone", self.remote_url, organizer])
         self.configure_git(organizer)
@@ -151,7 +153,12 @@ class ArchiveHarness(e2e.Harness):
             "--scope", TASK, "--scope", DESTINATION, "--scope-note", "The user requested this archive source and destination.",
         )
         worktree = Path(created["path"])
-        archived = self.wm(worktree, "archive", TASK)
+        manifest = created["manifest"]
+        self.check(worktree == organizer.resolve()
+                   and self.git(worktree, "branch", "--show-current").stdout.strip() == "main",
+                   "infrastructure archive works in the shared main checkout")
+        index_before = self.git(worktree, "ls-files", "--stage").stdout
+        archived = self.wm(worktree, "archive", TASK, "--manifest", manifest)
         self.check(archived["status"] == "archived" and archived["remote_writes"] is False,
                    "archive is a local operation in the infrastructure task")
         self.check(not (worktree / TASK).exists() and (worktree / DESTINATION / "single.txt.dvc").is_file(),
@@ -163,7 +170,9 @@ class ArchiveHarness(e2e.Harness):
         planned = json.loads((worktree / DESTINATION / RECEIPT).read_text())
         self.check(planned["status"] == "planned" and len(planned["versions"]) == len(original),
                    "the durable local plan includes the complete source history")
-        return organizer, worktree, created["branch"]
+        self.check(self.git(worktree, "ls-files", "--stage").stdout == index_before,
+                   "archive leaves the shared Git index untouched")
+        return organizer, worktree, created["branch"], manifest
 
     def check_copied_history(self, receipt, original):
         mapped = {(row["source_object"], row["source_version_id"]): row for row in receipt["versions"]}
@@ -193,11 +202,11 @@ class ArchiveHarness(e2e.Harness):
                                "historical user metadata and tags survive the copy")
         return copied
 
-    def publish_and_retry(self, worktree, branch, original):
+    def publish_and_retry(self, worktree, branch, original, manifest):
         self.section("copy-before-Git publication, rejection, and idempotent retry")
         reject_flag = self.install_rejecting_hook()
         reject_flag.write_text("reject archive publication\n")
-        refused = self.wm(worktree, "publish", "-m", "Archive full S3 histories", expected=2)
+        refused = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Archive full S3 histories", expected=2)
         self.check("reject" in refused["stderr"].lower(), "the deliberate Git publication failure is visible")
         self.check(self.remote_ref(branch) is None, "failed Git publication creates no remote infrastructure branch")
         receipt = json.loads((worktree / DESTINATION / RECEIPT).read_text())
@@ -231,7 +240,7 @@ class ArchiveHarness(e2e.Harness):
             self.unmapped_source_versions.append((f"{TASK}/{name}", response["VersionId"]))
         source_after_late_writes = self.namespace_versions(TASK)
         reject_flag.unlink()
-        published = self.wm(worktree, "publish", "-m", "Retry archive Git publication")
+        published = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Retry archive Git publication")
         self.check(published["status"] == "pushed", "archive Git publication retries successfully")
         self.check(self.namespace_versions(DESTINATION) == copied, "retry creates no duplicate destination history")
         self.check(self.namespace_versions(TASK) == source_after_late_writes,
@@ -239,7 +248,7 @@ class ArchiveHarness(e2e.Harness):
         repaired = yaml.safe_load((worktree / DESTINATION / "single.txt.dvc").read_text())["outs"][0]
         self.check(repaired["cloud"]["workspace-mgr"]["version_id"] == version,
                    "retry repairs old path-bound metadata even when the private copy journal is complete")
-        repeated = self.wm(worktree, "publish", "-m", "Verify completed archive is idempotent")
+        repeated = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Verify completed archive is idempotent")
         self.check(repeated["status"] == "no_changes" and self.namespace_versions(DESTINATION) == copied,
                    "completed publication verifies history without recopying")
         return copied
@@ -250,6 +259,11 @@ class ArchiveHarness(e2e.Harness):
         refreshed = self.wm(organizer, "refresh")
         self.check(refreshed["status"] == "updated" and refreshed["new_oid"] == merged,
                    "refresh receives the merged archived tree")
+        self.check(any(row["branch"] == BRANCH and row["remote"]
+                       for row in refreshed["branch_cleanup"]["deleted"]),
+                   "refresh removes the verified merged source branch before pending S3 retirement")
+        self.check(self.remote_ref(BRANCH) is None,
+                   "automatic branch cleanup removes the old source's last remote branch protection")
         remaining = self.namespace_versions(TASK)
         self.check({(row["key"].removeprefix("dvc/"), row["version_id"]) for row in remaining}
                    == set(self.unmapped_source_versions),
@@ -279,8 +293,8 @@ class ArchiveHarness(e2e.Harness):
     def execute(self):
         self.initialize()
         first_oid, original = self.publish_original()
-        organizer, worktree, branch = self.organize_without_materialization(original)
-        copied = self.publish_and_retry(worktree, branch, original)
+        organizer, worktree, branch, manifest = self.organize_without_materialization(original)
+        copied = self.publish_and_retry(worktree, branch, original, manifest)
         self.merge_and_read_history(organizer, branch, first_oid, copied)
         summary = {"status": "passed", "assertions": self.assertions, "evidence": str(self.evidence_path),
                    "git_remote": self.remote_url, "s3_endpoint": self.endpoint, "bucket": self.bucket}

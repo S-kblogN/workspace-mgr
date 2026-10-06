@@ -6,6 +6,7 @@ fn user_documentation_covers_the_complete_public_model() {
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
     let configuration = include_str!("../docs/configuration.md");
+    let architecture = include_str!("../docs/architecture.md");
     let changelog = include_str!("../CHANGELOG.md");
     let e2e_readme = include_str!("e2e/README.md");
     let e2e_coverage = include_str!("e2e/COVERAGE.md");
@@ -71,6 +72,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "config show",
         "task create",
         "task rename",
+        "archive",
         "task status",
         "task discard",
         "task approve-cloud-usage",
@@ -91,7 +93,8 @@ fn user_documentation_covers_the_complete_public_model() {
         );
     }
     assert!(guide.contains("itself create a remote branch or call a hosting provider"));
-    assert!(guide.contains("does not call a GitHub or other hosting API"));
+    assert!(guide.contains("it does not create or update a pull"));
+    assert!(guide.contains("can read GitHub merge evidence through `gh`"));
     for responsibility in [
         "immediately follows creation",
         "create exactly one",
@@ -116,15 +119,66 @@ fn user_documentation_covers_the_complete_public_model() {
     assert!(guide.contains("semantic-placement-review"));
     assert!(guide.contains("task-record-unchanged"));
     assert!(guide.contains("bulk-publication"));
-    // The one warning refresh reports, and the report field beside it, are
+    // Refresh's storage warning and report field are
     // named wherever an agent looks up a code it just received.
     for (name, document) in [("guide", guide), ("commands", commands)] {
-        assert!(
-            document.contains("unaddressable-storage-metadata"),
-            "{name} does not name the warning refresh reports"
-        );
+        for code in [
+            "unaddressable-storage-metadata",
+            "branch-cleanup-unavailable",
+            "branch-cleanup-failed",
+        ] {
+            assert!(document.contains(code), "{name} is missing warning {code}");
+        }
     }
     assert!(commands.contains("storage.unaddressable"));
+    for (name, document) in [("guide", guide), ("commands", commands)] {
+        let normalized_document = document
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for fact in [
+            "branch_cleanup",
+            "`planned`",
+            "`deleted`",
+            "`skipped`",
+            "`errors`",
+            "`warnings`",
+            "`unavailable`",
+            "`not_applicable`",
+            "`branches_cleaned`",
+            "squash",
+            "legacy or custom worktree",
+            "never detaches",
+        ] {
+            assert!(
+                normalized_document.contains(&fact.to_ascii_lowercase()),
+                "{name} is missing merged-branch cleanup fact {fact:?}"
+            );
+        }
+        assert!(!document.contains("planned_detach_worktrees"));
+        assert!(!document.contains("detached_worktrees"));
+    }
+    for (name, document) in [
+        ("readme", readme),
+        ("guide", guide),
+        ("commands", commands),
+        ("model", model),
+        ("configuration", configuration),
+        ("architecture", architecture),
+    ] {
+        let normalized_document = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !normalized_document.contains("isolated worktree"),
+            "{name} still directs infrastructure tasks to an isolated worktree"
+        );
+        assert!(
+            document.contains("--manifest"),
+            "{name} omits explicit task selection"
+        );
+    }
+    assert!(commands.contains("Infrastructure creation reports `path` as the repository root"));
+    assert!(configuration.contains("workspace-mgr/infrastructure-tasks/<id>"));
     assert!(guide.contains("ignored_paths"));
     assert!(guide.contains(".workspace-mgr/repository.gitignore"));
     assert!(guide.contains(".git/info/exclude"));
@@ -308,6 +362,7 @@ fn user_documentation_covers_the_complete_public_model() {
         "Version-aware S3",
         "Publish failure ordering",
         "Shared-checkout refresh",
+        "Merged branch cleanup",
         "Refresh ancestry",
         "Pull-request ownership",
         "Task slug rename",

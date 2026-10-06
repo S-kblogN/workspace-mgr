@@ -351,7 +351,16 @@ fn infrastructure_rename_updates_only_mutable_metadata() {
     let branch = created["branch"].as_str().unwrap().to_owned();
     let task_id = created["task_id"].as_str().unwrap().to_owned();
 
-    let renamed = json(&workspace(&worktree, ["task", "rename", "current-policy"]));
+    let renamed = json(&workspace(
+        &worktree,
+        [
+            "task",
+            "rename",
+            "current-policy",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ],
+    ));
     assert_eq!(renamed["status"], "renamed");
     assert_eq!(renamed["task_id"], task_id);
     assert_eq!(renamed["branch"], branch);
@@ -363,7 +372,10 @@ fn infrastructure_rename_updates_only_mutable_metadata() {
     assert!(raw.contains("slug = \"current-policy\""));
     assert!(raw.contains(&format!("id = \"{task_id}\"")));
     assert!(raw.contains(&format!("branch = \"{branch}\"")));
-    let status = json(&workspace(&worktree, ["task", "status"]));
+    let status = json(&workspace(
+        &worktree,
+        ["task", "status", "--manifest", manifest.to_str().unwrap()],
+    ));
     assert_eq!(status["slug"], "current-policy");
 }
 
