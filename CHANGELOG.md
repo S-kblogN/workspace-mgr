@@ -7,6 +7,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [0.7.1] - 2026-10-07
 
+### Fixed
+
+- Interrupted S3 GET and HEAD requests retry at most twice when the HTTP
+  transport reports `Interrupted` before returning a response. Other failures
+  still surface immediately; the transport never replays writes or deletions.
+
 ### Added
 
 - Regression coverage for multi-megabyte S3 purge requests through the native
