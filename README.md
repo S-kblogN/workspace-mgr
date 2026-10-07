@@ -101,7 +101,7 @@ PR merge or S3 publication status. See the
 [discovery commands](docs/commands.md#workspace-mgr-task-list).
 
 Active deliverable task directories stay at the repository's top level. After
-the task is done and its pull request is confirmed merged, the user may request
+the task's corresponding pull request is closed, the user may request
 that its directory be grouped under a time folder, such as `2026/`, `202607/`,
 or `2026/07/`. Organizing completed tasks is an explicitly requested
 infrastructure task, never an automatic action after merge or at turn end. If
@@ -115,28 +115,29 @@ and destination scopes, then apply `archive` in that infrastructure task.
 The command moves local directories; normal publication copies and verifies
 their complete retained S3 history, rewrites storage metadata, and records
 durable exact-version mappings before obsolete source objects are purged.
-Archive verifies current task identity against opaque Git directory trees,
-commit ancestry, and hosting review records; it never reads historical task
-configuration blobs or infers old paths or branches from their format.
-`task upgrade --manifest <task-config> --dry-run` previews a one-time backfill
-of verified review evidence into a schema 4 completion checkpoint. Apply and
-publish that metadata through a scoped infrastructure review, merge and refresh
-it, then archive. The checkpoint requires 0.7.0 and is revalidated against live
-reviews and subsequent changes; it is not a permanent completed flag. A current
-manifest without a checkpoint remains eligible for the same bootstrap checks
-at its known path. Unverifiable ownership or path continuity is refused, and
-manifestless legacy tasks use explicit `task adopt` before archive.
-For a direct import, the reviewed adoption commit becomes the history boundary;
-later changes still need review. Empty `.git` cache markers are preserved.
-Before movement, archive reports literal old paths in scripts and README files
-and checks cross-task dependencies against the whole move batch. Explicit
-`--historical-record <file>` confirmation preserves inert historical logs and
-reports unchanged, with content digests retained in the preview and receipt.
-Archive refuses external Git administration, stale registrations and
-location-bound Python environments; the command reference explains repair steps.
-See the [task upgrade command](docs/commands.md#workspace-mgr-task-upgrade).
-Preview or undo an
-unpublished local attempt with `archive --cancel --manifest <owner> --dry-run`;
+Archive uses the current task configuration, including saved branch hints
+after a branch change, to identify a corresponding closed PR and confirm
+there is no associated open PR. Both merged and closed without merging
+qualify. It checks current managed-storage integrity, source and destination
+scopes, and move conflicts. It does not inspect historical task configuration,
+require earlier commits to have reviews, or replay a completion checkpoint's
+historical proof. Manifestless legacy tasks use explicit `task adopt` to
+establish current task metadata. `task upgrade` remains a separate metadata
+operation, not an archive prerequisite.
+
+Ordinary contents, scripts, README commands, historical logs, and environments
+move unchanged, even if their paths no longer work after relocation. Nested
+Git repositories must be ignored by the outer repository's shared ignore
+rules and have no files tracked by the outer repository. Their Git controls
+and any external administration are left untouched. Empty `.git` cache markers
+remain ordinary content. See the
+[archive command](docs/commands.md#workspace-mgr-archive) for the ignore rule.
+`plan` and `publish` also enforce this nested-repository boundary before
+storage placement; task-local `.gitignore` rules can be added and published
+with the task.
+
+Preview or undo an unpublished local attempt with
+`archive --cancel --manifest <owner> --dry-run`;
 cancel preserves ignored and hydrated local content while removing this
 attempt's S3 copies and registry records. Archive completion requires the old
 S3 prefix to contain no data versions or delete markers; protected or unmapped

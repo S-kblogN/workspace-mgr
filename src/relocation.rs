@@ -79,6 +79,22 @@ pub(crate) fn prepare(source: &Path, destination: &Path) -> Result<RelocationPla
 }
 
 impl RelocationPlan {
+    /// Archive moves payloads without interpreting or rewriting their contents.
+    /// In particular, ignored nested repositories retain their Git control
+    /// files and any external registrations exactly as they were.
+    pub(crate) fn opaque(source: &Path, destination: &Path) -> Result<Self> {
+        let source = source.canonicalize().at(source)?;
+        if !destination.is_absolute() {
+            return Err(Error::message("relocation destination must be absolute"));
+        }
+        Ok(Self {
+            source,
+            destination: normalize(destination),
+            references: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn reference_paths(&self) -> Vec<PathBuf> {
         self.references
             .iter()

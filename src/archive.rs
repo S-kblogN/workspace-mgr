@@ -18,7 +18,6 @@ use crate::manifest::{
 use crate::path::{allowed, reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::process;
-use crate::storage;
 use crate::task_rename::validate_checkout;
 
 #[derive(Debug, Clone)]
@@ -28,7 +27,6 @@ pub struct ArchiveOptions {
     pub paths: Vec<String>,
     pub layout: String,
     pub dry_run: bool,
-    pub historical_records: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,7 +41,6 @@ pub struct ArchiveReport {
     pub skipped: Vec<SkippedTask>,
     pub required_scopes: Vec<String>,
     pub remote_writes: bool,
-    pub historical_records: Vec<crate::historical_records::HistoricalRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,8 +49,7 @@ pub struct ArchiveTask {
     pub branch: String,
     pub source: String,
     pub destination: String,
-    pub pull_request: MergedPullRequest,
-    pub review_history: Vec<MergedPullRequest>,
+    pub pull_request: ArchivePullRequest,
     pub receipt: serde_json::Value,
 }
 
@@ -70,6 +66,18 @@ pub struct MergedPullRequest {
     pub merged_at: String,
     pub merge_commit: String,
     pub head_commit: String,
+}
+
+/// Live state of a pull request associated with the current task configuration.
+/// A closed, unmerged request does not have merge evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchivePullRequest {
+    pub number: u64,
+    pub url: String,
+    pub state: String,
+    pub head_commit: String,
+    pub merged_at: Option<String>,
+    pub merge_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,8 +126,6 @@ struct ReviewedTaskTree {
 }
 
 struct CompletionProof {
-    pull_request: MergedPullRequest,
-    reviews: Vec<MergedPullRequest>,
     checkpoint: ArchiveCompletion,
 }
 
@@ -162,9 +168,6 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         &format!("{}/{}", config.git.remote, config.git.branch),
     )?;
     let sources = task_sources(&repo, &options.paths)?;
-    let historical_records =
-        crate::historical_records::prepare(&repo.root, &options.historical_records)?;
-    let historical_paths = crate::historical_records::paths(&repo.root, &historical_records);
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
     let mut destinations = BTreeSet::new();
@@ -208,32 +211,23 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
                 "archive source must be a deliverable task's declared directory: {source}"
             )));
         }
-        let eligible = merged_pull_request(
+        let eligible = closed_pull_request(
             &repo,
-            &config.git.remote,
             host.as_deref().expect("a source has a hosting repository"),
             &task,
-            &base_oid,
         )?;
         let Some(completion) = eligible else {
             if !options.paths.is_empty() {
                 return Err(Error::message(format!(
-                    "archive refuses active or unverified task {source}; its matching pull request must be merged into {:?}",
-                    config.git.branch
+                    "archive refuses active or unverified task {source}; its associated pull request must be closed"
                 )));
             }
             skipped.push(SkippedTask {
                 path: source.clone(),
-                reason: "no verified merged pull request for this task on the configured base"
-                    .to_owned(),
+                reason: "no associated closed pull request for this task".to_owned(),
             });
             continue;
         };
-        if !tree_manifest_matches(&repo, &base_oid, source, &task)? {
-            return Err(Error::message(format!(
-                "archive task {source} is absent or has a different identity on the fetched shared branch; refresh or resolve the task state first"
-            )));
-        }
         let identity = parse_task_identity(task.kind, &task.task_id)?;
         let date = identity
             .timestamp
@@ -273,23 +267,11 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
                 }
             }
         }
-        validate_clean_paths(&repo, &base_oid, source, &destination)?;
-        for shared in repo.branch_worktrees(&config.git.branch)? {
-            if shared != repo.root {
-                let shared_repo = GitRepo { root: shared };
-                validate_overlays(&shared_repo, source, &destination)?;
-                validate_materialized(&shared_repo, source)?;
-            }
-        }
-        validate_materialized(&repo, source)?;
-        let relocation =
-            crate::relocation::prepare(&source_dir, &resolved_under(&repo.root, &destination))?;
-        crate::runtime_references::validate(
+        crate::nested_git::validate_move(&repo, source, &destination)?;
+        validate_materialized(&repo, &config, source)?;
+        let relocation = crate::relocation::RelocationPlan::opaque(
             &source_dir,
             &resolved_under(&repo.root, &destination),
-            source,
-            &relocation.reference_paths(),
-            &historical_paths,
         )?;
         let original_manifest = fs::read_to_string(&manifest_path).at(&manifest_path)?;
         let mut next: TaskManifest =
@@ -338,21 +320,11 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             .ok_or_else(|| Error::message("archive migration plan must be an object"))?;
         object.insert("task_id".to_owned(), task.task_id.clone().into());
         object.insert("status".to_owned(), "planned".into());
-        if !historical_records.is_empty() {
-            object.insert(
-                "historical_records".to_owned(),
-                serde_json::to_value(&historical_records).map_err(|error| {
-                    Error::message(format!(
-                        "failed to render historical record attestations: {error}"
-                    ))
-                })?,
-            );
-        }
         object.insert(
-            "completion_reviews".to_owned(),
-            serde_json::to_value(&completion.reviews).map_err(|error| {
+            "closed_pull_request".to_owned(),
+            serde_json::to_value(&completion).map_err(|error| {
                 Error::message(format!(
-                    "failed to render archive completion evidence: {error}"
+                    "failed to render archive pull request state: {error}"
                 ))
             })?,
         );
@@ -365,8 +337,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
                 branch: task.branch,
                 source: source.clone(),
                 destination,
-                pull_request: completion.pull_request,
-                review_history: completion.reviews,
+                pull_request: completion,
                 receipt,
             },
             original_manifest,
@@ -374,22 +345,6 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             original_receipt,
             relocation,
         });
-    }
-    if !prepared.is_empty() {
-        let locations = dependency_locations(&repo, &prepared)?;
-        let git_controls = prepared
-            .iter()
-            .flat_map(|task| task.relocation.reference_paths())
-            .collect::<Vec<_>>();
-        crate::task_dependencies::validate(
-            &repo.root,
-            &locations,
-            &git_controls,
-            &historical_paths,
-        )?;
-        // Host and storage inspection can take time; bind the exemption to the
-        // exact bytes and mode inspected before allowing any directory move.
-        crate::historical_records::revalidate(&repo.root, &historical_records)?;
     }
     if !options.dry_run {
         apply(&repo, &config, &prepared, owner.as_ref())?;
@@ -410,7 +365,6 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         skipped,
         required_scopes: required_scopes.into_iter().collect(),
         remote_writes: false,
-        historical_records,
     })
 }
 
@@ -471,55 +425,6 @@ fn task_sources(repo: &GitRepo, selected: &[String]) -> Result<Vec<String>> {
         }
     }
     Ok(sources.into_iter().collect())
-}
-
-/// Inspect only current locations. Neither identity nor dependency discovery
-/// reads old task configuration bodies from Git history.
-fn dependency_locations(
-    repo: &GitRepo,
-    prepared: &[PreparedTask],
-) -> Result<Vec<crate::task_dependencies::TaskLocation>> {
-    let mut paths = prepared
-        .iter()
-        .map(|task| task.report.source.clone())
-        .collect::<BTreeSet<_>>();
-    let mut walker = walkdir::WalkDir::new(&repo.root)
-        .follow_links(false)
-        .into_iter();
-    while let Some(entry) = walker.next() {
-        let entry = entry.map_err(|error| {
-            Error::message(format!("cannot inspect current task locations: {error}"))
-        })?;
-        if !entry.file_type().is_dir() || entry.path() == repo.root {
-            continue;
-        }
-        let name = entry.file_name().to_str().unwrap_or("");
-        if matches!(name, ".git" | ".dvc" | ".workspace-mgr") {
-            walker.skip_current_dir();
-            continue;
-        }
-        if parse_task_identity(TaskKind::Deliverable, name).is_ok()
-            || entry.path().join(TASK_MANIFEST_NAME).is_file()
-        {
-            let path = crate::path::relative_to(entry.path(), &repo.root, "current task location")?;
-            paths.insert(path);
-            walker.skip_current_dir();
-        }
-    }
-    Ok(paths
-        .into_iter()
-        .map(|source| {
-            let destination = prepared
-                .iter()
-                .find(|task| task.report.source == source)
-                .map(|task| task.report.destination.clone())
-                .unwrap_or_else(|| source.clone());
-            crate::task_dependencies::TaskLocation {
-                source: PathBuf::from(source),
-                destination: PathBuf::from(destination),
-            }
-        })
-        .collect())
 }
 
 fn grouping(layout: &str, timestamp: &str) -> Result<String> {
@@ -609,6 +514,129 @@ pub(crate) fn completion_checkpoint(
         merged_pull_request(repo, &config.git.remote, &host, task, base)?
             .map(|proof| proof.checkpoint),
     )
+}
+
+/// Archive eligibility depends on current configuration and live PR state.
+/// Saved branch names are lookup hints, not assertions about historical trees.
+fn closed_pull_request(
+    repo: &GitRepo,
+    host: &str,
+    task: &ResolvedTask,
+) -> Result<Option<ArchivePullRequest>> {
+    let mut branches = BTreeSet::from([task.branch.clone()]);
+    if let Some(record) = &task.archive_completion {
+        branches.extend(record.branches.iter().cloned());
+        branches.extend(record.reviews.iter().map(|review| review.branch.clone()));
+    }
+    let mut closed = Vec::new();
+    for branch in branches {
+        // Query live open state separately so a reopened request cannot hide
+        // behind a closed one or another repository's similarly named branch.
+        if current_branch_requests(repo, host, &branch, "open")?
+            .iter()
+            .any(|request| request.state == "OPEN")
+        {
+            return Ok(None);
+        }
+        for request in current_branch_requests(repo, host, &branch, "all")? {
+            match request.state.as_str() {
+                "OPEN" => return Ok(None),
+                "CLOSED" | "MERGED" => {}
+                _ => {
+                    return Err(Error::message(
+                        "archive cannot verify the current pull request state",
+                    ));
+                }
+            }
+            closed.push(request);
+        }
+    }
+    closed.sort_by_key(|request| request.number);
+    if closed.is_empty() {
+        // Pre-0.7 adoption stored the PR's branch beside the manifest. This
+        // optional current lookup hint is used only when the manifest has no
+        // associated closed PR; its historical trees are never inspected.
+        let source = task.task_path.as_deref().expect("deliverable path");
+        let path = resolved_under(&repo.root, source).join(crate::archive_adoption::LEGACY_RECORD);
+        if fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 16 * 1024 * 1024)
+        {
+            let hint = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            if let Some(branch) = hint
+                .as_ref()
+                .filter(|hint| hint["task_id"].as_str() == Some(task.task_id.as_str()))
+                .and_then(|hint| hint["branch"].as_str())
+                .filter(|branch| repo.validate_branch(branch).is_ok())
+            {
+                if current_branch_requests(repo, host, branch, "open")?
+                    .iter()
+                    .any(|request| request.state == "OPEN")
+                {
+                    return Ok(None);
+                }
+                for request in current_branch_requests(repo, host, branch, "all")? {
+                    match request.state.as_str() {
+                        "OPEN" => return Ok(None),
+                        "CLOSED" | "MERGED" => closed.push(request),
+                        _ => {
+                            return Err(Error::message(
+                                "archive cannot verify the current pull request state",
+                            ));
+                        }
+                    }
+                }
+                closed.sort_by_key(|request| request.number);
+            }
+        }
+    }
+    Ok(closed.pop().map(|request| ArchivePullRequest {
+        number: request.number,
+        url: request.url,
+        state: request.state,
+        head_commit: request.head_ref_oid,
+        merged_at: request.merged_at,
+        merge_commit: request.merge_commit.map(|commit| commit.oid),
+    }))
+}
+
+fn current_branch_requests(
+    repo: &GitRepo,
+    host: &str,
+    branch: &str,
+    state: &str,
+) -> Result<Vec<HostingPullRequest>> {
+    let args = vec![
+        "pr",
+        "list",
+        "--repo",
+        host,
+        "--head",
+        branch,
+        "--state",
+        state,
+        "--limit",
+        "100",
+        "--json",
+        "number,url,state,mergedAt,mergeCommit,headRefName,headRefOid,baseRefName,isCrossRepository",
+    ];
+    let output = process::run(&hosting_command(), args, &repo.root)?;
+    let requests: Vec<HostingPullRequest> =
+        serde_json::from_str(&output.stdout).map_err(|error| {
+            Error::message(format!(
+                "archive current pull request lookup returned invalid JSON: {error}"
+            ))
+        })?;
+    if state == "open" && requests.len() >= 100 {
+        return Err(Error::message(
+            "archive open pull request lookup reached its limit; cannot confirm this task has no open pull request",
+        ));
+    }
+    Ok(requests
+        .into_iter()
+        .filter(|request| request.head_ref_name == branch && !request.is_cross_repository)
+        .collect())
 }
 
 fn merged_pull_request(
@@ -852,7 +880,7 @@ fn merged_pull_request(
             }
         }
     }
-    let pull_request = match newest_review {
+    let _pull_request = match newest_review {
         Some(proof) => proof,
         None => {
             let snapshot = checkpoint_snapshot.as_ref().expect("a verified checkpoint");
@@ -886,12 +914,6 @@ fn merged_pull_request(
         .collect::<Vec<_>>();
     saved_reviews.sort_by_key(|review| review.number);
     saved_reviews.dedup_by_key(|review| review.number);
-    let mut reviews = reviewed
-        .into_iter()
-        .map(|(_, proof)| proof)
-        .collect::<Vec<_>>();
-    reviews.sort_by_key(|review| review.number);
-    reviews.dedup_by_key(|review| review.number);
     let checkpoint = match checkpoint {
         Some(record) => record.clone(),
         None => {
@@ -911,11 +933,7 @@ fn merged_pull_request(
             }
         }
     };
-    Ok(Some(CompletionProof {
-        pull_request,
-        reviews,
-        checkpoint,
-    }))
+    Ok(Some(CompletionProof { checkpoint }))
 }
 
 fn saved_review(review: &ArchiveCompletionReview) -> MergedPullRequest {
@@ -1265,28 +1283,6 @@ fn current_task_tree_at(
     }
 }
 
-fn tree_manifest_matches(
-    repo: &GitRepo,
-    oid: &str,
-    directory: &str,
-    task: &ResolvedTask,
-) -> Result<bool> {
-    let output =
-        repo.run_unchecked(["show", &format!("{oid}:{directory}/{TASK_MANIFEST_NAME}")])?;
-    if !output.success() {
-        return Ok(false);
-    }
-    let value: toml::Value = toml::from_str(&output.stdout).map_err(|error| {
-        Error::message(format!("invalid published archive task manifest: {error}"))
-    })?;
-    Ok(
-        value.get("kind").and_then(toml::Value::as_str) == Some("deliverable")
-            && value.get("id").and_then(toml::Value::as_str) == Some(task.task_id.as_str())
-            && value.get("branch").and_then(toml::Value::as_str) == Some(task.branch.as_str())
-            && value.get("path").and_then(toml::Value::as_str) == Some(directory),
-    )
-}
-
 fn reject_overlapping_moves(sources: &[String], destination: &str) -> Result<()> {
     if sources.iter().any(|source| {
         destination == source
@@ -1358,27 +1354,29 @@ fn validate_overlays(repo: &GitRepo, source: &str, destination: &str) -> Result<
     Ok(())
 }
 
-fn validate_materialized(repo: &GitRepo, source: &str) -> Result<()> {
+fn validate_materialized(repo: &GitRepo, config: &Config, source: &str) -> Result<()> {
     let scopes = vec![source.to_owned()];
-    for boundary in storage::local_boundaries(repo, &scopes)? {
-        if resolved_under(&repo.root, &boundary).exists() {
-            return Err(Error::message(format!(
-                "archive task {source} contains retained local-only payload {boundary} at {}; preserve or restore tracking before organizing it",
-                repo.root.display()
-            )));
-        }
-    }
-    for pointer in dvc::discover(repo, &scopes)? {
-        let raw = fs::read_to_string(resolved_under(&repo.root, &pointer)).at(&pointer)?;
-        let output = dvc::metadata_output(repo, &pointer, &raw)?;
+    let pointers = dvc::discover(repo, &scopes)?;
+    for pointer in &pointers {
+        let raw = fs::read_to_string(resolved_under(&repo.root, pointer)).at(pointer)?;
+        let output = dvc::metadata_output(repo, pointer, &raw)?;
         if resolved_under(&repo.root, &output).exists()
-            && !dvc::payload_matches_metadata(repo, &pointer, &raw)?
+            && !dvc::payload_matches_metadata(repo, pointer, &raw)?
         {
             return Err(Error::message(format!(
                 "archive refuses locally changed materialized S3 output {output} at {}; publish or preserve it first",
                 repo.root.display()
             )));
         }
+    }
+    // Missing local payloads are allowed. Their metadata still needs a
+    // supported digest and complete directory manifest, and exact remote
+    // versions must exist before moving any local directory.
+    for entry in crate::native_engine::metadata_entries(repo, None, &pointers)? {
+        crate::native_versions::validate_digest(&entry)?;
+    }
+    if config.s3_enabled() && !pointers.is_empty() {
+        crate::native_versions::read(repo, &pointers, "--verify", &[])?;
     }
     Ok(())
 }
@@ -1555,14 +1553,14 @@ mod tests {
                     branch: format!("codex/{name}"),
                     source,
                     destination: destination.clone(),
-                    pull_request: MergedPullRequest {
+                    pull_request: ArchivePullRequest {
                         number: index as u64 + 1,
                         url: "https://example.invalid/pull/1".to_owned(),
-                        merged_at: "2026-07-12T20:00:00Z".to_owned(),
-                        merge_commit: "a".repeat(40),
+                        state: "MERGED".to_owned(),
+                        merged_at: Some("2026-07-12T20:00:00Z".to_owned()),
+                        merge_commit: Some("a".repeat(40)),
                         head_commit: "b".repeat(40),
                     },
-                    review_history: Vec::new(),
                     receipt: serde_json::json!({"status": "planned"}),
                 },
                 original_manifest: original,

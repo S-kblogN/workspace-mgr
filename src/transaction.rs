@@ -319,6 +319,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         installed: &installed,
     };
 
+    // Nested Git repositories are always opaque, ignored local content.
+    // Check before placement so S3/local storage cannot hide a tracked repo.
+    for scope in &scopes {
+        if resolved_under(&repo.root, scope).is_dir() {
+            crate::nested_git::validate(&repo, scope)?;
+        }
+    }
     let local_only = storage::local_boundaries(&repo, &scopes)?;
     for boundary in &local_only {
         let pointer = format!("{boundary}.dvc");

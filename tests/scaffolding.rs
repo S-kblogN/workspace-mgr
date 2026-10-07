@@ -526,7 +526,8 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("own files are its durable record"));
     for organization_rule in [
         "Active deliverable task directories must remain at the repository top level",
-        "Only completed tasks whose pull requests are confirmed merged",
+        "Only tasks whose corresponding pull requests are closed",
+        "merged and closed without merging both qualify",
         "`YYYY/<task-dir>`, `YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>`",
         "only when the user explicitly requests it",
         "through a repository-infrastructure task",
@@ -539,6 +540,21 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
             "task instructions are missing {organization_rule:?}"
         );
     }
+    for archive_rule in [
+        "Archive uses current task configuration and its associated PRs",
+        "without inspecting historical configuration, tree history, commit review coverage, or branch-tip ancestry",
+        "Completion checkpoints and task upgrade are not archive prerequisites",
+        "Ordinary tracked, staged, untracked, ignored, and local-only content moves unchanged",
+        "runtime usability after relocation is outside archive scope",
+        "no outer-tracked files or gitlinks",
+        "archive never repairs them or edits external administration",
+    ] {
+        assert!(
+            task_rules.contains(archive_rule),
+            "task instructions are missing archive scope rule {archive_rule:?}"
+        );
+    }
+    assert!(!task_rules.contains("--historical-record"));
     // A record added to a cleanup would make it growth the limit refuses, so
     // the lifecycle and hygiene rules defer it to the same publication.
     assert!(
@@ -567,6 +583,18 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(artifact_rules.contains("only a machine-local rule hides"));
     assert!(artifact_rules.contains("`bulk-publication` warning"));
     assert!(artifact_rules.contains("S3 is not a dumping ground"));
+    assert!(
+        artifact_rules
+            .contains("Every nested Git repository must be ignored as an entire directory")
+    );
+    assert!(
+        artifact_rules.contains("Plan and publish enforce this boundary before storage placement")
+    );
+    assert!(
+        artifact_rules
+            .contains("A new task-local ignore file may be carried by the same publication")
+    );
+    assert!(artifact_rules.contains("Never create a gitlink for a nested repository"));
     // The repository layer is a shared root path, so the curation rule and the
     // write-boundary rule have to read as one policy rather than two that
     // contradict each other.

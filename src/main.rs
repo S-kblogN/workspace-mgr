@@ -16,7 +16,6 @@ mod dvc;
 mod error;
 mod git;
 mod hex;
-mod historical_records;
 mod instructions;
 mod local_state;
 mod lock;
@@ -25,6 +24,7 @@ mod native_archive;
 mod native_engine;
 mod native_s3;
 mod native_versions;
+mod nested_git;
 mod output;
 mod path;
 mod policy;
@@ -32,13 +32,11 @@ mod process;
 mod refresh;
 mod relocation;
 mod runtime;
-mod runtime_references;
 mod s3_purge;
 mod scaffold;
 mod storage;
 mod task_approval;
 mod task_catalog;
-mod task_dependencies;
 mod task_rename;
 mod task_upgrade;
 mod transaction;
@@ -290,7 +288,6 @@ fn run(cli: Cli) -> Result<()> {
                 paths: args.paths,
                 layout: args.layout,
                 dry_run: args.dry_run,
-                historical_records: args.historical_record,
             })?,
             cli.format,
         ),

@@ -238,14 +238,9 @@ pub struct ArchiveArgs {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
 
-    /// Inspect merged tasks and required scopes without moving content.
+    /// Inspect tasks with closed pull requests without moving content.
     #[arg(long)]
     pub dry_run: bool,
-
-    /// Confirm an exact repository-relative file as inert historical evidence.
-    /// Repeat for multiple records; their bytes are retained unchanged.
-    #[arg(long, value_name = "FILE", conflicts_with = "cancel")]
-    pub historical_record: Vec<String>,
 
     /// Restore an unpublished archive attempt, preserving every local payload.
     #[arg(long, conflicts_with = "layout")]

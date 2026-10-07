@@ -21,25 +21,20 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   task metadata, scopes and cloud-usage approval.
 - Previewable, idempotent `archive --cancel` with durable local metadata and Git
   reference snapshots, preserving ignored/hydrated content and other task edits.
-- Explicit `archive --historical-record <file>` confirmations bind inert logs
-  and previous execution reports to their exact bytes and modes. Preview,
-  receipts, S3 publication and cancellation preserve this evidence unchanged.
 
 ### Fixed
 
-- Archive completion uses current identity, stored review metadata, opaque Git
-  directory trees and hosting commit-to-PR associations, without reading or
-  parsing historical task configuration blobs or inferring old paths/branches
-  from their format. Bootstrap verifies relevant known-path history once;
-  published checkpoints retain original provenance and limit later tree checks
-  to checkpoint through fetched base. Live reviews and retained refs are still
-  rechecked, and branch tips behind a verified PR head are accepted. Open
-  reviews, unreviewed changes, divergent refs, missing path continuity and
-  ambiguous identity fail; shallow history remains refused.
-- Archive path preflight checks cross-task dependencies against the complete
-  move batch, including unselected and previously grouped tasks. Different-month
-  parent-relative references and unverifiable outward dynamic paths refuse
-  before any local move; explicitly confirmed historical records are preserved.
+- Archive uses current task configuration and live associated PR states,
+  including saved review branches after a branch change. Merged PRs
+  and PRs closed without merging qualify; open, missing or
+  unverifiable corresponding PRs refuse. Historical configuration, directory
+  trees, commit review coverage, full-history availability and branch-tip
+  ancestry no longer determine archive eligibility. Existing completion
+  checkpoints remain readable but are not an archive prerequisite.
+- Archive preserves all ordinary local contents unchanged, including tracked,
+  staged, untracked, ignored and local-only files. It checks managed-storage
+  integrity, scopes and move conflicts without checking script paths,
+  cross-task references, logs, README commands or environment usability.
 - Archive retirement completes only after a full S3 history scan finds no data
   versions or delete markers under the original task prefix. Protected history
   reports `cleanup_pending`; unmapped concurrent writes report
@@ -60,17 +55,13 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   before archive merge, even when the old Git snapshot has no task manifest.
   After the copied receipt merges, historical tags hydrate mapped versions
   through the registry without retaining duplicate source history.
-- Moving ignored nested Git worktrees repairs verifiable absolute/relative Git
-  control paths within the task. Zero-byte `.git` cache markers no longer
-  count as malformed Git pointers. External Git administration and linked
-  checkouts refuse before mutation, including when loading saved plans.
-- Verified legacy adoption establishes a new review boundary for directly
-  imported tasks; its introducing commit and later changes still need merged
-  reviews, while pre-adoption imports no longer require retroactive PRs.
-- Archive preflight reports literal old-path references in ordinary scripts
-  and README files by file and line before moving, including ignored text.
-  Documentation explains how to repair these references, location-bound
-  Python environments, and stale Git worktree registrations.
+- Nested Git repositories must be covered by shared outer-repository ignore
+  rules at both their source and destination, with no outer-tracked files or
+  gitlinks. Task-local rules may be added and published with the task. `plan`
+  and `publish` enforce the same boundary before storage placement. Ignored
+  repositories move unchanged; archive does not repair Git
+  controls, registrations, or external administration. Zero-byte `.git` cache
+  markers remain ordinary content.
 - Archive receipts independently raise the publication requirement to 0.7.0,
   including schema 2/3 tasks and empty S3 histories. Private purge and copy
   journals use schema 2 so 0.6.0 rejects them before deleting protected versions.
@@ -101,12 +92,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Upgrading
 
-- In a refreshed clone, preview and apply `task upgrade` for a task's current
-  manifest, then publish it through a scoped infrastructure review, merge and
-  refresh before archive. Upgrade writes no S3 data or Git remote. Current
-  manifests without a checkpoint remain compatible through opaque-tree
-  bootstrap; unknown historical config formats need no adapter, while missing
-  identity/path provenance is never guessed.
+- `task upgrade` remains a separate operation for current manifest metadata
+  and verified review provenance, with its own history checks. Archive needs
+  no checkpoint or upgrade: it validates a supported current manifest and
+  corresponding closed PRs without consulting historical task configuration.
+  Manifestless directories still require explicit `task adopt` to establish
+  current metadata; archive does not trace their pre-adoption imports.
 - Lossless `archive --cancel` requires an attempt journal created by this
   release, including its copy reservation nonce. Old receipts alone cannot
   reconstruct ownership and all original local metadata.

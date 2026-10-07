@@ -168,7 +168,7 @@ fn cancel_preserves_ignored_content_metadata_permissions_index_and_other_tasks()
 }
 
 #[test]
-fn cancel_repairs_nested_absolute_git_worktree_and_restores_exact_control_bytes() {
+fn cancel_restores_opaque_nested_absolute_git_worktree_and_exact_control_bytes() {
     let (f, gh, manifest) = fixture();
     let primary = f.shared.join(SOURCE).join("cache/nested-origin");
     command(
@@ -192,9 +192,26 @@ fn cancel_repairs_nested_absolute_git_worktree_and_restores_exact_control_bytes(
         .to_owned();
     let backlink = std::fs::read(Path::new(&admin).join("gitdir")).unwrap();
     invoke(&f.shared, &gh, &manifest, false, false);
-    git(
-        &f.shared.join(DEST).join("nested"),
-        ["status", "--porcelain"],
+    assert_eq!(
+        std::fs::read(f.shared.join(DEST).join("nested/.git")).unwrap(),
+        pointer
+    );
+    assert_eq!(
+        std::fs::read(
+            f.shared
+                .join(DEST)
+                .join("cache/nested-origin/.git/worktrees/nested/gitdir")
+        )
+        .unwrap(),
+        backlink
+    );
+    assert!(
+        !git_unchecked(
+            &f.shared.join(DEST).join("nested"),
+            ["status", "--porcelain"]
+        )
+        .status
+        .success()
     );
     invoke(&f.shared, &gh, &manifest, true, false);
     git(&nested, ["status", "--porcelain"]);

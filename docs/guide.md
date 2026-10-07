@@ -345,6 +345,13 @@ Git, place them with `workspace-mgr storage` or keep the bytes locally with
 `workspace-mgr untrack`; do not move them outside the repository to avoid the
 decision, and do not route bulk by-products to S3 to keep Git small.
 
+Nested Git repositories are always excluded from outer publication. Cover the
+whole nested directory with a shared repository or task-local `.gitignore`
+rule and remove any outer-tracked files or gitlinks. `plan` and `publish`
+check this boundary before storage placement. A new task-local ignore file
+can be published with the task; a global ignore or `.git/info/exclude` alone
+does not satisfy the rule.
+
 Every remaining file under the task is in one of two states: selected, meaning
 published in Git or placement-recorded for S3 or local-only retention, or
 ignored by a rule this repository tracks. Publication stages the whole declared
@@ -512,7 +519,8 @@ Git index.
 Creating and maintaining the task's one draft pull request remains a
 repository-hosting action.
 `publish` writes the branch transaction; it does not create or update a pull
-request. `archive` and `refresh` can read GitHub merge evidence through `gh`.
+request. `archive` reads the task's corresponding PR state through `gh`;
+`refresh` reads merge evidence for branch cleanup.
 Immediately after publishing a new deliverable task's scaffold, the agent finds
 the request by head branch, reuses
 it or creates exactly one draft pull request, and never creates a duplicate. An
@@ -803,7 +811,7 @@ pending S3 purge retry may proceed when a removed branch was the last live
 reference protecting an already queued path. Directory organization remains a
 separate user-requested infrastructure task.
 
-### Upgrade task configuration before organization
+### Upgrade current task configuration
 
 In a new clone, refresh the configured shared branch before upgrading current
 task configuration. Preview a completed task's evidence, declare its exact
@@ -816,7 +824,7 @@ task_config=20260918-120000-example/.workspace-mgr-task.toml
 workspace-mgr task upgrade --manifest "$task_config" --dry-run
 workspace-mgr task create task-config-upgrade --kind infrastructure \
   --title "Upgrade completed task configuration" \
-  --purpose "Retain verified review provenance before organization" \
+  --purpose "Retain verified review provenance in current metadata" \
   --scope "$task_config" \
   --scope-note "The user requested this task configuration upgrade"
 upgrade_manifest=/absolute/path/reported/by/task-create
@@ -826,9 +834,9 @@ workspace-mgr publish --manifest "$upgrade_manifest" \
   -m "Retain verified task completion evidence"
 ```
 
-Review and merge that infrastructure pull request, then run `refresh` before
-the archive preview. Upgrade is idempotent and writes only current local task
-metadata; it writes no S3 data or Git remote. The current task configuration
+Review and merge that infrastructure pull request, then run `refresh` to
+receive the updated metadata. Upgrade is idempotent and writes only current
+local task metadata; it writes no S3 data or Git remote. The current task configuration
 must already be published and have no unrelated staged or unpublished edits.
 Task metadata, declared scopes and cloud-usage approval are retained.
 
@@ -842,16 +850,15 @@ its bytes remain opaque members of the Git tree. The current configuration
 still must satisfy the current schema; missing identity or unverifiable path
 and review provenance cannot be guessed.
 
-Archive without a saved checkpoint can perform the same bootstrap verification.
-Publishing upgrade first makes the result durable for other clones. Later
-archive checks only directory changes from the checkpoint to the fetched base,
-while revalidating its original tree and reviews and checking live open PRs
-and retained local/remote refs. A checkpoint does not permanently mark a task
-complete. Both bootstrap and subsequent verification require complete Git
-history; a shallow clone must fetch its missing history before proceeding.
+These review-provenance checks belong to `task upgrade`, which requires
+complete Git history. Archive is independent of that operation: it uses the
+current task configuration and its associated PR state, without inspecting
+configuration or directory-tree history or replaying a saved checkpoint's
+historical proof. Saved metadata can supply PR associations after a branch
+change. Upgrade is not an archive prerequisite.
 
 Active deliverable task directories remain at the repository's top level.
-After a task is done and its pull request is confirmed merged, the user may
+After a task's corresponding pull request is closed, the user may
 explicitly request that old task directories be organized under time folders.
 Handle that request through a repository-infrastructure task with the affected
 paths in scope; do not organize them automatically after merge or as part of
@@ -870,7 +877,7 @@ workspace-mgr archive --dry-run
 
 With no paths, the command scans top-level deliverable tasks and skips active
 or unverified tasks. Naming an active task explicitly refuses the operation.
-The preview reports merged-task evidence, proposed destinations, complete S3
+The preview reports closed-PR evidence, proposed destinations, complete S3
 history, and the source and destination paths to declare in an infrastructure
 task. It changes no repository content or remote. In the shared checkout, run
 `archive --manifest <path>`, then `plan --manifest <path>` and
@@ -878,36 +885,37 @@ task. It changes no repository content or remote. In the shared checkout, run
 `--layout '{year}'` and `--layout '{year}{month}'` select the other example
 structures; the default `{year}/{month}` uses each task's creation timestamp.
 
-Resolve relocation preflight failures before applying. Ordinary scripts and
-README commands with literal old absolute or repository-relative paths are
-reported by file and line, including ignored text; use script-relative inputs
-or run README commands from the task directory, review tracked repairs, then
-refresh and preview again. Cross-task references are checked against the
-whole batch, including dependencies from unselected tasks. A parent-relative
-reference to a sibling task needs repair when the tasks move to different
-months. Unverifiable recognized outward path expressions refuse. The static
-scan does not execute arbitrary language expressions; run the reproduction
-commands too. For an inert historical log or previous execution report, use
-`--historical-record <exact-repository-relative-file>` in preview and apply.
-This explicit confirmation records its content digest and mode and preserves
-the original bytes; scripts and control files cannot use this exemption.
-Zero-byte `.git` cache markers are retained. Real malformed Git pointers,
-stale worktree registrations, and Git administration or linked checkouts
-outside the task refuse. Consolidate the Git layout inside the task without
-losing refs or local content. Repair live registrations with `git worktree
-repair`; use `git worktree prune --dry-run` to inspect intentionally retired
-registrations before pruning. A Python environment bound to the old location
-also refuses: preserve its specification and local content, keep the old
-environment outside the task, rebuild outside the archive, and repair its
-callers. The [command reference](commands.md#workspace-mgr-archive) gives the
-preflight repair steps. Neither archive nor cancel deletes these runtimes.
+Archive verifies the current task configuration and its associated PRs in the
+configured repository, regardless of their target base branch. Merged PRs and
+PRs closed without merging qualify; an associated open PR, including a saved
+association from a previous task branch, blocks archive. One matching closed PR is required;
+when none is found, a pre-0.7 adoption record can provide a current branch
+hint. Malformed or unrelated adoption records add no extra gate. There is no
+commit-by-commit review, historical configuration parsing, full-history
+requirement, or branch-tip comparison for archive eligibility.
 
-For a manifestless directory imported directly into main, explicitly adopt
-its reviewed current tree and merge the adoption PR. The immutable adoption
-record's introducing commit becomes the review boundary; that commit and
-subsequent changes need merged reviews, while the earlier direct import does
-not need a retroactive PR. Open PRs and unmerged or divergent commits still
-block archive.
+Archive checks managed-storage integrity and move conflicts. Ordinary
+tracked, staged, untracked, ignored, and local-only files are retained;
+unpublished ordinary content does not prevent movement. Scripts, README
+commands, cross-task references, logs, symlinks, and Python environments move
+unchanged. Their paths may need later maintenance if you want to run them at
+the new location. Archive neither inspects those runtime dependencies nor rewrites
+them.
+
+Nested Git repositories must be covered by the outer repository's shared
+`.gitignore` rules at both the source and destination and contain no
+outer-tracked files or gitlinks. A local exclude or global ignore does not
+satisfy this rule. A new task-local `.gitignore` may be published with the task;
+the ignore file need not already be tracked. Ignored nested repositories and
+Git controls inside the task move unchanged; external Git administration and
+registrations remain untouched. Zero-byte `.git` cache markers remain ordinary
+content. The
+[command reference](commands.md#workspace-mgr-archive) describes this boundary.
+
+For a manifestless directory, use `task adopt` to establish current task
+metadata before archiving. Adoption has its own review checks; archive does
+not trace earlier imports or the adoption record's introducing commit. It
+checks the resulting current manifest and corresponding closed PR state.
 
 Archive moves the local directory and manifest together. Publication copies
 the complete retained S3 history, including old versions, delete markers, and
@@ -927,8 +935,7 @@ cancel an unpublished attempt with `archive --cancel --manifest <path> --dry-run
 apply restores local contents and metadata after verifying removal of its
 remote copies, markers, registry records and unfinished uploads.
 The copied history counts toward the infrastructure task's
-cloud-usage limit. Materialized local-only content must be preserved or
-returned to tracked storage before organization.
+cloud-usage limit. Local-only content remains local and travels with the task.
 
 To hydrate a historical Git checkout after source cleanup, use
 `workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
@@ -973,7 +980,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
 | `task upgrade` | Rewrites current configuration and verified completion evidence; dry-run changes no task content | Fetches the shared branch and verifies Git trees and hosting review records | None |
-| `archive` | Moves completed directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads GitHub merge evidence, Git refs, and complete S3 version history | None; publication copies history and records exact-version mappings |
+| `archive` | Moves closed-PR task directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads current GitHub PR states, current task/storage metadata, and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
 | `task approve-cloud-usage` | Rewrites the task manifest with the user's approval | None | None |

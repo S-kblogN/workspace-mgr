@@ -15,13 +15,14 @@ use crate::s3_purge::ObjectVersion;
 
 pub const RECEIPT_NAME: &str = ".workspace-mgr-archive.json";
 
-/// Rust-owned review metadata is retained beside the transport mapping. Keep
+/// Rust-owned task metadata is retained beside the transport mapping. Keep
 /// reconstruction and comparison in publish/cancel on the same field list.
-pub(crate) const RECEIPT_METADATA_FIELDS: [&str; 4] = [
+pub(crate) const RECEIPT_METADATA_FIELDS: [&str; 5] = [
     "task_id",
     "previous_receipt",
     "completion_reviews",
     "historical_records",
+    "closed_pull_request",
 ];
 
 pub fn plan(repo: &GitRepo, config: &Config, source: &str, destination: &str) -> Result<Value> {
@@ -151,17 +152,23 @@ pub fn prepare(
                     "archive migration requires both source and destination in the infrastructure task's declared scopes",
                 ));
             }
-            let manifest_path = format!("{source}/{TASK_MANIFEST_NAME}");
-            let original = repo.run(["show", &format!("{base}:{manifest_path}")])?;
-            let manifest: crate::manifest::TaskManifest = toml::from_str(&original.stdout)
-                .map_err(|error| {
-                    Error::message(format!("invalid archive source manifest: {error}"))
+            let manifest_path = format!("{destination}/{TASK_MANIFEST_NAME}");
+            reject_symlink_traversal(&repo.root, &manifest_path, "current archived task manifest")?;
+            let absolute = resolved_under(&repo.root, &manifest_path);
+            let current = fs::read_to_string(&absolute).at(&absolute)?;
+            let manifest: crate::manifest::TaskManifest =
+                toml::from_str(&current).map_err(|error| {
+                    Error::message(format!("invalid current archived task manifest: {error}"))
                 })?;
-            if manifest.id != text(&receipt, "task_id")? {
+            if manifest.kind != crate::manifest::TaskKind::Deliverable
+                || manifest.id != text(&receipt, "task_id")?
+                || manifest.path.as_deref() != Some(destination.as_str())
+            {
                 return Err(Error::message(
-                    "archive source identity changed since the migration was prepared",
+                    "current archived task identity or directory differs from the migration receipt",
                 ));
             }
+            crate::archive_cancel::validate_migration(repo, &receipt)?;
         }
         if receipt["status"] == "planned" {
             if config.s3_enabled() {
@@ -464,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_receipt_requires_both_scopes_and_original_task_identity() {
+    fn copied_receipt_requires_both_scopes_and_current_task_identity() {
         let (_temp, repo) = repository();
         repo.run(["init", "-b", "main"]).unwrap();
         repo.run(["config", "user.name", "workspace-mgr test"])
@@ -474,9 +481,7 @@ mod tests {
         write(
             &repo,
             &format!("{SOURCE}/{TASK_MANIFEST_NAME}"),
-            &format!(
-                "schema_version = 2\nkind = \"deliverable\"\nid = \"{SOURCE}\"\nslug = \"completed\"\npath = \"{SOURCE}\"\nbranch = \"codex/completed\"\ntitle = \"Retained task\"\npurpose = \"Keep the task\"\nadditional_scopes = []\n"
-            ),
+            "opaque historical format with no current manifest fields\n",
         );
         repo.run(["add", "."]).unwrap();
         repo.run(["commit", "-m", "Retain the source task"])
@@ -488,6 +493,13 @@ mod tests {
             .trim()
             .to_owned();
         let path = format!("{DESTINATION}/{RECEIPT_NAME}");
+        write(
+            &repo,
+            &format!("{DESTINATION}/{TASK_MANIFEST_NAME}"),
+            &format!(
+                "schema_version = 2\nkind = \"deliverable\"\nid = \"{SOURCE}\"\nslug = \"completed\"\npath = \"{DESTINATION}\"\nbranch = \"codex/completed\"\ntitle = \"Retained task\"\npurpose = \"Keep the task\"\nadditional_scopes = []\n"
+            ),
+        );
         let mut copied = receipt("copied", &[]);
         write(&repo, &path, &copied.to_string());
         let error = prepare(&repo, &Config::default(), &[DESTINATION.to_owned()], &base)
@@ -500,7 +512,7 @@ mod tests {
         let error = prepare(&repo, &Config::default(), &scopes, &base)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("source identity changed"), "{error}");
+        assert!(error.contains("current archived task identity"), "{error}");
         copied["task_id"] = SOURCE.into();
         write(&repo, &path, &copied.to_string());
         assert_eq!(

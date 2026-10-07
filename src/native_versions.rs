@@ -142,7 +142,7 @@ fn validate_info(entry: &Entry, info: &Value) -> Result<()> {
         )))
     }
 }
-fn validate_digest(entry: &StorageEntry) -> Result<()> {
+pub(crate) fn validate_digest(entry: &StorageEntry) -> Result<()> {
     let valid = entry.md5.as_deref().is_some_and(|v| {
         v.len() == 32
             && v.bytes()

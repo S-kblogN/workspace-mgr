@@ -590,11 +590,11 @@ fn stored_object(stores: &[PathBuf], md5: &str, suffix: &str) -> Option<PathBuf>
 pub fn discover(repo: &GitRepo, scopes: &[String]) -> Result<Vec<String>> {
     let mut found = BTreeSet::new();
     for path in repo.visible_paths(scopes)? {
-        if crate::storage::is_local(repo, &path)? {
-            continue;
-        }
         let absolute = resolved_under(&repo.root, &path);
         if absolute.extension().and_then(|value| value.to_str()) != Some("dvc") {
+            continue;
+        }
+        if crate::storage::is_local(repo, &path)? {
             continue;
         }
         let boundary = path

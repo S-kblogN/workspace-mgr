@@ -8,15 +8,12 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use serde_json::{Value, json as value};
-use sha2::{Digest, Sha256};
 
 const DONE: &str = "20260712-120000-completed";
 const ACTIVE: &str = "20260712-120100-active";
 const DESTINATION: &str = "2026/07/20260712-120000-completed";
 const RELATED: &str = "20260812-120000-related";
 const RELATED_DESTINATION: &str = "2026/08/20260812-120000-related";
-const RELATED_SAME_MONTH: &str = "20260712-121000-related";
-const RELATED_SAME_MONTH_DESTINATION: &str = "2026/07/20260712-121000-related";
 const MANIFEST: &str = ".workspace-mgr-task.toml";
 const RECEIPT: &str = ".workspace-mgr-archive.json";
 
@@ -110,16 +107,6 @@ fn related_completed_fixture_for(related: &str) -> (GitFixture, PathBuf) {
     (fixture, gh)
 }
 
-fn ignore_fixture_paths(repo: &Path, paths: &[String]) {
-    let exclude = repo.join(".git/info/exclude");
-    let original = std::fs::read_to_string(&exclude).unwrap();
-    let rules = paths
-        .iter()
-        .map(|path| format!("/{path}\n"))
-        .collect::<String>();
-    std::fs::write(exclude, format!("{original}\n{rules}")).unwrap();
-}
-
 fn pr(state: &str, number: u64, branch: &str, merged: &str, head: &str) -> Value {
     value!({
         "number": number,
@@ -175,7 +162,7 @@ fn write_gh_without_historical_queries(
     )
     .unwrap();
     std::fs::write(&path, format!(
-        "#!/usr/bin/env python3\nimport json, sys\nrequests = json.loads({literal})\nif sys.argv[1] == 'api':\n    commit = sys.argv[-1].split('/commits/')[1].split('/')[0]\n    if commit in {blocked}:\n        open({query_marker}, 'w').write(commit)\n        sys.exit('Historical commit review lookup is forbidden after a completion checkpoint')\n    rows = requests.get('commit:' + commit, [])\n    rows = [dict(number=row['number'], html_url=row['url'], state='closed' if row['state'] != 'OPEN' else 'open', merged_at=row['mergedAt'], merge_commit_sha=(row['mergeCommit'] or {{}}).get('oid'), head={{'ref': row['headRefName'], 'sha': row['headRefOid'], 'repo': {{'full_name': 'owner/archive-fixture'}}}}, base={{'ref': row['baseRefName'], 'sha': row['headRefOid'], 'repo': {{'full_name': 'owner/archive-fixture'}}}}) for row in rows]\nelif sys.argv[2] == 'view':\n    rows = [row for group in requests.values() for row in group if row['number'] == int(sys.argv[3])]\n    print(json.dumps(rows[0] if rows else {{}}))\n    sys.exit(0)\nelse:\n    head = sys.argv[sys.argv.index('--head') + 1]\n    rows = requests.get(head, [])\nif '--base' in sys.argv:\n    base = sys.argv[sys.argv.index('--base') + 1]\n    rows = [row for row in rows if row['baseRefName'] == base]\nprint(json.dumps(rows))\n"
+        "#!/usr/bin/env python3\nimport json, sys\nrequests = json.loads({literal})\nif sys.argv[1] == 'api':\n    commit = sys.argv[-1].split('/commits/')[1].split('/')[0]\n    if {blocked}:\n        open({query_marker}, 'w').write(commit)\n        sys.exit('Historical commit review lookup is forbidden after a completion checkpoint')\n    rows = requests.get('commit:' + commit, [])\n    rows = [dict(number=row['number'], html_url=row['url'], state='closed' if row['state'] != 'OPEN' else 'open', merged_at=row['mergedAt'], merge_commit_sha=(row['mergeCommit'] or {{}}).get('oid'), head={{'ref': row['headRefName'], 'sha': row['headRefOid'], 'repo': {{'full_name': 'owner/archive-fixture'}}}}, base={{'ref': row['baseRefName'], 'sha': row['headRefOid'], 'repo': {{'full_name': 'owner/archive-fixture'}}}}) for row in rows]\nelif sys.argv[2] == 'view':\n    rows = [row for group in requests.values() for row in group if row['number'] == int(sys.argv[3])]\n    print(json.dumps(rows[0] if rows else {{}}))\n    sys.exit(0)\nelse:\n    head = sys.argv[sys.argv.index('--head') + 1]\n    rows = requests.get(head, [])\nif '--base' in sys.argv:\n    base = sys.argv[sys.argv.index('--base') + 1]\n    rows = [row for row in rows if row['baseRefName'] == base]\nif '--state' in sys.argv:\n    state = sys.argv[sys.argv.index('--state') + 1]\n    if state != 'all':\n        rows = [row for row in rows if row['state'].lower() == state]\nif '--limit' in sys.argv:\n    rows = sorted(rows, key=lambda row: row['number'], reverse=True)[:int(sys.argv[sys.argv.index('--limit') + 1])]\nprint(json.dumps(rows))\n"
     )).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
@@ -300,6 +287,29 @@ fn forbid_historical_config_reads(fixture: &GitFixture, old_blob: &str) {
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn forbid_archive_history_operations(fixture: &GitFixture) {
+    let guard = fixture.root.join("historical-config-guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    let real_git = String::from_utf8(command(&fixture.root, "which", ["git"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let real_git = serde_json::to_string(&real_git).unwrap();
+    let marker = serde_json::to_string(
+        fixture
+            .root
+            .join("archive-history-operation")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let program = guard.join("git");
+    std::fs::write(&program, format!(
+        "#!/usr/bin/env python3\nimport os, sys\nargs = sys.argv[1:]\nif 'log' in args or 'merge-base' in args or any('refs/pull/' in arg for arg in args) or ('show' in args and any(':' in arg and arg.endswith('/{MANIFEST}') for arg in args)):\n    open({marker}, 'w').write(' '.join(args))\n    sys.exit('Archive history operations are forbidden')\nos.execv({real_git}, [{real_git}, *args])\n"
+    )).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_task() {
     let (fixture, merged) = managed_fixture(true);
@@ -397,9 +407,8 @@ fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_
 }
 
 #[test]
-fn archive_refuses_resumed_remote_branches_without_new_pull_requests() {
+fn archive_uses_closed_pr_state_instead_of_resumed_remote_branch_content() {
     let (fixture, merged) = managed_fixture(false);
-    // Record the immutable PR head before the previously merged task resumes.
     let gh = fake_gh(&fixture, &merged, false);
     git(&fixture.seed, ["switch", "codex/completed"]);
     std::fs::write(
@@ -410,46 +419,30 @@ fn archive_refuses_resumed_remote_branches_without_new_pull_requests() {
     git(&fixture.seed, ["add", DONE]);
     git(
         &fixture.seed,
-        ["commit", "-m", "Resume work after the merged PR"],
+        ["commit", "-m", "Resume work after the closed PR"],
     );
     git(&fixture.seed, ["push", "origin", "codex/completed"]);
-    let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
-    assert_eq!(preview["status"], "no_changes");
-    assert!(preview["tasks"].as_array().unwrap().is_empty());
-    assert_eq!(preview["skipped"][0]["path"], DONE);
-    rejected(
-        &fixture.shared,
-        &gh,
-        &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
-    );
-    let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-    rejected(
-        &worktree,
-        &gh,
-        &[
-            "archive",
-            DONE,
-            "--manifest",
-            infrastructure_manifest.to_str().unwrap(),
-        ],
-        "refuses active or unverified task",
-    );
-    assert!(worktree.join(DONE).join(MANIFEST).is_file());
-    assert!(!worktree.join(DESTINATION).exists());
-
-    // Removing the completed branch is allowed; GitHub's merged PR still
-    // supplies the original head and merge evidence.
-    git(
-        &fixture.seed,
-        ["push", "origin", "--delete", "codex/completed"],
-    );
     let preview = json(&archive(
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
     ));
     assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let report = json(&archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    ));
+    assert_eq!(report["status"], "archived");
+    assert_eq!(
+        std::fs::read_to_string(workplace.join(DESTINATION).join("result.md")).unwrap(),
+        "retained result\n"
+    );
+    assert_eq!(
+        oid(&fixture.remote, "refs/heads/codex/completed"),
+        oid(&fixture.seed, "codex/completed")
+    );
 }
 
 #[test]
@@ -525,699 +518,51 @@ fn archive_and_cancel_preserve_ordinary_uv_cache_git_markers_and_ignored_bytes()
 }
 
 #[test]
-fn archive_historical_records_require_explicit_acknowledgment_and_preserve_exact_bytes() {
-    let (fixture, merged) = managed_fixture(false);
-    let gh = fake_gh(&fixture, &merged, false);
-    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-    let history_path = format!("{DONE}/logs/history.log");
-    let root_history_path = "import-history.json";
-    let history = format!(
-        "2026-07-12 completed run\nrecorded cwd: {}\nrecorded input: {DONE}/result.md\nretained output: 中文\n",
-        workplace.join(DONE).display(),
-    )
-    .into_bytes();
-    let root_history =
-        format!("{{\"past_task\":\"{DONE}\",\"status\":\"completed\"}}\n").into_bytes();
-    std::fs::create_dir(workplace.join(DONE).join("logs")).unwrap();
-    std::fs::write(workplace.join(&history_path), &history).unwrap();
-    std::fs::write(workplace.join(root_history_path), &root_history).unwrap();
-    std::fs::set_permissions(
-        workplace.join(&history_path),
-        std::fs::Permissions::from_mode(0o440),
-    )
-    .unwrap();
-    ignore_fixture_paths(
-        &workplace,
-        &[format!("{DONE}/logs/"), root_history_path.to_owned()],
+fn archive_preserves_cross_task_scripts_even_when_tasks_move_to_different_months() {
+    let (fixture, gh) = related_completed_fixture();
+    let (workplace, manifest) =
+        organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
+    let script = format!(
+        "from pathlib import Path\nother = Path(__file__).parent.parent / '{RELATED}' / 'input.tsv'\nprint(other.read_text())\n"
     );
-    let original_manifest = std::fs::read(workplace.join(DONE).join(MANIFEST)).unwrap();
-    for dry_run in [true, false] {
-        let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(&workplace, &gh, &args, "path references");
-        assert!(!workplace.join(DESTINATION).exists());
-        assert_eq!(
-            std::fs::read(workplace.join(&history_path)).unwrap(),
-            history
-        );
-    }
-    let mut final_records = Value::Null;
-    for dry_run in [true, false] {
-        let mut args = vec![
-            "archive",
-            DONE,
-            "--manifest",
-            manifest.to_str().unwrap(),
-            "--historical-record",
-            history_path.as_str(),
-            "--historical-record",
-            root_history_path,
-        ];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        let report = json(&archive(&workplace, &gh, &args));
-        assert_eq!(
-            report["status"],
-            if dry_run { "dry_run" } else { "archived" }
-        );
-        let records = report["historical_records"].as_array().unwrap();
-        assert_eq!(records.len(), 2);
-        for (path, bytes) in [
-            (history_path.as_str(), &history),
-            (root_history_path, &root_history),
-        ] {
-            let record = records
-                .iter()
-                .find(|record| record["path"] == path)
-                .unwrap();
-            assert_eq!(record["role"], "historical-record");
-            let digest = Sha256::digest(bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            assert_eq!(record["sha256"], digest);
-            assert!(record["unix_mode"].as_u64().is_some());
-        }
-        if dry_run {
-            assert!(!workplace.join(DESTINATION).exists());
-            assert_eq!(
-                std::fs::read(workplace.join(&history_path)).unwrap(),
-                history
-            );
-        } else {
-            final_records = report["historical_records"].clone();
-        }
-    }
-    let archived_history = workplace.join(DESTINATION).join("logs/history.log");
-    assert_eq!(std::fs::read(&archived_history).unwrap(), history);
-    assert_eq!(
-        std::fs::metadata(&archived_history)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o440
-    );
-    assert_eq!(
-        std::fs::read(workplace.join(root_history_path)).unwrap(),
-        root_history
-    );
-    let receipt: Value =
-        serde_json::from_slice(&std::fs::read(workplace.join(DESTINATION).join(RECEIPT)).unwrap())
-            .unwrap();
-    assert_eq!(receipt["historical_records"], final_records);
-    let cancelled = json(&archive(
+    std::fs::write(workplace.join(DONE).join("read_other.py"), &script).unwrap();
+    let preview = json(&archive(
         &workplace,
         &gh,
         &[
             "archive",
             DONE,
+            RELATED,
             "--manifest",
             manifest.to_str().unwrap(),
-            "--cancel",
+            "--dry-run",
         ],
     ));
-    assert_eq!(cancelled["status"], "cancelled");
-    assert_eq!(
-        std::fs::read(workplace.join(&history_path)).unwrap(),
-        history
-    );
-    assert_eq!(
-        std::fs::metadata(workplace.join(&history_path))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o440
-    );
-    assert_eq!(
-        std::fs::read(workplace.join(root_history_path)).unwrap(),
-        root_history
-    );
-    assert_eq!(
-        std::fs::read(workplace.join(DONE).join(MANIFEST)).unwrap(),
-        original_manifest
-    );
-    assert!(!workplace.join(DESTINATION).exists());
-}
-
-#[test]
-fn archive_historical_acknowledgments_cannot_exempt_scripts_controls_or_invalid_paths() {
-    for case in [
-        "missing",
-        "directory",
-        "source",
-        "executable",
-        "shebang",
-        "manifest",
-        "git-ignore",
-        "uppercase-git-control",
-        "uppercase-workspace-control",
-        "git-hook",
-        "symlink",
-        "escape",
-    ] {
-        let (fixture, merged) = managed_fixture(false);
-        let gh = fake_gh(&fixture, &merged, false);
-        let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-        let source = workplace.join(DONE);
-        let cache = source.join(".cache");
-        std::fs::create_dir(&cache).unwrap();
-        ignore_fixture_paths(
-            &workplace,
-            &[format!("{DONE}/.cache/"), format!("{DONE}/.git/")],
-        );
-        let mut record = format!("{DONE}/.cache/history.log");
-        let contents = format!("historical cwd: {}\n", source.display());
-        match case {
-            "missing" => (),
-            "directory" => std::fs::create_dir(workplace.join(&record)).unwrap(),
-            "source" => {
-                record = format!("{DONE}/.cache/run.py");
-                std::fs::write(
-                    workplace.join(&record),
-                    format!("data = '{}/result.md'\n", source.display()),
-                )
-                .unwrap();
-            }
-            "executable" => {
-                std::fs::write(workplace.join(&record), &contents).unwrap();
-                std::fs::set_permissions(
-                    workplace.join(&record),
-                    std::fs::Permissions::from_mode(0o755),
-                )
-                .unwrap();
-            }
-            "shebang" => std::fs::write(
-                workplace.join(&record),
-                format!("#!/bin/sh\ncat '{}/result.md'\n", source.display()),
-            )
-            .unwrap(),
-            "manifest" => record = format!("{DONE}/{MANIFEST}"),
-            "git-ignore" => record = ".gitignore".to_owned(),
-            "uppercase-git-control" | "uppercase-workspace-control" => {
-                use std::os::unix::fs::MetadataExt;
-                let original = if case == "uppercase-git-control" {
-                    ".gitignore"
-                } else {
-                    ".workspace-mgr.toml"
-                };
-                record = original.to_ascii_uppercase();
-                let alias = workplace.join(&record);
-                if alias.exists() {
-                    let original = std::fs::metadata(workplace.join(original)).unwrap();
-                    let alias = std::fs::metadata(&alias).unwrap();
-                    assert_eq!((alias.dev(), alias.ino()), (original.dev(), original.ino()));
-                } else {
-                    // Case-sensitive hosts exercise the same protected spelling;
-                    // macOS also verifies the real same-inode alias above.
-                    std::fs::write(&alias, &contents).unwrap();
-                }
-            }
-            "git-hook" => {
-                record = format!("{DONE}/.git/hooks/history.log");
-                std::fs::create_dir_all(source.join(".git/hooks")).unwrap();
-                std::fs::write(workplace.join(&record), &contents).unwrap();
-            }
-            "symlink" => {
-                let external = fixture.root.join("external-history.log");
-                std::fs::write(&external, &contents).unwrap();
-                std::os::unix::fs::symlink(&external, workplace.join(&record)).unwrap();
-            }
-            "escape" => {
-                std::fs::write(fixture.root.join("external-history.log"), &contents).unwrap();
-                record = "../external-history.log".to_owned();
-            }
-            _ => unreachable!(),
-        }
-        let before = std::fs::read(source.join(MANIFEST)).unwrap();
-        let index = git(&workplace, ["write-tree"]).stdout;
-        for dry_run in [true, false] {
-            let mut args = vec![
-                "archive",
-                DONE,
-                "--manifest",
-                manifest.to_str().unwrap(),
-                "--historical-record",
-                &record,
-            ];
-            if dry_run {
-                args.push("--dry-run");
-            }
-            let env = archive_environment(&gh);
-            let env = env
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str()))
-                .collect::<Vec<_>>();
-            let output = workspace_env_unchecked(&workplace, &args, &env);
-            assert_eq!(
-                output.status.code(),
-                Some(2),
-                "case {case}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(!workplace.join(DESTINATION).exists(), "case {case}");
-            assert!(!source.join(RECEIPT).exists(), "case {case}");
-            assert_eq!(
-                std::fs::read(source.join(MANIFEST)).unwrap(),
-                before,
-                "case {case}"
-            );
-            assert_eq!(git(&workplace, ["write-tree"]).stdout, index, "case {case}");
-        }
-    }
-}
-
-#[test]
-fn archive_cannot_acknowledge_a_historical_record_executed_through_a_script_variable() {
-    let (fixture, merged) = managed_fixture(false);
-    let gh = fake_gh(&fixture, &merged, false);
-    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-    let source = workplace.join(DONE);
-    std::fs::create_dir(source.join(".cache")).unwrap();
-    let record_path = format!("{DONE}/.cache/history.log");
-    let record = format!(
-        "from pathlib import Path\nprint(Path('{}/result.md').read_text())\n",
-        source.display()
-    );
-    let script = "from pathlib import Path\nrecord = Path(__file__).parent / '.cache/history.log'\nexec(record.read_text())\n";
-    std::fs::write(workplace.join(&record_path), &record).unwrap();
-    std::fs::write(source.join("run.py"), script).unwrap();
-    ignore_fixture_paths(
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 2);
+    let report = json(&archive(
         &workplace,
-        &[format!("{DONE}/.cache/"), format!("{DONE}/run.py")],
-    );
-    let original = std::fs::read(source.join(MANIFEST)).unwrap();
-    for dry_run in [true, false] {
-        let mut args = vec![
-            "archive",
-            DONE,
-            "--manifest",
-            manifest.to_str().unwrap(),
-            "--historical-record",
-            &record_path,
-        ];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(&workplace, &gh, &args, "historical record");
-        assert_eq!(std::fs::read(source.join(MANIFEST)).unwrap(), original);
-        assert_eq!(
-            std::fs::read_to_string(workplace.join(&record_path)).unwrap(),
-            record
-        );
-        assert!(!workplace.join(DESTINATION).exists());
-        assert!(!source.join(RECEIPT).exists());
-    }
-}
-
-#[test]
-fn archive_checks_cross_task_dependencies_against_the_entire_move_graph() {
-    for (label, script, paths) in [
-        (
-            "pathlib sibling across months",
-            format!(
-                "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED}' / 'input.tsv'\n"
-            ),
-            vec![DONE, RELATED],
-        ),
-        (
-            "root-derived sibling across months",
-            format!(
-                "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\ninput_path = ROOT / '{RELATED}/input.tsv'\n"
-            ),
-            vec![DONE, RELATED],
-        ),
-        (
-            "relative sibling across months",
-            format!("from pathlib import Path\ninput_path = Path('../{RELATED}/input.tsv')\n"),
-            vec![DONE, RELATED],
-        ),
-        (
-            "moving owner with stationary dependency",
-            format!(
-                "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED}' / 'input.tsv'\n"
-            ),
-            vec![DONE],
-        ),
-        (
-            "stationary owner with moving dependency",
-            format!(
-                "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED}' / 'input.tsv'\n"
-            ),
-            vec![RELATED],
-        ),
-    ] {
-        let (fixture, gh) = related_completed_fixture();
-        let (workplace, manifest) =
-            organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
-        let script_path = workplace.join(DONE).join("run.py");
-        std::fs::write(&script_path, &script).unwrap();
-        ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
-        let manifests =
-            [DONE, RELATED].map(|path| std::fs::read(workplace.join(path).join(MANIFEST)).unwrap());
-        let index = git(&workplace, ["write-tree"]).stdout;
-        for dry_run in [true, false] {
-            let mut args = vec!["archive"];
-            args.extend(paths.iter().copied());
-            args.extend(["--manifest", manifest.to_str().unwrap()]);
-            if dry_run {
-                args.push("--dry-run");
-            }
-            rejected(&workplace, &gh, &args, "cross-task path dependencies");
-            for (path, before) in [DONE, RELATED].into_iter().zip(&manifests) {
-                assert_eq!(
-                    std::fs::read(workplace.join(path).join(MANIFEST)).unwrap(),
-                    *before,
-                    "{label}"
-                );
-                assert!(!workplace.join(path).join(RECEIPT).exists(), "{label}");
-            }
-            assert!(!workplace.join(DESTINATION).exists(), "{label}");
-            assert!(!workplace.join(RELATED_DESTINATION).exists(), "{label}");
-            assert_eq!(
-                std::fs::read_to_string(&script_path).unwrap(),
-                script,
-                "{label}"
-            );
-            assert_eq!(git(&workplace, ["write-tree"]).stdout, index, "{label}");
-        }
-    }
-}
-
-#[test]
-fn archive_preserves_stationary_task_symlink_dependencies_when_refusing_a_target_move() {
-    let (fixture, gh) = related_completed_fixture();
-    let (workplace, manifest) = organizer(&fixture, &[RELATED, RELATED_DESTINATION]);
-    let link_relative = format!("{DONE}/input-link");
-    let link = workplace.join(&link_relative);
-    let target = PathBuf::from(format!("../{RELATED}/input.tsv"));
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    ignore_fixture_paths(&workplace, &[link_relative]);
-    let original_index = git(&workplace, ["write-tree"]).stdout;
-    let original_manifests =
-        [DONE, RELATED].map(|path| std::fs::read(workplace.join(path).join(MANIFEST)).unwrap());
-    let input = std::fs::read(workplace.join(RELATED).join("input.tsv")).unwrap();
-    assert_eq!(std::fs::read(&link).unwrap(), input);
-    for dry_run in [true, false] {
-        let mut args = vec!["archive", RELATED, "--manifest", manifest.to_str().unwrap()];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(&workplace, &gh, &args, "cross-task path dependencies");
-        for (path, original) in [DONE, RELATED].into_iter().zip(&original_manifests) {
-            assert!(workplace.join(path).is_dir());
-            assert_eq!(
-                std::fs::read(workplace.join(path).join(MANIFEST)).unwrap(),
-                *original
-            );
-            assert!(!workplace.join(path).join(RECEIPT).exists());
-        }
-        assert!(!workplace.join(DESTINATION).exists());
-        assert!(!workplace.join(RELATED_DESTINATION).exists());
-        assert_eq!(git(&workplace, ["write-tree"]).stdout, original_index);
-        assert_eq!(std::fs::read_link(&link).unwrap(), target);
-        assert_eq!(std::fs::read(&link).unwrap(), input);
-        assert_eq!(
-            std::fs::read(workplace.join(RELATED).join("input.tsv")).unwrap(),
-            input
-        );
-    }
-}
-
-#[test]
-fn archive_batch_preserves_provable_file_relative_sibling_dependencies_in_the_same_month() {
-    let (fixture, gh) = related_completed_fixture_for(RELATED_SAME_MONTH);
-    let (workplace, manifest) = organizer(
-        &fixture,
+        &gh,
         &[
-            DONE,
-            DESTINATION,
-            RELATED_SAME_MONTH,
-            RELATED_SAME_MONTH_DESTINATION,
-        ],
-    );
-    let script = format!(
-        "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED_SAME_MONTH}' / 'input.tsv'\n",
-    );
-    std::fs::write(workplace.join(DONE).join("run.py"), &script).unwrap();
-    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
-    for dry_run in [true, false] {
-        let mut args = vec![
-            "archive",
-            DONE,
-            RELATED_SAME_MONTH,
-            "--manifest",
-            manifest.to_str().unwrap(),
-        ];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        let report = json(&archive(&workplace, &gh, &args));
-        assert_eq!(
-            report["status"],
-            if dry_run { "dry_run" } else { "archived" }
-        );
-        assert_eq!(report["tasks"].as_array().unwrap().len(), 2);
-    }
-    assert_eq!(
-        std::fs::read_to_string(workplace.join(DESTINATION).join("run.py")).unwrap(),
-        script,
-    );
-    let after_anchor = workplace
-        .join(DESTINATION)
-        .parent()
-        .unwrap()
-        .join(RELATED_SAME_MONTH)
-        .join("input.tsv");
-    assert_eq!(
-        std::fs::read_to_string(after_anchor).unwrap(),
-        "value\n17\n"
-    );
-}
-
-#[test]
-fn archive_does_not_reuse_a_file_relative_anchor_after_an_inline_reassignment() {
-    let (fixture, gh) = related_completed_fixture_for(RELATED_SAME_MONTH);
-    let (workplace, manifest) = organizer(
-        &fixture,
-        &[
-            DONE,
-            DESTINATION,
-            RELATED_SAME_MONTH,
-            RELATED_SAME_MONTH_DESTINATION,
-        ],
-    );
-    let script = format!(
-        "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\nif True: ROOT = Path('{}')\ninput_path = ROOT / '{RELATED_SAME_MONTH}' / 'input.tsv'\n",
-        workplace.display(),
-    );
-    std::fs::write(workplace.join(DONE).join("run.py"), &script).unwrap();
-    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
-    for dry_run in [true, false] {
-        let mut args = vec![
-            "archive",
-            DONE,
-            RELATED_SAME_MONTH,
-            "--manifest",
-            manifest.to_str().unwrap(),
-        ];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(&workplace, &gh, &args, "cross-task path dependencies");
-        assert!(workplace.join(DONE).is_dir());
-        assert!(workplace.join(RELATED_SAME_MONTH).is_dir());
-        assert!(!workplace.join(DESTINATION).exists());
-        assert!(!workplace.join(RELATED_SAME_MONTH_DESTINATION).exists());
-        assert!(!workplace.join(DONE).join(RECEIPT).exists());
-        assert!(!workplace.join(RELATED_SAME_MONTH).join(RECEIPT).exists());
-        assert_eq!(
-            std::fs::read_to_string(workplace.join(DONE).join("run.py")).unwrap(),
-            script
-        );
-    }
-}
-
-#[test]
-fn archive_refuses_uncertain_dynamic_cross_task_paths_without_a_literal_task_basename() {
-    let (fixture, gh) = related_completed_fixture();
-    let (workplace, manifest) =
-        organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
-    let script = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\nTARGET = ''.join(['20260812', '-120000-', 'related'])\ninput_path = ROOT / TARGET / 'input.tsv'\n";
-    assert!(!script.contains(RELATED));
-    std::fs::write(workplace.join(DONE).join("run.py"), script).unwrap();
-    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
-    let index = git(&workplace, ["write-tree"]).stdout;
-    for dry_run in [true, false] {
-        let mut args = vec![
             "archive",
             DONE,
             RELATED,
             "--manifest",
             manifest.to_str().unwrap(),
-        ];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(&workplace, &gh, &args, "cross-task path dependencies");
-        assert!(workplace.join(DONE).is_dir());
-        assert!(workplace.join(RELATED).is_dir());
-        assert!(!workplace.join(DESTINATION).exists());
-        assert!(!workplace.join(RELATED_DESTINATION).exists());
-        assert!(!workplace.join(DONE).join(RECEIPT).exists());
-        assert!(!workplace.join(RELATED).join(RECEIPT).exists());
-        assert_eq!(git(&workplace, ["write-tree"]).stdout, index);
-    }
-}
-
-#[test]
-fn archive_batch_accepts_repaired_task_local_dependencies_without_rewriting_scripts() {
-    let (fixture, gh) = related_completed_fixture();
-    let (workplace, manifest) =
-        organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
-    let script =
-        "from pathlib import Path\ninput_path = Path(__file__).resolve().parent / 'result.md'\n";
-    std::fs::write(workplace.join(DONE).join("run.py"), script).unwrap();
-    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
-    for dry_run in [true, false] {
-        let mut args = vec![
-            "archive",
-            DONE,
-            RELATED,
-            "--manifest",
-            manifest.to_str().unwrap(),
-        ];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        let report = json(&archive(&workplace, &gh, &args));
-        assert_eq!(
-            report["status"],
-            if dry_run { "dry_run" } else { "archived" }
-        );
-        assert_eq!(report["tasks"].as_array().unwrap().len(), 2);
-    }
+        ],
+    ));
+    assert_eq!(report["status"], "archived");
     assert_eq!(
-        std::fs::read_to_string(workplace.join(DESTINATION).join("run.py")).unwrap(),
+        std::fs::read_to_string(workplace.join(DESTINATION).join("read_other.py")).unwrap(),
         script
     );
     assert_eq!(
         std::fs::read_to_string(workplace.join(RELATED_DESTINATION).join("input.tsv")).unwrap(),
         "value\n17\n"
     );
-    assert!(!workplace.join(DONE).exists());
-    assert!(!workplace.join(RELATED).exists());
 }
 
 #[test]
-fn archive_preflight_refuses_a_location_bound_runtime_without_moving_content() {
-    let (fixture, merged) = managed_fixture(false);
-    let gh = fake_gh(&fixture, &merged, false);
-    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-    let source = workplace.join(DONE);
-    let venv = source.join(".venv");
-    std::fs::create_dir_all(venv.join("bin")).unwrap();
-    std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
-    let launcher = format!("#!{}/bin/python\nprint('keep')\n", venv.display());
-    std::fs::write(venv.join("bin/tool"), &launcher).unwrap();
-    let exclude = workplace.join(".git/info/exclude");
-    let old_exclude = std::fs::read_to_string(&exclude).unwrap();
-    std::fs::write(&exclude, format!("{old_exclude}\n/{DONE}/.venv/\n")).unwrap();
-    let manifest_before = std::fs::read(source.join(MANIFEST)).unwrap();
-    for dry_run in [true, false] {
-        let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(
-            &workplace,
-            &gh,
-            &args,
-            "relocation would invalidate the Python virtual environment",
-        );
-        assert!(!workplace.join(DESTINATION).exists());
-        assert_eq!(
-            std::fs::read(source.join(MANIFEST)).unwrap(),
-            manifest_before
-        );
-        assert_eq!(
-            std::fs::read_to_string(venv.join("bin/tool")).unwrap(),
-            launcher
-        );
-        assert!(!source.join(RECEIPT).exists());
-    }
-}
-
-#[test]
-fn archive_reports_ordinary_script_and_readme_paths_before_any_move() {
-    let (fixture, merged) = managed_fixture(false);
-    let gh = fake_gh(&fixture, &merged, false);
-    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-    let source = workplace.join(DONE);
-    let cache = source.join(".cache");
-    std::fs::create_dir(&cache).unwrap();
-    let script = format!("#!/bin/sh\ncat '{}/result.md'\n", source.display());
-    let readme = format!("# Run\nsh {DONE}/.cache/run.sh\n");
-    std::fs::write(cache.join("run.sh"), &script).unwrap();
-    std::fs::write(cache.join("README.md"), &readme).unwrap();
-    let exclude = workplace.join(".git/info/exclude");
-    let old_exclude = std::fs::read_to_string(&exclude).unwrap();
-    std::fs::write(&exclude, format!("{old_exclude}\n/{DONE}/.cache/\n")).unwrap();
-    let before = std::fs::read(source.join(MANIFEST)).unwrap();
-    for dry_run in [true, false] {
-        let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        let env = archive_environment(&gh);
-        let env = env
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect::<Vec<_>>();
-        let output = workspace_env_unchecked(&workplace, &args, &env);
-        assert_eq!(output.status.code(), Some(2));
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("ordinary file path references"), "{error}");
-        assert!(error.contains("run.sh:2"), "{error}");
-        assert!(error.contains("README.md:2"), "{error}");
-        assert!(error.contains("Derive task-local inputs"), "{error}");
-        assert!(!workplace.join(DESTINATION).exists());
-        assert!(!source.join(RECEIPT).exists());
-        assert_eq!(std::fs::read(source.join(MANIFEST)).unwrap(), before);
-        assert_eq!(
-            std::fs::read_to_string(cache.join("run.sh")).unwrap(),
-            script
-        );
-        assert_eq!(
-            std::fs::read_to_string(cache.join("README.md")).unwrap(),
-            readme
-        );
-    }
-    std::fs::write(
-        cache.join("run.sh"),
-        "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")/..\"\ncat result.md\n",
-    )
-    .unwrap();
-    std::fs::write(
-        cache.join("README.md"),
-        "From the task directory, run `sh .cache/run.sh`.\n",
-    )
-    .unwrap();
-    let report = json(&archive(
-        &workplace,
-        &gh,
-        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
-    ));
-    assert_eq!(report["status"], "archived");
-    assert!(workplace.join(DESTINATION).join(".cache/run.sh").is_file());
-}
-
-#[test]
-fn archive_refuses_external_git_administration_before_preview_or_apply_mutations() {
+fn archive_moves_an_ignored_external_git_worktree_without_touching_its_administration() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
@@ -1233,13 +578,12 @@ fn archive_refuses_external_git_administration_before_preview_or_apply_mutations
         &external,
         ["worktree", "add", "--detach", checkout.to_str().unwrap()],
     );
-    let exclude = workplace.join(".git/info/exclude");
-    let old_exclude = std::fs::read_to_string(&exclude).unwrap();
     std::fs::write(
-        &exclude,
-        format!("{old_exclude}\n/{DONE}/ignored-checkout/\n"),
+        workplace.join(DONE).join(".gitignore"),
+        "ignored-checkout/\n",
     )
     .unwrap();
+    let pointer = std::fs::read(checkout.join(".git")).unwrap();
     let admin = PathBuf::from(
         String::from_utf8(git(&checkout, ["rev-parse", "--absolute-git-dir"]).stdout)
             .unwrap()
@@ -1247,25 +591,45 @@ fn archive_refuses_external_git_administration_before_preview_or_apply_mutations
     );
     let backlink = std::fs::read(admin.join("gitdir")).unwrap();
     let common = std::fs::read(admin.join("commondir")).unwrap();
-    let original_manifest = std::fs::read(workplace.join(DONE).join(MANIFEST)).unwrap();
-    let original_index = git(&workplace, ["write-tree"]).stdout;
-    for dry_run in [true, false] {
-        let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        rejected(&workplace, &gh, &args, "outside the task scope");
-        assert_eq!(std::fs::read(admin.join("gitdir")).unwrap(), backlink);
-        assert_eq!(std::fs::read(admin.join("commondir")).unwrap(), common);
-        assert_eq!(
-            std::fs::read(workplace.join(DONE).join(MANIFEST)).unwrap(),
-            original_manifest
-        );
-        assert_eq!(git(&workplace, ["write-tree"]).stdout, original_index);
-        assert!(checkout.is_dir());
-        assert!(!workplace.join(DESTINATION).exists());
-        assert!(!workplace.join(DONE).join(RECEIPT).exists());
-    }
+    let index = git(&workplace, ["ls-files", "--stage"]).stdout;
+    let preview = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--dry-run",
+        ],
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    );
+    assert_eq!(
+        std::fs::read(workplace.join(DESTINATION).join("ignored-checkout/.git")).unwrap(),
+        pointer
+    );
+    assert_eq!(std::fs::read(admin.join("gitdir")).unwrap(), backlink);
+    assert_eq!(std::fs::read(admin.join("commondir")).unwrap(), common);
+    assert_eq!(git(&workplace, ["ls-files", "--stage"]).stdout, index);
+    archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--cancel",
+        ],
+    );
+    assert_eq!(std::fs::read(checkout.join(".git")).unwrap(), pointer);
+    assert_eq!(std::fs::read(admin.join("gitdir")).unwrap(), backlink);
+    git(&checkout, ["status", "--porcelain"]);
 }
 
 #[test]
@@ -1298,7 +662,7 @@ fn archive_new_protocol_requires_070_before_creating_local_attempt_state() {
 }
 
 #[test]
-fn archive_and_cancel_keep_internal_absolute_git_worktrees_operational() {
+fn archive_and_cancel_preserve_internal_absolute_git_worktree_bytes_without_repairs() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
@@ -1315,11 +679,9 @@ fn archive_and_cancel_keep_internal_absolute_git_worktrees_operational() {
         ["worktree", "add", "--detach", linked.to_str().unwrap()],
     );
     let original_pointer = std::fs::read(linked.join(".git")).unwrap();
-    let exclude = workplace.join(".git/info/exclude");
-    let old_exclude = std::fs::read_to_string(&exclude).unwrap();
     std::fs::write(
-        &exclude,
-        format!("{old_exclude}\n/{DONE}/nested-main/\n/{DONE}/nested-linked/\n"),
+        workplace.join(DONE).join(".gitignore"),
+        "nested-main/\nnested-linked/\n",
     )
     .unwrap();
     archive(
@@ -1328,9 +690,13 @@ fn archive_and_cancel_keep_internal_absolute_git_worktrees_operational() {
         &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
     );
     let moved = workplace.join(DESTINATION).join("nested-linked");
-    let top = String::from_utf8(git(&moved, ["rev-parse", "--show-toplevel"]).stdout).unwrap();
-    assert_eq!(top.trim(), moved.canonicalize().unwrap().to_str().unwrap());
-    git(&moved, ["status", "--porcelain"]);
+    assert_eq!(std::fs::read(moved.join(".git")).unwrap(), original_pointer);
+    assert!(
+        !git_unchecked(&moved, ["status", "--porcelain"])
+            .status
+            .success(),
+        "archive preserves absolute control paths even when this breaks the moved worktree"
+    );
     archive(
         &workplace,
         &gh,
@@ -1350,7 +716,7 @@ fn archive_and_cancel_keep_internal_absolute_git_worktrees_operational() {
 }
 
 #[test]
-fn archive_keeps_an_unpublished_resumed_local_branch_active_without_file_overlays() {
+fn archive_ignores_unpublished_local_branch_history_when_the_pr_is_closed() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     let reference = "refs/heads/codex/completed";
@@ -1388,8 +754,7 @@ fn archive_keeps_an_unpublished_resumed_local_branch_active_without_file_overlay
             .is_empty()
     );
     let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
-    assert!(preview["tasks"].as_array().unwrap().is_empty());
-    assert_eq!(preview["skipped"][0]["path"], DONE);
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(
         String::from_utf8(git(&fixture.shared, ["rev-parse", reference]).stdout)
             .unwrap()
@@ -1431,7 +796,7 @@ fn archive_supports_year_and_compact_month_layouts() {
 }
 
 #[test]
-fn archive_refuses_scope_collisions_and_shared_overlays_before_moving() {
+fn archive_refuses_scope_and_destination_collisions_but_accepts_ordinary_overlays() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE]);
@@ -1448,7 +813,7 @@ fn archive_refuses_scope_collisions_and_shared_overlays_before_moving() {
     );
     assert!(worktree.join(DONE).is_dir());
 
-    // Read-only previews still decide collisions and overlays before planning migrations.
+    // Read-only previews still decide destination collisions before planning migrations.
     std::fs::create_dir_all(fixture.shared.join(DESTINATION)).unwrap();
     rejected(
         &fixture.shared,
@@ -1458,7 +823,8 @@ fn archive_refuses_scope_collisions_and_shared_overlays_before_moving() {
     );
     std::fs::remove_dir_all(fixture.shared.join("2026")).unwrap();
     std::fs::write(fixture.shared.join(DONE).join("result.md"), "local edits\n").unwrap();
-    rejected(&fixture.shared, &gh, &["archive", "--dry-run"], "overlays");
+    let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert!(fixture.shared.join(DONE).is_dir());
     assert!(!fixture.shared.join(DESTINATION).exists());
     assert!(!fixture.shared.join(DONE).join(RECEIPT).exists());
@@ -1533,7 +899,7 @@ fn archive_accepts_a_stale_local_branch_that_is_an_ancestor_of_the_reviewed_head
 }
 
 #[test]
-fn archive_rejects_a_divergent_local_branch_even_when_the_tree_is_identical() {
+fn archive_accepts_a_divergent_local_branch_when_the_associated_pr_is_closed() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     let head = oid(&fixture.shared, "origin/codex/completed");
@@ -1560,12 +926,13 @@ fn archive_rejects_a_divergent_local_branch_even_when_the_tree_is_identical() {
         &fixture.shared,
         ["update-ref", "refs/heads/codex/completed", &diverged],
     );
-    rejected(
+    let preview = json(&archive(
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
-    );
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(oid(&fixture.shared, "refs/heads/codex/completed"), diverged);
 }
 
 fn migrated_fixture(reviewed: bool) -> (GitFixture, PathBuf) {
@@ -1646,6 +1013,12 @@ fn migrated_fixture(reviewed: bool) -> (GitFixture, PathBuf) {
 #[test]
 fn archive_follows_reviewed_task_updates_without_reading_historical_configuration() {
     let (fixture, gh) = migrated_fixture(true);
+    let manifest = fixture.shared.join(DONE).join(MANIFEST);
+    archive(
+        &fixture.shared,
+        &gh,
+        &["task", "upgrade", "--manifest", manifest.to_str().unwrap()],
+    );
     let preview = json(&archive(
         &fixture.shared,
         &gh,
@@ -1665,7 +1038,7 @@ fn archive_follows_reviewed_task_updates_without_reading_historical_configuratio
 }
 
 #[test]
-fn archive_rejects_an_identity_migration_without_a_verified_review() {
+fn archive_refuses_a_current_branch_without_an_associated_closed_pr() {
     let (fixture, gh) = migrated_fixture(false);
     rejected(
         &fixture.shared,
@@ -1696,7 +1069,7 @@ impl CompletionFixture {
     fn assert_no_historical_lookup(&self) {
         assert!(
             !self.git.root.join("blocked-historical-query").exists(),
-            "archive must use the current completion checkpoint instead of rediscovering old reviews"
+            "archive must use current PR state instead of rediscovering old commit reviews"
         );
         assert!(
             !self.git.root.join("historical-config-read").exists(),
@@ -1878,6 +1251,7 @@ fn task_upgrade_preserves_current_metadata_and_backfills_completion_once() {
 #[test]
 fn archive_uses_current_completion_metadata_without_reading_any_historical_configuration() {
     let fixture = completion_fixture();
+    forbid_archive_history_operations(&fixture.git);
     let gh = fixture.hosting();
     let preview = json(&archive(
         &fixture.git.shared,
@@ -1885,7 +1259,9 @@ fn archive_uses_current_completion_metadata_without_reading_any_historical_confi
         &["archive", DONE, "--dry-run"],
     ));
     assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
-    assert_eq!(preview["tasks"][0]["pull_request"]["number"], 3);
+    // The current configuration links the task and schema-migration PRs.
+    // The later infrastructure PR is not rediscovered from commit history.
+    assert_eq!(preview["tasks"][0]["pull_request"]["number"], 2);
     let (workplace, manifest) = organizer(&fixture.git, &[DONE, DESTINATION]);
     let result = json(&archive(
         &workplace,
@@ -1899,6 +1275,7 @@ fn archive_uses_current_completion_metadata_without_reading_any_historical_confi
     );
     assert!(!workplace.join(DONE).exists());
     fixture.assert_no_historical_lookup();
+    assert!(!fixture.git.root.join("archive-history-operation").exists());
 }
 
 #[test]
@@ -1925,52 +1302,7 @@ fn completion_checkpoint_keeps_a_historical_branch_with_an_open_pr_active() {
 }
 
 #[test]
-fn completion_checkpoint_rejects_unmerged_local_and_remote_commits_even_with_identical_content() {
-    for local in [true, false] {
-        let fixture = completion_fixture();
-        let repo = if local {
-            &fixture.git.shared
-        } else {
-            &fixture.git.remote
-        };
-        configure_git(repo);
-        let branch = "refs/heads/historical/completed";
-        let head = oid(&fixture.git.remote, branch);
-        let tree = oid(repo, &format!("{head}^{{tree}}"));
-        let resumed = String::from_utf8(
-            git(
-                repo,
-                [
-                    "commit-tree",
-                    &tree,
-                    "-p",
-                    &head,
-                    "-m",
-                    "Unmerged work after completion",
-                ],
-            )
-            .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_owned();
-        git(repo, ["update-ref", branch, &resumed]);
-        let gh = fixture.hosting();
-        rejected(
-            &fixture.git.shared,
-            &gh,
-            &["archive", DONE, "--dry-run"],
-            "refuses active or unverified task",
-        );
-        assert_eq!(oid(repo, branch), resumed);
-        assert!(fixture.git.shared.join(DONE).join(MANIFEST).is_file());
-        assert!(!fixture.git.shared.join(DESTINATION).exists());
-        fixture.assert_no_historical_lookup();
-    }
-}
-
-#[test]
-fn completion_checkpoint_rejects_unreviewed_content_added_on_main_after_the_checkpoint() {
+fn archive_accepts_current_content_without_rechecking_checkpoint_history() {
     let fixture = completion_fixture();
     std::fs::write(
         fixture.git.seed.join(DONE).join("result.md"),
@@ -1982,12 +1314,12 @@ fn completion_checkpoint_rejects_unreviewed_content_added_on_main_after_the_chec
         .commit_seed("Change completed task without a review");
     git(&fixture.git.shared, ["pull", "--ff-only", "origin", "main"]);
     let gh = fixture.hosting();
-    rejected(
+    let preview = json(&archive(
         &fixture.git.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
-    );
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(
         std::fs::read_to_string(fixture.git.shared.join(DONE).join("result.md")).unwrap(),
         "Unreviewed direct main edit\n"
@@ -1997,74 +1329,7 @@ fn completion_checkpoint_rejects_unreviewed_content_added_on_main_after_the_chec
 }
 
 #[test]
-fn completion_checkpoint_accepts_later_reviewed_content_without_reopening_old_formats() {
-    let mut fixture = completion_fixture();
-    git(&fixture.git.seed, ["switch", "-c", "codex/completed"]);
-    std::fs::write(
-        fixture.git.seed.join(DONE).join("result.md"),
-        "Further reviewed content after the checkpoint\n",
-    )
-    .unwrap();
-    git(&fixture.git.seed, ["add", DONE]);
-    git(
-        &fixture.git.seed,
-        ["commit", "-m", "Extend the completed task through review"],
-    );
-    let later_head = oid(&fixture.git.seed, "HEAD");
-    git(&fixture.git.seed, ["push", "origin", "codex/completed"]);
-    git(&fixture.git.seed, ["switch", "main"]);
-    git(&fixture.git.seed, ["merge", "--squash", "codex/completed"]);
-    git(
-        &fixture.git.seed,
-        ["commit", "-m", "Merge the reviewed task extension"],
-    );
-    let later_merge = oid(&fixture.git.seed, "HEAD");
-    git(&fixture.git.seed, ["push", "origin", "main"]);
-    git(&fixture.git.shared, ["pull", "--ff-only", "origin", "main"]);
-    let review = pr("MERGED", 4, "codex/completed", &later_merge, &later_head);
-    fixture
-        .requests
-        .insert("codex/completed".to_owned(), vec![review.clone()]);
-    fixture
-        .requests
-        .insert(format!("commit:{later_merge}"), vec![review]);
-    let gh = fixture.hosting();
-    let preview = json(&archive(
-        &fixture.git.shared,
-        &gh,
-        &["archive", DONE, "--dry-run"],
-    ));
-    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
-    assert_eq!(preview["tasks"][0]["pull_request"]["number"], 4);
-    assert_eq!(
-        preview["tasks"][0]["review_history"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4
-    );
-    fixture.assert_no_historical_lookup();
-}
-
-#[test]
-fn completion_checkpoint_rechecks_immutable_provider_evidence() {
-    let mut fixture = completion_fixture();
-    fixture.requests.get_mut("historical/completed").unwrap()[0]["mergedAt"] =
-        value!("2026-07-13T20:00:00Z");
-    let gh = fixture.hosting();
-    rejected(
-        &fixture.git.shared,
-        &gh,
-        &["archive", DONE, "--dry-run"],
-        "no longer matches its immutable provider evidence",
-    );
-    assert!(fixture.git.shared.join(DONE).join(MANIFEST).is_file());
-    assert!(!fixture.git.shared.join(DESTINATION).exists());
-    fixture.assert_no_historical_lookup();
-}
-
-#[test]
-fn completion_checkpoint_rejects_a_current_record_bound_to_the_wrong_task_tree() {
+fn archive_does_not_verify_saved_checkpoint_trees() {
     let fixture = completion_fixture();
     let manifest = fixture.git.shared.join(DONE).join(MANIFEST);
     let mut current: toml::Value =
@@ -2073,19 +1338,19 @@ fn completion_checkpoint_rejects_a_current_record_bound_to_the_wrong_task_tree()
     std::fs::write(&manifest, toml::to_string_pretty(&current).unwrap()).unwrap();
     let before = std::fs::read(&manifest).unwrap();
     let gh = fixture.hosting();
-    rejected(
+    let preview = json(&archive(
         &fixture.git.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "does not match its published task tree",
-    );
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(std::fs::read(&manifest).unwrap(), before);
     assert!(!fixture.git.shared.join(DESTINATION).exists());
     fixture.assert_no_historical_lookup();
 }
 
 #[test]
-fn archive_rejects_a_local_completion_upgrade_until_it_has_been_reviewed() {
+fn archive_accepts_current_completion_metadata_without_requiring_another_review() {
     let (fixture, gh) = migrated_fixture(true);
     let manifest = fixture.shared.join(DONE).join(MANIFEST);
     archive(
@@ -2094,12 +1359,12 @@ fn archive_rejects_a_local_completion_upgrade_until_it_has_been_reviewed() {
         &["task", "upgrade", "--manifest", manifest.to_str().unwrap()],
     );
     let before = std::fs::read(&manifest).unwrap();
-    rejected(
+    let preview = json(&archive(
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses staged, modified, or untracked overlays",
-    );
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(std::fs::read(&manifest).unwrap(), before);
     assert!(!fixture.shared.join(DESTINATION).exists());
     assert!(!fixture.root.join("historical-config-read").exists());
@@ -2252,12 +1517,18 @@ fn legacy_tasks_are_visible_and_require_explicit_reviewed_adoption() {
         record
     );
     assert!(!workplace.join(format!("{record_path}.dvc")).exists());
-    rejected(
+    let archive_preview = json(&archive(
         &workplace,
         &gh,
-        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
-        "refuses active or unverified task",
-    );
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--dry-run",
+        ],
+    ));
+    assert_eq!(archive_preview["tasks"].as_array().unwrap().len(), 1);
 
     // Publish adoption through a separate infrastructure review, then verify
     // that both the legacy review and its explicit migration remain usable.
@@ -2418,12 +1689,14 @@ fn directly_imported_adoption_fixture(
 }
 
 #[test]
-fn reviewed_adoption_starts_completion_after_an_unreviewed_direct_import() {
+fn archive_follows_the_closed_adopted_pr_without_audit_of_the_direct_import() {
     let (fixture, workplace, manifest) = directly_imported_adoption_fixture(true);
     let gh = fixture.hosting();
     let preview = json(&archive(&workplace, &gh, &["archive", DONE, "--dry-run"]));
     assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
-    assert_eq!(preview["tasks"][0]["pull_request"]["number"], 2);
+    // The current adoption record links the legacy task PR. A separate
+    // infrastructure PR that introduced the record is irrelevant to archive.
+    assert_eq!(preview["tasks"][0]["pull_request"]["number"], 1);
     let result = json(&archive(
         &workplace,
         &gh,
@@ -2439,27 +1712,19 @@ fn reviewed_adoption_starts_completion_after_an_unreviewed_direct_import() {
 }
 
 #[test]
-fn adoption_boundary_requires_its_own_merged_review() {
+fn archive_does_not_require_an_additional_adoption_review() {
     let (fixture, workplace, _) = directly_imported_adoption_fixture(false);
     let gh = fixture.hosting();
-    rejected(
-        &workplace,
-        &gh,
-        &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
-    );
+    let preview = json(&archive(&workplace, &gh, &["archive", DONE, "--dry-run"]));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert!(workplace.join(DONE).join(MANIFEST).is_file());
     assert!(!workplace.join(DESTINATION).exists());
     fixture.assert_no_historical_lookup();
 }
 
 #[test]
-fn reviewed_adoption_keeps_open_legacy_current_and_adoption_branches_active() {
-    for branch in [
-        "legacy/completed",
-        "codex/completed",
-        "codex/infra-archive-completed",
-    ] {
+fn archive_rejects_open_prs_for_all_currently_recorded_task_branches() {
+    for branch in ["legacy/completed", "codex/completed"] {
         let (mut fixture, workplace, _) = directly_imported_adoption_fixture(true);
         let head = oid(&workplace, "HEAD");
         fixture
@@ -2467,49 +1732,6 @@ fn reviewed_adoption_keeps_open_legacy_current_and_adoption_branches_active() {
             .entry(branch.to_owned())
             .or_default()
             .push(pr("OPEN", 3, branch, "", &head));
-        let gh = fixture.hosting();
-        rejected(
-            &workplace,
-            &gh,
-            &["archive", DONE, "--dry-run"],
-            if branch == "legacy/completed" {
-                "legacy adoption refuses an open"
-            } else {
-                "refuses active or unverified task"
-            },
-        );
-        assert!(workplace.join(DONE).is_dir());
-        assert!(!workplace.join(DESTINATION).exists());
-        fixture.assert_no_historical_lookup();
-    }
-}
-
-#[test]
-fn reviewed_adoption_does_not_accept_new_unreviewed_content_or_commits() {
-    for branch_only in [false, true] {
-        let (fixture, workplace, _) = directly_imported_adoption_fixture(true);
-        if branch_only {
-            git(&workplace, ["switch", "-c", "codex/completed"]);
-            git(
-                &workplace,
-                [
-                    "commit",
-                    "--allow-empty",
-                    "-m",
-                    "Unmerged work after adoption",
-                ],
-            );
-            git(&workplace, ["switch", "main"]);
-        } else {
-            std::fs::write(
-                workplace.join(DONE).join("result.md"),
-                "Unreviewed post-adoption work\n",
-            )
-            .unwrap();
-            git(&workplace, ["add", DONE]);
-            git(&workplace, ["commit", "-m", "Direct edit after adoption"]);
-            git(&workplace, ["push", "origin", "main"]);
-        }
         let gh = fixture.hosting();
         rejected(
             &workplace,
@@ -2524,7 +1746,7 @@ fn reviewed_adoption_does_not_accept_new_unreviewed_content_or_commits() {
 }
 
 #[test]
-fn archive_rejects_unreviewed_task_content_on_the_shared_base() {
+fn archive_accepts_current_content_without_a_review_for_every_historical_edit() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     std::fs::write(
@@ -2534,12 +1756,12 @@ fn archive_rejects_unreviewed_task_content_on_the_shared_base() {
     .unwrap();
     fixture.commit_seed("Direct change to completed task content");
     git(&fixture.shared, ["pull", "--ff-only", "origin", "main"]);
-    rejected(
+    let preview = json(&archive(
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
-    );
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert!(fixture.shared.join(DONE).is_dir());
 }
 
@@ -2586,17 +1808,10 @@ fn archive_accepts_later_reviewed_content_with_an_unchanged_manifest() {
     ));
     assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(preview["tasks"][0]["pull_request"]["number"], 2);
-    assert_eq!(
-        preview["tasks"][0]["review_history"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
 }
 
 #[test]
-fn archive_fetches_a_deleted_branches_missing_immutable_review_head_for_a_stale_local_ref() {
+fn archive_does_not_fetch_missing_historical_pr_heads() {
     let (fixture, merged) = managed_fixture(false);
     let head = oid(&fixture.remote, "refs/heads/codex/completed");
     let older = oid(&fixture.seed, &format!("{head}^"));
@@ -2642,19 +1857,20 @@ fn archive_fetches_a_deleted_branches_missing_immutable_review_head_for_a_stale_
     let preview = json(&archive(&historical, &gh, &["archive", DONE, "--dry-run"]));
     assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert!(
-        git_unchecked(
+        !git_unchecked(
             &historical,
             ["cat-file", "-e", &format!("{head}^{{commit}}")]
         )
         .status
-        .success()
+        .success(),
+        "archive must not fetch old PR commits when their current state is enough"
     );
     assert_eq!(oid(&historical, "refs/heads/codex/completed"), older);
     assert!(!historical.join(".git/FETCH_HEAD").exists());
 }
 
 #[test]
-fn archive_refuses_shallow_history_that_hides_the_original_task_review() {
+fn archive_accepts_shallow_checkouts_using_only_current_task_and_pr_state() {
     let (fixture, original_merge) = managed_fixture(false);
     let manifest = fixture.seed.join(DONE).join(MANIFEST);
     let raw = std::fs::read_to_string(&manifest).unwrap().replace(
@@ -2668,8 +1884,8 @@ fn archive_refuses_shallow_history_that_hides_the_original_task_review() {
         &fixture.seed,
         ["push", "origin", "--delete", "codex/completed"],
     );
-    // A shallow clone sees only the later reviewed manifest. Its missing
-    // ancestry must not hide the original branch, reviews, or identity gaps.
+    // The current manifest and PR state are sufficient even when the clone
+    // does not contain the original task creation history.
     let shallow = fixture.root.join("shallow-shared");
     let remote_url = format!("file://{}", fixture.remote.display());
     git(
@@ -2706,16 +1922,505 @@ fn archive_refuses_shallow_history_that_hides_the_original_task_review() {
         )]),
     );
     let before = std::fs::read(shallow.join(DONE).join(MANIFEST)).unwrap();
-    rejected(
-        &shallow,
-        &gh,
-        &["archive", DONE, "--dry-run"],
-        "archive requires complete Git history",
-    );
+    let preview = json(&archive(&shallow, &gh, &["archive", DONE, "--dry-run"]));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(
         std::fs::read(shallow.join(DONE).join(MANIFEST)).unwrap(),
         before
     );
     assert!(!shallow.join(DESTINATION).exists());
     assert_eq!(oid(&shallow, "HEAD"), latest);
+}
+
+#[test]
+fn archive_preserves_arbitrary_local_content_and_user_index_through_cancel() {
+    use std::os::unix::fs::symlink;
+
+    let (fixture, merged) = managed_fixture(false);
+    let gh = fake_gh(&fixture, &merged, false);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let source = workplace.join(DONE);
+    let original_manifest = std::fs::read(source.join(MANIFEST)).unwrap();
+    std::fs::write(source.join("result.md"), "staged local result\n").unwrap();
+    git(&workplace, ["add", &format!("{DONE}/result.md")]);
+    std::fs::write(source.join("result.md"), "unstaged local result\n").unwrap();
+    let script = format!("#!/bin/sh\ncat '{}/result.md'\n", source.display());
+    let readme = format!("# Old command\nsh {DONE}/run.sh\n");
+    let historical = format!("Previously executed in {}\n", source.display());
+    std::fs::write(source.join("run.sh"), &script).unwrap();
+    std::fs::set_permissions(
+        source.join("run.sh"),
+        std::fs::Permissions::from_mode(0o751),
+    )
+    .unwrap();
+    std::fs::write(source.join("README.md"), &readme).unwrap();
+    std::fs::create_dir_all(source.join("logs")).unwrap();
+    std::fs::write(source.join("logs/history.log"), &historical).unwrap();
+    std::fs::write(source.join("new-untracked.bin"), b"\0new local bytes\xff").unwrap();
+    std::fs::write(source.join("local.bin"), b"\0retained local-only bytes\xfe").unwrap();
+    std::fs::write(
+        source.join("local.bin.workspace-mgr-storage.toml"),
+        "schema_version = 1\ntarget = \"local\"\nreason = \"Keep payload in this checkout\"\n",
+    )
+    .unwrap();
+    std::fs::write(source.join(".gitignore"), "/local.bin\n/.venv/\n/cache/\n").unwrap();
+    let venv = source.join(".venv");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::fs::write(
+        venv.join("pyvenv.cfg"),
+        format!("home = {}\n", source.display()),
+    )
+    .unwrap();
+    let launcher = format!("#!{}/bin/python\nprint('keep')\n", venv.display());
+    std::fs::write(venv.join("bin/tool"), &launcher).unwrap();
+    std::fs::create_dir_all(source.join("cache")).unwrap();
+    std::fs::write(
+        source.join("cache/hydrated.bin"),
+        b"ignored hydrated contents",
+    )
+    .unwrap();
+    let link_target = source.join("result.md");
+    symlink(&link_target, source.join("absolute-link")).unwrap();
+    let other = workplace.join("README.md");
+    std::fs::write(&other, "another task pending change\n").unwrap();
+    git(&workplace, ["add", "README.md"]);
+    let index = git(&workplace, ["ls-files", "--stage", "-z"]).stdout;
+    let staged_result = git(&workplace, ["show", &format!(":{DONE}/result.md")]).stdout;
+    let originals = [
+        "result.md",
+        "run.sh",
+        "README.md",
+        "logs/history.log",
+        "new-untracked.bin",
+        "local.bin",
+        "local.bin.workspace-mgr-storage.toml",
+        ".gitignore",
+        ".venv/pyvenv.cfg",
+        ".venv/bin/tool",
+        "cache/hydrated.bin",
+    ]
+    .into_iter()
+    .map(|relative| (relative, std::fs::read(source.join(relative)).unwrap()))
+    .collect::<Vec<_>>();
+    let preview = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--dry-run",
+        ],
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    let result = json(&archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    ));
+    assert_eq!(result["status"], "archived");
+    let destination = workplace.join(DESTINATION);
+    for (relative, bytes) in &originals {
+        assert_eq!(
+            std::fs::read(destination.join(relative)).unwrap(),
+            *bytes,
+            "{relative}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(destination.join("absolute-link")).unwrap(),
+        link_target
+    );
+    assert_eq!(
+        std::fs::metadata(destination.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
+    );
+    assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(destination.join(RECEIPT)).unwrap()).unwrap();
+    assert!(receipt.get("historical_records").is_none());
+    assert!(receipt.get("completion_reviews").is_none());
+    let cancelled = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--cancel",
+        ],
+    ));
+    assert_eq!(cancelled["status"], "cancelled");
+    for (relative, bytes) in &originals {
+        assert_eq!(
+            std::fs::read(source.join(relative)).unwrap(),
+            *bytes,
+            "{relative}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(source.join(MANIFEST)).unwrap(),
+        original_manifest
+    );
+    assert!(!source.join(RECEIPT).exists());
+    assert_eq!(
+        std::fs::read_link(source.join("absolute-link")).unwrap(),
+        link_target
+    );
+    assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+    assert_eq!(
+        git(&workplace, ["show", &format!(":{DONE}/result.md")]).stdout,
+        staged_result
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other).unwrap(),
+        "another task pending change\n"
+    );
+    assert_eq!(
+        json(&archive(
+            &workplace,
+            &gh,
+            &[
+                "archive",
+                DONE,
+                "--manifest",
+                manifest.to_str().unwrap(),
+                "--cancel"
+            ]
+        ))["status"],
+        "no_changes"
+    );
+}
+
+#[test]
+fn archive_accepts_closed_unmerged_pr_and_publishes_a_task_absent_from_shared_history() {
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["init"]);
+    fixture.commit_seed("Initialize managed workspace without the task");
+    fixture.clone_shared();
+    write_task(&fixture.shared, DONE, "completed", false);
+    let head = oid(&fixture.shared, "HEAD");
+    let gh = write_gh(
+        &fixture,
+        &BTreeMap::from([(
+            "codex/completed",
+            vec![pr("CLOSED", 7, "codex/completed", "", &head)],
+        )]),
+    );
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let original_index = git(&workplace, ["ls-files", "--stage", "-z"]).stdout;
+    let report = json(&archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    ));
+    assert_eq!(report["status"], "archived");
+    assert_eq!(report["tasks"][0]["pull_request"]["state"], "CLOSED");
+    assert!(report["tasks"][0]["pull_request"]["merged_at"].is_null());
+    assert!(report["tasks"][0]["pull_request"]["merge_commit"].is_null());
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(workplace.join(DESTINATION).join(RECEIPT)).unwrap())
+            .unwrap();
+    assert_eq!(receipt["closed_pull_request"]["number"], 7);
+    assert_eq!(receipt["closed_pull_request"]["state"], "CLOSED");
+    let published = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Archive current contents after the PR closed",
+        ],
+    ));
+    assert_eq!(published["status"], "pushed");
+    let commit = published["commit_oid"].as_str().unwrap();
+    assert_eq!(
+        git(
+            &workplace,
+            ["show", &format!("{commit}:{DESTINATION}/result.md")]
+        )
+        .stdout,
+        b"retained result\n"
+    );
+    assert_eq!(
+        git(&workplace, ["ls-files", "--stage", "-z"]).stdout,
+        original_index
+    );
+    assert!(
+        !git_unchecked(
+            &workplace,
+            ["cat-file", "-e", &format!("{head}:{DONE}/{MANIFEST}")]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn archive_refuses_a_closed_pr_if_any_current_branch_review_is_open() {
+    let (fixture, merged) = managed_fixture(false);
+    let head = oid(&fixture.remote, "refs/heads/codex/completed");
+    let gh = write_gh(
+        &fixture,
+        &BTreeMap::from([(
+            "codex/completed",
+            vec![
+                pr("CLOSED", 3, "codex/completed", "", &head),
+                pr("OPEN", 4, "codex/completed", "", &head),
+            ],
+        )]),
+    );
+    rejected(
+        &fixture.shared,
+        &gh,
+        &["archive", DONE, "--dry-run"],
+        "refuses active or unverified task",
+    );
+    assert!(fixture.shared.join(DONE).is_dir());
+    assert!(!fixture.shared.join(DESTINATION).exists());
+    assert_eq!(oid(&fixture.remote, "refs/heads/main"), merged);
+}
+
+#[test]
+fn archive_rejects_malformed_current_dvc_metadata_before_moving() {
+    let (fixture, merged) = managed_fixture(false);
+    let gh = fake_gh(&fixture, &merged, false);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let pointer = workplace.join(DONE).join("data.bin.dvc");
+    std::fs::write(&pointer, "invalid: [unclosed metadata\n").unwrap();
+    let before = std::fs::read(&pointer).unwrap();
+    let env = archive_environment(&gh);
+    let env = env
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let output = workspace_env_unchecked(
+        &workplace,
+        [
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &env,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&pointer).unwrap(), before);
+    assert!(workplace.join(DONE).is_dir());
+    assert!(!workplace.join(DESTINATION).exists());
+}
+
+#[test]
+fn archive_requires_nested_git_repositories_to_be_ignored_and_untracked() {
+    for mode in [
+        "unignored",
+        "info-only",
+        "git-control-only",
+        "tracked-gitlink",
+        "old-path-only",
+    ] {
+        let (fixture, merged) = managed_fixture(false);
+        let gh = fake_gh(&fixture, &merged, false);
+        let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+        let nested = workplace.join(DONE).join("vendor");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::write(nested.join("local-content"), b"opaque payload").unwrap();
+        let reason = match mode {
+            "info-only" => {
+                let exclude = workplace.join(".git/info/exclude");
+                let original = std::fs::read_to_string(&exclude).unwrap();
+                std::fs::write(exclude, format!("{original}\n/{DONE}/vendor/\n")).unwrap();
+                "machine-local ignore rule"
+            }
+            "git-control-only" => {
+                std::fs::write(workplace.join(DONE).join(".gitignore"), "/vendor/.git/\n").unwrap();
+                "must be ignored as an entire directory"
+            }
+            "tracked-gitlink" => {
+                std::fs::write(workplace.join(DONE).join(".gitignore"), "/vendor/\n").unwrap();
+                let head = oid(&workplace, "HEAD");
+                git(
+                    &workplace,
+                    [
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("160000,{head},{DONE}/vendor"),
+                    ],
+                );
+                "tracked by the outer repository"
+            }
+            "old-path-only" => {
+                let ignore = workplace.join(".gitignore");
+                let original = std::fs::read_to_string(&ignore).unwrap();
+                std::fs::write(ignore, format!("{original}\n/{DONE}/vendor/\n")).unwrap();
+                "would leave nested Git repository"
+            }
+            _ => "must be ignored as an entire directory",
+        };
+        let index = git(&workplace, ["ls-files", "--stage", "-z"]).stdout;
+        for dry in [true, false] {
+            let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
+            if dry {
+                args.push("--dry-run");
+            }
+            rejected(&workplace, &gh, &args, reason);
+            assert!(nested.is_dir());
+            assert!(!workplace.join(DESTINATION).exists());
+            assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+            assert_eq!(
+                std::fs::read(nested.join("local-content")).unwrap(),
+                b"opaque payload"
+            );
+        }
+    }
+}
+
+#[test]
+fn archive_no_longer_accepts_the_historical_record_flag() {
+    let (fixture, merged) = managed_fixture(false);
+    let gh = fake_gh(&fixture, &merged, false);
+    rejected(
+        &fixture.shared,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--dry-run",
+            "--historical-record",
+            "logs/history.log",
+        ],
+        "unexpected argument '--historical-record'",
+    );
+}
+
+#[test]
+fn archive_ignores_broken_or_obsolete_legacy_records_when_current_pr_is_closed() {
+    for legacy in [
+        b"\0not-json obsolete configuration\xff\n".as_slice(),
+        b"{\"task_id\":\"another-task\",\"branch\":\"codex/unrelated\",\"tree\":\"broken\"}\n".as_slice(),
+        b"{\"schema_version\":999,\"old_branch\":\"deleted/historical\",\"former_directory\":\"/missing/old/task\"}\n".as_slice(),
+    ] {
+        let (fixture, merged) = managed_fixture(false);
+        let gh = fake_gh(&fixture, &merged, false);
+        let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+        let record = ".workspace-mgr-legacy.json";
+        std::fs::write(workplace.join(DONE).join(record), legacy).unwrap();
+        let history = format!("Historic old cwd: /removed/location/{DONE}\n");
+        std::fs::write(workplace.join(DONE).join("former-run.log"), &history).unwrap();
+        let preview = json(&archive(&workplace, &gh,
+            &["archive", DONE, "--manifest", manifest.to_str().unwrap(), "--dry-run"]));
+        assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+        let report = json(&archive(&workplace, &gh,
+            &["archive", DONE, "--manifest", manifest.to_str().unwrap()]));
+        assert_eq!(report["status"], "archived");
+        assert_eq!(std::fs::read(workplace.join(DESTINATION).join(record)).unwrap(), legacy);
+        assert_eq!(std::fs::read_to_string(workplace.join(DESTINATION).join("former-run.log")).unwrap(), history);
+    }
+}
+
+#[test]
+fn archive_does_not_let_same_named_fork_prs_mask_current_repository_pr_state() {
+    let (fixture, merged) = managed_fixture(false);
+    let head = oid(&fixture.remote, "refs/heads/codex/completed");
+    let own_open = pr("OPEN", 1, "codex/completed", "", &head);
+    let mut fork_open = pr("OPEN", 2, "codex/completed", "", &head);
+    fork_open["isCrossRepository"] = value!(true);
+    let own_closed = pr("CLOSED", 3, "codex/completed", "", &head);
+    let gh = write_gh(
+        &fixture,
+        &BTreeMap::from([(
+            "codex/completed",
+            vec![own_open, fork_open, own_closed.clone()],
+        )]),
+    );
+    rejected(
+        &fixture.shared,
+        &gh,
+        &["archive", DONE, "--dry-run"],
+        "refuses active or unverified task",
+    );
+    let mut fork_closed = pr("CLOSED", 4, "codex/completed", "", &head);
+    fork_closed["isCrossRepository"] = value!(true);
+    let gh = write_gh(
+        &fixture,
+        &BTreeMap::from([("codex/completed", vec![own_closed, fork_closed])]),
+    );
+    let report = json(&archive(
+        &fixture.shared,
+        &gh,
+        &["archive", DONE, "--dry-run"],
+    ));
+    assert_eq!(report["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(report["tasks"][0]["pull_request"]["number"], 3);
+    assert_eq!(oid(&fixture.remote, "refs/heads/main"), merged);
+}
+
+#[test]
+fn archive_accepts_closed_task_prs_targeting_a_former_or_different_base_branch() {
+    let (fixture, _) = managed_fixture(false);
+    let head = oid(&fixture.remote, "refs/heads/codex/completed");
+    let mut closed = pr("CLOSED", 8, "codex/completed", "", &head);
+    closed["baseRefName"] = value!("former-default-branch");
+    let gh = write_gh(
+        &fixture,
+        &BTreeMap::from([("codex/completed", vec![closed])]),
+    );
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let report = json(&archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    ));
+    assert_eq!(report["status"], "archived");
+    assert_eq!(report["tasks"][0]["pull_request"]["number"], 8);
+    assert_eq!(report["tasks"][0]["pull_request"]["state"], "CLOSED");
+    assert!(workplace.join(DESTINATION).join("result.md").is_file());
+}
+
+#[test]
+fn archive_rejects_invalid_unhydrated_dvc_hashes_and_incomplete_directory_manifests() {
+    for (metadata, reason) in [
+        (
+            "outs:\n- path: data.bin\n  hash: md5\n  size: 4\n  cloud:\n    workspace-mgr:\n      version_id: original-v1\n",
+            "supported content hash",
+        ),
+        (
+            "outs:\n- path: data.bin\n  hash: md5\n  md5: 00000000000000000000000000000000.dir\n  size: 4\n",
+            "directory metadata is incomplete",
+        ),
+    ] {
+        let (fixture, merged) = managed_fixture(false);
+        let gh = fake_gh(&fixture, &merged, false);
+        let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+        let pointer = workplace.join(DONE).join("data.bin.dvc");
+        std::fs::write(&pointer, metadata).unwrap();
+        let index = git(&workplace, ["ls-files", "--stage", "-z"]).stdout;
+        assert!(!workplace.join(DONE).join("data.bin").exists());
+        for dry in [true, false] {
+            let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
+            if dry {
+                args.push("--dry-run");
+            }
+            rejected(&workplace, &gh, &args, reason);
+            assert!(workplace.join(DONE).is_dir());
+            assert!(!workplace.join(DESTINATION).exists());
+            assert_eq!(std::fs::read_to_string(&pointer).unwrap(), metadata);
+            assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+        }
+    }
 }

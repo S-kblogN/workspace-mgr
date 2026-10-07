@@ -77,8 +77,8 @@ fn attempt_path(repo: &GitRepo, source: &str, destination: &str) -> Result<PathB
         .join(format!("{digest}.json")))
 }
 
-/// Must be durable before the first local rename. The relocation plan has been
-/// preflighted while every original nested Git reference is still valid.
+/// Must be durable before the first local rename. New attempts carry opaque
+/// relocation plans; old reference snapshots remain readable for cancellation.
 pub fn record_attempt(
     repo: &GitRepo,
     owner: &ResolvedTask,
@@ -179,6 +179,35 @@ pub fn moved(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
     let mut attempt: Attempt = read(&path)?;
     attempt.status = "moved".to_owned();
     save(&path, &attempt)
+}
+
+/// Bind an unpublished migration to its local attempt when one was recorded.
+/// Older receipts without an undo journal still use current manifest and
+/// exact-version transport validation, but cannot promise lossless cancel.
+pub(crate) fn validate_migration(repo: &GitRepo, receipt: &Value) -> Result<()> {
+    let source = receipt["source"].as_str().ok_or_else(receipt_edit_error)?;
+    let destination = receipt["destination"]
+        .as_str()
+        .ok_or_else(receipt_edit_error)?;
+    let path = attempt_path(repo, source, destination)?;
+    let attempt: Attempt = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|error| Error::message(format!("invalid archive attempt: {error}")))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(Error::Io { path, source }),
+    };
+    if attempt.schema_version != 1
+        || attempt.root != repo.root
+        || attempt.source != source
+        || attempt.destination != destination
+        || !matches!(attempt.status.as_str(), "prepared" | "moved" | "published")
+    {
+        return Err(Error::message(
+            "archive migration does not match an active attempt",
+        ));
+    }
+    validate_current_receipt(repo, &attempt, receipt)?;
+    validate_metadata(repo, &resolved_under(&repo.root, destination), &attempt)
 }
 
 /// Used after an in-process apply rollback has already restored the directory.

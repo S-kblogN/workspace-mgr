@@ -458,7 +458,7 @@ workspace-mgr publish -m "Rename the task for its current topic"
 
 ## `workspace-mgr task upgrade`
 
-Upgrade current task configuration and backfill verified archive review
+Upgrade current task configuration and backfill verified review
 provenance without moving task contents or writing a remote.
 
 ```text
@@ -495,15 +495,11 @@ manifest validation remains strict; unknown current fields or schemas are not
 guessed or rewritten.
 
 Publish the upgraded manifest through an infrastructure task whose declared
-scope covers that exact file. Review and merge this publication, then refresh
-before archiving. Repeating upgrade with the same verified inputs is
-idempotent. It writes no S3 data or Git remote. A saved checkpoint is provenance,
-not a boolean assertion that the task is still complete: later archive checks
-live PR state and retained refs and verifies only directory changes after the
-checkpoint against the fetched base. Missing or ambiguous identity, path or
-review evidence is refused. A current task without a checkpoint can still
-bootstrap this evidence during archive; upgrade makes that evidence durable
-and reviewable before organization.
+scope covers that exact file. Repeating upgrade with the same verified inputs
+is idempotent. It writes no S3 data or Git remote. These review-provenance
+checks belong to `task upgrade`; archive does not require upgrade or use its
+saved checkpoint to decide eligibility. A supported current manifest and its
+corresponding closed PR suffice for archive's task-state verification.
 
 ## `workspace-mgr archive`
 
@@ -513,35 +509,32 @@ repository-infrastructure task.
 ```text
 workspace-mgr archive [<task-path> ...]
   [--layout <template>] [--repo <path>] [--manifest <path>] [--dry-run]
-  [--historical-record <exact-repository-relative-file> ...]
 workspace-mgr archive [<source-or-destination> ...]
   --cancel --manifest <owning-infrastructure-manifest> [--dry-run]
 ```
 
 With no paths, inspect top-level deliverable directories and skip tasks without
-a verified merged pull request. An explicitly named active or unverified task
-is refused. Verification uses the current task configuration, saved review
-provenance, Git directory tree IDs and commit ancestry, and GitHub review
-associations. Historical task configuration blobs are never read or parsed;
-their bytes are opaque members of the verified trees. Only the current known
-path and a saved checkpoint path are inspected. Actual PR head names and saved
-review branches provide branch history; old configurations cannot supply it.
-Without a checkpoint, relevant directory changes must each have matching
-merged review evidence. For a verified legacy adoption, the introducing
-adoption-record commit is the review boundary: it must have a merged adoption
-PR, and subsequent changes still need review, while earlier direct imports
-do not need retroactive PRs. With a published schema 4 checkpoint, archive binds
-its original tree and immutable review facts again and checks subsequent
-directory changes through the fetched base. It still reads live PR states and
-checks local and remote refs. Retained branch tips may lag behind a reviewed
-head but must be its ancestors. Open reviews, new or divergent commits,
-unknown path continuity, and ambiguous evidence remain ineligible;
-`gh` must be installed and able to read the repository. Active task directories
-stay at the top level, and merge or turn-end synchronization never runs archive
-automatically.
+a corresponding closed pull request. An explicitly named task whose PR is
+open, missing, or unverifiable is refused. Archive reads only the
+current task configuration for task identity, branch, and any saved associated
+review branches, then verifies corresponding PR state in the
+configured repository through `gh`. The PR need not target today's configured
+base branch. An associated open PR blocks archive, including when the task's
+current branch has changed.
+Both merged PRs and PRs closed without merging qualify; an open PR does not.
+Current configuration remains strictly validated.
 
-Verification requires complete Git history. A shallow checkout is refused;
-fetch its missing history with `git fetch --unshallow` before retrying.
+Archive does not inspect historical configuration, directory-tree history,
+commit-to-PR associations, or historical checkpoint proofs. Saved review
+metadata supplies branch lookup hints only; its historical tree and ancestry
+checks are not replayed. If there is no matching PR, a pre-0.7 adoption record
+can provide a current branch hint; malformed or unrelated records add no
+extra refusal. Archive needs a verifiable closed PR and no associated open PR.
+It does not require earlier commits to have reviewed PRs, full Git history,
+or retained branch tips to equal or descend from reviewed heads. Changes to
+ordinary task contents do not determine eligibility. Active task directories
+stay at the top level,
+and merge or turn-end synchronization never runs archive automatically.
 
 `--layout` uses `{year}` and `{month}` from each task directory's creation
 timestamp. The default is `{year}/{month}`; `{year}` and `{year}{month}` also
@@ -550,94 +543,44 @@ hidden repository-control directories. The task directory's basename, retained
 contents, immutable ID, and target branch are preserved.
 
 Run `--dry-run` from the shared checkout or an infrastructure task to inspect
-`tasks`, `skipped`, and `required_scopes`. It fetches Git evidence and reads
+`tasks`, `skipped`, and `required_scopes`. It reads current PR state and
 versioned S3 history but changes no repository content or remote. Applying
 archive requires an infrastructure task with both source and destination paths
 declared. The command moves complete local directories, updates manifest paths,
 and writes `.workspace-mgr-archive.json` migration receipts. It writes neither
-Git nor S3 remotes. It refuses destination collisions, source state that differs
-from the shared branch, staged or untracked overlays, changed materialized S3
-payloads, and materialized local-only content that must first be preserved or
-returned to tracked storage.
+Git nor S3 remotes. It refuses destination collisions, invalid current task
+metadata, inconsistent managed-storage pointers or hashes, and unavailable
+referenced S3 generations. It validates supported pointer hashes and complete
+directory metadata, verifies hydrated payload hashes, and checks exact S3
+versions for unhydrated payloads. Ordinary tracked, staged, untracked,
+ignored, and local-only contents move with the directory; unpublished content
+alone does not prevent archive. The shared Git index is left unchanged.
 
-Preflight scans ordinary UTF-8 text, including ignored scripts and README files,
-for literal absolute and repository-relative source paths. It also checks
-cross-task references throughout the repository against the entire proposed
-batch, including stationary tasks and already grouped task directories. It
-reports files and lines (up to 200 detailed references per scan, with a
-truncation notice) and refuses preview and apply when a dependency would break
-or its anchor cannot be verified. For example, a script using
-`Path(__file__).resolve().parents[1] / "<other-task>" / "input.tsv"` must be
-repaired if the tasks will reside in different months; moving only one end of
-the dependency also requires repair. No ordinary content is automatically
-rewritten. Binary payloads, verified Git controls, workspace-mgr metadata and
-storage pointers are excluded. Recognized outward dynamic path expressions
-are refused when they cannot be resolved; this static check does not execute
-arbitrary language expressions, so also run the reproduction commands.
-Links from stationary tasks to moved data are checked without following the
-repository traversal through symlinks. Known source files whose encoding
-cannot be checked refuse explicitly instead of being treated as binary data.
-Unsupported anchor reassignment or working-directory changes cannot establish
-a preserved dependency.
+Archive preserves ordinary local contents byte for byte, including scripts,
+README commands, historical logs, ignored caches, symlinks, and Python
+environments.
+It does not scan runtime paths or cross-task dependencies, run reproduction
+commands, rebuild environments, or rewrite their references. A script that
+depends on the former directory may need separate maintenance after moving;
+that does not prevent archive.
 
-Historical logs and previous execution reports can keep the paths they record.
-Inspect each exact file and confirm it as inert historical evidence with the
-repeatable `--historical-record <repository-relative-file>` option, in both
-preview and apply:
+Every nested Git repository must be ignored by the outer repository's shared
+ignore rules and contain no outer-tracked files or gitlinks. Use a repository
+or task-local `.gitignore` rule covering the whole nested directory, for example
+`vendor/tool/`, and ensure the rule still covers its archived destination.
+Local `.git/info/exclude` or a global ignore file is insufficient because
+another clone must enforce the same boundary. Archive refuses a nested
+repository that violates this rule before moving. Ignored nested repositories
+move unchanged: Git pointer files, registrations and external administrative
+files are neither parsed for relocation nor repaired. This may leave their
+old references unusable. Zero-byte `.git` cache markers are ordinary content
+and do not establish a nested repository.
 
-```bash
-workspace-mgr archive <task-path> --dry-run \
-  --historical-record <task-path>/logs/previous-run.log
-workspace-mgr archive <task-path> --manifest "$task_manifest" \
-  --historical-record <task-path>/logs/previous-run.log
-```
-
-The confirmation covers that file's current bytes, not a directory, glob, or
-extension. `historical_records` in the preview and migration receipt records
-its path, SHA-256 digest, mode, and historical role. Files are retained without
-rewriting; content or permission changes during preflight invalidate the
-confirmation. Historical records elsewhere in the repository can also be
-confirmed without editing them. Scripts, executable files, shebangs, symlinks,
-Git hooks and repository control files cannot be confirmed this way. Recognized
-commands that execute or source an acknowledged record still refuse. Use this
-option only for records of previous events, never to suppress a live input,
-configuration, or command dependency.
-Reading an acknowledged log or JSON report as historical data is allowed;
-executing its contents requires resolving its operational role first.
-
-Prefer deriving inputs from the script's directory, for example
-`Path(__file__).resolve().parent / "data"` in Python, or
-`cd -- "$(dirname -- "$0")"` in a shell script. README commands can run from
-the task directory and use `./run.sh` and `data/input.tsv`. Publish tracked
-repairs through review and refresh before retrying; repair ignored local
-scripts directly. Do not replace a working source path with a future absolute
-destination before the move.
-
-Zero-byte `.git` files in ordinary caches are inert markers and are retained.
-Nonempty malformed Git pointers still refuse. Absolute nested Git controls
-are repaired only when the repository, administrative directory, and all
-registered linked worktrees are inside the task. External Git administration
-or checkouts refuse before moving and name the offending path; archive does
-not expand its declared scopes or edit external repositories. Preserve all
-refs and local content while making the nested checkout independent inside
-the task, or consolidate all linked checkouts and their administration inside
-it, then retry preview.
-
-Two genuine relocation limits need preparation:
-
-- A Python environment with launchers or activation scripts bound to its old
-  absolute directory cannot safely move. Preserve its lockfile/specification
-  and any local content, relocate the old environment outside the task for
-  safekeeping, rebuild an environment outside the archive from that
-  specification, and repair task commands to use it before retrying. Archive
-  and cancel never delete or rebuild it for you.
-- A stale Git worktree registration cannot be verified. Inspect
-  `git -C <nested-primary> worktree list --porcelain`, repair live registrations
-  with `git -C <nested-primary> worktree repair <actual-checkout>`, and rerun
-  preview. For intentionally retired checkouts, inspect
-  `git -C <nested-primary> worktree prune --dry-run` and prune registrations
-  only after confirming and preserving their local content. Live external
-  worktrees still need the layout change described above.
+The rule need not already be tracked: a new task-local `.gitignore` can travel
+with the task and be carried by its publication. `plan` and `publish` enforce
+the same nested-repository boundary before evaluating storage placement in
+the selected directory scopes; they also verify that the publication carries
+its ignore rules.
 
 The normal `plan` and `publish` flow handles the migration. Publication copies
 every retained data version and delete marker under the source task prefix,
@@ -706,14 +649,16 @@ ordering. Unknown endpoints keep conditional publication and fail safely if
 their provider rejects it.
 
 `--cancel --dry-run` previews a journaled local attempt. Apply restores its
-source directory, original manifest, receipt, storage pointer bytes and permissions,
-and verified nested Git control references. All local payloads, including
+source directory, original manifest, receipt, storage pointer bytes and permissions.
+All local payloads, including nested Git controls,
 ignored and hydrated content and files added after moving, travel with the
 directory. Cancellation changes neither the shared Git index nor another
 task's files. A failed publication's generated local tree and retirement queue
 are reversed only for the selected archive paths; other scoped work is retained.
 Independent metadata/ref edits and destination collisions refuse cancellation
 before movement. Repeating cancel is safe, including after interruption.
+Existing attempt journals remain readable, including saved relocation
+metadata from older attempts; new attempts do not rewrite nested Git controls.
 
 Cancellation verifies that all original source versions and markers remain
 intact, withdraws only this attempt's exact registry versions, deletes its

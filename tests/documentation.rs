@@ -94,7 +94,8 @@ fn user_documentation_covers_the_complete_public_model() {
     }
     assert!(guide.contains("itself create a remote branch or call a hosting provider"));
     assert!(guide.contains("it does not create or update a pull"));
-    assert!(guide.contains("can read GitHub merge evidence through `gh`"));
+    assert!(guide.contains("`archive` reads the task's corresponding PR state through `gh`"));
+    assert!(guide.contains("`refresh` reads merge evidence for branch cleanup"));
     for responsibility in [
         "immediately follows creation",
         "create exactly one",
@@ -248,6 +249,41 @@ fn user_documentation_covers_the_complete_public_model() {
         );
     }
     let normalized_commands = commands.split_whitespace().collect::<Vec<_>>().join(" ");
+    let archive_reference = commands
+        .split("## `workspace-mgr archive`")
+        .nth(1)
+        .and_then(|section| section.split("\n## ").next())
+        .expect("archive command reference");
+    let normalized_archive = archive_reference
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for fact in [
+        "Archive needs a verifiable closed PR and no associated open PR",
+        "Both merged PRs and PRs closed without merging qualify",
+        "The PR need not target today's configured base branch",
+        "Archive does not inspect historical configuration, directory-tree history",
+        "It does not scan runtime paths or cross-task dependencies",
+        "Ordinary tracked, staged, untracked, ignored, and local-only contents move with the directory",
+        "The rule need not already be tracked",
+        "Local `.git/info/exclude` or a global ignore file is insufficient",
+        "new attempts do not rewrite nested Git controls",
+    ] {
+        assert!(
+            normalized_archive.contains(fact),
+            "archive reference omits current scope fact {fact:?}"
+        );
+    }
+    for (name, document) in [
+        ("README.md", readme),
+        ("guide", guide),
+        ("commands", commands),
+    ] {
+        assert!(
+            !document.contains("--historical-record"),
+            "{name} still documents the removed historical-record option"
+        );
+    }
     for fact in [
         "`task rename`, `plan`, and `publish`",
         "this command changed nothing",

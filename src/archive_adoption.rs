@@ -100,7 +100,6 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
             paths: vec![path.clone()],
             layout: "{year}/{month}".to_owned(),
             dry_run: options.dry_run,
-            historical_records: Vec::new(),
         },
     )?;
     if let Some(owner) = &owner {
@@ -207,7 +206,7 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
         legacy_branch,
         pull_request: review,
         required_scopes: vec![path],
-        review_required_before_archive: true,
+        review_required_before_archive: false,
         remote_writes: false,
     })
 }
