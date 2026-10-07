@@ -131,7 +131,7 @@ where
         .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env_remove(CLOUD_USAGE_THRESHOLD_ENV)
         .env_remove(CLI_VERSION_ENV);
-    inject_test_storage_engine(&mut command);
+    isolate_storage_environment(&mut command);
     command.envs(env.iter().copied());
     command
 }
@@ -162,6 +162,7 @@ pub fn binary_command() -> Command {
         .env("WORKSPACE_MGR_UPDATE_CHECK_DISABLE", "1")
         .env_remove(CLOUD_USAGE_THRESHOLD_ENV)
         .env_remove(CLI_VERSION_ENV);
+    isolate_storage_environment(&mut command);
     command
 }
 
@@ -203,11 +204,32 @@ where
         .expect("run workspace-mgr")
 }
 
-fn inject_test_storage_engine(_command: &mut Command) {
-    #[cfg(feature = "test-storage")]
-    if let Ok(program) = which::which("dvc") {
-        _command.env("WORKSPACE_MGR_STORAGE_DVC", program);
+fn isolate_storage_environment(command: &mut Command) {
+    for name in [
+        "WORKSPACE_MGR_STORAGE_DVC",
+        "WORKSPACE_MGR_STORAGE_PYTHON",
+        "WORKSPACE_MGR_TEST_STORAGE_HOOK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+    ] {
+        command.env_remove(name);
     }
+    command
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_CONFIG_FILE", "/__workspace_mgr_test_no_credentials__")
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "/__workspace_mgr_test_no_credentials__",
+        );
 }
 
 /// Records something in the task's own documentation, which publication

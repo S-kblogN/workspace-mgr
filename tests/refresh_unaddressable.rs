@@ -153,10 +153,6 @@ fn revision(repo: &Path, name: &str) -> String {
 
 #[test]
 fn refresh_skips_one_unaddressable_boundary_and_hydrates_everything_else() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     let shared = &branch.fixture.shared;
     let task = branch.task();
@@ -211,10 +207,6 @@ fn refresh_skips_one_unaddressable_boundary_and_hydrates_everything_else() {
 
 #[test]
 fn refresh_dry_run_reports_the_condition_instead_of_a_false_green() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     let shared = &branch.fixture.shared;
     let task = branch.task();
@@ -245,10 +237,6 @@ fn refresh_dry_run_reports_the_condition_instead_of_a_false_green() {
 
 #[test]
 fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     let shared = &branch.fixture.shared;
     let boundary = unaddressable_boundary();
@@ -384,10 +372,6 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
 
 #[test]
 fn refresh_refuses_to_leave_a_payload_under_metadata_that_no_longer_describes_it() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     // The crafting checkout still holds the payload it published.
     let publisher = branch.fixture.root.join("publisher");
@@ -449,10 +433,6 @@ fn refresh_refuses_to_leave_a_payload_under_metadata_that_no_longer_describes_it
 
 #[test]
 fn a_payload_refresh_cannot_address_is_kept_only_when_it_already_matches() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     let shared = &branch.fixture.shared;
     let task = branch.task();
@@ -494,10 +474,6 @@ fn a_payload_refresh_cannot_address_is_kept_only_when_it_already_matches() {
 
 #[test]
 fn a_failed_move_restores_a_boundary_that_has_no_payload_to_put_back() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     let task = branch.task();
     let boundary = unaddressable_boundary();
@@ -536,10 +512,6 @@ fn a_failed_move_restores_a_boundary_that_has_no_payload_to_put_back() {
 /// changes.
 #[test]
 fn an_incoming_requirement_is_refused_before_unaddressable_metadata_is_inspected() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let branch = shared_branch_carrying_unaddressable_metadata();
     let fixture = &branch.fixture;
     let shared = &fixture.shared;

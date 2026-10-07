@@ -373,178 +373,42 @@ fn infrastructure_plan_and_publish_require_main_refresh_before_replacing_upstrea
 }
 
 #[test]
-fn setup_dry_run_reports_private_runtime_without_installing_it() {
+fn setup_verifies_native_storage_without_python_or_directory_changes() {
     let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
-    let report = workspace(
-        &fixture.root,
-        [
-            "setup",
-            "--runtime-dir",
-            runtime.to_str().unwrap(),
-            "--dry-run",
-        ],
-    );
-    assert_eq!(json(&report)["status"], "dry_run");
-    assert_eq!(json(&report)["storage_runtime"], "3.67.1");
-    assert!(!runtime.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn setup_installs_and_reuses_a_verified_private_runtime() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
-    let bootstrap = fixture.root.join("bootstrap-python");
-    std::fs::write(
-        &bootstrap,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ]; then\n  mkdir -p \"$3/bin\"\n  cp \"$0\" \"$3/bin/python\"\n  cp \"$0\" \"$3/bin/dvc\"\n  printf '#!%s/bin/python\\n' \"$3\" > \"$3/bin/generated-launcher\"\n  exit 0\nfi\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"pip\" ]; then\n  exit 0\nfi\nif [ \"${1:-}\" = \"-c\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nexit 23\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&bootstrap).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&bootstrap, permissions).unwrap();
-
-    let install = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
-        .output()
-        .unwrap();
-    assert!(
-        install.status.success(),
-        "setup failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr)
-    );
-    assert_eq!(json(&install)["status"], "installed");
-    assert!(runtime.join("bin/dvc").is_file());
-    assert!(runtime.join("bin/python").is_file());
-    assert_eq!(
-        std::fs::read_to_string(runtime.join(".workspace-mgr-runtime")).unwrap(),
-        "workspace-mgr private runtime v1\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(runtime.join("bin/generated-launcher")).unwrap(),
-        format!("#!{}/bin/python\n", runtime.display())
-    );
-
-    let repeated = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
-        .output()
-        .unwrap();
-    assert!(
-        repeated.status.success(),
-        "repeat setup failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&repeated.stdout),
-        String::from_utf8_lossy(&repeated.stderr)
-    );
-    assert_eq!(json(&repeated)["status"], "no_changes");
-}
-
-#[cfg(unix)]
-#[test]
-fn failed_runtime_install_restores_the_previous_directory() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
+    let runtime = fixture.root.join("former-runtime");
     std::fs::create_dir(&runtime).unwrap();
-    std::fs::write(runtime.join("sentinel"), "previous runtime\n").unwrap();
-    std::fs::write(
-        runtime.join(".workspace-mgr-runtime"),
-        "workspace-mgr private runtime v1\n",
-    )
-    .unwrap();
-    let bootstrap = fixture.root.join("failing-bootstrap-python");
-    std::fs::write(
-        &bootstrap,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ]; then\n  mkdir -p \"$3/bin\"\n  cp \"$0\" \"$3/bin/python\"\n  exit 0\nfi\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"pip\" ]; then\n  exit 23\nfi\nexit 23\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&bootstrap).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&bootstrap, permissions).unwrap();
-
-    let failed = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
-        .output()
-        .unwrap();
-    assert_eq!(failed.status.code(), Some(2));
-    assert_eq!(
-        std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
-        "previous runtime\n"
-    );
-    assert_eq!(
-        std::fs::read_dir(runtime).unwrap().count(),
-        2,
-        "partial replacement files must be removed"
-    );
-    assert!(std::fs::read_dir(&fixture.root).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".workspace-mgr-runtime-backup-")
-    }));
-}
-
-#[test]
-fn setup_refuses_to_replace_an_unmanaged_directory() {
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("ordinary-data");
-    std::fs::create_dir(&runtime).unwrap();
-    std::fs::write(runtime.join("sentinel"), "must survive\n").unwrap();
-
-    let rejected = workspace_unchecked(
-        &fixture.root,
-        [
-            "setup",
-            "--runtime-dir",
-            runtime.to_str().unwrap(),
-            "--dry-run",
-        ],
-    );
-    assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not owned"));
-    assert_eq!(
-        std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
-        "must survive\n"
-    );
-}
-
-#[test]
-fn concurrent_runtime_install_is_rejected_before_provisioning() {
-    use fs2::FileExt;
-
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
-    let lock_path = fixture.root.join(".workspace-mgr-setup.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)
-        .unwrap();
-    lock.try_lock_exclusive().unwrap();
-
-    let blocked = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .output()
-        .unwrap();
-    assert_eq!(blocked.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("setup operation is running"));
-    assert!(!runtime.exists());
+    std::fs::write(runtime.join("sentinel"), "preserve\n").unwrap();
+    for dry_run in [true, false] {
+        let mut args = vec!["setup", "--runtime-dir", runtime.to_str().unwrap()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = binary_command()
+            .args(args)
+            .current_dir(&fixture.root)
+            .env("WORKSPACE_MGR_FORMAT", "json")
+            .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", "/does-not-exist/python")
+            .env("WORKSPACE_MGR_STORAGE_DVC", "/does-not-exist/dvc")
+            .env("WORKSPACE_MGR_STORAGE_PYTHON", "/does-not-exist/python")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = json(&output);
+        assert_eq!(
+            report["storage_runtime"],
+            format!("native Rust {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(report["runtime_dir"], "");
+        assert_eq!(
+            std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 1);
+    }
 }
 
 #[test]
@@ -903,10 +767,6 @@ fn tracked_configuration_rejects_credentials_and_policy_keys() {
 
 #[test]
 fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     fixture.clone_shared();
     let dvc_dir = fixture.shared.join(".dvc");

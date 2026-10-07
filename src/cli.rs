@@ -30,7 +30,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Provision the private execution runtime used by managed storage.
+    /// Verify the native storage engine and Git installation.
     Setup(SetupArgs),
 
     /// Initialize or reconcile repository facts and managed scaffolding.
@@ -75,7 +75,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct SetupArgs {
-    /// Override the private runtime directory.
+    /// Legacy compatibility option; native storage needs no runtime directory.
     #[arg(long)]
     pub runtime_dir: Option<PathBuf>,
 

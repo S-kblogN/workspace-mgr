@@ -4144,11 +4144,6 @@ mod tests {
 
     #[test]
     fn storage_engine_status_feeds_pending_uploads() {
-        let runtime = dvc::dvc_program();
-        if !Path::new(&runtime).is_file() {
-            eprintln!("skipping: managed storage runtime is unavailable");
-            return;
-        }
         let fixture = Fixture::new();
         fixture.write("README.md", b"base\n");
         dvc::execute_engine(&fixture.repo.root, ["init", "-q"]).unwrap();

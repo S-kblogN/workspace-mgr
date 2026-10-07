@@ -260,10 +260,6 @@ fn untrack_complete_git_directory_excludes_existing_and_future_descendants() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "local-s3");
     let path = format!("{task_id}/data.bin");

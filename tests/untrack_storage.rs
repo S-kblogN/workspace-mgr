@@ -296,9 +296,6 @@ fn untrack_rejects_symlink_ignore_files_and_symlink_payloads() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn s3_untrack_keeps_payload_and_retrack_restores_pointer() {
-    if which::which("dvc").is_err() {
-        return;
-    }
     let (_fixture, task) = fixture_with_storage(true);
     fs::write(task.join("cloud.bin"), b"cloud payload").unwrap();
     let payload = path("cloud.bin");
@@ -345,9 +342,6 @@ fn s3_untrack_keeps_payload_and_retrack_restores_pointer() {
 #[test]
 fn failed_s3_untrack_rolls_back_all_metadata_and_keeps_payload() {
     use std::os::unix::fs::PermissionsExt;
-    if which::which("dvc").is_err() {
-        return;
-    }
     let (fixture, task) = fixture_with_storage(true);
     fs::write(task.join("cloud.bin"), b"cloud payload").unwrap();
     let payload = path("cloud.bin");

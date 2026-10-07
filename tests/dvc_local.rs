@@ -1,13 +1,10 @@
 mod common;
 
 use common::*;
+use md5::Digest;
 
 #[test]
 fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -126,10 +123,6 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
 #[cfg(unix)]
 #[test]
 fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -234,10 +227,6 @@ fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
 #[cfg(unix)]
 #[test]
 fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -267,7 +256,27 @@ fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
     std::fs::write(task.join("top\\level.bin"), vec![7_u8; 10_485_761]).unwrap();
     // Earlier releases let automatic placement create this metadata before
     // publication failed, leaving every later transaction broken.
-    command(&task, "dvc", ["add", "--quiet", "--", "top\\level.bin"]);
+    let payload = std::fs::read(task.join("top\\level.bin")).unwrap();
+    let digest = md5::Md5::digest(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::fs::write(
+        task.join("top\\level.bin.dvc"),
+        format!(
+            "outs:\n- md5: {digest}\n  size: {}\n  hash: md5\n  path: top\\level.bin\n",
+            payload.len()
+        ),
+    )
+    .unwrap();
+    std::fs::write(task.join(".gitignore"), "/top\\\\level.bin\n").unwrap();
+    let cache = fixture
+        .shared
+        .join(".dvc/cache/files/md5")
+        .join(&digest[..2])
+        .join(&digest[2..]);
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(cache, payload).unwrap();
     assert!(task.join("top\\level.bin.dvc").is_file());
     let stale_pointer = format!("{top_level}.dvc");
 
@@ -311,10 +320,6 @@ fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
 
 #[test]
 fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
@@ -499,10 +504,6 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
 
 #[test]
 fn a_published_git_file_can_move_to_s3_without_remaining_in_git() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
@@ -574,10 +575,6 @@ fn a_published_git_file_can_move_to_s3_without_remaining_in_git() {
 fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
     use std::os::unix::fs::PermissionsExt;
 
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -652,10 +649,6 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
 fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
     use std::os::unix::fs::PermissionsExt;
 
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -709,10 +702,6 @@ fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
 
 #[test]
 fn publish_refuses_a_missing_dirty_dvc_output() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
@@ -762,22 +751,7 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
 #[cfg(unix)]
 #[test]
 fn object_version_adapter_and_engine_config_are_internal() {
-    use std::os::unix::fs::PermissionsExt;
-
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
-    let fake_python = fixture.root.join("fake-python");
-    std::fs::write(
-        &fake_python,
-        "#!/bin/sh\ncase \"$2\" in\n  *'print(dvc.__version__)'*) printf '%s\\n' '3.67.1' ;;\n  *) printf '%s\\n' '{\"mode\":\"version-aware\",\"remote\":\"fake\",\"checked_objects\":[]}' ;;\nesac\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&fake_python).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_python, permissions).unwrap();
     let output = binary_command()
         .args([
             "init",
@@ -788,8 +762,6 @@ fn object_version_adapter_and_engine_config_are_internal() {
         ])
         .current_dir(&fixture.seed)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_STORAGE_DVC", which::which("dvc").unwrap())
-        .env("WORKSPACE_MGR_STORAGE_PYTHON", &fake_python)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -806,10 +778,6 @@ fn object_version_adapter_and_engine_config_are_internal() {
 
 #[test]
 fn content_routed_to_s3_still_needs_a_task_record() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -884,10 +852,6 @@ fn content_routed_to_s3_still_needs_a_task_record() {
 
 #[test]
 fn bulk_publication_counts_an_automatic_boundary_the_same_at_plan_and_publish() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(

@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = Path(__file__).parents[2] / "assets" / "dvc_version_verify.py"
+SCRIPT = Path(__file__).parents[2] / "tests" / "oracles" / "dvc_version_verify.py"
 SPEC = importlib.util.spec_from_file_location("dvc_version_verify", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 verifier = importlib.util.module_from_spec(SPEC)

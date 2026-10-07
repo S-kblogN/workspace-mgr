@@ -29,7 +29,7 @@ from unittest import mock
 HAS_STORAGE_RUNTIME = all(
     importlib.util.find_spec(name) is not None for name in ("dvc", "s3fs", "yaml")
 )
-SCRIPT = Path(__file__).resolve().parents[2] / "assets" / "dvc_version_verify.py"
+SCRIPT = Path(__file__).resolve().parents[2] / "tests" / "oracles" / "dvc_version_verify.py"
 
 
 class ResponseBody:

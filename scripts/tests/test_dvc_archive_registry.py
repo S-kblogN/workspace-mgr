@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 
 def load_asset(name):
-    path = Path(__file__).parents[2] / "assets" / f"{name}.py"
+    path = Path(__file__).parents[2] / "tests" / "oracles" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

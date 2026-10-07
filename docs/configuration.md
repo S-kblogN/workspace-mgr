@@ -45,6 +45,16 @@ fragments are rejected so tracked locations cannot carry credentials or signed
 URLs. Authentication belongs in ignored local configuration or
 platform-standard identity and environment mechanisms.
 
+The native engine reads AWS access/secret keys and optional session tokens from
+the environment, the selected shared credentials/profile files, or ignored
+local remote settings. It also accepts a profile `credential_process`, invoking
+its argument vector directly without a shell. Role, SSO, and web identity
+profiles must supply resolved temporary environment credentials or a credential
+process; unsupported profiles fail before any S3 request.
+Set the bucket's region through `AWS_REGION`, `AWS_DEFAULT_REGION`, or the
+selected profile. B2 regions can also be inferred from their service endpoint.
+The native transport does not replay signed requests across provider redirects.
+
 `workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes these
 public facts and deterministically generates the private storage-engine
 configuration. Every S3 operation rejects drift in that derived file. Users and

@@ -19,7 +19,7 @@ agents do not configure or invoke private execution engines directly.
 
 ## Repository lifecycle
 
-### 1. Provision the CLI runtime
+### 1. Install the CLI and verify Git
 
 Native archives include `install.sh`, which installs the executable and runs
 `workspace-mgr setup`. After `cargo install`, run setup explicitly:
@@ -28,11 +28,11 @@ Native archives include `install.sh`, which installs the executable and runs
 workspace-mgr setup
 ```
 
-Setup uses an isolated user data directory and verifies the exact private
-storage runtime. `workspace-mgr setup --dry-run` reports the intended location
-and actions without changing the host. A custom `--runtime-dir` must be absent
-or already carry workspace-mgr's private ownership marker; setup never replaces
-an arbitrary existing directory.
+Setup checks that Git is available and reports the built-in Rust storage engine.
+It creates no separate runtime or user data directory. `workspace-mgr setup
+--dry-run` performs the same check without changes. The legacy `--runtime-dir`
+flag remains accepted for older installers; setup does not inspect or modify
+that directory.
 
 Every invocation also checks the local update cache. A successful registry
 check remains fresh for six hours; a failed check is silent and is retried after
@@ -849,7 +849,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 
 | Command | Local effect | Remote reads | Remote writes |
 | --- | --- | --- | --- |
-| `setup` | Installs an isolated private runtime | Python package index | None |
+| `setup` | Verifies Git and the built-in engine | None | None |
 | `init` | Creates or repairs scaffolding | None | None |
 | `instructions`, `config show` | Read-only checks/output | None | None |
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |

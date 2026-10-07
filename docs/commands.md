@@ -10,13 +10,13 @@ The [user guide](guide.md) explains how the commands form one workflow.
   from a task directory. `/` is their only separator: on the supported Linux
   and macOS targets a backslash is an ordinary file-name character that is
   never rewritten, so typed paths, Git paths, and storage metadata compare
-  exactly. The storage engine reads a backslash as a separator, so an S3
+  exactly. The established storage path convention excludes backslashes, so an S3
   boundary path may not contain one. Automatic placement, explicit
   `storage set --to s3`, and a `storage reset` whose automatic policy selects
   S3 refuse such a path before any metadata is written, and `move` refuses it
   as a destination for content already in S3; rename the path, or keep it in
   Git with `storage set --to git`. Storage metadata that an earlier release
-  left at such a path cannot be addressed at all, so `plan`, `publish`,
+  left at such a path remains excluded from normal operations, so `plan`, `publish`,
   `storage hydrate`, `storage set`, and `untrack` refuse it with status 2 and
   a `workspace-mgr move` recovery hint.
 - `--repo <path>` selects the starting repository or task path and defaults to
@@ -67,20 +67,15 @@ The [user guide](guide.md) explains how the commands form one workflow.
 
 ## `workspace-mgr setup`
 
-Provision and verify the private managed-storage runtime.
+Verify Git and the built-in native storage engine.
 
 ```text
 workspace-mgr setup [--runtime-dir <path>] [--dry-run]
 ```
 
-The default location follows `WORKSPACE_MGR_RUNTIME_DIR`, then
-`XDG_DATA_HOME`, then `${HOME}/.local/share`. Setup creates an isolated Python
-environment and installs the exact compatible storage runtime. It requires Git
-and Python for provisioning, but users and agents do not invoke the private
-engine directly. `--dry-run` performs no installation or package download. An
-existing target is replaced only when it carries workspace-mgr's private
-ownership marker; an arbitrary file, directory, or symlink is refused without
-modification.
+No separate runtime or package download is needed. `--runtime-dir` remains an
+accepted compatibility option and has no filesystem effect, including when it
+names an existing user directory. Setup leaves former runtimes unchanged.
 
 ## `workspace-mgr init`
 
@@ -1257,11 +1252,10 @@ workspace-mgr refresh --dry-run
 ```
 
 An incoming S3 boundary whose path contains a backslash is the one exception.
-The storage engine reads the backslash as a path separator in some commands,
-including the one that verifies content, so that boundary cannot be verified,
-and refresh hydrates only what it verifies. Handing it to the engine would fail
-and roll back the whole refresh, and refusing the whole refresh would freeze
-inbound synchronization for every checkout over one path. Refresh detects those
+Older storage engines interpreted backslashes inconsistently. The native
+migration preserves the existing boundary convention and hydrates only
+addressable paths, while allowing synchronization of everything else. Refresh
+detects those
 boundaries before it changes the branch, the index, the working tree, or stored
 content, then advances everything else and leaves only their payload
 unhydrated. It lists them in `storage.unaddressable` and reports one

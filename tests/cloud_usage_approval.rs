@@ -1152,10 +1152,6 @@ mod test_storage {
     }
 
     pub fn dvc_available() -> bool {
-        if which::which("dvc").is_err() {
-            eprintln!("skipping: dvc is unavailable");
-            return false;
-        }
         true
     }
 
@@ -2251,14 +2247,10 @@ fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
     assert_eq!(first["cloud_usage"]["projected"]["s3_bytes"], 6);
 
     // A background writer changes the worktree right before an engine step.
-    let engine = which::which("dvc").unwrap();
     let writer = fixture.root.join("background-writer");
     std::fs::write(
         &writer,
-        format!(
-            "#!/bin/sh\nif [ \"$LATE_MODE\" = grow ] && [ \"$1\" = commit ]; then\n  head -c 400000 /dev/zero >> \"$LATE_TARGET\"\nfi\nif [ \"$LATE_MODE\" = add ] && [ \"$1\" = push ]; then\n  head -c 400000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexec '{}' \"$@\"\n",
-            engine.display()
-        ),
+        "#!/bin/sh\nif [ \"$LATE_MODE\" = grow ] && [ \"$1\" = commit ]; then\n  head -c 400000 /dev/zero >> \"$LATE_TARGET\"\nfi\nif [ \"$LATE_MODE\" = add ] && [ \"$1\" = push ]; then\n  head -c 400000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexit 0\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&writer).unwrap().permissions();
@@ -2271,7 +2263,7 @@ fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
             &[
                 LIMIT_300KB[0],
                 LIMIT_300KB[1],
-                ("WORKSPACE_MGR_STORAGE_DVC", writer.to_str().unwrap()),
+                ("WORKSPACE_MGR_TEST_STORAGE_HOOK", writer.to_str().unwrap()),
                 ("LATE_MODE", mode),
                 ("LATE_TARGET", target.to_str().unwrap()),
             ],

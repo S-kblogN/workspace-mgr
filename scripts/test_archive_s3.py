@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real CLI archive/publication/history E2E against a CI-owned MinIO service.
 
-Requires a --features test-storage binary, the pinned DVC[s3] installation, and
+Requires a --features test-storage binary, boto3/PyYAML for this test oracle, and
 the same WORKSPACE_MGR_BIN / WORKSPACE_MGR_E2E_ROOT / MINIO_* variables as the
 ordinary E2E harness. This scenario uses its own bucket and temporary home; it
 never reads user credentials or connects to an AWS endpoint.
@@ -37,9 +37,10 @@ class ArchiveHarness(e2e.Harness):
         if urlsplit(self.endpoint).hostname not in ("127.0.0.1", "localhost", "::1", "minio"):
             raise e2e.E2EFailure("archive E2E requires a local CI-owned MinIO endpoint")
         self.bucket = os.environ.get("MINIO_ARCHIVE_BUCKET", self.bucket + "-archive")
-        self.env["WORKSPACE_MGR_STORAGE_PYTHON"] = sys.executable
-        dvc_program = shutil.which("dvc") or str(Path(sys.executable).parent / "dvc")
-        self.env["WORKSPACE_MGR_STORAGE_DVC"] = dvc_program
+        # The obsolete Python override deliberately selects a missing program.
+        # The test-only DVC fault injector remains unset for these real flows.
+        self.env["WORKSPACE_MGR_STORAGE_PYTHON"] = str(self.root / "python-must-not-run")
+        self.env.pop("WORKSPACE_MGR_STORAGE_DVC", None)
         self.unmapped_source_versions = []
 
     def namespace_versions(self, task):
@@ -132,14 +133,15 @@ class ArchiveHarness(e2e.Harness):
 
     def initialize(self):
         self.section("isolated versioned S3 and Git fixture")
-        actual = self.run([sys.executable, "-c", "import dvc; print(dvc.__version__)"]).stdout.strip()
-        self.check(actual == "3.67.1", "the archive fixture uses the pinned DVC version", version=actual)
         self.setup_s3()
         self.setup_repository()
         self.wm(self.shared, "init", "--s3-url", f"s3://{self.bucket}/dvc", "--s3-endpoint-url", self.endpoint)
         self.git(self.shared, "add", "-A")
         self.git(self.shared, "commit", "-m", "Initialize archive fixture")
         self.git(self.shared, "push", "origin", "main")
+        self.check(not Path(self.env["WORKSPACE_MGR_STORAGE_PYTHON"]).exists()
+                   and "WORKSPACE_MGR_STORAGE_DVC" not in self.env,
+                   "native storage initialization ignores a missing legacy Python runtime override")
 
     def publish_original(self):
         self.section("published standalone and directory version histories")

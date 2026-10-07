@@ -18,7 +18,7 @@ from unittest import mock
 from urllib.parse import parse_qsl
 
 
-SCRIPT = Path(__file__).resolve().parents[2] / "assets" / "dvc_version_archive.py"
+SCRIPT = Path(__file__).resolve().parents[2] / "tests" / "oracles" / "dvc_version_archive.py"
 SPEC = importlib.util.spec_from_file_location("dvc_version_archive", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 adapter = importlib.util.module_from_spec(SPEC)

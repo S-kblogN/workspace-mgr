@@ -5,7 +5,7 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
-## [0.6.1] - 2026-10-06
+## [0.7.0] - 2026-10-06
 
 ### Added
 
@@ -44,6 +44,14 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   automatic S3 placement, explicit storage changes, and untracking.
 
 ### Changed
+
+- Managed storage runs entirely in Rust, including DVC-compatible local pointer
+  and cache handling, streaming exact-version S3 reads, Signature Version 4,
+  full-history archive copy, immutable registry publication, and lossless cancel.
+  Python and DVC are no longer production runtime dependencies. Existing pointer,
+  cache, receipt, and private transaction formats remain readable.
+- `setup` verifies Git and the native engine without installing packages or
+  modifying former runtime directories; `--runtime-dir` remains accepted.
 
 - Canonical archive registries use an immutable complete-receipt binding on a
   reserved Git control tag for compare-and-create ownership. A separate source

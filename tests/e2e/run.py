@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -50,6 +51,8 @@ class Harness:
         self.git_daemon: subprocess.Popen[str] | None = None
         self.git_daemon_log = None
         self.endpoint = os.environ.get("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+        if urlsplit(self.endpoint).hostname not in ("127.0.0.1", "localhost", "::1", "minio"):
+            raise E2EFailure("E2E tests require a local CI-owned MinIO endpoint")
         self.bucket = os.environ.get("MINIO_BUCKET", "workspace-mgr-e2e")
         self.access_key = os.environ.get("AWS_ACCESS_KEY_ID", "workspace-mgr-e2e")
         self.secret_key = os.environ.get(
@@ -208,26 +211,16 @@ class Harness:
         self.check(self.list_s3_versions() == [], "S3 bucket starts empty")
 
     def provision_runtime(self) -> None:
-        self.section("private runtime provisioning")
-        runtime = (
-            self.home
-            / ".local"
-            / "share"
-            / "workspace-mgr"
-            / "storage-3.67.1"
-        )
+        self.section("native storage setup")
+        runtime = self.home / ".local" / "share" / "workspace-mgr" / "storage-3.67.1"
         dry = self.wm(self.root, "setup", "--dry-run")
-        self.check(dry["status"] == "dry_run", "setup dry-run reports provisioning")
+        self.check(dry["status"] == "dry_run", "setup dry-run verifies native storage")
         self.check(not runtime.exists(), "setup dry-run creates no runtime")
-        installed = self.wm(self.root, "setup")
-        self.check(installed["status"] == "installed", "setup provisions private runtime")
-        self.check((runtime / "bin" / "dvc").is_file(), "private storage executable exists")
-        self.check((runtime / "bin" / "python").is_file(), "private Python adapter exists")
-        self.check(
-            runtime.joinpath(".workspace-mgr-runtime").read_text(encoding="utf-8")
-            == "workspace-mgr private runtime v1\n",
-            "private runtime records explicit workspace-mgr ownership",
-        )
+        checked = self.wm(self.root, "setup")
+        self.check(checked["status"] == "no_changes", "setup requires no installation")
+        self.check(checked["storage_runtime"].startswith("native Rust "), "storage is native Rust")
+        self.check(checked["runtime_dir"] == "", "storage has no separate runtime directory")
+        self.check(not runtime.exists(), "setup never provisions Python or DVC")
         repeated = self.wm(self.root, "setup")
         self.check(repeated["status"] == "no_changes", "setup is idempotent")
 
@@ -801,8 +794,8 @@ class Harness:
             if check["name"] == "managed-storage-version-adapter"
         )
         self.check(
-            adapter["detail"] == "internal adapter 3.67.1",
-            "doctor verifies the provisioned private runtime's exact adapter version",
+            adapter["detail"].startswith("native Rust "),
+            "doctor verifies the built-in Rust version adapter",
         )
         self.check(
             str(self.home) not in adapter["detail"],
@@ -1977,43 +1970,20 @@ class Harness:
             self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
             "provider failure preserves a clean shared index",
         )
-        runtime_dvc = (
-            self.home
-            / ".local"
-            / "share"
-            / "workspace-mgr"
-            / "storage-3.67.1"
-            / "bin"
-            / "dvc"
-        )
-        real_dvc = runtime_dvc.with_name("dvc.workspace-mgr-e2e-real")
         checkout_counter = self.root / "refresh-checkout-counter"
-        runtime_dvc.rename(real_dvc)
-        runtime_dvc.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            "if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' '3.67.1'; exit 0; fi\n"
+        checkout_hook = self.root / "refresh-checkout-hook"
+        checkout_hook.write_text(
+            "#!/bin/sh\nset -eu\n"
             "if [ \"${1:-}\" = \"checkout\" ] && [ ! -f \"$CHECKOUT_COUNTER\" ]; then\n"
-            "  : > \"$CHECKOUT_COUNTER\"\n"
-            "  exit 23\n"
-            "fi\n"
-            "exec \"$WORKSPACE_MGR_E2E_REAL_DVC\" \"$@\"\n",
+            "  : > \"$CHECKOUT_COUNTER\"\n  exit 23\nfi\nexit 0\n",
             encoding="utf-8",
         )
-        runtime_dvc.chmod(0o755)
-        try:
-            failed_refresh = self.wm(
-                self.shared,
-                "refresh",
-                expected=2,
-                env={
-                    "CHECKOUT_COUNTER": str(checkout_counter),
-                    "WORKSPACE_MGR_E2E_REAL_DVC": str(real_dvc),
-                },
-            )
-        finally:
-            runtime_dvc.unlink(missing_ok=True)
-            real_dvc.rename(runtime_dvc)
+        checkout_hook.chmod(0o755)
+        failed_refresh = self.wm(
+            self.shared, "refresh", expected=2,
+            env={"CHECKOUT_COUNTER": str(checkout_counter),
+                 "WORKSPACE_MGR_TEST_STORAGE_HOOK": str(checkout_hook)},
+        )
         self.check("rolled back" in failed_refresh["stderr"], "post-ref refresh failure is rolled back")
         self.check(
             self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
@@ -2898,22 +2868,25 @@ class Harness:
         self.merge_branch_to_main(branch)
         self.wm(self.shared, "refresh")
 
-        # No current command can place this boundary, so craft the revision an
-        # older release would have published. Targeting the pointer would make
-        # the engine resolve its path; pushing the task directory uploads both
-        # objects and records their version IDs without naming either.
-        runtime_dvc = (
-            self.home / ".local" / "share" / "workspace-mgr" / "storage-3.67.1" / "bin" / "dvc"
-        )
+        # Construct an old published pointer literally through the isolated S3
+        # fixture client. The native product does not invoke a legacy engine.
         publisher = self.root / "unaddressable-publisher"
         self.run(["git", "clone", self.remote_url, publisher], cwd=self.root)
         self.configure_git(publisher)
         publisher_task = publisher / task_id
-        (publisher_task / "second.bin").write_bytes(second)
-        (publisher_task / "top\\level.bin").write_bytes(unaddressable)
-        self.run([runtime_dvc, "add", "--quiet", "--", "second.bin"], cwd=publisher_task)
-        self.run([runtime_dvc, "add", "--quiet", "--", "top\\level.bin"], cwd=publisher_task)
-        self.run([runtime_dvc, "push", "--quiet", "-R", task_id], cwd=publisher)
+        import hashlib
+        for name, body in [("second.bin", second), ("top\\level.bin", unaddressable)]:
+            (publisher_task / name).write_bytes(body)
+            uploaded = self.s3.put_object(Bucket=self.bucket, Key=f"dvc/{task_id}/{name}", Body=body)
+            md5 = hashlib.md5(body).hexdigest()
+            (publisher_task / (name + ".dvc")).write_text(
+                f"outs:\n- md5: {md5}\n  size: {len(body)}\n  hash: md5\n  path: {name}\n"
+                f"  cloud:\n    workspace-mgr:\n      version_id: {uploaded['VersionId']}\n"
+                f"      etag: {uploaded['ETag'].strip(chr(34))}\n",
+                encoding="utf-8",
+            )
+            with (publisher_task / ".gitignore").open("a", encoding="utf-8") as ignore:
+                ignore.write("/" + name.replace("\\", "\\\\") + "\n")
         crafted_pointer = (publisher_task / "top\\level.bin.dvc").read_text(encoding="utf-8")
         self.check("version_id" in crafted_pointer, "crafted unaddressable metadata records its S3 version")
         old_version = self.s3_version_for_body(unaddressable)

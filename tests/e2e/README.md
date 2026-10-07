@@ -11,7 +11,7 @@ lifecycle against two local network services:
 - a bare repository through `git daemon`, including an intentional server-side
   rejection.
 
-The scenario covers private-runtime setup, initialization,
+The scenario covers native-engine setup, initialization,
 instructions, diagnostics, task creation, storage status, explicit Git and S3
 placement, published task slug rename with stable branch/PR identity and exact
 S3 hydration, aggregate boundary sizing, tiny-S3 warnings, the semantic review

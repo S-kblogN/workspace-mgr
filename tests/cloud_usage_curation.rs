@@ -252,10 +252,6 @@ mod test_storage {
     pub const ROOMY_10MB: [(&str, &str); 1] = [(CLOUD_USAGE_THRESHOLD_ENV, "10000000")];
 
     pub fn dvc_available() -> bool {
-        if which::which("dvc").is_err() {
-            eprintln!("skipping: dvc is unavailable");
-            return false;
-        }
         true
     }
 
@@ -1115,14 +1111,10 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
     assert_eq!(warning_codes(&plan), ["task-record-unchanged"]);
 
     // A writer lands inside the boundary right before the engine commits it.
-    let engine = which::which("dvc").unwrap();
     let writer = fixture.root.join("late-writer");
     std::fs::write(
         &writer,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = commit ]; then\n  head -c 5000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexec '{}' \"$@\"\n",
-            engine.display()
-        ),
+        "#!/bin/sh\nif [ \"$1\" = commit ]; then\n  head -c 5000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexit 0\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&writer).unwrap().permissions();
@@ -1138,7 +1130,7 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
         ["publish", "-m", "Remove one output"],
         &[
             ROOMY_10MB[0],
-            ("WORKSPACE_MGR_STORAGE_DVC", writer.to_str().unwrap()),
+            ("WORKSPACE_MGR_TEST_STORAGE_HOOK", writer.to_str().unwrap()),
             ("LATE_TARGET", late.to_str().unwrap()),
         ],
     );

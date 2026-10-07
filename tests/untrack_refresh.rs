@@ -159,10 +159,6 @@ fn pending_local_choices_preserve_payloads_across_upstream_type_changes() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn s3_untrack_refresh_preserves_dirty_bytes_without_the_old_remote_or_cache() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
@@ -255,10 +251,6 @@ fn s3_untrack_refresh_preserves_dirty_bytes_without_the_old_remote_or_cache() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn incoming_s3_updates_cannot_replace_a_pending_local_choice() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(

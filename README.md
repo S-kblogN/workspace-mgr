@@ -206,8 +206,8 @@ storage mutation commands.
 
 ## Installation
 
-Install the latest stable release from crates.io, then provision its private
-storage runtime:
+Install the latest stable release from crates.io, then verify Git and its
+built-in storage engine:
 
 ```sh
 cargo install --locked workspace-mgr
@@ -225,14 +225,14 @@ extract it, and run:
 ./install.sh
 ```
 
-The native installer provisions the runtime and copies the CLI to
+The native installer checks Git and copies the CLI to
 `${HOME}/.local/bin` by default. Set `WORKSPACE_MGR_PREFIX` to choose another
 executable prefix.
 
-`setup` checks Git, creates a private Python environment, installs the pinned
-storage engine, and verifies both its executable and Python module. Users and
-agents never invoke that engine directly. The exact compatibility contract is in
-[docs/platform-support.md](docs/platform-support.md).
+`setup` checks Git. Storage, exact-version S3 reads, archive, and cancellation
+run inside the Rust executable; Python, DVC, and a separate storage runtime are
+not required. Existing DVC-compatible pointers, cache objects, and archive
+journals remain readable. See [docs/platform-support.md](docs/platform-support.md).
 
 Every CLI invocation consults a local update cache. At most once every six
 hours, it asks crates.io for newer non-yanked versions; a failed request is

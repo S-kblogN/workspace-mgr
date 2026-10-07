@@ -336,12 +336,11 @@ that intent. Native DVC does not interpret the
 canonical archive mappings, so old revisions use workspace-mgr hydration after
 their original versions have been retired.
 
-The executable and repository transaction rules are Rust. Managed S3 storage
-currently adapts the pinned Python DVC/s3fs runtime through embedded assets;
-`setup` provisions that runtime. A fully Rust storage engine would require
-replacing DVC pointer/cache behavior, exact-version hydration, metadata and tags,
-multipart copy, and provider compatibility. The existing implementation is a
-Rust CLI with a Python storage adapter.
+The executable, local storage engine, S3 transport, archive registry, and
+history copy/cancel adapters are Rust. DVC-compatible pointer and cache formats
+remain stable; no Python assets are embedded or executed. S3 requests use
+native Signature Version 4 and explicit checksum/conditional headers. The
+production path does not install or invoke Python or DVC.
 
 `task rename` is a local identity-preserving transition. It moves an ordinary
 task directory as one filesystem unit and atomically rewrites manifest schema
@@ -488,12 +487,10 @@ filesystem test remote, from the remote directory itself.
 
 ## Private storage adapter
 
-The S3 adapter currently uses DVC 3.67.1 internally. S3 remotes require exact
-object-version metadata and existence checks through an embedded verifier using
-the same exact DVC release. This is a maintainer compatibility boundary, not a
-public command or repository concept. A filesystem remote is compiled only by
-the `test-storage` feature for isolated tests and uses remote-presence
-verification. Release builds reject it in the public S3 schema.
+The storage adapter is built into the Rust executable. S3 remotes require
+exact object-version metadata and existence checks. A filesystem remote is
+compiled only by the `test-storage` feature for isolated tests and uses
+remote-presence verification. Release builds reject it in the public S3 schema.
 
 Versioned reads use a private adapter instead of the engine's generic fetch
 path. It requires a complete file/version manifest, checks existing cache bytes
@@ -563,18 +560,16 @@ The requirement check precedes detection, so refresh never inspects incoming
 storage metadata that only a newer release can read, and `--dry-run` refuses
 where an applied refresh would. Detection precedes every change, including the
 purge queue, so `--dry-run` reports the same condition an applied refresh does.
-An unaddressable boundary is excluded from prefetch, checkout, verification, and
-the unsafe-output scan, which resolve each pointer as an engine command target:
-the engine's `status` rewrites the backslash, reports the rewritten path
-missing, and fails, so verifying such a boundary would roll back the whole
-refresh. The purge adapter still enumerates it, because it collects pointers
-through the engine's Python API, which reads the path literally. Its metadata
-advances with the branch, and refresh places no payload for it. A payload this
-checkout already holds there is compared with the incoming metadata without the
-engine: an exact match is kept, and anything else, including a payload with no
-metadata beside it, refuses the refresh before any change, because refresh can
-neither replace nor verify it. Rollback therefore restores such a boundary from
-its metadata alone, because refresh never placed or removed an output for it.
+An unaddressable boundary is excluded from prefetch, checkout, verification,
+and the unsafe-output scan. This preserves the existing path convention during
+the native migration; older engines disagreed about literal backslashes. The
+purge adapter still enumerates its metadata literally. Its metadata advances
+with the branch, and refresh places no payload for it. A payload already held
+there is compared with incoming metadata: an exact match is kept; different
+bytes or a payload without accompanying metadata refuse refresh before any
+change. Rollback restores the boundary from its metadata alone because refresh
+never placed or removed its output. `move` is the supported recovery to a name
+without backslashes.
 
 A `move` whose source payload is not materialized fetches it through the source
 metadata before any change and checks it out at the destination, because the
