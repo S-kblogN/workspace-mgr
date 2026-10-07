@@ -955,7 +955,10 @@ mod tests {
         .unwrap();
         assert_eq!(report.status, "blocked_unmapped");
         assert_eq!(report.deleted, [old]);
-        assert_eq!(report.protected, [protected.clone()]);
+        assert_eq!(
+            report.protected.as_slice(),
+            std::slice::from_ref(&protected)
+        );
         assert_eq!(report.retained_unmapped.len(), 2);
         assert_eq!(report.pending, state.pending);
         assert!(state.pending.contains(&late_payload));
