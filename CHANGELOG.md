@@ -9,6 +9,11 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Added
 
+- Read-only, offline `task list`, `task path`, and `task show` discover current
+  deliverable and private infrastructure tasks after rename or archive. Listing
+  supports search, kind and placement filters, and linewise paths; exact path
+  resolution refuses ambiguous selectors instead of guessing. Legacy task
+  candidates and malformed current metadata remain visible with diagnostics.
 - Explicit `task adopt` for reviewed legacy directories without manifests.
 - Previewable, idempotent `task upgrade` for current task configuration and
   durable verified review provenance. Its optional schema 4

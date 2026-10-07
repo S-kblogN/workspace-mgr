@@ -37,6 +37,7 @@ mod s3_purge;
 mod scaffold;
 mod storage;
 mod task_approval;
+mod task_catalog;
 mod task_dependencies;
 mod task_rename;
 mod task_upgrade;
@@ -64,8 +65,26 @@ use crate::task_rename::{TaskRenameOptions, rename as rename_task};
 use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
-    update::check_and_warn();
-    let cli = Cli::parse();
+    let parsed = Cli::try_parse();
+    // Directory lookups are offline, read-only shell utilities. Even the
+    // background update cache must not be created as a side effect.
+    let check_update = match &parsed {
+        Ok(cli) => !matches!(
+            &cli.command,
+            Command::Task(args)
+                if matches!(args.command, TaskCommand::List(_) | TaskCommand::Path(_) | TaskCommand::Show(_))
+        ),
+        // Help and argument errors should be immediate and side-effect free.
+        // Keep the established update notice on the explicit version command.
+        Err(error) => error.kind() == clap::error::ErrorKind::DisplayVersion,
+    };
+    if check_update {
+        update::check_and_warn();
+    }
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
     if let Err(error) = run(cli) {
         eprintln!("workspace-mgr: {error}");
         std::process::exit(2);
@@ -129,6 +148,9 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Task(args) => match args.command {
+            TaskCommand::List(args) => task_catalog::list(&args, cli.format),
+            TaskCommand::Path(args) => task_catalog::path(&args, cli.format),
+            TaskCommand::Show(args) => task_catalog::show(&args, cli.format),
             TaskCommand::Adopt(args) => emit(
                 &archive_adoption::adopt(&archive_adoption::ArchiveAdoptionOptions {
                     start: args.repo,

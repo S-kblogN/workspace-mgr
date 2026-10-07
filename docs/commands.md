@@ -29,11 +29,14 @@ The [user guide](guide.md) explains how the commands form one workflow.
   `--include` for multiple paths.
 - `--dry-run` previews local mutation for commands that support it. Task discard
   also saves a private revision-bound confirmation plan.
-- Human output is concise YAML, except Markdown from `instructions` and TOML
-  from `config show`. Use global `--format json` or set
+- Human output is concise YAML, except Markdown from `instructions`, TOML
+  from `config show`, the compact table from `task list`, and bare paths from
+  `task path` or `task list --paths`. Use global `--format json` or set
   `WORKSPACE_MGR_FORMAT=json` for stable structured output.
 - Errors exit with status 2 and start with `workspace-mgr:`.
-- Every invocation performs a best-effort cached update check. A newer
+- The offline discovery commands `task list`, `task path`, and `task show`,
+  help output, and argument errors skip the update check. Other invocations,
+  including `--version`, perform a best-effort cached update check. A newer
   applicable release produces exactly one `workspace-mgr: update available`
   line on stderr; stdout, structured output, and command exit status are
   unchanged. The CLI never updates itself. Agents report the versions and ask
@@ -236,6 +239,116 @@ workspace-mgr config show [--repo <path>]
 
 Human output is TOML. JSON output exposes the public configuration model and
 does not expose private engine configuration or credentials.
+
+## `workspace-mgr task list`
+
+List tasks in the current local repository, including directories already
+grouped under time folders.
+
+```text
+workspace-mgr task list [<query>]
+  [--kind deliverable|infrastructure]
+  [--placement top-level|nested|repository]
+  [--paths] [--repo <path>]
+```
+
+The default human output is a compact table of kind, metadata, placement,
+current name, path, and title. The optional query matches a
+case-insensitive substring of the immutable task ID, current basename, current
+slug, title, or repository-relative path. Filters combine with the query.
+Placement describes the current location: `top-level` deliverables are directly
+under the repository root, `nested` deliverables are below another directory,
+and `repository` infrastructure tasks have private metadata and no task
+directory. Nested placement alone says nothing about completion or review.
+
+Discovery walks the current filesystem, including ignored and untracked task
+directories. It stops at each task root and does not follow symbolic links.
+A root with a valid current task manifest remains a known task even if it has
+its own Git controls. Other nested Git checkouts are excluded before legacy
+candidate detection. Timestamped directories that have neither a task manifest
+nor a nested Git checkout appear as legacy candidates; their presence does not
+establish ownership or make them eligible for adoption or archive. The `metadata` field
+is `managed`, `legacy`, or `invalid`. Malformed current metadata appears as
+invalid with a diagnostic, so an unreadable manifest does
+not silently remove the task from the list. Private infrastructure metadata is
+read in place, including its previous private-state location before migration.
+Discovery does not migrate or repair it.
+
+`--paths` prints only repository-relative deliverable paths, one per line,
+without a table or headings. Infrastructure entries are omitted. If the
+selected deliverable metadata is invalid, the command refuses instead of
+emitting an incomplete path list. With global `--format json`, normal listing
+returns `{repo, tasks, warnings}` and `--paths` returns a string array.
+With `--paths`, discovery warnings go to stderr in both formats, leaving stdout
+as the path list or JSON array.
+
+These discovery commands are read-only and offline: they do not fetch, query
+GitHub or S3, run the update check, write a cache, or migrate private state.
+Local archive receipt status is reported as `archive_status`; it is not a live
+check that the task's PR merged or that S3 publication or cleanup finished.
+
+```sh
+workspace-mgr task list
+workspace-mgr task list model --kind deliverable
+workspace-mgr task list --placement nested
+workspace-mgr task list --kind deliverable --paths
+workspace-mgr --format json task list --repo /path/to/repository
+```
+
+## `workspace-mgr task path`
+
+Resolve one task to its current deliverable directory.
+
+```text
+workspace-mgr task path <selector> [--relative] [--repo <path>]
+```
+
+The selector must exactly match the immutable task ID, current basename,
+current slug, repository-relative directory path, or absolute directory path.
+Matching does not use fuzzy search, an old renamed slug, or a latest-task
+fallback. If more than one task matches, the command exits with status 2 and
+lists candidates; choose an ID or current path that identifies one task.
+Malformed current metadata also refuses resolution.
+
+Human output is one bare absolute path. `--relative` returns the current path
+relative to the repository root, even when the command starts in a task
+directory. Global `--format json` returns `{repo, id, path}` and applies the
+same `--relative` choice to `path`. Infrastructure tasks have no deliverable
+directory, so `task path` refuses them; use `task show` to obtain their manifest.
+When capturing the path in a shell command, pass `--format human` explicitly
+so a `WORKSPACE_MGR_FORMAT=json` environment setting cannot change the output.
+
+```sh
+cd "$(workspace-mgr --format human task path example-task)"
+workspace-mgr task path 20261007-120000-example-task --relative
+workspace-mgr task path 2026/10/20261007-120000-example-task
+```
+
+## `workspace-mgr task show`
+
+Inspect one task's current local identity and metadata.
+
+```text
+workspace-mgr task show <selector> [--repo <path>]
+```
+
+Selection follows the exact matching and ambiguity rules of `task path`, and
+also supports infrastructure task identity. Human output is concise YAML;
+global `--format json` returns `{repo, task}`. The task includes its immutable
+ID, current name, slug, title, purpose, branch, scopes, placement, and absolute
+manifest path. Deliverable directory paths are repository-relative;
+infrastructure tasks have no deliverable directory. Legacy candidates remain
+explicitly marked as candidates, and malformed current metadata refuses.
+
+The output describes the current filesystem and local receipt. It grants no
+write scope and does not establish completion or live review status. Use
+`task status` for resolved task-scoped status, `plan` for publication
+assessment, and `archive --dry-run` for current archive eligibility.
+
+```sh
+workspace-mgr task show example-task
+workspace-mgr --format json task show 20261007-120000-example-task
+```
 
 ## `workspace-mgr task create`
 

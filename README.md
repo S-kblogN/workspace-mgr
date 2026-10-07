@@ -78,6 +78,28 @@ filed: the tools the agent writes, the materials they use, and the task's own
 record of decisions, process, and hard-to-reproduce results all live inside it,
 listed in its README directory map.
 
+Find tasks by their current local metadata, including directories already
+grouped under time folders:
+
+```sh
+workspace-mgr task list
+workspace-mgr task list model --kind deliverable
+workspace-mgr task list --placement nested --paths
+workspace-mgr task show example-task
+cd "$(workspace-mgr --format human task path example-task)"
+```
+
+`task list` searches the whole repository, including ignored and untracked
+task directories; `--paths` prints repository-relative deliverable paths, one
+per line. `task path` resolves an exact immutable ID, current basename, slug,
+or path and prints an absolute directory suitable for shell use. Ambiguous
+selectors require choosing one of the reported candidates. `task show`
+reports the current metadata and absolute manifest path, including for private
+infrastructure tasks. These commands work offline and change no local state.
+They report current placement and local archive receipts; they do not verify
+PR merge or S3 publication status. See the
+[discovery commands](docs/commands.md#workspace-mgr-task-list).
+
 Active deliverable task directories stay at the repository's top level. After
 the task is done and its pull request is confirmed merged, the user may request
 that its directory be grouped under a time folder, such as `2026/`, `202607/`,
@@ -255,9 +277,11 @@ run inside the Rust executable; Python, DVC, and a separate storage runtime are
 not required. Existing DVC-compatible pointers, cache objects, and archive
 journals remain readable. See [docs/platform-support.md](docs/platform-support.md).
 
-Every CLI invocation consults a local update cache. At most once every six
-hours, it asks crates.io for newer non-yanked versions; a failed request is
-silently retried after one hour. When an applicable version is available, the
+CLI invocations other than `task list`, `task path`, `task show`, help output,
+and argument errors consult a local update cache; `--version` still checks.
+At most once every six hours, the check asks crates.io for newer non-yanked
+versions; a failed request is silently retried after one hour. When an applicable
+version is available, the
 CLI writes one agent-directed notice to stderr without changing command output
 or exit status. It never updates itself. The agent reports the versions and asks
 the user before updating, then runs `workspace-mgr setup`; managed repository

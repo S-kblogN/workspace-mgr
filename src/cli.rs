@@ -135,6 +135,12 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
+    /// List current tasks, including grouped directories and legacy candidates.
+    List(TaskListArgs),
+    /// Resolve an exact task ID, current name, slug, or path to its directory.
+    Path(TaskPathArgs),
+    /// Show a task's current metadata, manifest, and declared scopes.
+    Show(TaskShowArgs),
     /// Create a deliverable directory or a private infrastructure manifest on the shared branch.
     Create(TaskCreateArgs),
     /// Adopt a reviewed legacy task that has no manifest; publish before archiving.
@@ -149,6 +155,46 @@ pub enum TaskCommand {
     Discard(TaskDiscardArgs),
     /// Record the user's explicit approval of a cloud-usage limit for this task.
     ApproveCloudUsage(TaskApproveCloudUsageArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskListArgs {
+    /// Case-insensitive substring in a task's ID, name, slug, title, or path.
+    pub query: Option<String>,
+
+    #[arg(long, value_enum)]
+    pub kind: Option<TaskKind>,
+
+    /// Filter by current directory placement; this does not imply completion.
+    #[arg(long, value_enum)]
+    pub placement: Option<crate::task_catalog::Placement>,
+
+    /// Print repository-relative deliverable paths, omitting infrastructure tasks.
+    #[arg(long)]
+    pub paths: bool,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskPathArgs {
+    pub selector: String,
+
+    /// Return a repository-root-relative path instead of an absolute path.
+    #[arg(long)]
+    pub relative: bool,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskShowArgs {
+    pub selector: String,
+
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
 }
 
 #[derive(Debug, Args)]

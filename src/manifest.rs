@@ -206,6 +206,27 @@ impl TaskManifest {
 impl ResolvedTask {
     pub fn load(repo: &GitRepo, config: &Config, path: &Path) -> Result<Self> {
         let absolute = repo.resolve_manifest_path(path)?;
+        Self::load_at(repo, config, absolute, None)
+    }
+
+    /// Inspect current metadata without migrating any private state. The
+    /// catalog supplies a verified current or legacy private-state root.
+    pub(crate) fn load_read_only(
+        repo: &GitRepo,
+        config: &Config,
+        path: &Path,
+        infrastructure_root: &Path,
+    ) -> Result<Self> {
+        let absolute = path.canonicalize().at(path)?;
+        Self::load_at(repo, config, absolute, Some(infrastructure_root))
+    }
+
+    fn load_at(
+        repo: &GitRepo,
+        config: &Config,
+        absolute: PathBuf,
+        infrastructure_root: Option<&Path>,
+    ) -> Result<Self> {
         let raw = fs::read_to_string(&absolute).at(&absolute)?;
         let manifest: TaskManifest = toml::from_str(&raw).map_err(|source| Error::Toml {
             path: absolute.clone(),
@@ -288,8 +309,18 @@ impl ResolvedTask {
                         "infrastructure task manifest must not declare a task path",
                     ));
                 }
-                let expected = infrastructure_manifest_path(repo, &task_id)?;
-                let legacy = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
+                let (expected, legacy) = match infrastructure_root {
+                    Some(root) => (
+                        root.join("infrastructure-tasks")
+                            .join(&task_id)
+                            .join(INFRASTRUCTURE_TASK_MANIFEST_FILE),
+                        root.join("task.toml"),
+                    ),
+                    None => (
+                        infrastructure_manifest_path(repo, &task_id)?,
+                        repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME),
+                    ),
+                };
                 if absolute != expected && legacy.canonicalize().ok().as_ref() != Some(&absolute) {
                     return Err(Error::message(format!(
                         "infrastructure task manifest must be private per-task local state at {}; got {}",

@@ -34,12 +34,14 @@ It creates no separate runtime or user data directory. `workspace-mgr setup
 flag remains accepted for older installers; setup does not inspect or modify
 that directory.
 
-Every invocation also checks the local update cache. A successful registry
-check remains fresh for six hours; a failed check is silent and is retried after
-one hour. The network request has a short timeout, never changes the command's
-exit status, and never writes to stdout. If a newer applicable release is
-known, each invocation writes one line to stderr asking the agent to notify the
-user. Stable installations consider only stable releases; prerelease
+Invocations other than `task list`, `task path`, `task show`, help output, and
+argument errors also check the local update cache; `--version` still checks.
+A successful registry check remains fresh for six hours; a failed check is
+silent and is retried after one hour. The network request has a short timeout,
+never changes the command's exit status, and never writes to stdout. If a newer
+applicable release is known, each such invocation writes one line to stderr
+asking the agent to notify the user. Stable installations consider only stable
+releases; prerelease
 installations follow the newest non-yanked release, including prereleases.
 
 The CLI never updates itself. The agent reports the current and available
@@ -296,6 +298,41 @@ path and current path, and `publish` removes the old Git tree after preserving
 Git/S3 placement history. The agent then updates the existing pull request's
 title and description. An infrastructure rename uses `--manifest` to update its
 private current slug while its manifest path remains stable.
+
+### Find an existing task
+
+Use task discovery instead of assuming that every task is directly below the
+repository root. Renaming changes the current slug, and archiving can move the
+same task into a year or month folder while its immutable ID remains stable.
+
+```sh
+workspace-mgr task list
+workspace-mgr task list model --kind deliverable
+workspace-mgr task list --placement nested --paths
+workspace-mgr task show model-comparison
+cd "$(workspace-mgr --format human task path model-comparison)"
+```
+
+Listing searches current local task metadata throughout the repository,
+including ignored and untracked deliverables and private infrastructure tasks.
+The query is a case-insensitive substring search over identity, name, title,
+and path. `--paths` emits only repository-relative deliverable paths, one per
+line; use `task path <selector> --relative` for one such path. `task path`
+defaults to an absolute directory and requires an exact current slug,
+basename, immutable ID, or path. If a slug matches multiple tasks, it reports
+the candidates and requires a more precise selector.
+
+`task show` provides current metadata and the absolute manifest path. An
+infrastructure task has no deliverable directory; select its manifest from
+this output when using task-scoped commands. A timestamped directory without
+a manifest is a legacy candidate, and invalid current metadata is reported
+with a diagnostic. Neither a candidate nor a nested location proves that a
+task is complete. Local `archive_status` describes its current receipt,
+without checking GitHub merge or S3 publication status. Discovery is offline
+and read-only, including no update-check cache or private-state migration.
+It stops at task roots and skips symbolic links. A current task manifest can
+identify a task with its own Git controls; other nested Git checkouts are
+excluded, even when their names look like timestamped legacy tasks.
 
 ### 5. Choose where retained content lives
 
@@ -921,8 +958,9 @@ configuration or platform-standard identity mechanisms.
 
 ## Side effects by command
 
-In addition to the command-specific effects below, every invocation may read
-the crates.io release record when its local update cache is stale. This
+In addition to the command-specific effects below, invocations other than
+`task list`, `task path`, `task show`, help output, and argument errors may read
+the crates.io release record when their local update cache is stale. This
 best-effort check is bounded, failure-silent, and never performs a remote write.
 
 | Command | Local effect | Remote reads | Remote writes |
@@ -931,6 +969,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `init` | Creates or repairs scaffolding | None | None |
 | `instructions`, `config show` | Read-only checks/output | None | None |
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
+| `task list`, `task path`, `task show` | Read-only local discovery; no cache writes or state migration | None, including no update check | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
 | `task upgrade` | Rewrites current configuration and verified completion evidence; dry-run changes no task content | Fetches the shared branch and verifies Git trees and hosting review records | None |
