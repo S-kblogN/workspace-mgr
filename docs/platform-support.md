@@ -6,16 +6,18 @@ Release artifacts are built and tested natively on:
 - macOS on Apple Silicon.
 
 Building from source requires Rust 1.85 or newer. The native installer and
-`workspace-mgr setup` require platform Git and Python, then provision the S3
-storage engine in an isolated user data directory. These remain private
-execution engines: users and agents operate repositories through
-`workspace-mgr` only.
+`workspace-mgr setup` require platform Git. Storage operations run in the Rust
+binary, including AWS Signature Version 4, exact-version reads, history copying,
+registry publication, and cancellation. They require no Python or DVC install.
 
-The storage engine requirement is exact: both the `dvc` executable and the
-Python module imported by the version verifier must be DVC 3.67.1. A different
-patch release is rejected before a managed-storage transaction starts because
-the exact verifier intentionally uses DVC's Python remote APIs. CI installs
-`dvc[s3]==3.67.1` and tests this contract.
+Existing DVC-compatible YAML pointers and MD5 directory/file caches are retained.
+Setup accepts the old `--runtime-dir` flag for installer compatibility but does
+not create, inspect, replace, or remove that directory. A former Python runtime
+may be removed separately after upgrading; the CLI does not alter it.
+
+Python remains a development tool for isolated S3 fixture clients, legacy
+compatibility oracles, and release automation. It is not packaged or invoked by
+the production executable.
 
 Intel macOS and Windows are not supported release targets. The source contains
 portable path and symlink handling, but the end-to-end transaction suite does

@@ -78,8 +78,30 @@ filed: the tools the agent writes, the materials they use, and the task's own
 record of decisions, process, and hard-to-reproduce results all live inside it,
 listed in its README directory map.
 
+Find tasks by their current local metadata, including directories already
+grouped under time folders:
+
+```sh
+workspace-mgr task list
+workspace-mgr task list model --kind deliverable
+workspace-mgr task list --placement nested --paths
+workspace-mgr task show example-task
+cd "$(workspace-mgr --format human task path example-task)"
+```
+
+`task list` searches the whole repository, including ignored and untracked
+task directories; `--paths` prints repository-relative deliverable paths, one
+per line. `task path` resolves an exact immutable ID, current basename, slug,
+or path and prints an absolute directory suitable for shell use. Ambiguous
+selectors require choosing one of the reported candidates. `task show`
+reports the current metadata and absolute manifest path, including for private
+infrastructure tasks. These commands work offline and change no local state.
+They report current placement and local archive receipts; they do not verify
+PR merge or S3 publication status. See the
+[discovery commands](docs/commands.md#workspace-mgr-task-list).
+
 Active deliverable task directories stay at the repository's top level. After
-the task is done and its pull request is confirmed merged, the user may request
+the task's corresponding pull request is closed, the user may request
 that its directory be grouped under a time folder, such as `2026/`, `202607/`,
 or `2026/07/`. Organizing completed tasks is an explicitly requested
 infrastructure task, never an automatic action after merge or at turn end. If
@@ -93,6 +115,38 @@ and destination scopes, then apply `archive` in that infrastructure task.
 The command moves local directories; normal publication copies and verifies
 their complete retained S3 history, rewrites storage metadata, and records
 durable exact-version mappings before obsolete source objects are purged.
+Archive uses the current task configuration, including saved branch hints
+after a branch change, to identify a corresponding closed PR and confirm
+there is no associated open PR. Both merged and closed without merging
+qualify. It checks current managed-storage integrity, source and destination
+scopes, and move conflicts. It does not inspect historical task configuration,
+require earlier commits to have reviews, or replay a completion checkpoint's
+historical proof. Manifestless legacy tasks use explicit `task adopt` to
+establish current task metadata. `task upgrade` remains a separate metadata
+operation, not an archive prerequisite.
+
+Ordinary contents, scripts, README commands, historical logs, and environments
+move unchanged, even if their paths no longer work after relocation. Nested
+Git repositories must be ignored by the outer repository's shared ignore
+rules and have no files tracked by the outer repository. Their Git controls
+and any external administration are left untouched. Empty `.git` cache markers
+remain ordinary content. See the
+[archive command](docs/commands.md#workspace-mgr-archive) for the ignore rule.
+`plan` and `publish` also enforce this nested-repository boundary before
+storage placement; task-local `.gitignore` rules can be added and published
+with the task.
+
+Preview or undo an unpublished local attempt with
+`archive --cancel --manifest <owner> --dry-run`;
+cancel preserves ignored and hydrated local content while removing this
+attempt's S3 copies and registry records. Archive completion requires the old
+S3 prefix to contain no data versions or delete markers; protected or unmapped
+history remains explicitly pending. A Git control tag binds each canonical
+receipt, allowing B2-compatible publication without permanently retaining
+duplicate source history. See the [archive command](docs/commands.md#workspace-mgr-archive)
+for review, conflict, and cancellation guarantees.
+Every archive publication requires 0.7.0 independently of task schema; private
+purge/copy journals use schema 2 so 0.6.0 refuses protected retry state.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.
 
@@ -180,9 +234,11 @@ reset` does not undo a local-only choice. Git commit history remains available.
 `workspace-mgr init` installs a deliberately small `AGENTS.md` that tells the
 agent to run `workspace-mgr instructions --repo .`. The generated document
 begins with the same [workspace model](docs/management-model.md) read by users,
-then renders the complete product-owned policy using the repository's Git and
-S3 facts and appends an optional repository-specific content module. Every
-initialized repository gets the same management strategy; policy evolves with
+then gives the operation directory, session-wide constraints and current Git/S3
+control facts. It does not append every operation's policy. Read the relevant
+command's `--help` before acting; detailed compatibility topics remain available
+through `instructions <topic>`. A repository-specific instruction module is
+indexed by default and read with `instructions repository`. Every initialized repository gets the same management strategy; policy evolves with
 the CLI rather than through per-repository switches. Re-running `init` after a
 CLI update deterministically replaces product-owned scaffold files with the
 current versions; their ownership comes from the initialized repository and
@@ -196,8 +252,8 @@ storage mutation commands.
 
 ## Installation
 
-Install the latest stable release from crates.io, then provision its private
-storage runtime:
+Install the latest stable release from crates.io, then verify Git and its
+built-in storage engine:
 
 ```sh
 cargo install --locked workspace-mgr
@@ -215,18 +271,20 @@ extract it, and run:
 ./install.sh
 ```
 
-The native installer provisions the runtime and copies the CLI to
+The native installer checks Git and copies the CLI to
 `${HOME}/.local/bin` by default. Set `WORKSPACE_MGR_PREFIX` to choose another
 executable prefix.
 
-`setup` checks Git, creates a private Python environment, installs the pinned
-storage engine, and verifies both its executable and Python module. Users and
-agents never invoke that engine directly. The exact compatibility contract is in
-[docs/platform-support.md](docs/platform-support.md).
+`setup` checks Git. Storage, exact-version S3 reads, archive, and cancellation
+run inside the Rust executable; Python, DVC, and a separate storage runtime are
+not required. Existing DVC-compatible pointers, cache objects, and archive
+journals remain readable. See [docs/platform-support.md](docs/platform-support.md).
 
-Every CLI invocation consults a local update cache. At most once every six
-hours, it asks crates.io for newer non-yanked versions; a failed request is
-silently retried after one hour. When an applicable version is available, the
+CLI invocations other than `task list`, `task path`, `task show`, help output,
+and argument errors consult a local update cache; `--version` still checks.
+At most once every six hours, the check asks crates.io for newer non-yanked
+versions; a failed request is silently retried after one hour. When an applicable
+version is available, the
 CLI writes one agent-directed notice to stderr without changing command output
 or exit status. It never updates itself. The agent reports the versions and asks
 the user before updating, then runs `workspace-mgr setup`; managed repository
@@ -266,3 +324,10 @@ and a network Git server. Neither test path reads developer cloud credentials.
 ## License
 
 MIT
+
+Repository-development changes must keep information near its point of use.
+Global instructions contain mental model, operation discovery and genuinely
+session-wide constraints; prerequisites and procedures belong in the relevant
+command help, while outcome-specific reminders belong only in that command's
+execution report. See [contributing](CONTRIBUTING.md) and the
+[information-routing audit](docs/control-plane-audit.md).

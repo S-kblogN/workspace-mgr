@@ -70,6 +70,8 @@ pub struct StorageOperationReport {
     pub paths: Vec<String>,
     pub placements: Vec<PlacementStatus>,
     pub remote_writes: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::relocation::RelocationNotice>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +109,7 @@ pub fn status(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -133,6 +136,13 @@ pub fn set(
         return Err(Error::message(
             "archive migration receipts must remain in Git",
         ));
+    }
+    if target == StorageTarget::S3
+        && paths
+            .iter()
+            .any(|path| path.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD)))
+    {
+        return Err(Error::message("legacy adoption records must remain in Git"));
     }
     validate_boundary_targets(repo, scopes, &paths)?;
     let local = paths
@@ -199,6 +209,7 @@ pub fn set(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -325,6 +336,7 @@ pub fn untrack(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -385,6 +397,7 @@ pub fn reset(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -504,6 +517,11 @@ pub fn move_path(
         paths: vec![old_path, new_path.clone()],
         placements: vec![placement],
         remote_writes: false,
+        notices: if dry_run {
+            Vec::new()
+        } else {
+            vec![crate::relocation::RelocationNotice::moved_path()]
+        },
     })
 }
 
@@ -582,6 +600,7 @@ pub fn remove_paths(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -643,6 +662,7 @@ pub fn apply_automatic(
         if path.ends_with(".dvc")
             || path.ends_with(PLACEMENT_SUFFIX)
             || path.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
+            || path.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD))
         {
             continue;
         }
@@ -805,6 +825,9 @@ fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarg
 }
 
 fn automatic_target(repo: &GitRepo, config: &Config, path: &str) -> Result<StorageTarget> {
+    if path.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD)) {
+        return Ok(StorageTarget::Git);
+    }
     let metadata = fs::metadata(resolved_under(&repo.root, path)).at(path)?;
     let target = if metadata.is_file() {
         size_fallback_target(metadata.len())
@@ -1437,6 +1460,7 @@ fn reject_control_path(repo: &GitRepo, path: &str) -> Result<()> {
         || task_readme
         || name == TASK_MANIFEST_NAME
         || name == crate::archive_migration::RECEIPT_NAME
+        || name == crate::archive_adoption::LEGACY_RECORD
         || name == crate::config::CONFIG_NAME
         || name.ends_with(PLACEMENT_SUFFIX)
         || name.ends_with(".dvc")

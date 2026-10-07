@@ -252,10 +252,6 @@ mod test_storage {
     pub const ROOMY_10MB: [(&str, &str); 1] = [(CLOUD_USAGE_THRESHOLD_ENV, "10000000")];
 
     pub fn dvc_available() -> bool {
-        if which::which("dvc").is_err() {
-            eprintln!("skipping: dvc is unavailable");
-            return false;
-        }
         true
     }
 
@@ -825,10 +821,34 @@ fn a_file_removed_from_a_boundary_in_s3_is_a_cleanup_an_undocumented_task_publis
         ["remove", format!("{outputs}/a.bin").as_str()],
         &OVER_300KB,
     );
-    command(
+    // A rejected Git push leaves the metadata prepared by the native storage
+    // engine for a retry. Exercise that state through the public CLI rather
+    // than requiring a separate storage-engine executable in the fixture.
+    let unavailable = fixture.root.join("unavailable-push-remote.git");
+    git(
         &fixture.shared,
-        "dvc",
-        ["commit", "-q", "--force", pointer.as_str()],
+        [
+            "config",
+            "remote.origin.pushurl",
+            unavailable.to_str().unwrap(),
+        ],
+    );
+    let prepared = workspace_env_unchecked(
+        &task,
+        ["publish", "-m", "Prepare the second cleanup for a retry"],
+        &OVER_300KB,
+    );
+    git(
+        &fixture.shared,
+        ["config", "--unset", "remote.origin.pushurl"],
+    );
+    assert_refused(&prepared, "unavailable-push-remote.git");
+    assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
+    assert!(
+        std::fs::read_to_string(task.join("outputs.dvc"))
+            .unwrap()
+            .contains("nfiles: 1"),
+        "the failed publication already rewrote the metadata for its retry"
     );
     let retried = json(&workspace_env(&task, ["plan"], &OVER_300KB));
     assert_eq!(retried["status"], "dry_run");
@@ -984,12 +1004,22 @@ fn text_added_to_published_s3_metadata_is_content() {
         "# Run 3 reached accuracy 0.93.\n",
     ] {
         std::fs::write(task.join("stored.bin.dvc"), format!("{published}{added}")).unwrap();
-        let engine = command(
-            &fixture.shared,
-            "dvc",
-            ["status", "--json", pointer.as_str()],
+        // The record lets a public plan reach native storage inspection. Its
+        // payload status remains clean despite the added metadata text; once
+        // the record is removed, the curation guard must still refuse it.
+        document_task(&task);
+        let engine = json(&workspace_env(&task, ["plan"], &ROOMY_10MB));
+        assert_eq!(
+            engine["storage"]["s3"]["dirty_files"],
+            serde_json::json!([])
         );
-        assert_eq!(String::from_utf8_lossy(&engine.stdout).trim(), "{}");
+        assert!(
+            engine["storage"]["s3"]["files"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(pointer.as_str()))
+        );
+        std::fs::remove_file(task.join("record.md")).unwrap();
         for args in [&["plan"][..], &["publish", "-m", "Annotate the result"][..]] {
             assert_refused(
                 &workspace_env_unchecked(&task, args, &ROOMY_10MB),
@@ -1115,14 +1145,10 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
     assert_eq!(warning_codes(&plan), ["task-record-unchanged"]);
 
     // A writer lands inside the boundary right before the engine commits it.
-    let engine = which::which("dvc").unwrap();
     let writer = fixture.root.join("late-writer");
     std::fs::write(
         &writer,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = commit ]; then\n  head -c 5000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexec '{}' \"$@\"\n",
-            engine.display()
-        ),
+        "#!/bin/sh\nif [ \"$1\" = commit ]; then\n  head -c 5000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexit 0\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&writer).unwrap().permissions();
@@ -1138,7 +1164,7 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
         ["publish", "-m", "Remove one output"],
         &[
             ROOMY_10MB[0],
-            ("WORKSPACE_MGR_STORAGE_DVC", writer.to_str().unwrap()),
+            ("WORKSPACE_MGR_TEST_STORAGE_HOOK", writer.to_str().unwrap()),
             ("LATE_TARGET", late.to_str().unwrap()),
         ],
     );

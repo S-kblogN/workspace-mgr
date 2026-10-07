@@ -15,6 +15,7 @@ use crate::manifest::{
 };
 use crate::path::{reject_symlink_traversal, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
+use crate::relocation::{RelocationNotice, RelocationPlan};
 use crate::transaction::validate_remote_task_identity;
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,8 @@ pub struct TaskRenameReport {
     pub remote_branch_oid: Option<String>,
     pub local_actions: Vec<TaskRenameAction>,
     pub remote_writes: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<RelocationNotice>,
     pub review: TaskRenameReview,
 }
 
@@ -109,6 +112,16 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         &remote_base_oid,
         remote_branch_oid.as_deref(),
     )?;
+    let relocation = match (&task.task_path, &new_task_path) {
+        (Some(old), Some(new)) => {
+            crate::nested_git::validate_move(&task_repo, old, new)?;
+            Some(RelocationPlan::opaque(
+                &resolved_under(&task_repo.root, old),
+                &resolved_under(&task_repo.root, new),
+            )?)
+        }
+        _ => None,
+    };
 
     // The rewritten manifest keeps every other field, including a recorded
     // cloud-usage approval, and uses the lowest schema that represents it.
@@ -148,6 +161,7 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
             &task,
             new_task_path.as_deref(),
             &rendered,
+            relocation.as_ref(),
         )?;
     }
 
@@ -172,6 +186,11 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         remote_branch_oid,
         local_actions,
         remote_writes: false,
+        notices: if !options.dry_run && relocation.is_some() {
+            vec![RelocationNotice::renamed_directory()]
+        } else {
+            Vec::new()
+        },
         review: TaskRenameReview {
             head_branch_unchanged: true,
             pull_request: "reuse-existing-draft",
@@ -289,6 +308,7 @@ fn apply_rename(
     task: &ResolvedTask,
     new_task_path: Option<&str>,
     rendered: &str,
+    relocation: Option<&RelocationPlan>,
 ) -> Result<()> {
     match (task.task_path.as_deref(), new_task_path) {
         (Some(old_path), Some(new_path)) => {
@@ -301,6 +321,9 @@ fn apply_rename(
             let mut changed_pointers = Vec::new();
             let mut manifest_rewritten = false;
             let result = (|| {
+                if let Some(relocation) = relocation {
+                    relocation.apply()?;
+                }
                 for (index, snapshot) in pointer_snapshots.iter().enumerate() {
                     if dvc::reset_moved_pointer_cloud_metadata(repo, &snapshot.new_path)? {
                         changed_pointers.push(index);
@@ -317,6 +340,7 @@ fn apply_rename(
                     manifest_rewritten.then_some((&new_manifest, original.as_str())),
                     &pointer_snapshots,
                     &changed_pointers,
+                    relocation,
                 );
                 return Err(rollback_error(error, rollback));
             }
@@ -374,6 +398,7 @@ fn rollback_deliverable(
     manifest: Option<(&Path, &str)>,
     pointer_snapshots: &[MovedPointerSnapshot],
     changed_pointers: &[usize],
+    relocation: Option<&RelocationPlan>,
 ) -> Result<()> {
     let mut rollback = Ok(());
     for index in changed_pointers {
@@ -385,6 +410,11 @@ fn rollback_deliverable(
     }
     if let Some((path, contents)) = manifest {
         rollback = combine_rollbacks(rollback, atomic_write(path, contents));
+    }
+    if let Some(relocation) = relocation {
+        if let Err(error) = relocation.restore() {
+            return combine_rollbacks(rollback, Err(error));
+        }
     }
     combine_rollbacks(
         rollback,
@@ -420,6 +450,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         .ok_or_else(|| Error::message("task manifest has no parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     temporary.write_all(contents.as_bytes()).at(path)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .at(path)?;
+    }
     temporary.flush().at(path)?;
     temporary.persist(path).map_err(|error| Error::Io {
         path: path.to_path_buf(),

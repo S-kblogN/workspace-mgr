@@ -1,32 +1,46 @@
 use clap::Parser;
 
 mod archive;
+mod archive_adoption;
+mod archive_cancel;
 mod archive_migration;
+mod archive_registry;
+mod archive_reservation;
 mod branch_cleanup;
 mod cli;
 mod cloud_usage;
+mod command_guidance;
 mod config;
 mod discard;
 mod doctor;
 mod dvc;
 mod error;
 mod git;
+mod guidance;
 mod hex;
 mod instructions;
 mod local_state;
 mod lock;
 mod manifest;
+mod native_archive;
+mod native_engine;
+mod native_s3;
+mod native_versions;
+mod nested_git;
 mod output;
 mod path;
 mod policy;
 mod process;
 mod refresh;
+mod relocation;
 mod runtime;
 mod s3_purge;
 mod scaffold;
 mod storage;
 mod task_approval;
+mod task_catalog;
 mod task_rename;
+mod task_upgrade;
 mod transaction;
 mod update;
 
@@ -51,8 +65,26 @@ use crate::task_rename::{TaskRenameOptions, rename as rename_task};
 use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
 
 fn main() {
-    update::check_and_warn();
-    let cli = Cli::parse();
+    let parsed = Cli::try_parse();
+    // Directory lookups are offline, read-only shell utilities. Even the
+    // background update cache must not be created as a side effect.
+    let check_update = match &parsed {
+        Ok(cli) => !matches!(
+            &cli.command,
+            Command::Task(args)
+                if matches!(args.command, TaskCommand::List(_) | TaskCommand::Path(_) | TaskCommand::Show(_))
+        ),
+        // Help and argument errors should be immediate and side-effect free.
+        // Keep the established update notice on the explicit version command.
+        Err(error) => error.kind() == clap::error::ErrorKind::DisplayVersion,
+    };
+    if check_update {
+        update::check_and_warn();
+    }
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
     if let Err(error) = run(cli) {
         eprintln!("workspace-mgr: {error}");
         std::process::exit(2);
@@ -116,6 +148,21 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Task(args) => match args.command {
+            TaskCommand::List(args) => task_catalog::list(&args, cli.format),
+            TaskCommand::Path(args) => task_catalog::path(&args, cli.format),
+            TaskCommand::Show(args) => task_catalog::show(&args, cli.format),
+            TaskCommand::Adopt(args) => emit(
+                &archive_adoption::adopt(&archive_adoption::ArchiveAdoptionOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
+                    path: args.path,
+                    pull_request: args.pull_request,
+                    title: args.title,
+                    purpose: args.purpose,
+                    dry_run: args.dry_run,
+                })?,
+                cli.format,
+            ),
             TaskCommand::Create(args) => emit(
                 &create_task(&TaskCreateOptions {
                     repo: args.repo,
@@ -135,6 +182,14 @@ fn run(cli: Cli) -> Result<()> {
                     start: args.repo,
                     manifest: args.manifest,
                     new_slug: args.new_slug,
+                    dry_run: args.dry_run,
+                })?,
+                cli.format,
+            ),
+            TaskCommand::Upgrade(args) => emit(
+                &task_upgrade::upgrade(&task_upgrade::TaskUpgradeOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
                     dry_run: args.dry_run,
                 })?,
                 cli.format,
@@ -219,6 +274,15 @@ fn run(cli: Cli) -> Result<()> {
                 cli.format,
             )
         }
+        Command::Archive(args) if args.cancel => emit(
+            &archive_cancel::cancel(
+                &args.repo,
+                args.manifest.as_deref(),
+                &args.paths,
+                args.dry_run,
+            )?,
+            cli.format,
+        ),
         Command::Archive(args) => emit(
             &archive(&ArchiveOptions {
                 start: args.repo,

@@ -1008,7 +1008,7 @@ fn approvals_follow_publication_in_an_authorized_alternate_workflow() {
 }
 
 #[test]
-fn only_schema_3_manifests_may_carry_the_approval_table() {
+fn approval_table_requires_a_supported_schema_at_least_3() {
     let fixture = managed_fixture(false);
     let (_, task) = create_task(&fixture, "usage-schema", "20260918-115000");
     let manifest = task.join(MANIFEST);
@@ -1038,8 +1038,8 @@ fn only_schema_3_manifests_may_carry_the_approval_table() {
             "task schema 1 must not declare the schema 3 cloud_usage_approval table",
         ),
         (
-            approved.replace("schema_version = 3", "schema_version = 4"),
-            "unsupported task schema 4, expected 1, 2, or 3",
+            approved.replace("schema_version = 3", "schema_version = 5"),
+            "unsupported task schema 5, expected 1, 2, 3, or 4",
         ),
         (
             format!("{approved}recorded_at = \"2026-09-18T12:00:00Z\"\n"),
@@ -1152,10 +1152,6 @@ mod test_storage {
     }
 
     pub fn dvc_available() -> bool {
-        if which::which("dvc").is_err() {
-            eprintln!("skipping: dvc is unavailable");
-            return false;
-        }
         true
     }
 
@@ -2251,14 +2247,10 @@ fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
     assert_eq!(first["cloud_usage"]["projected"]["s3_bytes"], 6);
 
     // A background writer changes the worktree right before an engine step.
-    let engine = which::which("dvc").unwrap();
     let writer = fixture.root.join("background-writer");
     std::fs::write(
         &writer,
-        format!(
-            "#!/bin/sh\nif [ \"$LATE_MODE\" = grow ] && [ \"$1\" = commit ]; then\n  head -c 400000 /dev/zero >> \"$LATE_TARGET\"\nfi\nif [ \"$LATE_MODE\" = add ] && [ \"$1\" = push ]; then\n  head -c 400000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexec '{}' \"$@\"\n",
-            engine.display()
-        ),
+        "#!/bin/sh\nif [ \"$LATE_MODE\" = grow ] && [ \"$1\" = commit ]; then\n  head -c 400000 /dev/zero >> \"$LATE_TARGET\"\nfi\nif [ \"$LATE_MODE\" = add ] && [ \"$1\" = push ]; then\n  head -c 400000 /dev/urandom > \"$LATE_TARGET\"\nfi\nexit 0\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&writer).unwrap().permissions();
@@ -2271,7 +2263,7 @@ fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
             &[
                 LIMIT_300KB[0],
                 LIMIT_300KB[1],
-                ("WORKSPACE_MGR_STORAGE_DVC", writer.to_str().unwrap()),
+                ("WORKSPACE_MGR_TEST_STORAGE_HOOK", writer.to_str().unwrap()),
                 ("LATE_MODE", mode),
                 ("LATE_TARGET", target.to_str().unwrap()),
             ],

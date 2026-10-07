@@ -5,6 +5,122 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-06
+
+### Added
+
+- Read-only, offline `task list`, `task path`, and `task show` discover current
+  deliverable and private infrastructure tasks after rename or archive. Listing
+  supports search, kind and placement filters, and linewise paths; exact path
+  resolution refuses ambiguous selectors instead of guessing. Legacy task
+  candidates and malformed current metadata remain visible with diagnostics.
+- Explicit `task adopt` for reviewed legacy directories without manifests.
+- Previewable, idempotent `task upgrade` for supported current task metadata,
+  preserving identity, scopes, cloud-usage approval and compatible saved schema 4
+  review fields. It no longer produces historical task-content proofs.
+- Previewable, idempotent `archive --cancel` with durable local metadata and Git
+  reference snapshots, preserving ignored/hydrated content and other task edits.
+
+### Fixed
+
+- Archive uses current task configuration and live associated PR states,
+  including saved review branches after a branch change. Merged PRs
+  and PRs closed without merging qualify; open, missing or
+  unverifiable corresponding PRs refuse. Historical configuration, directory
+  trees, commit review coverage, full-history availability and branch-tip
+  ancestry no longer determine archive eligibility. Existing completion
+  checkpoints remain readable but are not an archive prerequisite.
+- Archive preserves all ordinary local contents unchanged, including tracked,
+  staged, untracked, ignored and local-only files. It checks managed-storage
+  integrity, scopes and move conflicts without checking script paths,
+  cross-task references, logs, README commands or environment usability.
+- Archive retirement completes only after a full S3 history scan finds no data
+  versions or delete markers under the original task prefix. Protected history
+  reports `cleanup_pending`; unmapped concurrent writes report
+  `blocked_unmapped` and remain durably queued instead of being forgotten.
+  Publication and refresh report these incomplete cleanup states separately
+  from successful Git push or synchronization. Empty original inventories also
+  retain typed prefix cleanup intents until a published-receipt scan verifies
+  no source versions or delete markers remain.
+- Archive cancellation removes the attempt's exact registry versions, copied
+  payloads, delete markers and unfinished uploads after verifying the original
+  source generations. It releases its exact canonical binding and copy
+  reservation after durable remote cleanup and local restoration,
+  preserving unrelated history and refusing terminal success on conflicts.
+  Retries after durable remote cleanup preserve later foreign writes and newer
+  claims while completing local undo; completed retries do not require source
+  versions that a subsequent archive may have retired.
+- Live legacy task trees on branches or tags protect their complete S3 prefix
+  before archive merge, even when the old Git snapshot has no task manifest.
+  After the copied receipt merges, historical tags hydrate mapped versions
+  through the registry without retaining duplicate source history.
+- Nested Git repositories must be covered by shared outer-repository ignore
+  rules at both their source and destination, with no outer-tracked files or
+  gitlinks. Task-local rules may be added and published with the task. `plan`
+  and `publish` enforce the same boundary before storage placement. Ignored
+  repositories move unchanged; archive does not repair Git
+  controls, registrations, or external administration. Zero-byte `.git` cache
+  markers remain ordinary content.
+- Archive receipts independently raise the publication requirement to 0.7.0,
+  including schema 2/3 tasks and empty S3 histories. Private purge and copy
+  journals use schema 2 so 0.6.0 rejects them before deleting protected versions.
+  Legacy private state is durably upgraded before a destructive retry or
+  cancellation; previews preserve it and public receipts remain schema 1.
+- Legacy adoption review records remain in Git and are protected from
+  automatic S3 placement, explicit storage changes, and untracking.
+
+### Changed
+
+- Default and explicit `instructions all` now provide the short mental model,
+  operation directory and session-wide constraints. Operation prerequisites and
+  retained policies live in command help and on-demand compatibility topics;
+  outcome-specific guidance lives in execution reports. The user-owned
+  repository instruction module remains accessible through `instructions
+  repository`, and its bytes still affect the effective policy hash.
+- Directory relocation no longer validates or repairs ordinary runtime content,
+  Python environments, symlinks or nested Git administrative references. Actual
+  successful moves report a manual-content-audit notice; global instructions and
+  dry-runs do not issue unconditional broken-link warnings. Existing cancel
+  journals remain readable for lossless undo.
+- Task upgrade/adoption no longer require proof about ordinary historical task
+  content, directory-tree transitions or earlier imports. Current task/PR/ref
+  control checks remain. Other repository-management policies, including task
+  documentation, whitespace, storage semantics, ignore, symlink publication and
+  cloud-usage requirements, are retained and relocated rather than removed.
+- Managed storage runs entirely in Rust, including DVC-compatible local pointer
+  and cache handling, streaming exact-version S3 reads, Signature Version 4,
+  full-history archive copy, immutable registry publication, and lossless cancel.
+  Python and DVC are no longer production runtime dependencies. Existing pointer,
+  cache, receipt, and private transaction formats remain readable.
+- `setup` verifies Git and the native engine without installing packages or
+  modifying former runtime directories; `--runtime-dir` remains accepted.
+
+- Canonical archive registries use an immutable complete-receipt binding on a
+  reserved Git control tag for compare-and-create ownership. A separate source
+  copy reservation binds a normalized planned receipt and attempt nonce before
+  any copied history is written. Both ownership claims do not
+  expire or permit takeover. B2 registry writes suppress automatic checksum
+  headers and send Content-MD5 while retaining conditional Put as the first
+  attempt. An explicit unsupported-operation response permits a plain retry
+  only under the verified binding; completed archives retire their original
+  payload prefix instead of retaining duplicate source history permanently.
+
+### Upgrading
+
+- `task upgrade` remains a separate operation for current manifest control
+  metadata, with current published identity and client compatibility checks.
+  It preserves old checkpoint fields without synthesizing or replaying payload
+  history proof. Archive needs no checkpoint or upgrade: supported current
+  metadata and corresponding closed PRs suffice.
+  Manifestless directories still require explicit `task adopt` to establish
+  current metadata; archive does not trace their pre-adoption imports.
+- Lossless `archive --cancel` requires an attempt journal created by this
+  release, including its copy reservation nonce. Old receipts alone cannot
+  reconstruct ownership and all original local metadata.
+- Use this protocol on every CLI that archives, cancels or purges the same
+  repository. The configured Git remote must permit creating and conditionally
+  deleting the reserved `archive-copy` and `archive-registry` control tags.
+
 ## [0.6.0] - 2026-10-06
 
 ### Changed

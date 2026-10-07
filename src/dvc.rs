@@ -1,74 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
-use crate::hex::encode_lower;
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
-use crate::process::{CommandOutput, run as run_process, run_unchecked as run_process_unchecked};
+use crate::process::CommandOutput;
 
-const VERSION_VERIFY_SCRIPT: &str = include_str!("../assets/dvc_version_verify.py");
-const VERSION_PURGE_SCRIPT: &str = include_str!("../assets/dvc_version_purge.py");
-const VERSION_ARCHIVE_SCRIPT: &str = include_str!("../assets/dvc_version_archive.py");
-const ARCHIVE_REGISTRY_SCRIPT: &str = include_str!("../assets/dvc_archive_registry.py");
 const INTERNAL_CONFIG_HEADER: &str =
     "# Managed by workspace-mgr. Edit .workspace-mgr.toml and rerun workspace-mgr init.\n";
-pub const REQUIRED_DVC_VERSION: &str = "3.67.1";
 pub const INTERNAL_REMOTE: &str = "workspace-mgr";
-#[cfg(feature = "test-storage")]
-pub const STORAGE_PYTHON_ENV: &str = "WORKSPACE_MGR_STORAGE_PYTHON";
 
-pub fn storage_python() -> String {
-    crate::runtime::storage_python()
-}
-
-pub fn dvc_program() -> String {
-    crate::runtime::dvc_program()
-}
-
-pub fn require_runtime(repo: &GitRepo) -> Result<String> {
-    let output = inspect_engine(&repo.root, ["--version"])?;
-    if !output.success() {
-        return Err(Error::message(
-            "managed-storage runtime is unavailable; install workspace-mgr with its required storage runtime",
-        ));
-    }
-    let actual = output.stdout.trim();
-    if actual != REQUIRED_DVC_VERSION {
-        return Err(Error::message(format!(
-            "managed-storage runtime version {actual:?} is incompatible; workspace-mgr requires exactly {REQUIRED_DVC_VERSION}"
-        )));
-    }
-    Ok(actual.to_owned())
+pub fn require_runtime(_repo: &GitRepo) -> Result<String> {
+    Ok(format!("native Rust {}", env!("CARGO_PKG_VERSION")))
 }
 
 pub fn require_version_adapter(repo: &GitRepo) -> Result<String> {
-    let python = storage_python();
-    let output = run_process_unchecked(
-        &python,
-        ["-c", "import dvc; print(dvc.__version__)"],
-        &repo.root,
-    )
-    .map_err(private_engine_error)?;
-    if !output.success() {
-        return Err(Error::message(
-            "managed-storage version adapter is unavailable; run `workspace-mgr setup`",
-        ));
-    }
-    let actual = output.stdout.trim();
-    if actual != REQUIRED_DVC_VERSION {
-        return Err(Error::message(format!(
-            "managed-storage version adapter {actual:?} is incompatible; workspace-mgr requires exactly {REQUIRED_DVC_VERSION}"
-        )));
-    }
-    Ok(format!("internal adapter {actual}"))
+    require_runtime(repo)
 }
 
 pub fn render_internal_config(config: &Config) -> Result<Option<String>> {
@@ -211,30 +164,7 @@ pub fn verify_object_versioning(repo: &GitRepo, config: &Config) -> Result<serde
     if !config.requires_object_versioning() {
         return Ok(serde_json::json!({"mode": "not-required"}));
     }
-    let python = storage_python();
-    let output = run_process_unchecked(
-        &python,
-        [
-            "-c",
-            VERSION_VERIFY_SCRIPT,
-            &repo.root.to_string_lossy(),
-            "[]",
-            "--check-versioning-only",
-        ],
-        &repo.root,
-    )
-    .map_err(private_engine_error)?;
-    if !output.success() {
-        return Err(Error::message(format!(
-            "failed to verify S3 bucket object versioning: {}",
-            private_detail(&output)
-        )));
-    }
-    serde_json::from_str(output.stdout.trim()).map_err(|error| {
-        Error::message(format!(
-            "bucket-versioning verifier returned invalid JSON: {error}"
-        ))
-    })
+    crate::native_versions::check_versioning(repo)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +191,8 @@ struct Pointer {
 #[derive(Debug, Clone, Deserialize)]
 struct PointerOut {
     path: String,
+    #[serde(default)]
+    hash: Option<String>,
     #[serde(default)]
     md5: Option<String>,
     #[serde(default)]
@@ -585,7 +517,7 @@ pub(crate) fn local_object_stores(repo: &GitRepo, config: &Config) -> Vec<PathBu
 
 /// The engine's cache directory: `cache.dir` from the private or generated
 /// engine config, relative to the config directory, or the default.
-fn cache_dir(engine_dir: &Path) -> PathBuf {
+pub(crate) fn cache_dir(engine_dir: &Path) -> PathBuf {
     ["config.local", "config"]
         .iter()
         .filter_map(|name| fs::read_to_string(engine_dir.join(name)).ok())
@@ -658,11 +590,11 @@ fn stored_object(stores: &[PathBuf], md5: &str, suffix: &str) -> Option<PathBuf>
 pub fn discover(repo: &GitRepo, scopes: &[String]) -> Result<Vec<String>> {
     let mut found = BTreeSet::new();
     for path in repo.visible_paths(scopes)? {
-        if crate::storage::is_local(repo, &path)? {
-            continue;
-        }
         let absolute = resolved_under(&repo.root, &path);
         if absolute.extension().and_then(|value| value.to_str()) != Some("dvc") {
+            continue;
+        }
+        if crate::storage::is_local(repo, &path)? {
             continue;
         }
         let boundary = path
@@ -726,17 +658,10 @@ pub fn metadata_output(repo: &GitRepo, pointer: &str, raw: &str) -> Result<Strin
     Ok(output)
 }
 
-/// The storage engine resolves a `\` in a command target inconsistently.
-/// Measured with the pinned engine on Unix, `add`, `fetch`, `checkout`, and
-/// `move` address such a path literally, while `status` rewrites the `\` to
-/// `/`, reports the rewritten path missing, and fails, so nothing can verify
-/// such a boundary through the engine. Which subcommands rewrite is
-/// undocumented and free to change between engine versions, so the commands
-/// that place content refuse such a path outright rather than rest on the ones
-/// that happen to work today. `refresh` does not choose what a shared branch
-/// carries, so it skips that one boundary and reports it instead of refusing
-/// the whole update; `move`, which fetches the payload through the old
-/// metadata and then renames it, is the recovery.
+/// Preserve the established managed-storage path convention across the native
+/// migration. Older engines interpreted backslashes inconsistently. Refresh
+/// reports legacy boundaries; move reads their literal metadata and recovers
+/// them under an addressable name.
 pub fn is_addressable(path: &str) -> bool {
     !path.contains('\\')
 }
@@ -744,7 +669,7 @@ pub fn is_addressable(path: &str) -> bool {
 pub fn require_addressable(path: &str, field: &str, remedy: &str) -> Result<()> {
     if !is_addressable(path) {
         return Err(Error::message(format!(
-            "{field} {path:?} contains a backslash, which the storage engine reads as a path separator; {remedy}"
+            "{field} {path:?} contains a backslash, which is unsupported in managed-storage boundary names; {remedy}"
         )));
     }
     Ok(())
@@ -898,48 +823,12 @@ fn version_read_adapter(
     pointers: &[String],
     operation: &str,
 ) -> Result<serde_json::Value> {
-    let python = storage_python();
-    let script = format!(
-        "import sys, types\n_archive = types.ModuleType('dvc_archive_registry')\nexec({}, _archive.__dict__)\nsys.modules['dvc_archive_registry'] = _archive\nexec({}, globals())",
-        serde_json::to_string(ARCHIVE_REGISTRY_SCRIPT)
-            .map_err(|error| Error::message(error.to_string()))?,
-        serde_json::to_string(VERSION_VERIFY_SCRIPT)
-            .map_err(|error| Error::message(error.to_string()))?
-    );
-    let serialized = serde_json::to_string(pointers).map_err(|error| {
-        Error::message(format!("failed to encode storage metadata files: {error}"))
-    })?;
     let receipts = crate::archive_migration::receipts(repo, &[])?
         .into_iter()
         .map(|(_, receipt)| receipt)
         .filter(|receipt| receipt["status"] == "planned")
         .collect::<Vec<_>>();
-    let serialized_receipts =
-        serde_json::to_string(&receipts).map_err(|error| Error::message(error.to_string()))?;
-    let output = run_process_unchecked(
-        &python,
-        [
-            "-c",
-            &script,
-            &repo.root.to_string_lossy(),
-            &serialized,
-            operation,
-            &serialized_receipts,
-        ],
-        &repo.root,
-    )
-    .map_err(private_engine_error)?;
-    if !output.success() {
-        return Err(Error::message(format!(
-            "failed to read or verify versioned storage content: {}",
-            private_detail(&output)
-        )));
-    }
-    serde_json::from_str(output.stdout.trim()).map_err(|error| {
-        Error::message(format!(
-            "version-aware verifier returned invalid JSON: {error}"
-        ))
-    })
+    crate::native_versions::read(repo, pointers, operation, &receipts)
 }
 
 /// Populate the local cache. Versioned S3 reads validate GET metadata and local
@@ -965,35 +854,46 @@ pub fn version_purge_adapter(
     operation: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let python = storage_python();
-    let serialized = serde_json::to_string(payload).map_err(|error| {
-        Error::message(format!(
-            "failed to encode managed-storage purge request: {error}"
-        ))
-    })?;
-    let output = run_process_unchecked(
-        &python,
-        [
-            "-c",
-            VERSION_PURGE_SCRIPT,
-            &repo.root.to_string_lossy(),
-            operation,
-            &serialized,
-        ],
-        &repo.root,
-    )
-    .map_err(private_engine_error)?;
-    if !output.success() {
-        return Err(Error::message(format!(
-            "managed-storage permanent deletion failed: {}",
-            private_detail(&output)
-        )));
+    let mut coordination = Vec::new();
+    if operation == "delete" {
+        let mut sources = BTreeSet::new();
+        let candidates = payload.get("candidates").unwrap_or(payload);
+        for candidate in candidates.as_array().into_iter().flatten() {
+            if let Some(source) = candidate["pointer"]
+                .as_str()
+                .and_then(|pointer| pointer.strip_suffix("/.workspace-mgr-archive.json"))
+            {
+                sources.insert(source.to_owned());
+            } else if let Some(object) = candidate["object"].as_str() {
+                let parts = object.split('/').collect::<Vec<_>>();
+                for length in 1..parts.len() {
+                    sources.insert(parts[..length].join("/"));
+                }
+            }
+        }
+        for receipt in payload["prefixes"].as_array().into_iter().flatten() {
+            if let Some(source) = receipt["source"].as_str() {
+                sources.insert(source.to_owned());
+            }
+        }
+        for source in sources {
+            let inspected =
+                archive_registry_adapter(repo, "inspect", &serde_json::json!({"source":source}))?;
+            let Some(receipt) = inspected.get("receipt").filter(|value| value.is_object()) else {
+                continue;
+            };
+            coordination.push(serde_json::json!({"receipt":receipt,"coordination":crate::archive_registry::coordinate_published(repo, receipt)?}));
+        }
     }
-    serde_json::from_str(output.stdout.trim()).map_err(|error| {
-        Error::message(format!(
-            "managed-storage purge adapter returned invalid JSON: {error}"
-        ))
-    })
+    let mut request = if payload.is_object() || coordination.is_empty() {
+        payload.clone()
+    } else {
+        serde_json::json!({"candidates":payload})
+    };
+    if !coordination.is_empty() {
+        request["coordination"] = coordination.into();
+    }
+    crate::native_versions::purge(repo, operation, &request)
 }
 
 pub(crate) fn version_archive_adapter(
@@ -1001,28 +901,7 @@ pub(crate) fn version_archive_adapter(
     operation: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let serialized = serde_json::to_string(payload)
-        .map_err(|error| Error::message(format!("failed to encode archive request: {error}")))?;
-    let output = run_process_unchecked(
-        &storage_python(),
-        [
-            "-c",
-            VERSION_ARCHIVE_SCRIPT,
-            &repo.root.to_string_lossy(),
-            operation,
-            &serialized,
-        ],
-        &repo.root,
-    )
-    .map_err(private_engine_error)?;
-    if !output.success() {
-        return Err(Error::message(format!(
-            "storage history archive failed: {}",
-            private_detail(&output)
-        )));
-    }
-    serde_json::from_str(output.stdout.trim())
-        .map_err(|error| Error::message(format!("archive adapter returned invalid JSON: {error}")))
+    crate::native_archive::execute(repo, operation, payload)
 }
 
 pub(crate) fn archive_registry_adapter(
@@ -1030,28 +909,12 @@ pub(crate) fn archive_registry_adapter(
     operation: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let serialized =
-        serde_json::to_string(payload).map_err(|error| Error::message(error.to_string()))?;
-    let output = run_process_unchecked(
-        &storage_python(),
-        [
-            "-c",
-            ARCHIVE_REGISTRY_SCRIPT,
-            &repo.root.to_string_lossy(),
-            operation,
-            &serialized,
-        ],
-        &repo.root,
-    )
-    .map_err(private_engine_error)?;
-    if !output.success() {
-        return Err(Error::message(format!(
-            "archive registry failed: {}",
-            private_detail(&output)
-        )));
-    }
-    serde_json::from_str(output.stdout.trim())
-        .map_err(|error| Error::message(format!("invalid archive registry response: {error}")))
+    let coordinated = if operation == "publish" {
+        serde_json::json!({"receipt":payload,"coordination":crate::archive_registry::coordinate(repo, payload, true)?})
+    } else {
+        payload.clone()
+    };
+    crate::native_archive::registry(repo, operation, &coordinated)
 }
 
 pub(crate) fn verify_archived(repo: &GitRepo, pointers: &[String]) -> Result<serde_json::Value> {
@@ -1224,7 +1087,10 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
             if output.size != Some(fs::metadata(&boundary_path).at(&boundary_path)?.len()) {
                 return Ok(false);
             }
-            Ok(md5_file(&boundary_path)? == *expected_md5)
+            Ok(crate::native_engine::file_digest(
+                &boundary_path,
+                output.hash.as_deref().unwrap_or("md5-dos2unix"),
+            )? == *expected_md5)
         }
         Some(files) => {
             if !boundary_path.is_dir() {
@@ -1268,7 +1134,10 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
                     return Ok(false);
                 };
                 if fs::metadata(entry.path()).at(entry.path())?.len() != *expected_size
-                    || md5_file(entry.path())? != **expected_md5
+                    || crate::native_engine::file_digest(
+                        entry.path(),
+                        output.hash.as_deref().unwrap_or("md5-dos2unix"),
+                    )? != **expected_md5
                 {
                     return Ok(false);
                 }
@@ -1277,20 +1146,6 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
             Ok(actual.len() == expected.len())
         }
     }
-}
-
-fn md5_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path).at(path)?;
-    let mut hasher = Md5::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).at(path)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(encode_lower(hasher.finalize()))
 }
 
 pub fn management(
@@ -1485,7 +1340,14 @@ pub fn link_private_worktree_state(source: &GitRepo, checkout: &GitRepo) -> Resu
     let shared_local = source.root.join(".dvc/config.local");
     let checkout_local = checkout.root.join(".dvc/config.local");
     if shared_local.is_file() && !checkout_local.exists() {
-        symlink_file(&shared_local, &checkout_local)?;
+        reject_symlink_traversal(
+            &source.root,
+            ".dvc/config.local",
+            "private storage configuration",
+        )?;
+        // The temporary checkout is removed after preparation. A regular copy
+        // keeps the native adapter's no-symlink credential/config boundary.
+        fs::copy(&shared_local, &checkout_local).at(&checkout_local)?;
     }
     Ok(())
 }
@@ -1593,16 +1455,6 @@ fn symlink_dir(source: &Path, target: &Path) -> Result<()> {
     std::os::windows::fs::symlink_dir(source, target).at(target)
 }
 
-#[cfg(unix)]
-fn symlink_file(source: &Path, target: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(source, target).at(target)
-}
-
-#[cfg(windows)]
-fn symlink_file(source: &Path, target: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_file(source, target).at(target)
-}
-
 trait EmptyFallback {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
 }
@@ -1618,7 +1470,15 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    run_process(&dvc_program(), args, cwd).map_err(private_engine_error)
+    let output = inspect_engine(cwd, args)?;
+    if !output.success() {
+        return Err(Error::Command {
+            command: "managed-storage".to_owned(),
+            code: output.code,
+            detail: private_detail(&output),
+        });
+    }
+    Ok(output)
 }
 
 fn inspect_engine<I, S>(cwd: &Path, args: I) -> Result<CommandOutput>
@@ -1626,9 +1486,15 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    run_process_unchecked(&dvc_program(), args, cwd).map_err(private_engine_error)
+    crate::native_engine::execute(
+        cwd,
+        args.into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect(),
+    )
 }
 
+#[cfg(test)]
 fn private_engine_error(error: Error) -> Error {
     match error {
         Error::Command { code, detail, .. } => Error::Command {
@@ -1678,21 +1544,30 @@ fn sanitize_private_detail(detail: &str) -> String {
         .or_else(|| candidates.last())
         .copied()
         .unwrap_or("internal engine reported a failure");
-    let mut sanitized = line
-        .replace("DVC", "internal engine")
-        .replace("dvc", "internal engine");
-    if let Some(runtime) = crate::runtime::managed_runtime_dir() {
-        let runtime = runtime.to_string_lossy();
-        if !runtime.is_empty() {
-            sanitized = sanitized.replace(runtime.as_ref(), "<private-runtime>");
-        }
-    }
-    sanitized
+    line.replace("DVC", "internal engine")
+        .replace("dvc", "internal engine")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_normalized_hash_verifies_crlf_payload_without_losing_change_detection() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_owned(),
+        };
+        for pointer in [
+            "outs:\n- path: data.bin\n  size: 7\n  hash: md5-dos2unix\n  md5: b1946ac92492d2347c6235b4d2611184\n",
+            "outs:\n- path: data.bin\n  size: 7\n  md5: b1946ac92492d2347c6235b4d2611184\n",
+        ] {
+            fs::write(temp.path().join("data.bin"), b"hello\r\n").unwrap();
+            assert!(payload_matches_metadata(&repo, "data.bin.dvc", pointer).unwrap());
+            fs::write(temp.path().join("data.bin"), b"HELLO\r\n").unwrap();
+            assert!(!payload_matches_metadata(&repo, "data.bin.dvc", pointer).unwrap());
+        }
+    }
 
     #[test]
     fn prefetch_error_is_actionable_without_exposing_the_engine_command() {
@@ -1713,7 +1588,7 @@ mod tests {
 
     #[test]
     fn private_engine_errors_hide_runtime_details_and_tracebacks() {
-        let runtime = crate::runtime::managed_runtime_dir().unwrap();
+        let runtime = std::path::PathBuf::from("<private-runtime>");
         let error = private_engine_error(Error::Command {
             command: runtime.join("bin/dvc").display().to_string(),
             code: 23,
@@ -1727,7 +1602,7 @@ mod tests {
         assert!(detail.contains("exit code 23"));
         assert!(detail.contains("internal engine failed"));
         assert!(!detail.contains("Traceback"));
-        assert!(!detail.contains(&runtime.display().to_string()));
+        assert!(!detail.contains("internal Python frame"));
         assert!(!detail.contains("DVC"));
         assert!(!detail.contains("dvc"));
 

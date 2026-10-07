@@ -52,27 +52,52 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
         model < rules,
         "management model must precede operational rules"
     );
-    assert!(text.contains("one writable conversation (chat) = one task"));
-    assert!(text.contains("Effective repository instructions"));
-    assert!(text.contains("shared checkout"));
-    assert!(text.contains("Repository-wide reading is allowed"));
-    assert!(text.contains("default write boundary is its own task directory"));
-    assert!(text.contains("another chat's task directory"));
-    assert!(text.contains("explicitly authorize the exact path and action"));
-    assert!(text.contains("they do not create authorization"));
-    assert!(text.contains("write boundary is instead the exact user-authorized paths"));
-    assert!(text.contains("is limited to 1 GiB (1073741824 bytes)"));
-    assert!(text.contains("stop this task's work immediately"));
-    assert!(text.contains("records the user's explicit answer from this chat"));
-    assert!(text.contains("this repository requires a newer workspace-mgr"));
-    assert!(text.contains("Never add, edit, or remove either by hand"));
-    // The cloud-usage pause and the curation habits share one turn end.
-    assert!(text.contains("The pause outranks the turn-end reconciliation"));
-    assert!(text.contains("decide their structural refusals before they measure cloud usage"));
-    assert!(text.contains("if it reports `cloud_usage.status: approval_required`, stop there"));
-    assert!(text.contains("the `changed_paths` that remain unpublished"));
-    assert!(text.contains("Publish that reduction on its own"));
-    assert!(text.contains("policy="));
+    let normalized_text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for global in [
+        "one writable conversation (chat) = one task",
+        "Effective repository instructions",
+        "shared checkout",
+        "Reading and ownership are separate",
+        "default write boundary is its own task directory",
+        "another chat's task directory",
+        "explicit user authorization for the exact path and action",
+        "do not manufacture it",
+        "cloud-usage approval, CLI installation and updates",
+        "before every writable-task turn",
+        "task create --help",
+        "archive --help",
+        "policy=",
+    ] {
+        assert!(
+            normalized_text.contains(global),
+            "global instructions omit {global:?}"
+        );
+    }
+    assert!(
+        text.len() < 10_000,
+        "default output grew into an operation manual"
+    );
+    for operation_detail in [
+        "## Task lifecycle",
+        "## Publication",
+        "## Artifact hygiene",
+        "## Storage placement",
+        "## Repository infrastructure",
+        "--historical-record",
+        "small-s3-boundary",
+        "source retirement",
+        "1.25 GiB (1342177280 bytes)",
+    ] {
+        assert!(
+            !text.contains(operation_detail),
+            "default output leaked {operation_detail:?}"
+        );
+    }
+    let explicit_all = workspace(
+        &fixture.shared,
+        ["--format", "human", "instructions", "all"],
+    );
+    assert_eq!(explicit_all.stdout, text.as_bytes());
 
     let model_only = workspace(
         &fixture.shared,
@@ -373,178 +398,42 @@ fn infrastructure_plan_and_publish_require_main_refresh_before_replacing_upstrea
 }
 
 #[test]
-fn setup_dry_run_reports_private_runtime_without_installing_it() {
+fn setup_verifies_native_storage_without_python_or_directory_changes() {
     let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
-    let report = workspace(
-        &fixture.root,
-        [
-            "setup",
-            "--runtime-dir",
-            runtime.to_str().unwrap(),
-            "--dry-run",
-        ],
-    );
-    assert_eq!(json(&report)["status"], "dry_run");
-    assert_eq!(json(&report)["storage_runtime"], "3.67.1");
-    assert!(!runtime.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn setup_installs_and_reuses_a_verified_private_runtime() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
-    let bootstrap = fixture.root.join("bootstrap-python");
-    std::fs::write(
-        &bootstrap,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ]; then\n  mkdir -p \"$3/bin\"\n  cp \"$0\" \"$3/bin/python\"\n  cp \"$0\" \"$3/bin/dvc\"\n  printf '#!%s/bin/python\\n' \"$3\" > \"$3/bin/generated-launcher\"\n  exit 0\nfi\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"pip\" ]; then\n  exit 0\nfi\nif [ \"${1:-}\" = \"-c\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nexit 23\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&bootstrap).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&bootstrap, permissions).unwrap();
-
-    let install = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
-        .output()
-        .unwrap();
-    assert!(
-        install.status.success(),
-        "setup failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr)
-    );
-    assert_eq!(json(&install)["status"], "installed");
-    assert!(runtime.join("bin/dvc").is_file());
-    assert!(runtime.join("bin/python").is_file());
-    assert_eq!(
-        std::fs::read_to_string(runtime.join(".workspace-mgr-runtime")).unwrap(),
-        "workspace-mgr private runtime v1\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(runtime.join("bin/generated-launcher")).unwrap(),
-        format!("#!{}/bin/python\n", runtime.display())
-    );
-
-    let repeated = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
-        .output()
-        .unwrap();
-    assert!(
-        repeated.status.success(),
-        "repeat setup failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&repeated.stdout),
-        String::from_utf8_lossy(&repeated.stderr)
-    );
-    assert_eq!(json(&repeated)["status"], "no_changes");
-}
-
-#[cfg(unix)]
-#[test]
-fn failed_runtime_install_restores_the_previous_directory() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
+    let runtime = fixture.root.join("former-runtime");
     std::fs::create_dir(&runtime).unwrap();
-    std::fs::write(runtime.join("sentinel"), "previous runtime\n").unwrap();
-    std::fs::write(
-        runtime.join(".workspace-mgr-runtime"),
-        "workspace-mgr private runtime v1\n",
-    )
-    .unwrap();
-    let bootstrap = fixture.root.join("failing-bootstrap-python");
-    std::fs::write(
-        &bootstrap,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ]; then\n  mkdir -p \"$3/bin\"\n  cp \"$0\" \"$3/bin/python\"\n  exit 0\nfi\nif [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"pip\" ]; then\n  exit 23\nfi\nexit 23\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&bootstrap).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&bootstrap, permissions).unwrap();
-
-    let failed = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", &bootstrap)
-        .output()
-        .unwrap();
-    assert_eq!(failed.status.code(), Some(2));
-    assert_eq!(
-        std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
-        "previous runtime\n"
-    );
-    assert_eq!(
-        std::fs::read_dir(runtime).unwrap().count(),
-        2,
-        "partial replacement files must be removed"
-    );
-    assert!(std::fs::read_dir(&fixture.root).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".workspace-mgr-runtime-backup-")
-    }));
-}
-
-#[test]
-fn setup_refuses_to_replace_an_unmanaged_directory() {
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("ordinary-data");
-    std::fs::create_dir(&runtime).unwrap();
-    std::fs::write(runtime.join("sentinel"), "must survive\n").unwrap();
-
-    let rejected = workspace_unchecked(
-        &fixture.root,
-        [
-            "setup",
-            "--runtime-dir",
-            runtime.to_str().unwrap(),
-            "--dry-run",
-        ],
-    );
-    assert_eq!(rejected.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not owned"));
-    assert_eq!(
-        std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
-        "must survive\n"
-    );
-}
-
-#[test]
-fn concurrent_runtime_install_is_rejected_before_provisioning() {
-    use fs2::FileExt;
-
-    let fixture = GitFixture::new();
-    let runtime = fixture.root.join("private-runtime");
-    let lock_path = fixture.root.join(".workspace-mgr-setup.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)
-        .unwrap();
-    lock.try_lock_exclusive().unwrap();
-
-    let blocked = binary_command()
-        .args(["setup", "--runtime-dir", runtime.to_str().unwrap()])
-        .current_dir(&fixture.root)
-        .output()
-        .unwrap();
-    assert_eq!(blocked.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("setup operation is running"));
-    assert!(!runtime.exists());
+    std::fs::write(runtime.join("sentinel"), "preserve\n").unwrap();
+    for dry_run in [true, false] {
+        let mut args = vec!["setup", "--runtime-dir", runtime.to_str().unwrap()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = binary_command()
+            .args(args)
+            .current_dir(&fixture.root)
+            .env("WORKSPACE_MGR_FORMAT", "json")
+            .env("WORKSPACE_MGR_BOOTSTRAP_PYTHON", "/does-not-exist/python")
+            .env("WORKSPACE_MGR_STORAGE_DVC", "/does-not-exist/dvc")
+            .env("WORKSPACE_MGR_STORAGE_PYTHON", "/does-not-exist/python")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = json(&output);
+        assert_eq!(
+            report["storage_runtime"],
+            format!("native Rust {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(report["runtime_dir"], "");
+        assert_eq!(
+            std::fs::read_to_string(runtime.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 1);
+    }
 }
 
 #[test]
@@ -629,14 +518,12 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
 
     let all = workspace(&fixture.shared, ["--format", "human", "instructions"]);
     let text = String::from_utf8(all.stdout).unwrap();
-    assert!(text.contains("Operating model"));
-    assert!(text.contains("Task lifecycle"));
-    assert!(text.contains("\n## Publication\n"));
-    assert!(text.contains("\n## Pull request responsibility\n"));
-    assert!(text.contains("\n## Artifact hygiene\n"));
-    assert!(text.contains("\n## Storage placement\n"));
-    assert!(text.contains("\n## Shared checkout\n"));
-    assert!(text.contains("\n## Repository infrastructure\n"));
+    assert!(text.contains("## Mental model"));
+    assert!(text.contains("## Session-wide constraints"));
+    assert!(text.contains("## Find the next operation"));
+    assert!(!text.contains("\n## Artifact hygiene\n"));
+    assert!(!text.contains("\n## Storage placement\n"));
+    assert!(!text.contains("\n## Publication\n"));
 
     for topic in [
         "task",
@@ -662,7 +549,8 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("own files are its durable record"));
     for organization_rule in [
         "Active deliverable task directories must remain at the repository top level",
-        "Only completed tasks whose pull requests are confirmed merged",
+        "Only tasks whose corresponding pull requests are closed",
+        "merged and closed without merging both qualify",
         "`YYYY/<task-dir>`, `YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>`",
         "only when the user explicitly requests it",
         "through a repository-infrastructure task",
@@ -675,6 +563,21 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
             "task instructions are missing {organization_rule:?}"
         );
     }
+    for archive_rule in [
+        "Archive uses current task configuration and its associated PRs",
+        "without inspecting historical configuration, tree history, commit review coverage, or branch-tip ancestry",
+        "Completion checkpoints and task upgrade are not archive prerequisites",
+        "Ordinary tracked, staged, untracked, ignored, and local-only content moves unchanged",
+        "runtime usability after relocation is outside archive scope",
+        "no outer-tracked files or gitlinks",
+        "archive never repairs them or edits external administration",
+    ] {
+        assert!(
+            task_rules.contains(archive_rule),
+            "task instructions are missing archive scope rule {archive_rule:?}"
+        );
+    }
+    assert!(!task_rules.contains("--historical-record"));
     // A record added to a cleanup would make it growth the limit refuses, so
     // the lifecycle and hygiene rules defer it to the same publication.
     assert!(
@@ -703,6 +606,18 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(artifact_rules.contains("only a machine-local rule hides"));
     assert!(artifact_rules.contains("`bulk-publication` warning"));
     assert!(artifact_rules.contains("S3 is not a dumping ground"));
+    assert!(
+        artifact_rules
+            .contains("Every nested Git repository must be ignored as an entire directory")
+    );
+    assert!(
+        artifact_rules.contains("Plan and publish enforce this boundary before storage placement")
+    );
+    assert!(
+        artifact_rules
+            .contains("A new task-local ignore file may be carried by the same publication")
+    );
+    assert!(artifact_rules.contains("Never create a gitlink for a nested repository"));
     // The repository layer is a shared root path, so the curation rule and the
     // write-boundary rule have to read as one policy rather than two that
     // contradict each other.
@@ -903,10 +818,6 @@ fn tracked_configuration_rejects_credentials_and_policy_keys() {
 
 #[test]
 fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     fixture.clone_shared();
     let dvc_dir = fixture.shared.join(".dvc");
@@ -1342,4 +1253,43 @@ fn a_repository_module_may_not_carry_the_products_own_block_markers() {
     let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
     assert!(stderr.contains("managed block markers"), "{stderr}");
     assert!(!fixture.shared.join(".gitignore").exists());
+}
+
+#[test]
+fn global_instructions_index_repository_policy_without_leaking_its_body() {
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    workspace(&fixture.shared, ["init"]);
+    let module = fixture
+        .shared
+        .join(".workspace-mgr/instructions/repository.md");
+    std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+    let first = "  User-owned specific procedure: keep exact spacing.\n\n";
+    std::fs::write(&module, first).unwrap();
+    let all = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions"],
+    ));
+    let markdown = all["markdown"].as_str().unwrap();
+    assert!(markdown.contains("workspace-mgr instructions repository"));
+    assert!(markdown.contains("Read it before task work"));
+    assert!(!markdown.contains("keep exact spacing"));
+    let detailed = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions", "repository"],
+    ));
+    assert!(detailed["markdown"].as_str().unwrap().contains(first));
+    let next = "Changed user-owned procedure, not product policy.\n";
+    std::fs::write(&module, next).unwrap();
+    let changed = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions", "all"],
+    ));
+    assert_ne!(all["policy_hash"], changed["policy_hash"]);
+    assert!(!changed["markdown"].as_str().unwrap().contains(next));
+    let explicit = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions", "repository"],
+    ));
+    assert!(explicit["markdown"].as_str().unwrap().contains(next));
 }

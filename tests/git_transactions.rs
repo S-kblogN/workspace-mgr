@@ -599,7 +599,7 @@ fn refresh_rejects_new_storage_metadata_below_a_symlink() {
 }
 
 #[test]
-fn rejects_unmanaged_large_files_and_nested_gitlinks() {
+fn rejects_unmanaged_large_files_and_unignored_nested_repositories() {
     let fixture = managed_fixture();
     workspace(
         &fixture.shared,
@@ -646,9 +646,14 @@ fn rejects_unmanaged_large_files_and_nested_gitlinks() {
     std::fs::write(nested.join("README.md"), "nested repository\n").unwrap();
     git(&nested, ["add", "README.md"]);
     git(&nested, ["commit", "-m", "Nested commit"]);
-    let gitlink = workspace_unchecked(&task, ["plan"]);
-    assert_eq!(gitlink.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&gitlink.stderr).contains("gitlink"));
+    let unignored = workspace_unchecked(&task, ["plan"]);
+    assert_eq!(unignored.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unignored.stderr)
+            .contains("must be ignored as an entire directory"),
+        "{}",
+        String::from_utf8_lossy(&unignored.stderr)
+    );
 }
 
 #[test]
@@ -1810,4 +1815,77 @@ fn warning_codes(report: &serde_json::Value) -> Vec<&str> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[test]
+fn public_plan_and_publish_require_bare_nested_repositories_to_be_ignored_before_placement() {
+    let fixture = managed_fixture();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "bare-boundary",
+            "--title",
+            "Bare Git boundary",
+            "--purpose",
+            "Keep nested repositories opaque and local",
+            "--timestamp",
+            "20260829-170159",
+        ],
+    );
+    let task_id = "20260829-170159-bare-boundary";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    let bare = task.join("cache.git");
+    git(&fixture.shared, ["init", "--bare", bare.to_str().unwrap()]);
+    let payload = bare.join("objects/large-local-object");
+    std::fs::write(&payload, vec![7_u8; 10_485_761]).unwrap();
+    let index = git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout;
+    let remote = git(&fixture.remote, ["show-ref"]).stdout;
+    for args in [
+        vec!["plan"],
+        vec![
+            "publish",
+            "-m",
+            "Refuse unignored bare Git before placement",
+        ],
+    ] {
+        let output = workspace_unchecked(&task, args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("must be ignored as an entire directory"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
+            index
+        );
+        assert_eq!(git(&fixture.remote, ["show-ref"]).stdout, remote);
+        assert_eq!(std::fs::metadata(&payload).unwrap().len(), 10_485_761);
+        assert!(!bare.join("objects/large-local-object.dvc").exists());
+        assert!(!fixture.shared.join(".workspace-mgr/local/uploads").exists());
+    }
+    std::fs::write(task.join(".gitignore"), "/cache.git/\n").unwrap();
+    let planned = json(&workspace(&task, ["plan"]));
+    assert_eq!(planned["status"], "dry_run");
+    assert!(
+        planned["storage"]["placement"]["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cache.git/"))
+    );
+    assert_eq!(
+        git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
+        index
+    );
+    assert_eq!(git(&fixture.remote, ["show-ref"]).stdout, remote);
+    assert!(!bare.join("objects/large-local-object.dvc").exists());
+    assert!(!fixture.shared.join(".workspace-mgr/local/uploads").exists());
 }

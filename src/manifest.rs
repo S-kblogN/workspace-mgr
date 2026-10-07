@@ -15,6 +15,8 @@ pub const INFRASTRUCTURE_TASK_MANIFEST_FILE: &str = ".workspace-mgr-infrastructu
 pub const TASK_SCHEMA_VERSION: u32 = 2;
 /// Schema 2 plus the optional `[cloud_usage_approval]` table.
 pub const CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION: u32 = 3;
+/// Schema 3 plus durable, verified archive completion evidence.
+pub const ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION: u32 = 4;
 const LEGACY_TASK_SCHEMA_VERSION: u32 = 1;
 
 /// Infrastructure tasks share the main checkout. Their explicit manifests
@@ -56,6 +58,83 @@ pub struct TaskManifest {
     pub additional_scopes: Vec<AdditionalScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_usage_approval: Option<CloudUsageApproval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_completion: Option<ArchiveCompletion>,
+}
+
+/// A verified lifecycle checkpoint retained across task configuration upgrades.
+/// Archive revalidates its hosting facts and any later task changes before use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCompletion {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub repository: String,
+    pub base_branch: String,
+    pub checkpoint_commit: String,
+    pub checkpoint_path: String,
+    pub checkpoint_tree: String,
+    pub branches: Vec<String>,
+    pub reviews: Vec<ArchiveCompletionReview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCompletionReview {
+    pub branch: String,
+    pub number: u64,
+    pub url: String,
+    pub merged_at: String,
+    pub merge_commit: String,
+    pub head_commit: String,
+}
+
+fn validate_archive_completion(
+    repo: &GitRepo,
+    kind: TaskKind,
+    task_id: &str,
+    completion: &ArchiveCompletion,
+) -> Result<()> {
+    let valid_oid =
+        |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if kind != TaskKind::Deliverable
+        || completion.schema_version != 1
+        || completion.task_id != task_id
+        || !valid_oid(&completion.checkpoint_commit)
+        || !valid_oid(&completion.checkpoint_tree)
+        || completion.branches.is_empty()
+        || completion.reviews.is_empty()
+    {
+        return Err(Error::message("invalid archive completion checkpoint"));
+    }
+    one_line(&completion.repository, "archive completion repository")?;
+    repo.validate_branch(&completion.base_branch)?;
+    repo_path(
+        &completion.checkpoint_path,
+        "archive completion checkpoint path",
+    )?;
+    let mut branches = std::collections::BTreeSet::new();
+    for branch in &completion.branches {
+        repo.validate_branch(branch)?;
+        if !branches.insert(branch) {
+            return Err(Error::message("duplicate archive completion branch"));
+        }
+    }
+    let mut numbers = std::collections::BTreeSet::new();
+    for review in &completion.reviews {
+        repo.validate_branch(&review.branch)?;
+        one_line(&review.url, "archive completion pull request URL")?;
+        if review.number == 0
+            || !numbers.insert(review.number)
+            || !branches.contains(&review.branch)
+            || chrono::DateTime::parse_from_rfc3339(&review.merged_at).is_err()
+            || !valid_oid(&review.merge_commit)
+            || !valid_oid(&review.head_commit)
+        {
+            return Err(Error::message("invalid archive completion review"));
+        }
+    }
+    Ok(())
 }
 
 /// The user's decision to let this task keep more cloud data than the fixed
@@ -100,6 +179,7 @@ pub struct ResolvedTask {
     pub shared_head: String,
     pub additional_scopes: Vec<AdditionalScope>,
     pub cloud_usage_approval: Option<CloudUsageApproval>,
+    pub archive_completion: Option<ArchiveCompletion>,
 }
 
 impl TaskManifest {
@@ -113,7 +193,9 @@ impl TaskManifest {
     }
 
     pub fn minimal_schema_version(&self) -> u32 {
-        if self.cloud_usage_approval.is_some() {
+        if self.archive_completion.is_some() {
+            ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION
+        } else if self.cloud_usage_approval.is_some() {
             CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
         } else {
             TASK_SCHEMA_VERSION
@@ -124,6 +206,27 @@ impl TaskManifest {
 impl ResolvedTask {
     pub fn load(repo: &GitRepo, config: &Config, path: &Path) -> Result<Self> {
         let absolute = repo.resolve_manifest_path(path)?;
+        Self::load_at(repo, config, absolute, None)
+    }
+
+    /// Inspect current metadata without migrating any private state. The
+    /// catalog supplies a verified current or legacy private-state root.
+    pub(crate) fn load_read_only(
+        repo: &GitRepo,
+        config: &Config,
+        path: &Path,
+        infrastructure_root: &Path,
+    ) -> Result<Self> {
+        let absolute = path.canonicalize().at(path)?;
+        Self::load_at(repo, config, absolute, Some(infrastructure_root))
+    }
+
+    fn load_at(
+        repo: &GitRepo,
+        config: &Config,
+        absolute: PathBuf,
+        infrastructure_root: Option<&Path>,
+    ) -> Result<Self> {
         let raw = fs::read_to_string(&absolute).at(&absolute)?;
         let manifest: TaskManifest = toml::from_str(&raw).map_err(|source| Error::Toml {
             path: absolute.clone(),
@@ -134,13 +237,15 @@ impl ResolvedTask {
             LEGACY_TASK_SCHEMA_VERSION
                 | TASK_SCHEMA_VERSION
                 | CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
+                | ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION
         ) {
             return Err(Error::message(format!(
-                "unsupported task schema {}, expected {}, {}, or {}",
+                "unsupported task schema {}, expected {}, {}, {}, or {}",
                 manifest.schema_version,
                 LEGACY_TASK_SCHEMA_VERSION,
                 TASK_SCHEMA_VERSION,
-                CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
+                CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION,
+                ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION
             )));
         }
         let task_id = one_line(&manifest.id, "task id")?;
@@ -154,7 +259,9 @@ impl ResolvedTask {
                 }
                 identity.original_slug.clone()
             }
-            TASK_SCHEMA_VERSION | CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION => {
+            TASK_SCHEMA_VERSION
+            | CLOUD_USAGE_APPROVAL_TASK_SCHEMA_VERSION
+            | ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION => {
                 validate_task_slug(&manifest.slug)?;
                 manifest.slug.clone()
             }
@@ -202,8 +309,18 @@ impl ResolvedTask {
                         "infrastructure task manifest must not declare a task path",
                     ));
                 }
-                let expected = infrastructure_manifest_path(repo, &task_id)?;
-                let legacy = repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME);
+                let (expected, legacy) = match infrastructure_root {
+                    Some(root) => (
+                        root.join("infrastructure-tasks")
+                            .join(&task_id)
+                            .join(INFRASTRUCTURE_TASK_MANIFEST_FILE),
+                        root.join("task.toml"),
+                    ),
+                    None => (
+                        infrastructure_manifest_path(repo, &task_id)?,
+                        repo.git_dir()?.join(INFRASTRUCTURE_MANIFEST_NAME),
+                    ),
+                };
                 if absolute != expected && legacy.canonicalize().ok().as_ref() != Some(&absolute) {
                     return Err(Error::message(format!(
                         "infrastructure task manifest must be private per-task local state at {}; got {}",
@@ -230,6 +347,15 @@ impl ResolvedTask {
         }
         let title = one_line(&manifest.title, "task title")?;
         let purpose = one_line(&manifest.purpose, "task purpose")?;
+        if let Some(completion) = &manifest.archive_completion {
+            if manifest.schema_version < ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION {
+                return Err(Error::message(format!(
+                    "task schema {} must not declare the schema {} archive_completion table",
+                    manifest.schema_version, ARCHIVE_COMPLETION_TASK_SCHEMA_VERSION
+                )));
+            }
+            validate_archive_completion(repo, manifest.kind, &task_id, completion)?;
+        }
         Ok(Self {
             manifest_path: absolute,
             kind: manifest.kind,
@@ -244,6 +370,7 @@ impl ResolvedTask {
             shared_head: config.git.branch.clone(),
             additional_scopes,
             cloud_usage_approval,
+            archive_completion: manifest.archive_completion,
         })
     }
 
@@ -260,6 +387,7 @@ impl ResolvedTask {
             purpose: self.purpose.clone(),
             additional_scopes: self.additional_scopes.clone(),
             cloud_usage_approval: self.cloud_usage_approval.clone(),
+            archive_completion: self.archive_completion.clone(),
         };
         manifest.schema_version = manifest.minimal_schema_version();
         manifest
@@ -613,6 +741,7 @@ mod tests {
             shared_head: "main".to_owned(),
             additional_scopes: Vec::new(),
             cloud_usage_approval: None,
+            archive_completion: None,
         };
         assert_eq!(
             published_task_paths(&repo, &tree, &task).unwrap(),
@@ -763,10 +892,83 @@ mod tests {
                 "{table:?} was accepted"
             );
         }
-        let error = load_manifest(&deliverable_manifest(4, ""))
+        let error = load_manifest(&deliverable_manifest(5, ""))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unsupported task schema 4"), "{error}");
+        assert!(error.contains("unsupported task schema 5"), "{error}");
+    }
+
+    fn completion() -> ArchiveCompletion {
+        ArchiveCompletion {
+            schema_version: 1,
+            task_id: "20260918-120000-demo".to_owned(),
+            repository: "github.com/example/workspace".to_owned(),
+            base_branch: "main".to_owned(),
+            checkpoint_commit: "a".repeat(40),
+            checkpoint_path: "20260918-120000-demo".to_owned(),
+            checkpoint_tree: "b".repeat(40),
+            branches: vec!["codex/demo".to_owned(), "historical/demo".to_owned()],
+            reviews: vec![ArchiveCompletionReview {
+                branch: "historical/demo".to_owned(),
+                number: 12,
+                url: "https://github.com/example/workspace/pull/12".to_owned(),
+                merged_at: "2026-09-18T12:10:00Z".to_owned(),
+                merge_commit: "c".repeat(40),
+                head_commit: "d".repeat(40),
+            }],
+        }
+    }
+
+    #[test]
+    fn completion_survives_manifest_rewrites_and_approval_removal() {
+        let task = load_manifest(&deliverable_manifest(3, APPROVAL_TABLE)).unwrap();
+        let mut manifest = task.manifest();
+        manifest.archive_completion = Some(completion());
+        let raw = manifest.render().unwrap();
+        assert!(raw.starts_with("schema_version = 4\n"));
+        let loaded = load_manifest(&raw).unwrap();
+        assert_eq!(loaded.archive_completion, Some(completion()));
+        assert_eq!(loaded.manifest().render().unwrap(), raw);
+        let mut rewritten = loaded.manifest();
+        rewritten.cloud_usage_approval = None;
+        assert_eq!(rewritten.minimal_schema_version(), 4);
+        let rewritten = load_manifest(&rewritten.render().unwrap()).unwrap();
+        assert_eq!(rewritten.archive_completion, Some(completion()));
+        assert_eq!(rewritten.cloud_usage_approval, None);
+    }
+
+    #[test]
+    fn completion_requires_its_schema_and_rejects_invalid_identity_or_reviews() {
+        let task = load_manifest(&deliverable_manifest(2, "")).unwrap();
+        let mut manifest = task.manifest();
+        manifest.archive_completion = Some(completion());
+        let raw = manifest.render().unwrap();
+        let old_schema = raw.replacen("schema_version = 4", "schema_version = 3", 1);
+        assert!(
+            load_manifest(&old_schema)
+                .unwrap_err()
+                .to_string()
+                .contains("must not declare the schema 4 archive_completion table")
+        );
+        for invalid in [
+            raw.replace("checkpoint_tree =", "unknown_checkpoint_tree ="),
+            raw.replace("number = 12", "number = 0"),
+            raw.replace("2026-09-18T12:10:00Z", "yesterday"),
+            raw.replace(
+                "checkpoint_path = \"20260918-120000-demo\"",
+                "checkpoint_path = \"../outside\"",
+            ),
+            raw.replace("branch = \"historical/demo\"", "branch = \"unknown/demo\""),
+        ] {
+            assert!(load_manifest(&invalid).is_err(), "accepted {invalid}");
+        }
+        let mut wrong_id = manifest.clone();
+        wrong_id.archive_completion.as_mut().unwrap().task_id = "20260918-120000-other".to_owned();
+        assert!(load_manifest(&wrong_id.render().unwrap()).is_err());
+        let mut duplicate_review = manifest;
+        let checkpoint = duplicate_review.archive_completion.as_mut().unwrap();
+        checkpoint.reviews.push(checkpoint.reviews[0].clone());
+        assert!(load_manifest(&duplicate_review.render().unwrap()).is_err());
     }
 
     #[test]

@@ -19,7 +19,7 @@ agents do not configure or invoke private execution engines directly.
 
 ## Repository lifecycle
 
-### 1. Provision the CLI runtime
+### 1. Install the CLI and verify Git
 
 Native archives include `install.sh`, which installs the executable and runs
 `workspace-mgr setup`. After `cargo install`, run setup explicitly:
@@ -28,18 +28,20 @@ Native archives include `install.sh`, which installs the executable and runs
 workspace-mgr setup
 ```
 
-Setup uses an isolated user data directory and verifies the exact private
-storage runtime. `workspace-mgr setup --dry-run` reports the intended location
-and actions without changing the host. A custom `--runtime-dir` must be absent
-or already carry workspace-mgr's private ownership marker; setup never replaces
-an arbitrary existing directory.
+Setup checks that Git is available and reports the built-in Rust storage engine.
+It creates no separate runtime or user data directory. `workspace-mgr setup
+--dry-run` performs the same check without changes. The legacy `--runtime-dir`
+flag remains accepted for older installers; setup does not inspect or modify
+that directory.
 
-Every invocation also checks the local update cache. A successful registry
-check remains fresh for six hours; a failed check is silent and is retried after
-one hour. The network request has a short timeout, never changes the command's
-exit status, and never writes to stdout. If a newer applicable release is
-known, each invocation writes one line to stderr asking the agent to notify the
-user. Stable installations consider only stable releases; prerelease
+Invocations other than `task list`, `task path`, `task show`, help output, and
+argument errors also check the local update cache; `--version` still checks.
+A successful registry check remains fresh for six hours; a failed check is
+silent and is retried after one hour. The network request has a short timeout,
+never changes the command's exit status, and never writes to stdout. If a newer
+applicable release is known, each such invocation writes one line to stderr
+asking the agent to notify the user. Stable installations consider only stable
+releases; prerelease
 installations follow the newest non-yanked release, including prereleases.
 
 The CLI never updates itself. The agent reports the current and available
@@ -206,18 +208,20 @@ instructions --repo .`. An unapproved or failed installation remains a
 blocker; the agent does not substitute lower-level repository or storage
 commands.
 
-`instructions` is intentionally different from `help`: help explains command
-syntax, while instructions first establishes the shared workspace model and
-then renders the repository's actual operating policy. The output combines the
-canonical model document, the complete built-in policy, `.workspace-mgr.toml`
-facts, and the optional repository-specific content module. Run
-`workspace-mgr doctor` before work
-if the installation or repository state may be inconsistent.
+Default `instructions` and explicit `instructions all` provide the mental
+model, operation directory, genuinely session-wide constraints and current
+repository facts. They do not print every operation's detailed policy. Read
+`workspace-mgr <command> --help` before that operation for its prerequisites,
+applicable repository-management rules and next steps. Execution reports supply
+facts and reminders that become relevant only after the operation runs.
 
-The default `all` document contains the model followed by the complete fixed
-policy. `instructions model` returns only the conceptual model. Every
-operational topic is always available; a repository cannot disable selected
-rules and thereby give an agent an incomplete management contract.
+`instructions model` returns only the short conceptual document. Existing
+`core`, `task`, `publish`, `artifacts`, `storage`, `shared-checkout` and
+`infrastructure` topics remain detailed on-demand compatibility views; this
+changes where policy appears, not the policy itself. The user's
+`.workspace-mgr/instructions/repository.md` is indexed by default; read it before
+task work, either directly or with `instructions repository`. Its bytes still
+contribute to the effective policy hash even when its body is not printed.
 
 ### 4. Create one task
 
@@ -297,6 +301,41 @@ Git/S3 placement history. The agent then updates the existing pull request's
 title and description. An infrastructure rename uses `--manifest` to update its
 private current slug while its manifest path remains stable.
 
+### Find an existing task
+
+Use task discovery instead of assuming that every task is directly below the
+repository root. Renaming changes the current slug, and archiving can move the
+same task into a year or month folder while its immutable ID remains stable.
+
+```sh
+workspace-mgr task list
+workspace-mgr task list model --kind deliverable
+workspace-mgr task list --placement nested --paths
+workspace-mgr task show model-comparison
+cd "$(workspace-mgr --format human task path model-comparison)"
+```
+
+Listing searches current local task metadata throughout the repository,
+including ignored and untracked deliverables and private infrastructure tasks.
+The query is a case-insensitive substring search over identity, name, title,
+and path. `--paths` emits only repository-relative deliverable paths, one per
+line; use `task path <selector> --relative` for one such path. `task path`
+defaults to an absolute directory and requires an exact current slug,
+basename, immutable ID, or path. If a slug matches multiple tasks, it reports
+the candidates and requires a more precise selector.
+
+`task show` provides current metadata and the absolute manifest path. An
+infrastructure task has no deliverable directory; select its manifest from
+this output when using task-scoped commands. A timestamped directory without
+a manifest is a legacy candidate, and invalid current metadata is reported
+with a diagnostic. Neither a candidate nor a nested location proves that a
+task is complete. Local `archive_status` describes its current receipt,
+without checking GitHub merge or S3 publication status. Discovery is offline
+and read-only, including no update-check cache or private-state migration.
+It stops at task roots and skips symbolic links. A current task manifest can
+identify a task with its own Git controls; other nested Git checkouts are
+excluded, even when their names look like timestamped legacy tasks.
+
 ### 5. Choose where retained content lives
 
 First decide whether content should be retained at all. Ignore safely
@@ -307,6 +346,13 @@ look like intermediate output. Retain them. If they are too large for ordinary
 Git, place them with `workspace-mgr storage` or keep the bytes locally with
 `workspace-mgr untrack`; do not move them outside the repository to avoid the
 decision, and do not route bulk by-products to S3 to keep Git small.
+
+Nested Git repositories are always excluded from outer publication. Cover the
+whole nested directory with a shared repository or task-local `.gitignore`
+rule and remove any outer-tracked files or gitlinks. `plan` and `publish`
+check this boundary before storage placement. A new task-local ignore file
+can be published with the task; a global ignore or `.git/info/exclude` alone
+does not satisfy the rule.
 
 Every remaining file under the task is in one of two states: selected, meaning
 published in Git or placement-recorded for S3 or local-only retention, or
@@ -475,7 +521,8 @@ Git index.
 Creating and maintaining the task's one draft pull request remains a
 repository-hosting action.
 `publish` writes the branch transaction; it does not create or update a pull
-request. `archive` and `refresh` can read GitHub merge evidence through `gh`.
+request. `archive` reads the task's corresponding PR state through `gh`;
+`refresh` reads merge evidence for branch cleanup.
 Immediately after publishing a new deliverable task's scaffold, the agent finds
 the request by head branch, reuses
 it or creates exactly one draft pull request, and never creates a duplicate. An
@@ -620,7 +667,7 @@ workspace-mgr publish -m "Publish the training checkpoints"
 
 Recording an approval documents the user's decision; it never creates one. The
 command writes the approved limit and the user's note into the task manifest,
-which becomes schema 3, and the next publication carries that change, so
+which requires at least schema 3, and the next publication carries that change, so
 reviewers see it in the pull request. Each publication commit also names the
 approval in a `Cloud-Usage-Approval` trailer; for an infrastructure task, whose
 manifest is private, the trailer is the only published record. A user may also
@@ -766,8 +813,30 @@ pending S3 purge retry may proceed when a removed branch was the last live
 reference protecting an already queued path. Directory organization remains a
 separate user-requested infrastructure task.
 
+### Upgrade current task configuration
+
+`task upgrade` upgrades supported current task metadata locally and idempotently.
+It preserves task identity, scopes, cloud-usage approval and compatible saved
+review metadata. It fetches the configured shared branch to validate current task control
+identity and compatibility, and guards staged manifest edits. It does not query
+PRs, compare ordinary historical directory trees or require task payloads to be
+clean. Preview first, then publish
+the authorized current manifest change through its scoped task.
+
+```sh
+task_config=20260918-120000-example/.workspace-mgr-task.toml
+workspace-mgr task upgrade --manifest "$task_config" --dry-run
+workspace-mgr task upgrade --manifest "$task_config"
+```
+
+Older schema 4 completion checkpoints remain readable. Their current review
+branch associations can help find live PRs after a branch change; the tool
+neither produces new historical content proofs nor replays existing trees,
+ancestry or commit-to-PR coverage. Current manifest validation remains strict.
+Upgrade is not an archive prerequisite.
+
 Active deliverable task directories remain at the repository's top level.
-After a task is done and its pull request is confirmed merged, the user may
+After a task's corresponding pull request is closed, the user may
 explicitly request that old task directories be organized under time folders.
 Handle that request through a repository-infrastructure task with the affected
 paths in scope; do not organize them automatically after merge or as part of
@@ -786,7 +855,7 @@ workspace-mgr archive --dry-run
 
 With no paths, the command scans top-level deliverable tasks and skips active
 or unverified tasks. Naming an active task explicitly refuses the operation.
-The preview reports merged-task evidence, proposed destinations, complete S3
+The preview reports closed-PR evidence, proposed destinations, complete S3
 history, and the source and destination paths to declare in an infrastructure
 task. It changes no repository content or remote. In the shared checkout, run
 `archive --manifest <path>`, then `plan --manifest <path>` and
@@ -794,20 +863,63 @@ task. It changes no repository content or remote. In the shared checkout, run
 `--layout '{year}'` and `--layout '{year}{month}'` select the other example
 structures; the default `{year}/{month}` uses each task's creation timestamp.
 
+Archive verifies the current task configuration and its associated PRs in the
+configured repository, regardless of their target base branch. Merged PRs and
+PRs closed without merging qualify; an associated open PR, including a saved
+association from a previous task branch, blocks archive. One matching closed PR is required;
+when none is found, a pre-0.7 adoption record can provide a current branch
+hint. Malformed or unrelated adoption records add no extra gate. There is no
+commit-by-commit review, historical configuration parsing, full-history
+requirement, or branch-tip comparison for archive eligibility.
+
+Archive checks managed-storage integrity and move conflicts. Ordinary
+tracked, staged, untracked, ignored, and local-only files are retained;
+unpublished ordinary content does not prevent movement. Scripts, README
+commands, cross-task references, logs, symlinks, and Python environments move
+unchanged. Their paths may need later maintenance if you want to run them at
+the new location. Archive neither inspects those runtime dependencies nor rewrites
+them.
+
+Nested Git repositories must be covered by the outer repository's shared
+`.gitignore` rules at both the source and destination and contain no
+outer-tracked files or gitlinks. A local exclude or global ignore does not
+satisfy this rule. A new task-local `.gitignore` may be published with the task;
+the ignore file need not already be tracked. Ignored nested repositories and
+Git controls inside the task move unchanged; external Git administration and
+registrations remain untouched. Zero-byte `.git` cache markers remain ordinary
+content. The
+[command reference](commands.md#workspace-mgr-archive) describes this boundary.
+
+For a manifestless directory, use `task adopt` to establish current task
+metadata before archiving. Adoption has current PR/ref control checks but no
+ordinary content-tree proof. Its separate adoption PR need not merge before
+archive. Archive checks the resulting current manifest and associated closed PR,
+without tracing earlier imports or the adoption record's introducing commit.
+
 Archive moves the local directory and manifest together. Publication copies
 the complete retained S3 history, including old versions, delete markers, and
 retired paths, verifies it, and rewrites storage metadata automatically. Its
 receipt records original and destination keys, version IDs, and timestamps;
 the S3 registry makes those mappings available to older Git snapshots. Source
-history is purged only after Git publication and while no live remote branch
-or tag protects it. The copied history counts toward the infrastructure task's
-cloud-usage limit. Materialized local-only content must be preserved or
-returned to tracked storage before organization.
+history is purged only after the copied receipt merges into the shared branch.
+Historical tags remain and hydrate mapped versions through the registry; new
+referenced generations without mappings stay protected. Storage retirement is complete only when a full scan finds
+no old-prefix data versions or delete markers. `storage.purge` distinguishes
+`complete`, `cleanup_pending` and `blocked_unmapped`; the latter two preserve
+retry state and report a warning even when Git push or refresh succeeded.
+An empty original inventory also keeps a `pending_prefixes` cleanup intent
+until its published receipt's full source scan confirms an empty prefix.
+Concurrent unmapped history is preserved and blocks completion. Preview and
+cancel an unpublished attempt with `archive --cancel --manifest <path> --dry-run`;
+apply restores local contents and metadata after verifying removal of its
+remote copies, markers, registry records and unfinished uploads.
+The copied history counts toward the infrastructure task's
+cloud-usage limit. Local-only content remains local and travels with the task.
 
 To hydrate a historical Git checkout after source cleanup, use
 `workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
-the archive registry. Publishing nested archived task state raises the minimum
-CLI requirement to 0.5.0 for any supported manifest schema. Removing a
+the archive registry. Publishing nested archived task state requires at least
+0.5.0; the new archive protocol and schema 4 completion evidence require 0.7.0. Removing a
 cloud-usage approval does not clear this path requirement; an older CLI needs
 an update.
 
@@ -832,19 +944,22 @@ configuration or platform-standard identity mechanisms.
 
 ## Side effects by command
 
-In addition to the command-specific effects below, every invocation may read
-the crates.io release record when its local update cache is stale. This
+In addition to the command-specific effects below, invocations other than
+`task list`, `task path`, `task show`, help output, and argument errors may read
+the crates.io release record when their local update cache is stale. This
 best-effort check is bounded, failure-silent, and never performs a remote write.
 
 | Command | Local effect | Remote reads | Remote writes |
 | --- | --- | --- | --- |
-| `setup` | Installs an isolated private runtime | Python package index | None |
+| `setup` | Verifies Git and the built-in engine | None | None |
 | `init` | Creates or repairs scaffolding | None | None |
 | `instructions`, `config show` | Read-only checks/output | None | None |
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
+| `task list`, `task path`, `task show` | Read-only local discovery; no cache writes or state migration | None, including no update check | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
-| `archive` | Moves completed directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads GitHub merge evidence, Git refs, and complete S3 version history | None; publication copies history and records exact-version mappings |
+| `task upgrade` | Upgrades current task metadata while preserving compatible saved fields; dry-run changes nothing | Fetches the configured shared branch for current manifest identity and version control | None |
+| `archive` | Moves closed-PR task directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads current GitHub PR states, current task/storage metadata, and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
 | `task approve-cloud-usage` | Rewrites the task manifest with the user's approval | None | None |
@@ -889,3 +1004,9 @@ guard to investigate, not a signal to invoke internal version-control or storage
 commands directly.
 
 For exact syntax and every option, see the [command reference](commands.md).
+
+Relocation execution reports contain a success-only notice with code
+`manual-content-audit-after-relocation` after an actual directory move. It asks
+the user to manually inspect links and path references; the tool does not
+validate or repair them. The notice is absent from global instructions,
+dry-runs, no-change operations, metadata-only rename and archive cancellation.

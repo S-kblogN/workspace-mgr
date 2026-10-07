@@ -1294,6 +1294,7 @@ fn is_control_file(path: &str) -> bool {
         || name == ".gitignore"
         || name == TASK_MANIFEST_NAME
         || name == crate::archive_migration::RECEIPT_NAME
+        || name == crate::archive_adoption::LEGACY_RECORD
         || path == CONFIG_NAME
 }
 
@@ -3493,6 +3494,7 @@ mod tests {
             shared_head: "main".to_owned(),
             additional_scopes: Vec::new(),
             cloud_usage_approval: None,
+            archive_completion: None,
         }
     }
 
@@ -4143,11 +4145,6 @@ mod tests {
 
     #[test]
     fn storage_engine_status_feeds_pending_uploads() {
-        let runtime = dvc::dvc_program();
-        if !Path::new(&runtime).is_file() {
-            eprintln!("skipping: managed storage runtime is unavailable");
-            return;
-        }
         let fixture = Fixture::new();
         fixture.write("README.md", b"base\n");
         dvc::execute_engine(&fixture.repo.root, ["init", "-q"]).unwrap();

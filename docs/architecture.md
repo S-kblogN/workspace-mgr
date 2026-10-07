@@ -7,7 +7,8 @@ scoped task state, and private runtime state. `.workspace-mgr.toml` contains
 only non-secret Git and optional S3 locations, plus the `minimum_cli_version`
 compatibility declaration that `workspace-mgr` maintains itself. Task manifests
 contain identity, purpose, current slug, scope, and branch state and, from
-schema 3, the user's cloud-usage approval. The task ID and review branch are
+schema 3, the user's cloud-usage approval and, from schema 4, durable archive
+review provenance. The task ID and review branch are
 immutable; the slug and deliverable path may change together. Deliverable
 manifests are tracked inside their task directories; infrastructure manifests
 live below the primary checkout's `.workspace-mgr/local/` and are selected
@@ -66,9 +67,9 @@ is unsupported.
 
 The user's cloud-usage approval is task state. `task approve-cloud-usage`
 writes it into the task manifest's `[cloud_usage_approval]` table, which makes
-the manifest schema 3, so a deliverable publishes the approval with the task
-and reviewers see it in the pull request. An infrastructure manifest keeps it
-private. Every publication commit also carries a `Cloud-Usage-Approval`
+the manifest at least schema 3, so a deliverable publishes the approval with
+the task and reviewers see it in the pull request. An infrastructure manifest
+keeps it private. Every publication commit also carries a `Cloud-Usage-Approval`
 trailer while the manifest records an approval; the trailer is written for
 review only and is never read back. The usage gate, the reminder, and
 `task status` read the approval from the manifest alone. Each task's private
@@ -106,6 +107,26 @@ authority are compiled product policy. They
 are intentionally absent from repository configuration so different
 repositories cannot drift into different management strategies.
 
+## Information routing
+
+Default and explicit `instructions all` load a short mental model, operation
+index and session-wide constraints, plus current repository facts. Detailed
+policy remains in `guidance::topic` for explicit compatibility views. Command
+help is rendered by `command_guidance::command` and is available without
+repository configuration or network access. Conditions and outcomes that only
+become known at execution are reported by that operation; relocation success
+reminders never appear unconditionally in global instructions.
+
+The user-owned repository instruction module is indexed globally and exposed
+through `instructions repository`. Default rendering validates its path, size
+and encoding and includes its current bytes in the policy hash without printing
+the body. This preserves effective-policy change detection while avoiding a
+second global operation manual.
+
+New policy and guidance follow the durable information locality requirement in
+[CONTRIBUTING.md](../CONTRIBUTING.md). The routing and retained-policy audit is
+[control-plane-audit.md](control-plane-audit.md).
+
 ## Repository compatibility
 
 Tracked task state evolves with the CLI. Releases parse task manifests
@@ -133,10 +154,12 @@ release, a repository declares the oldest compatible release in
   raises.
 - Product policy maps each task manifest schema to the oldest release that
   reads it: top-level manifests with schemas 1 and 2 need no declaration, and
-  schema 3 needs 0.4.0. A nested archive task manifest needs 0.5.0 regardless
+  schema 3 needs 0.4.0 and schema 4 completion evidence needs 0.7.0.
+  A nested archive task manifest needs at least 0.5.0 regardless
   of its schema; publication uses the higher schema or path requirement.
   Writers use the lowest schema that represents a manifest, so only a task that
-  records a cloud-usage approval produces schema 3.
+  records a cloud-usage approval without a checkpoint produces schema 3, and a
+  task retaining a checkpoint stays at schema 4 even after approval reset.
 - Publication reconciles the declaration. Each private publication index (the
   preview, the pre-upload validation, and the final index) is scanned for task
   manifests at the top level and in nested archived task directories, excluding
@@ -187,9 +210,11 @@ release, a repository declares the oldest compatible release in
 ## Update observation boundary
 
 Update discovery is advisory and user-scoped, not repository configuration.
-Before parsing any command, the executable reads a small cache in the user's
-cache directory. A successful crates.io result is reused for six hours and a
-failed attempt for one hour. Refresh uses a nonblocking process lock, a 750 ms
+Arguments are parsed before update discovery. Help, argument errors and offline
+`task list`, `task path` and `task show` skip the update cache and network check.
+Other invocations, including explicit `--version`, read a small cache in the
+user's cache directory. A successful crates.io result is reused for six hours
+and a failed attempt for one hour. Refresh uses a nonblocking process lock, a 750 ms
 request deadline, a 1 MiB response limit, and an atomic cache replacement. Lock
 contention, unavailable cache storage, malformed responses, and all network
 failures are ignored.
@@ -276,16 +301,98 @@ follows bounded mappings only after an exact original version is missing,
 preserving hash and size checks. Planned local pointers can read their original
 exact versions before publication.
 
-Only after Git push verification are mapped source versions queued for cleanup.
-A live branch or tag containing the original task manifest protects the whole
-source prefix. Cleanup deletes only the exact copied versions; concurrent
-unmapped additions remain and are reported. Native DVC does not interpret the
+Archive completion uses supported current task identity and current associated
+PR state. Saved review branch metadata is a lookup hint, never replayed content
+proof. Historical configuration, directory-tree transitions, commit-to-PR
+coverage, full-history availability and branch-tip ancestry do not determine
+eligibility. `task upgrade` locally preserves compatible current metadata rather
+than creating a new historical checkpoint. `task adopt` verifies the supplied
+live PR control association without inspecting ordinary payload trees or dirty
+content.
+
+Archive and task rename move ordinary directory contents unchanged. They do not
+parse Git worktree pointers or administration, inspect environment launchers,
+follow ordinary links, scan script paths, or repair runtime dependencies. Nested
+Git remains governed by shared-ignore and no-outer-tracking control rules.
+Zero-byte `.git` cache markers remain ordinary payloads. New relocation plans
+contain no runtime rewrite references. Old attempt journals retain their saved
+reference snapshots for backward-compatible cancellation.
+
+Before a local archive move, `.workspace-mgr/local/archive-attempts/` saves
+original tool-mutated metadata, modes, directory relocation facts, owner refs,
+and retirement records. Older journals may also hold saved Git rewrite
+snapshots, which remain readable for lossless cancellation. It records generated publication commits before
+their ref update and verified pushes before cleanup. `archive --cancel` restores
+only an unpublished attempt, preserving whole local directories by rename.
+Cancel phases and generated undo commits are durable, so interruption can be
+resumed without losing other infrastructure work. Before local restoration,
+cancel verifies the original source history, withdraws only the attempt's exact
+registry versions, deletes owned copies and markers by exact version ID, and
+aborts owned unfinished uploads. A full scan must prove remote cleanup and
+record it durably before local restoration. Cancel restores local directories,
+metadata, refs and retirement state and removes empty generated parents, then
+releases both exact ownership claims before marking the attempt cancelled.
+Foreign history blocks initial remote cleanup and stays intact. A retry after
+durable remote cleanup finishes local undo without touching later foreign writes
+or another owner's claims; completed retries do not recheck original source
+generations that a newer archive may have retired.
+
+The configured Git remote first reserves source copying with a control tag under
+`refs/tags/workspace-mgr/archive-copy/`. Its immutable descriptor binds the
+normalized planned receipt and the private copy journal's attempt nonce before
+any destination history is written. It coordinates canonical publication with
+a separate tag under `refs/tags/workspace-mgr/archive-registry/`. Its immutable blob
+binds the complete copied receipt and transaction. Compare-and-create chooses
+the owner; exact remote object ID checks fence mutations. Bindings have no
+expiration or takeover. Cancellation releases only its exact copy reservation
+and canonical binding after remote cleanup and local restoration. Canonical mappings for completed
+archives remain available to historical readers.
+
+Conditional registry Put remains the default. For B2's official endpoints, a
+separate writer suppresses SDK flexible checksum headers and writes Content-MD5.
+An explicit provider not-implemented/not-supported response permits an
+unconditional retry only with the verified Git binding for that exact receipt.
+Fresh reads enumerate and compare every registry version, rejecting conflicts
+or delete markers. This retains concurrency protection without retaining a
+second payload history at the original task path.
+
+Source deletion requires the exact copied receipt on the configured shared
+branch. Before that merge, a live branch or tag containing the original task
+tree protects the whole source prefix, including trees from before manifest
+adoption. After merge, old mapped generations hydrate through the registry, so
+historical tags remain while their source bytes can retire. Actual newer
+referenced generations without mappings remain protected. Cleanup deletes
+only verified mapped versions and completes only when a full scan finds the
+original prefix empty of both payload versions and delete markers. Protected
+history reports `cleanup_pending`; unmapped concurrent additions report
+`blocked_unmapped` and remain in the durable retry queue. Neither is terminal
+completion, even when Git publication or synchronization succeeded. A typed
+copied-receipt prefix intent persists even when its original inventory is
+empty; only a published-receipt scan confirming no versions or markers clears
+that intent. Native DVC does not interpret the
 canonical archive mappings, so old revisions use workspace-mgr hydration after
 their original versions have been retired.
 
+Private purge queues and copy journals use schema 2, fencing the released
+0.6.0 reader's schema-1 deletion/resume path. New clients read old schema 1
+journals for preview, then durably persist schema 2 before any copy,
+registry mutation, source deletion or remote cancellation. Restoring an old
+purge snapshot through cancel also writes schema 2. Public receipt/registry
+contexts normalize to schema 1 so immutable receipt bindings and old data
+formats remain stable. Any archive receipt in the publication index requires
+workspace-mgr 0.7.0 independently of task schema or S3 inventory size, and the
+managed repository declaration rises before uploads.
+
+The executable, local storage engine, S3 transport, archive registry, and
+history copy/cancel adapters are Rust. DVC-compatible pointer and cache formats
+remain stable; no Python assets are embedded or executed. S3 requests use
+native Signature Version 4 and explicit checksum/conditional headers. The
+production path does not install or invoke Python or DVC.
+
 `task rename` is a local identity-preserving transition. It moves an ordinary
-task directory as one filesystem unit and atomically rewrites manifest schema
-2, or rewrites only private metadata for infrastructure. Existing schema 1
+task directory as one filesystem unit and atomically rewrites the lowest schema
+that preserves its fields, including schema 4 completion evidence, or rewrites
+only private metadata for infrastructure. Existing schema 1
 manifests remain readable and are upgraded by rename. The immutable task ID
 keeps private state and commit ownership stable, while the unchanged target
 branch preserves the existing pull request. When a published deliverable path
@@ -428,12 +535,10 @@ filesystem test remote, from the remote directory itself.
 
 ## Private storage adapter
 
-The S3 adapter currently uses DVC 3.67.1 internally. S3 remotes require exact
-object-version metadata and existence checks through an embedded verifier using
-the same exact DVC release. This is a maintainer compatibility boundary, not a
-public command or repository concept. A filesystem remote is compiled only by
-the `test-storage` feature for isolated tests and uses remote-presence
-verification. Release builds reject it in the public S3 schema.
+The storage adapter is built into the Rust executable. S3 remotes require
+exact object-version metadata and existence checks. A filesystem remote is
+compiled only by the `test-storage` feature for isolated tests and uses
+remote-presence verification. Release builds reject it in the public S3 schema.
 
 Versioned reads use a private adapter instead of the engine's generic fetch
 path. It requires a complete file/version manifest, checks existing cache bytes
@@ -503,18 +608,16 @@ The requirement check precedes detection, so refresh never inspects incoming
 storage metadata that only a newer release can read, and `--dry-run` refuses
 where an applied refresh would. Detection precedes every change, including the
 purge queue, so `--dry-run` reports the same condition an applied refresh does.
-An unaddressable boundary is excluded from prefetch, checkout, verification, and
-the unsafe-output scan, which resolve each pointer as an engine command target:
-the engine's `status` rewrites the backslash, reports the rewritten path
-missing, and fails, so verifying such a boundary would roll back the whole
-refresh. The purge adapter still enumerates it, because it collects pointers
-through the engine's Python API, which reads the path literally. Its metadata
-advances with the branch, and refresh places no payload for it. A payload this
-checkout already holds there is compared with the incoming metadata without the
-engine: an exact match is kept, and anything else, including a payload with no
-metadata beside it, refuses the refresh before any change, because refresh can
-neither replace nor verify it. Rollback therefore restores such a boundary from
-its metadata alone, because refresh never placed or removed an output for it.
+An unaddressable boundary is excluded from prefetch, checkout, verification,
+and the unsafe-output scan. This preserves the existing path convention during
+the native migration; older engines disagreed about literal backslashes. The
+purge adapter still enumerates its metadata literally. Its metadata advances
+with the branch, and refresh places no payload for it. A payload already held
+there is compared with incoming metadata: an exact match is kept; different
+bytes or a payload without accompanying metadata refuse refresh before any
+change. Rollback restores the boundary from its metadata alone because refresh
+never placed or removed its output. `move` is the supported recovery to a name
+without backslashes.
 
 A `move` whose source payload is not materialized fetches it through the source
 metadata before any change and checks it out at the destination, because the

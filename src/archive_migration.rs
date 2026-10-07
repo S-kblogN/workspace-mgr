@@ -15,6 +15,16 @@ use crate::s3_purge::ObjectVersion;
 
 pub const RECEIPT_NAME: &str = ".workspace-mgr-archive.json";
 
+/// Rust-owned task metadata is retained beside the transport mapping. Keep
+/// reconstruction and comparison in publish/cancel on the same field list.
+pub(crate) const RECEIPT_METADATA_FIELDS: [&str; 5] = [
+    "task_id",
+    "previous_receipt",
+    "completion_reviews",
+    "historical_records",
+    "closed_pull_request",
+];
+
 pub fn plan(repo: &GitRepo, config: &Config, source: &str, destination: &str) -> Result<Value> {
     if !config.s3_enabled() {
         return Ok(
@@ -60,7 +70,7 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::message(format!("archive receipt is missing {key}")))
 }
 
-fn validate(path: &str, receipt: &Value) -> Result<()> {
+pub(crate) fn validate(path: &str, receipt: &Value) -> Result<()> {
     let source = repo_path(text(receipt, "source")?, "archive source")?;
     let destination = repo_path(text(receipt, "destination")?, "archive destination")?;
     if receipt["schema_version"] != 1
@@ -142,17 +152,23 @@ pub fn prepare(
                     "archive migration requires both source and destination in the infrastructure task's declared scopes",
                 ));
             }
-            let manifest_path = format!("{source}/{TASK_MANIFEST_NAME}");
-            let original = repo.run(["show", &format!("{base}:{manifest_path}")])?;
-            let manifest: crate::manifest::TaskManifest = toml::from_str(&original.stdout)
-                .map_err(|error| {
-                    Error::message(format!("invalid archive source manifest: {error}"))
+            let manifest_path = format!("{destination}/{TASK_MANIFEST_NAME}");
+            reject_symlink_traversal(&repo.root, &manifest_path, "current archived task manifest")?;
+            let absolute = resolved_under(&repo.root, &manifest_path);
+            let current = fs::read_to_string(&absolute).at(&absolute)?;
+            let manifest: crate::manifest::TaskManifest =
+                toml::from_str(&current).map_err(|error| {
+                    Error::message(format!("invalid current archived task manifest: {error}"))
                 })?;
-            if manifest.id != text(&receipt, "task_id")? {
+            if manifest.kind != crate::manifest::TaskKind::Deliverable
+                || manifest.id != text(&receipt, "task_id")?
+                || manifest.path.as_deref() != Some(destination.as_str())
+            {
                 return Err(Error::message(
-                    "archive source identity changed since the migration was prepared",
+                    "current archived task identity or directory differs from the migration receipt",
                 ));
             }
+            crate::archive_cancel::validate_migration(repo, &receipt)?;
         }
         if receipt["status"] == "planned" {
             if config.s3_enabled() {
@@ -162,18 +178,19 @@ pub fn prepare(
                 let journal_dir = repo.local_state_dir()?.join("archive");
                 fs::create_dir_all(&journal_dir).at(&journal_dir)?;
                 let journal = journal_dir.join(format!("{digest}.json"));
+                let reservation = crate::archive_reservation::reserve(repo, &receipt)?;
                 let copied = dvc::version_archive_adapter(
                     repo,
                     "copy",
                     &json!({
                         "source":source,"destination":destination,"planned":receipt,
-                        "state_path":journal.to_string_lossy()
+                        "state_path":journal.to_string_lossy(),"reservation":reservation
                     }),
                 )?;
                 // Keep task identity and earlier receipts, which the transport
                 // intentionally does not interpret.
                 let mut next = copied;
-                for key in ["task_id", "previous_receipt"] {
+                for key in RECEIPT_METADATA_FIELDS {
                     if let Some(value) = receipt.get(key) {
                         next.as_object_mut()
                             .ok_or_else(|| Error::message("archive copy did not return an object"))?
@@ -204,7 +221,7 @@ pub fn prepare(
     Ok(completed)
 }
 
-fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
+pub(crate) fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
     let source = text(receipt, "source")?;
     let destination = text(receipt, "destination")?;
     let digest = crate::hex::encode_lower(
@@ -221,6 +238,12 @@ fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
     };
     let mut journal: Value = serde_json::from_str(&raw)
         .map_err(|error| Error::message(format!("invalid private archive journal: {error}")))?;
+    if !matches!(journal["schema_version"].as_u64(), Some(1 | 2)) {
+        return Err(Error::message(
+            "private archive copy journal has an unsupported schema",
+        ));
+    }
+    journal["schema_version"] = 1.into();
     if [
         "schema_version",
         "remote",
@@ -232,7 +255,10 @@ fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
     ]
     .iter()
     .any(|key| journal[key] != receipt[key])
-        || journal["status"] != "copied"
+        || !matches!(
+            journal["status"].as_str(),
+            Some("copied" | "canceling" | "cancelled")
+        )
     {
         return Ok(false);
     }
@@ -243,6 +269,9 @@ fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
         if let Some(object) = version.as_object_mut() {
             object.remove("started");
             object.remove("multipart_upload_id");
+            object.remove("cancel_started");
+            object.remove("cancel_deleted");
+            object.remove("cancel_owned_versions");
         }
     }
     Ok(journal["versions"] == receipt["versions"])
@@ -294,6 +323,7 @@ fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()>
     }
     let rendered =
         serde_yaml::to_string(&document).map_err(|error| Error::message(error.to_string()))?;
+    crate::archive_cancel::record_pointer_rewrite(repo, receipt, pointer, rendered.as_bytes())?;
     atomic_write(&absolute, rendered.as_bytes())
 }
 
@@ -335,6 +365,11 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| Error::message("archive metadata has no parent"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     temp.write_all(bytes).at(path)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temp.as_file()
+            .set_permissions(metadata.permissions())
+            .at(path)?;
+    }
     temp.as_file().sync_all().at(path)?;
     temp.persist(path).map_err(|error| Error::Io {
         path: path.to_path_buf(),
@@ -373,6 +408,7 @@ mod tests {
         let repo = GitRepo {
             root: temp.path().canonicalize().unwrap(),
         };
+        repo.run(["init", "-b", "main"]).unwrap();
         (temp, repo)
     }
 
@@ -435,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_receipt_requires_both_scopes_and_original_task_identity() {
+    fn copied_receipt_requires_both_scopes_and_current_task_identity() {
         let (_temp, repo) = repository();
         repo.run(["init", "-b", "main"]).unwrap();
         repo.run(["config", "user.name", "workspace-mgr test"])
@@ -445,9 +481,7 @@ mod tests {
         write(
             &repo,
             &format!("{SOURCE}/{TASK_MANIFEST_NAME}"),
-            &format!(
-                "schema_version = 2\nkind = \"deliverable\"\nid = \"{SOURCE}\"\nslug = \"completed\"\npath = \"{SOURCE}\"\nbranch = \"codex/completed\"\ntitle = \"Retained task\"\npurpose = \"Keep the task\"\nadditional_scopes = []\n"
-            ),
+            "opaque historical format with no current manifest fields\n",
         );
         repo.run(["add", "."]).unwrap();
         repo.run(["commit", "-m", "Retain the source task"])
@@ -459,6 +493,13 @@ mod tests {
             .trim()
             .to_owned();
         let path = format!("{DESTINATION}/{RECEIPT_NAME}");
+        write(
+            &repo,
+            &format!("{DESTINATION}/{TASK_MANIFEST_NAME}"),
+            &format!(
+                "schema_version = 2\nkind = \"deliverable\"\nid = \"{SOURCE}\"\nslug = \"completed\"\npath = \"{DESTINATION}\"\nbranch = \"codex/completed\"\ntitle = \"Retained task\"\npurpose = \"Keep the task\"\nadditional_scopes = []\n"
+            ),
+        );
         let mut copied = receipt("copied", &[]);
         write(&repo, &path, &copied.to_string());
         let error = prepare(&repo, &Config::default(), &[DESTINATION.to_owned()], &base)
@@ -471,7 +512,7 @@ mod tests {
         let error = prepare(&repo, &Config::default(), &scopes, &base)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("source identity changed"), "{error}");
+        assert!(error.contains("current archived task identity"), "{error}");
         copied["task_id"] = SOURCE.into();
         write(&repo, &path, &copied.to_string());
         assert_eq!(

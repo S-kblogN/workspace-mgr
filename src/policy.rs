@@ -12,12 +12,21 @@ pub const BULK_PUBLICATION_BYTES: u64 = 268_435_456;
 /// in, derived from the threshold itself so the two cannot disagree.
 pub const BULK_PUBLICATION_MIB: u64 = BULK_PUBLICATION_BYTES / 1_048_576;
 pub const CLOUD_USAGE_APPROVAL_BYTES: u64 = 1_073_741_824;
-pub const INSTRUCTION_POLICY_VERSION: u32 = 12;
+pub const INSTRUCTION_POLICY_VERSION: u32 = 14;
 /// The first workspace-mgr release that reads task manifest schema 3, which
 /// adds the optional `[cloud_usage_approval]` table.
 pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 0);
+/// The first release that reads the optional saved task review record format.
+pub const TASK_SCHEMA_4_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 7, 0);
 /// The first release that reads task manifests below date-grouping directories.
 pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 5, 0);
+/// The first release that fences archive copies and preserves protected,
+/// unmapped source generations through complete-prefix retirement retries.
+pub const ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION: semver::Version =
+    semver::Version::new(0, 7, 0);
+/// Private copy journals are deliberately incompatible with 0.6.0's
+/// uncoordinated resume path. Public, immutable archive receipts remain schema 1.
+pub const ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 pub const REVIEW_PULL_REQUEST: &str = "required";
 pub const REVIEW_INITIAL_STATE: &str = "draft";
@@ -32,6 +41,7 @@ pub const REVIEW_SYNC_CADENCE: &str = "before-every-turn-end";
 pub fn minimum_cli_version_for_task_schema(schema_version: u32) -> Option<semver::Version> {
     match schema_version {
         3 => Some(TASK_SCHEMA_3_MINIMUM_CLI_VERSION),
+        4 => Some(TASK_SCHEMA_4_MINIMUM_CLI_VERSION),
         _ => None,
     }
 }
@@ -41,12 +51,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_task_manifest_schema_3_raises_the_minimum_cli_version() {
+    fn optional_task_metadata_schemas_raise_the_minimum_cli_version() {
         assert_eq!(minimum_cli_version_for_task_schema(1), None);
         assert_eq!(minimum_cli_version_for_task_schema(2), None);
         assert_eq!(
             minimum_cli_version_for_task_schema(3).map(|version| version.to_string()),
             Some("0.4.0".to_owned())
+        );
+        assert_eq!(
+            minimum_cli_version_for_task_schema(4).map(|version| version.to_string()),
+            Some("0.7.0".to_owned())
         );
     }
 
@@ -78,6 +92,13 @@ mod tests {
         assert!(
             crate::config::cli_version_satisfies(&package, &ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION),
             "package version {package} is below the workspace-mgr {ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION} that archived task paths require"
+        );
+        assert!(
+            crate::config::cli_version_satisfies(
+                &package,
+                &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION
+            ),
+            "package version {package} is below the workspace-mgr {ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION} that archive storage coordination requires"
         );
     }
 }

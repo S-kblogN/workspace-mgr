@@ -803,10 +803,6 @@ fn a_raise_applies_on_top_of_an_authorized_configuration_change() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn init_with_storage_keeps_the_declaration_first() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     workspace(&fixture.seed, ["init"]);
     let config_path = fixture.seed.join(CONFIG);
@@ -1557,10 +1553,6 @@ fn an_authorized_comment_in_the_configuration_is_never_reverted() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
-    if which::which("dvc").is_err() {
-        eprintln!("skipping: dvc is unavailable");
-        return;
-    }
     let fixture = GitFixture::new();
     workspace(
         &fixture.seed,

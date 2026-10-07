@@ -45,6 +45,16 @@ fragments are rejected so tracked locations cannot carry credentials or signed
 URLs. Authentication belongs in ignored local configuration or
 platform-standard identity and environment mechanisms.
 
+The native engine reads AWS access/secret keys and optional session tokens from
+the environment, the selected shared credentials/profile files, or ignored
+local remote settings. It also accepts a profile `credential_process`, invoking
+its argument vector directly without a shell. Role, SSO, and web identity
+profiles must supply resolved temporary environment credentials or a credential
+process; unsupported profiles fail before any S3 request.
+Set the bucket's region through `AWS_REGION`, `AWS_DEFAULT_REGION`, or the
+selected profile. B2 regions can also be inferred from their service endpoint.
+The native transport does not replay signed requests across provider redirects.
+
 `workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes these
 public facts and deterministically generates the private storage-engine
 configuration. Every S3 operation rejects drift in that derived file. Users and
@@ -71,7 +81,8 @@ A pre-release also meets a declaration of its own release, so 0.4.0-rc.1 meets
 `"0.4.0"`, while it does not meet `"0.4.1"`.
 
 Publication maintains the declaration. Task manifest schema 3, which records a
-cloud-usage approval, needs `workspace-mgr` 0.4.0. Top-level manifests with
+cloud-usage approval, needs `workspace-mgr` 0.4.0. Schema 4, which retains
+archive completion evidence, needs 0.7.0. Top-level manifests with
 schemas 1 and 2 need no declaration. A nested archive task manifest needs
 0.5.0 regardless of whether its schema is 1, 2, or 3. Unless the task is
 authorized to change `.workspace-mgr.toml` itself, and as long as the task
@@ -218,7 +229,8 @@ The manifest schema version describes serialized task state; it is not a
 strategy selector.
 
 Every field shown above except `additional_scopes` is required; the schema 3
-`cloud_usage_approval` table described below is optional. The ID is the
+`cloud_usage_approval` and schema 4 `archive_completion` tables described below
+are optional. The ID is the
 immutable creation identity: a deliverable uses
 `YYYYMMDD-HHMMSS-<original-slug>` and an infrastructure task uses
 `infra-<original-slug>`. The branch is derived from that immutable identity and
@@ -234,7 +246,8 @@ branch. An infrastructure task has no `path`; its private manifest remains
 keyed by the stable ID. Declared scopes must be distinct and non-overlapping.
 Schema 1 manifests are still readable with their original slug; `task rename`
 and `task approve-cloud-usage` rewrite them as schema 2, or as schema 3 when
-they record an approval. These constraints are validated whenever a manifest is
+they record an approval. A retained completion checkpoint uses schema 4.
+These constraints are validated whenever a manifest is
 loaded, so hand-editing task state cannot select another repository-management
 strategy.
 
@@ -263,10 +276,13 @@ most 9223372036854775807, and `note` is the user's decision on one non-empty
 line. Both are required and no other field is accepted; Git history records when
 the approval was made. Schema 1 and 2 manifests must not contain the table.
 `workspace-mgr` writes the lowest schema that represents a manifest: schema 2
-without an approval and schema 3 with one. A manifest without an approval needs
-no newer release for its schema, but a nested archive path still needs 0.5.0.
+without either optional table, schema 3 with only an approval, and schema 4
+with a completion checkpoint, whether or not it also has an approval. A
+manifest without either table needs no newer release for its schema, but a
+nested archive path still needs 0.5.0.
 Running `task approve-cloud-usage` with a limit equal to the threshold removes
-the table and returns the manifest to schema 2;
+the approval table and returns the manifest to schema 2 only if no checkpoint
+remains;
 publishing that change also withdraws the task branch's `minimum_cli_version`
 raise unless another task manifest still needs it, but never below the base
 branch's declaration. Reading schema 3 needs
@@ -274,3 +290,26 @@ branch's declaration. Reading schema 3 needs
 that records an approval raises `minimum_cli_version`. An infrastructure
 manifest stays private, so its approval is published only as the
 `Cloud-Usage-Approval` commit trailer and never raises the declaration.
+
+Schema 4 adds an optional `[archive_completion]` table for deliverable tasks.
+Existing checkpoints remain readable and are preserved by current metadata
+operations; `task upgrade` no longer synthesizes historical content proof.
+Archive uses saved current branch associations as hints, not proof replay.
+Do not create or edit the evidence by hand. The table contains:
+
+| Fields | Meaning |
+| --- | --- |
+| `schema_version = 1` | Format of this evidence record, distinct from task schema 4 |
+| `task_id`, `repository`, `base_branch` | Binding to the current task and hosting repository/base |
+| `checkpoint_commit`, `checkpoint_path`, `checkpoint_tree` | Original Git commit, known directory path and opaque tree ID |
+| `branches` | Verified review branches and the current canonical branch |
+| `reviews` | Immutable PR number/URL, branch, merge timestamp, merge commit and head commit facts |
+
+The record is compatible saved control metadata, not a trusted completed flag.
+Archive queries live PR facts for current associated branches, without verifying
+historical directory-tree changes, branch ancestry or commit review coverage.
+Neither upgrade nor archive reads historical task configuration. Current
+manifest validation remains strict and rejects unknown fields or unsupported
+schemas. Rename, approval changes and archive preserve compatible checkpoint
+fields; clearing an approval therefore does not remove the schema 4 requirement.
+Publishing schema 4 raises `minimum_cli_version` to at least 0.7.0.

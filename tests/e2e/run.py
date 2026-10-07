@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -50,6 +51,8 @@ class Harness:
         self.git_daemon: subprocess.Popen[str] | None = None
         self.git_daemon_log = None
         self.endpoint = os.environ.get("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+        if urlsplit(self.endpoint).hostname not in ("127.0.0.1", "localhost", "::1", "minio"):
+            raise E2EFailure("E2E tests require a local CI-owned MinIO endpoint")
         self.bucket = os.environ.get("MINIO_BUCKET", "workspace-mgr-e2e")
         self.access_key = os.environ.get("AWS_ACCESS_KEY_ID", "workspace-mgr-e2e")
         self.secret_key = os.environ.get(
@@ -208,26 +211,16 @@ class Harness:
         self.check(self.list_s3_versions() == [], "S3 bucket starts empty")
 
     def provision_runtime(self) -> None:
-        self.section("private runtime provisioning")
-        runtime = (
-            self.home
-            / ".local"
-            / "share"
-            / "workspace-mgr"
-            / "storage-3.67.1"
-        )
+        self.section("native storage setup")
+        runtime = self.home / ".local" / "share" / "workspace-mgr" / "storage-3.67.1"
         dry = self.wm(self.root, "setup", "--dry-run")
-        self.check(dry["status"] == "dry_run", "setup dry-run reports provisioning")
+        self.check(dry["status"] == "dry_run", "setup dry-run verifies native storage")
         self.check(not runtime.exists(), "setup dry-run creates no runtime")
-        installed = self.wm(self.root, "setup")
-        self.check(installed["status"] == "installed", "setup provisions private runtime")
-        self.check((runtime / "bin" / "dvc").is_file(), "private storage executable exists")
-        self.check((runtime / "bin" / "python").is_file(), "private Python adapter exists")
-        self.check(
-            runtime.joinpath(".workspace-mgr-runtime").read_text(encoding="utf-8")
-            == "workspace-mgr private runtime v1\n",
-            "private runtime records explicit workspace-mgr ownership",
-        )
+        checked = self.wm(self.root, "setup")
+        self.check(checked["status"] == "no_changes", "setup requires no installation")
+        self.check(checked["storage_runtime"].startswith("native Rust "), "storage is native Rust")
+        self.check(checked["runtime_dir"] == "", "storage has no separate runtime directory")
+        self.check(not runtime.exists(), "setup never provisions Python or DVC")
         repeated = self.wm(self.root, "setup")
         self.check(repeated["status"] == "no_changes", "setup is idempotent")
 
@@ -739,6 +732,7 @@ class Harness:
             "storage",
             "shared-checkout",
             "infrastructure",
+            "repository",
         ):
             document = self.wm(self.shared, "instructions", topic)
             self.check(document["topic"] == topic, "instruction topic renders", topic=topic)
@@ -759,31 +753,43 @@ class Harness:
             "instructions explain the workspace purpose before its mechanics",
         )
         self.check(
-            "The agent owns pull-request operations" in all_instructions["markdown"]
-            and "must not merge" in all_instructions["markdown"]
-            and "Before ending every turn" in all_instructions["markdown"],
+            "The user controls" in all_instructions["markdown"]
+            and "draft PR" in all_instructions["markdown"]
+            and "before every writable-task turn" in all_instructions["markdown"],
             "instructions fix agent PR ownership and user merge authority",
         )
+        core = self.wm(self.shared, "instructions", "core")["markdown"]
         self.check(
-            "deterministic scaffold reconciliation and upgrade operation"
-            in all_instructions["markdown"]
-            and "never by their old contents" in all_instructions["markdown"],
-            "instructions define structural scaffold ownership and upgrade behavior",
+            "deterministic scaffold reconciliation and upgrade operation" in core
+            and "never by their old contents" in core
+            and "never by their old contents" not in all_instructions["markdown"],
+            "scaffold details are available on demand rather than globally",
         )
+        storage_rules = self.wm(self.shared, "instructions", "storage")["markdown"]
         self.check(
-            "collaboration and control plane" in all_instructions["markdown"]
-            and "artifact and data plane" in all_instructions["markdown"]
-            and "small-s3-boundary" in all_instructions["markdown"],
-            "instructions teach semantic placement and tiny-boundary economics",
+            "collaboration and control plane" in storage_rules
+            and "artifact and data plane" in storage_rules
+            and "small-s3-boundary" in storage_rules
+            and "small-s3-boundary" not in all_instructions["markdown"],
+            "preserved placement policy is loaded only when relevant",
         )
+        repository_rules = self.wm(self.shared, "instructions", "repository")["markdown"]
         self.check(
-            "Preserve this repository-specific rule" in all_instructions["markdown"],
-            "repository-specific instructions are composed into output",
+            "Preserve this repository-specific rule" in repository_rules
+            and "Preserve this repository-specific rule" not in all_instructions["markdown"]
+            and "instructions repository" in all_instructions["markdown"],
+            "global instructions index the accessible repository-owned module",
         )
         self.check(
             "They do not change the fixed task, storage, publication, or review policy"
-            in all_instructions["markdown"],
+            in repository_rules,
             "repository-specific content cannot redefine workspace strategy",
+        )
+        self.check(
+            "workspace-mgr archive --help" in all_instructions["markdown"]
+            and "many broken links" not in all_instructions["markdown"]
+            and "manually audit and repair" not in all_instructions["markdown"],
+            "global instructions route operations without unconditional relocation reminders",
         )
         human = self.run([self.binary, "instructions"], cwd=self.shared)
         self.check("Effective repository instructions" in human.stdout, "human instructions render")
@@ -801,8 +807,8 @@ class Harness:
             if check["name"] == "managed-storage-version-adapter"
         )
         self.check(
-            adapter["detail"] == "internal adapter 3.67.1",
-            "doctor verifies the provisioned private runtime's exact adapter version",
+            adapter["detail"].startswith("native Rust "),
+            "doctor verifies the built-in Rust version adapter",
         )
         self.check(
             str(self.home) not in adapter["detail"],
@@ -1313,7 +1319,9 @@ class Harness:
         self.check(local_branch.returncode == 128, "infrastructure discard deletes its local branch")
         self.check(
             all(item["key"] != infra_discarded_key for item in self.list_s3_versions())
-            and discarded["s3_purge"]["status"] == "deleted",
+            and discarded["s3_purge"]["status"] == "complete"
+            and discarded["s3_purge"]["pending"] == []
+            and discarded["s3_purge"].get("pending_prefixes", []) == [],
             "infrastructure discard permanently purges unreferenced versioned S3 content",
         )
         self.assert_shared_head()
@@ -1975,43 +1983,20 @@ class Harness:
             self.git(self.shared, "diff", "--cached", "--name-only").stdout == "",
             "provider failure preserves a clean shared index",
         )
-        runtime_dvc = (
-            self.home
-            / ".local"
-            / "share"
-            / "workspace-mgr"
-            / "storage-3.67.1"
-            / "bin"
-            / "dvc"
-        )
-        real_dvc = runtime_dvc.with_name("dvc.workspace-mgr-e2e-real")
         checkout_counter = self.root / "refresh-checkout-counter"
-        runtime_dvc.rename(real_dvc)
-        runtime_dvc.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            "if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' '3.67.1'; exit 0; fi\n"
+        checkout_hook = self.root / "refresh-checkout-hook"
+        checkout_hook.write_text(
+            "#!/bin/sh\nset -eu\n"
             "if [ \"${1:-}\" = \"checkout\" ] && [ ! -f \"$CHECKOUT_COUNTER\" ]; then\n"
-            "  : > \"$CHECKOUT_COUNTER\"\n"
-            "  exit 23\n"
-            "fi\n"
-            "exec \"$WORKSPACE_MGR_E2E_REAL_DVC\" \"$@\"\n",
+            "  : > \"$CHECKOUT_COUNTER\"\n  exit 23\nfi\nexit 0\n",
             encoding="utf-8",
         )
-        runtime_dvc.chmod(0o755)
-        try:
-            failed_refresh = self.wm(
-                self.shared,
-                "refresh",
-                expected=2,
-                env={
-                    "CHECKOUT_COUNTER": str(checkout_counter),
-                    "WORKSPACE_MGR_E2E_REAL_DVC": str(real_dvc),
-                },
-            )
-        finally:
-            runtime_dvc.unlink(missing_ok=True)
-            real_dvc.rename(runtime_dvc)
+        checkout_hook.chmod(0o755)
+        failed_refresh = self.wm(
+            self.shared, "refresh", expected=2,
+            env={"CHECKOUT_COUNTER": str(checkout_counter),
+                 "WORKSPACE_MGR_TEST_STORAGE_HOOK": str(checkout_hook)},
+        )
         self.check("rolled back" in failed_refresh["stderr"], "post-ref refresh failure is rolled back")
         self.check(
             self.git(self.shared, "rev-parse", "main").stdout.strip() == original_main,
@@ -2178,8 +2163,9 @@ class Harness:
             "published tree retains placement intent and removes payloads and S3 pointer",
         )
         self.check(
-            published["storage"]["purge"]["status"] == "protected"
+            published["storage"]["purge"]["status"] == "cleanup_pending"
             and published["storage"]["purge"]["pending"]
+            and any(warning["code"] == "s3-cleanup-pending" for warning in published.get("warnings", []))
             and self.list_s3_versions() == versions_before,
             "live main and tag references keep every retired S3 version pending",
         )
@@ -2190,7 +2176,9 @@ class Harness:
         repeated = self.wm(task, "publish", "-m", "Retry protected local-retention cleanup")
         self.check(
             repeated["status"] == "no_changes"
+            and repeated["storage"]["purge"]["status"] == "cleanup_pending"
             and repeated["storage"]["purge"]["pending"]
+            and any(warning["code"] == "s3-cleanup-pending" for warning in repeated.get("warnings", []))
             and self.list_s3_versions() == versions_before,
             "repeat publication neither uploads local content nor loses protected cleanup",
         )
@@ -2207,8 +2195,9 @@ class Harness:
             "merge and refresh preserve both clean Git bytes and edited S3 bytes locally",
         )
         self.check(
-            refreshed["storage"]["purge"]["status"] == "protected"
+            refreshed["storage"]["purge"]["status"] == "cleanup_pending"
             and refreshed["storage"]["purge"]["pending"]
+            and any(warning["code"] == "s3-cleanup-pending" for warning in refreshed.get("warnings", []))
             and self.list_s3_versions() == versions_before,
             "the remote tag independently protects retired S3 versions after main is merged",
         )
@@ -2216,7 +2205,7 @@ class Harness:
         cleaned = self.wm(self.shared, "refresh")
         self.check(
             cleaned["status"] == "s3_purged"
-            and cleaned["storage"]["purge"]["status"] == "deleted"
+            and cleaned["storage"]["purge"]["status"] == "complete"
             and cleaned["storage"]["purge"]["pending"] == [],
             "refresh retries and completes cleanup after the last remote reference disappears",
         )
@@ -2794,7 +2783,9 @@ class Harness:
         self.check(local_branch.returncode == 128, "deliverable discard deletes its local branch")
         self.check(
             all(item["key"] != discarded_key for item in self.list_s3_versions())
-            and discarded["s3_purge"]["status"] == "deleted",
+            and discarded["s3_purge"]["status"] == "complete"
+            and discarded["s3_purge"]["pending"] == []
+            and discarded["s3_purge"].get("pending_prefixes", []) == [],
             "deliverable discard permanently removes every S3 version owned only by its branch",
         )
         self.check(
@@ -2890,22 +2881,25 @@ class Harness:
         self.merge_branch_to_main(branch)
         self.wm(self.shared, "refresh")
 
-        # No current command can place this boundary, so craft the revision an
-        # older release would have published. Targeting the pointer would make
-        # the engine resolve its path; pushing the task directory uploads both
-        # objects and records their version IDs without naming either.
-        runtime_dvc = (
-            self.home / ".local" / "share" / "workspace-mgr" / "storage-3.67.1" / "bin" / "dvc"
-        )
+        # Construct an old published pointer literally through the isolated S3
+        # fixture client. The native product does not invoke a legacy engine.
         publisher = self.root / "unaddressable-publisher"
         self.run(["git", "clone", self.remote_url, publisher], cwd=self.root)
         self.configure_git(publisher)
         publisher_task = publisher / task_id
-        (publisher_task / "second.bin").write_bytes(second)
-        (publisher_task / "top\\level.bin").write_bytes(unaddressable)
-        self.run([runtime_dvc, "add", "--quiet", "--", "second.bin"], cwd=publisher_task)
-        self.run([runtime_dvc, "add", "--quiet", "--", "top\\level.bin"], cwd=publisher_task)
-        self.run([runtime_dvc, "push", "--quiet", "-R", task_id], cwd=publisher)
+        import hashlib
+        for name, body in [("second.bin", second), ("top\\level.bin", unaddressable)]:
+            (publisher_task / name).write_bytes(body)
+            uploaded = self.s3.put_object(Bucket=self.bucket, Key=f"dvc/{task_id}/{name}", Body=body)
+            md5 = hashlib.md5(body).hexdigest()
+            (publisher_task / (name + ".dvc")).write_text(
+                f"outs:\n- md5: {md5}\n  size: {len(body)}\n  hash: md5\n  path: {name}\n"
+                f"  cloud:\n    workspace-mgr:\n      version_id: {uploaded['VersionId']}\n"
+                f"      etag: {uploaded['ETag'].strip(chr(34))}\n",
+                encoding="utf-8",
+            )
+            with (publisher_task / ".gitignore").open("a", encoding="utf-8") as ignore:
+                ignore.write("/" + name.replace("\\", "\\\\") + "\n")
         crafted_pointer = (publisher_task / "top\\level.bin.dvc").read_text(encoding="utf-8")
         self.check("version_id" in crafted_pointer, "crafted unaddressable metadata records its S3 version")
         old_version = self.s3_version_for_body(unaddressable)

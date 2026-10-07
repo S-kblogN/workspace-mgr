@@ -28,10 +28,10 @@ use crate::manifest::{
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
-    ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES,
-    BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB, REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE,
-    REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME,
-    TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
+    ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION,
+    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
+    REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
+    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
@@ -319,6 +319,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         installed: &installed,
     };
 
+    // Nested Git repositories are always opaque, ignored local content.
+    // Check before placement so S3/local storage cannot hide a tracked repo.
+    for scope in &scopes {
+        if resolved_under(&repo.root, scope).is_dir() {
+            crate::nested_git::validate(&repo, scope)?;
+        }
+    }
     let local_only = storage::local_boundaries(&repo, &scopes)?;
     for boundary in &local_only {
         let pointer = format!("{boundary}.dvc");
@@ -692,7 +699,16 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             report.status = "no_changes".to_owned();
         } else {
             let purge = s3_purge::purge_pending(&repo, &config, &task.remote)?;
-            report.status = if purge.deleted.is_empty() {
+            if let Some((code, message)) = purge.warning() {
+                report.warnings.push(TransactionWarning {
+                    code: code.to_owned(),
+                    message,
+                });
+            }
+            report.status = if purge.deleted.is_empty()
+                || !purge.pending.is_empty()
+                || !purge.pending_prefixes.is_empty()
+            {
                 "no_changes"
             } else {
                 "s3_purged"
@@ -752,8 +768,10 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     purge_candidates.sort();
     purge_candidates.dedup();
     s3_purge::queue(&repo, &purge_candidates)?;
+    s3_purge::queue_archive_prefixes(&repo, &archive_receipts)?;
     let local_ref = format!("refs/heads/{}", task.branch);
     let old_local_oid = repo.optional_oid(&local_ref)?;
+    crate::archive_cancel::record_publication(&repo, &task, &archive_receipts, &commit_oid, false)?;
     repo.run([
         "update-ref",
         "-m",
@@ -772,6 +790,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             "push verification failed: remote has {observed}, expected {commit_oid}"
         )));
     }
+    crate::archive_cancel::record_publication(&repo, &task, &archive_receipts, &commit_oid, true)?;
     repo.run([
         "update-ref",
         "-m",
@@ -781,6 +800,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     ])?;
     let mut purge = s3_purge::purge_pending(&repo, &config, &task.remote)?;
     purge.queued = purge_candidates;
+    if let Some((code, message)) = purge.warning() {
+        report.warnings.push(TransactionWarning {
+            code: code.to_owned(),
+            message,
+        });
+    }
     report.storage["purge"] = serde_json::to_value(purge)
         .map_err(|error| Error::message(format!("failed to encode S3 purge report: {error}")))?;
     report.status = "pushed".to_owned();
@@ -1222,6 +1247,7 @@ fn is_housekeeping_name(name: &str) -> bool {
         || name == TASK_MANIFEST_NAME
         || name == ".gitignore"
         || name == crate::archive_migration::RECEIPT_NAME
+        || name == crate::archive_adoption::LEGACY_RECORD
 }
 
 fn is_markdown(path: &str) -> bool {
@@ -1838,7 +1864,9 @@ fn check_large_files(
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     for relative in repo.visible_paths(scopes)? {
-        if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)) {
+        if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
+            || relative.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD))
+        {
             continue;
         }
         if storage::is_local(repo, &relative)? {
@@ -2437,7 +2465,7 @@ fn raise_staged_requirement(
         },
         minimum_cli_version: Some(target.to_string()),
         previous_minimum_cli_version: declared.map(|version| version.to_string()),
-        task_manifest_schema: required.map(|(_, schema)| schema),
+        task_manifest_schema: required.and_then(|(_, schema)| schema),
     }))
 }
 
@@ -2446,7 +2474,7 @@ fn raise_staged_requirement(
 fn describe_requirement_change(
     previous: Option<Version>,
     published: Option<Version>,
-    trigger: Option<(Version, u32)>,
+    trigger: Option<(Version, Option<u32>)>,
 ) -> Option<RepositoryRequirement> {
     let ordering = match (&previous, &published) {
         (None, None) => return None,
@@ -2469,7 +2497,7 @@ fn describe_requirement_change(
                 } else {
                     RequirementChange::Follow
                 },
-                trigger.map(|(_, schema)| schema),
+                trigger.and_then(|(_, schema)| schema),
             )
         }
         std::cmp::Ordering::Less => (RequirementChange::Withdraw, None),
@@ -2485,13 +2513,21 @@ fn describe_requirement_change(
 
 /// Refuses to publish a declaration this build does not meet, because the
 /// repository would then refuse the very build that raised it. The advice
-/// depends on whose manifest needs the newer release: only this task's own
-/// approval can be removed by this task.
+/// depends on whose manifest and metadata need the newer release. Only schema
+/// 3's own cloud-usage approval has the supported default-limit alternative;
+/// completion provenance must be retained.
 fn require_publishable(
     installed: &Version,
     needs: &ManifestNeeds,
     declaration: &Version,
 ) -> Result<()> {
+    if let Some(path) = &needs.archive_protocol {
+        if !cli_version_satisfies(installed, &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION) {
+            return Err(Error::message(format!(
+                "this build (workspace-mgr {installed}) cannot publish archive receipt {path}, because safe archive coordination and protected source retirement require workspace-mgr {ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION} or newer; update workspace-mgr"
+            )));
+        }
+    }
     if let Some(other) = &needs.others {
         if !cli_version_satisfies(installed, &other.version) {
             if other.archived {
@@ -2514,8 +2550,13 @@ fn require_publishable(
                     own.path, own.version
                 )));
             }
+            let advice = if own.schema == 3 {
+                "update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval."
+            } else {
+                "update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`."
+            };
             return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval.",
+                "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; {advice}",
                 own.schema, own.version
             )));
         }
@@ -2529,7 +2570,16 @@ fn require_publishable(
     Ok(())
 }
 
-fn missing_configuration(required: &Version, schema: u32, needs: &ManifestNeeds) -> Error {
+fn missing_configuration(required: &Version, schema: Option<u32>, needs: &ManifestNeeds) -> Error {
+    let Some(schema) = schema else {
+        return Error::message(format!(
+            "archive storage protocol for {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
+            needs
+                .archive_protocol
+                .as_deref()
+                .unwrap_or("archive receipts")
+        ));
+    };
     if let Some(need) = needs.highest_need().filter(|need| need.archived) {
         return Error::message(format!(
             "reading archived task manifest {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
@@ -2559,14 +2609,26 @@ struct ManifestNeeds {
     /// The most demanding other task manifest, such as one merged on the base
     /// branch.
     others: Option<ManifestNeed>,
+    /// Archive receipts use a storage protocol newer than their task manifest
+    /// and public data schemas. This floor must not depend on schema 4.
+    archive_protocol: Option<String>,
 }
 
 impl ManifestNeeds {
     /// The newest workspace-mgr any manifest needs, with that manifest
     /// instance's schema.
-    fn highest(&self) -> Option<(Version, u32)> {
-        self.highest_need()
-            .map(|need| (need.version.clone(), need.schema))
+    fn highest(&self) -> Option<(Version, Option<u32>)> {
+        let manifest = self.highest_need();
+        if self.archive_protocol.is_some()
+            && manifest.is_none_or(|need| {
+                ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION
+                    .cmp_precedence(&need.version)
+                    .is_gt()
+            })
+        {
+            return Some((ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, None));
+        }
+        manifest.map(|need| (need.version.clone(), Some(need.schema)))
     }
 
     fn highest_need(&self) -> Option<&ManifestNeed> {
@@ -2610,7 +2672,17 @@ fn manifest_requirement(
         }
         Ok(())
     })?;
-    let mut needs = ManifestNeeds::default();
+    let mut needs = ManifestNeeds {
+        archive_protocol: index_entries(
+            repo,
+            index,
+            &format!(":(glob)**/{}", archive_migration::RECEIPT_NAME),
+        )?
+        .into_iter()
+        .find(IndexEntry::is_regular_file)
+        .map(|entry| entry.path),
+        ..ManifestNeeds::default()
+    };
     for entry in manifests {
         let Some(schema) = schemas.get(&entry.oid).copied() else {
             continue;
@@ -3260,6 +3332,86 @@ mod tests {
     }
 
     #[test]
+    fn archive_receipts_require_0_7_independently_of_manifest_schema_or_storage() {
+        for schema in [2, 3] {
+            let fixture = Fixture::new(Some(PLAIN_CONFIG));
+            let main = fixture.main.clone();
+            let directory = "2026/09/20260918-120000-completed";
+            fixture.manifest(directory, schema);
+            let path = format!("{directory}/{}", archive_migration::RECEIPT_NAME);
+            // No bucket or completion checkpoint: public schema 1 does not
+            // imply old clients can safely implement the archive protocol.
+            fixture.write(
+                &path,
+                &serde_json::json!({
+                    "schema_version":1,"task_id":"20260918-120000-completed",
+                    "source":"20260918-120000-completed","destination":directory,
+                    "status":"copied","versions":[]
+                })
+                .to_string(),
+            );
+            fixture.stage(&main, &["2026"]);
+            let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+            assert_eq!(needs.highest(), Some((Version::new(0, 7, 0), None)));
+            let error = fixture
+                .reconcile(&main, &main, None, false, "0.6.0")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("archive receipt"), "{error}");
+            assert!(error.contains("require workspace-mgr 0.7.0"), "{error}");
+            assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+            assert_eq!(
+                fixture
+                    .reconcile(&main, &main, None, false, "0.7.0")
+                    .unwrap(),
+                Some(requirement(
+                    RequirementChange::Raise,
+                    Some("0.7.0"),
+                    None,
+                    None
+                ))
+            );
+            assert_eq!(
+                fixture.staged_config().unwrap(),
+                declaring("0.7.0", PLAIN_CONFIG)
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
+                PLAIN_CONFIG
+            );
+            let tip = fixture.publish(&main);
+            fixture.stage(&tip, &["2026"]);
+            assert!(
+                fixture
+                    .reconcile(&tip, &main, None, false, "0.7.0")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_protocol_floor_requires_a_repository_configuration() {
+        let fixture = Fixture::new(None);
+        let main = fixture.main.clone();
+        let directory = "2026/09/20260918-120000-completed";
+        fixture.write(
+            &format!("{directory}/{}", archive_migration::RECEIPT_NAME),
+            "{}",
+        );
+        fixture.stage(&main, &["2026"]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.7.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("archive storage protocol"), "{error}");
+        assert!(
+            error.contains("publication has no .workspace-mgr.toml"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn schema_3_manifests_raise_only_the_private_configuration() {
         let fixture = Fixture::new(Some(PLAIN_CONFIG));
         let main = fixture.main.clone();
@@ -3313,6 +3465,53 @@ mod tests {
         assert_eq!(
             fixture
                 .reconcile(&tip, &main, None, false, "0.4.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&tip));
+    }
+
+    #[test]
+    fn schema_4_publication_retains_provenance_and_requires_a_compatible_build() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 4);
+        fixture.write(&format!("{TASK}/notes.md"), "retain completion evidence\n");
+        fixture.stage(&main, &[TASK]);
+        let before = fixture.staged_config_oid();
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.6.9")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("task manifest schema 4"), "{error}");
+        assert!(error.contains("requires workspace-mgr 0.7.0"), "{error}");
+        assert!(!error.contains("remove the approval"), "{error}");
+        assert_eq!(fixture.staged_config_oid(), before);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.7.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Raise,
+                Some("0.7.0"),
+                None,
+                Some(4)
+            ))
+        );
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.7.0", PLAIN_CONFIG)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
+            PLAIN_CONFIG
+        );
+        let tip = fixture.publish(&main);
+        fixture.write(&format!("{TASK}/notes.md"), "additional reviewed notes\n");
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, None, false, "0.7.0")
                 .unwrap(),
             None
         );

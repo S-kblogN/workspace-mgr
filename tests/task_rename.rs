@@ -80,6 +80,7 @@ fn unpublished_deliverable_rename_moves_the_workspace_and_preserves_identity() {
     assert_eq!(preview["old_slug"], "initial-topic");
     assert_eq!(preview["new_slug"], "better-topic");
     assert_eq!(preview["branch"], branch);
+    assert!(preview.get("notices").is_none());
     assert_eq!(preview["review"]["head_branch_unchanged"], true);
     assert!(old_task.is_dir());
     assert!(!new_task.exists());
@@ -88,6 +89,16 @@ fn unpublished_deliverable_rename_moves_the_workspace_and_preserves_identity() {
     let renamed = json(&renamed);
     assert_eq!(renamed["status"], "renamed");
     assert_eq!(renamed["remote_writes"], false);
+    assert_eq!(
+        renamed["notices"][0]["code"],
+        "manual-content-audit-after-relocation"
+    );
+    assert!(
+        renamed["notices"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Rename succeeded.")
+    );
     assert!(!old_task.exists());
     assert_eq!(
         std::fs::read_to_string(new_task.join("nested/evidence.txt")).unwrap(),
@@ -109,6 +120,88 @@ fn unpublished_deliverable_rename_moves_the_workspace_and_preserves_identity() {
     assert_eq!(status["task_id"], task_id);
     assert_eq!(status["slug"], "better-topic");
     assert_eq!(status["scopes"][0], new_task_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_keeps_runtime_references_and_ignored_git_payloads_byte_for_byte() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = managed_fixture();
+    let (_, old_task, _) = create_task(&fixture, "opaque-move", "20260830-120050");
+    let destination = fixture.shared.join("20260830-120050-moved");
+    std::fs::write(old_task.join(".gitignore"), "/checkout/\n/stale/\n").unwrap();
+
+    let checkout = old_task.join("checkout");
+    git(
+        &fixture.seed,
+        ["worktree", "add", "--detach", checkout.to_str().unwrap()],
+    );
+    let external_admin = PathBuf::from(
+        String::from_utf8(git(&checkout, ["rev-parse", "--absolute-git-dir"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned(),
+    );
+    let pointer = std::fs::read(checkout.join(".git")).unwrap();
+    let registration = std::fs::read(external_admin.join("gitdir")).unwrap();
+    std::fs::create_dir(old_task.join("stale")).unwrap();
+    let stale = b"gitdir: /missing/old/runtime\n";
+    std::fs::write(old_task.join("stale/.git"), stale).unwrap();
+    std::fs::create_dir_all(old_task.join(".venv/bin")).unwrap();
+    std::fs::write(
+        old_task.join(".venv/pyvenv.cfg"),
+        "arbitrary environment specification\n",
+    )
+    .unwrap();
+    let launcher = format!(
+        "#!{}/.venv/bin/python\nprint('payload')\n",
+        old_task.display()
+    );
+    std::fs::write(old_task.join(".venv/bin/tool"), &launcher).unwrap();
+    let absolute_target = old_task.join("result.bin");
+    symlink(&absolute_target, old_task.join("absolute-input")).unwrap();
+    symlink("../../external-data", old_task.join("relative-input")).unwrap();
+
+    let preview = json(&workspace(
+        &old_task,
+        ["task", "rename", "moved", "--dry-run"],
+    ));
+    assert!(preview.get("notices").is_none());
+    assert!(old_task.exists());
+    assert!(!destination.exists());
+    let moved = json(&workspace(&old_task, ["task", "rename", "moved"]));
+    assert!(
+        moved["notices"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("manually audit and repair")
+    );
+
+    assert_eq!(
+        std::fs::read(destination.join("checkout/.git")).unwrap(),
+        pointer
+    );
+    assert_eq!(
+        std::fs::read(external_admin.join("gitdir")).unwrap(),
+        registration
+    );
+    assert_eq!(
+        std::fs::read(destination.join("stale/.git")).unwrap(),
+        stale
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join(".venv/bin/tool")).unwrap(),
+        launcher
+    );
+    assert_eq!(
+        std::fs::read_link(destination.join("absolute-input")).unwrap(),
+        absolute_target
+    );
+    assert_eq!(
+        std::fs::read_link(destination.join("relative-input")).unwrap(),
+        Path::new("../../external-data")
+    );
 }
 
 #[test]
@@ -366,6 +459,7 @@ fn infrastructure_rename_updates_only_mutable_metadata() {
     assert_eq!(renamed["branch"], branch);
     assert_eq!(renamed["old_path"], serde_json::Value::Null);
     assert_eq!(renamed["new_path"], serde_json::Value::Null);
+    assert!(renamed.get("notices").is_none());
     assert!(worktree.is_dir());
     let raw = std::fs::read_to_string(&manifest).unwrap();
     assert!(raw.contains("schema_version = 2"));
