@@ -1008,7 +1008,7 @@ fn approvals_follow_publication_in_an_authorized_alternate_workflow() {
 }
 
 #[test]
-fn only_schema_3_manifests_may_carry_the_approval_table() {
+fn approval_table_requires_a_supported_schema_at_least_3() {
     let fixture = managed_fixture(false);
     let (_, task) = create_task(&fixture, "usage-schema", "20260918-115000");
     let manifest = task.join(MANIFEST);
@@ -1038,8 +1038,8 @@ fn only_schema_3_manifests_may_carry_the_approval_table() {
             "task schema 1 must not declare the schema 3 cloud_usage_approval table",
         ),
         (
-            approved.replace("schema_version = 3", "schema_version = 4"),
-            "unsupported task schema 4, expected 1, 2, or 3",
+            approved.replace("schema_version = 3", "schema_version = 5"),
+            "unsupported task schema 5, expected 1, 2, 3, or 4",
         ),
         (
             format!("{approved}recorded_at = \"2026-09-18T12:00:00Z\"\n"),

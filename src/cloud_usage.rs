@@ -3494,6 +3494,7 @@ mod tests {
             shared_head: "main".to_owned(),
             additional_scopes: Vec::new(),
             cloud_usage_approval: None,
+            archive_completion: None,
         }
     }
 

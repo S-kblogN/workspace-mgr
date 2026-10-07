@@ -2506,8 +2506,9 @@ fn describe_requirement_change(
 
 /// Refuses to publish a declaration this build does not meet, because the
 /// repository would then refuse the very build that raised it. The advice
-/// depends on whose manifest needs the newer release: only this task's own
-/// approval can be removed by this task.
+/// depends on whose manifest and metadata need the newer release. Only schema
+/// 3's own cloud-usage approval has the supported default-limit alternative;
+/// completion provenance must be retained.
 fn require_publishable(
     installed: &Version,
     needs: &ManifestNeeds,
@@ -2535,8 +2536,13 @@ fn require_publishable(
                     own.path, own.version
                 )));
             }
+            let advice = if own.schema == 3 {
+                "update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval."
+            } else {
+                "update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`."
+            };
             return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval.",
+                "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; {advice}",
                 own.schema, own.version
             )));
         }
@@ -3334,6 +3340,53 @@ mod tests {
         assert_eq!(
             fixture
                 .reconcile(&tip, &main, None, false, "0.4.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.staged_config_oid(), fixture.config_oid_at(&tip));
+    }
+
+    #[test]
+    fn schema_4_publication_retains_provenance_and_requires_a_compatible_build() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let main = fixture.main.clone();
+        fixture.manifest(TASK, 4);
+        fixture.write(&format!("{TASK}/notes.md"), "retain completion evidence\n");
+        fixture.stage(&main, &[TASK]);
+        let before = fixture.staged_config_oid();
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.6.9")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("task manifest schema 4"), "{error}");
+        assert!(error.contains("requires workspace-mgr 0.7.0"), "{error}");
+        assert!(!error.contains("remove the approval"), "{error}");
+        assert_eq!(fixture.staged_config_oid(), before);
+        assert_eq!(
+            fixture
+                .reconcile(&main, &main, None, false, "0.7.0")
+                .unwrap(),
+            Some(requirement(
+                RequirementChange::Raise,
+                Some("0.7.0"),
+                None,
+                Some(4)
+            ))
+        );
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.7.0", PLAIN_CONFIG)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
+            PLAIN_CONFIG
+        );
+        let tip = fixture.publish(&main);
+        fixture.write(&format!("{TASK}/notes.md"), "additional reviewed notes\n");
+        fixture.stage(&tip, &[TASK]);
+        assert_eq!(
+            fixture
+                .reconcile(&tip, &main, None, false, "0.7.0")
                 .unwrap(),
             None
         );

@@ -7,7 +7,8 @@ scoped task state, and private runtime state. `.workspace-mgr.toml` contains
 only non-secret Git and optional S3 locations, plus the `minimum_cli_version`
 compatibility declaration that `workspace-mgr` maintains itself. Task manifests
 contain identity, purpose, current slug, scope, and branch state and, from
-schema 3, the user's cloud-usage approval. The task ID and review branch are
+schema 3, the user's cloud-usage approval and, from schema 4, durable archive
+review provenance. The task ID and review branch are
 immutable; the slug and deliverable path may change together. Deliverable
 manifests are tracked inside their task directories; infrastructure manifests
 live below the primary checkout's `.workspace-mgr/local/` and are selected
@@ -66,9 +67,9 @@ is unsupported.
 
 The user's cloud-usage approval is task state. `task approve-cloud-usage`
 writes it into the task manifest's `[cloud_usage_approval]` table, which makes
-the manifest schema 3, so a deliverable publishes the approval with the task
-and reviewers see it in the pull request. An infrastructure manifest keeps it
-private. Every publication commit also carries a `Cloud-Usage-Approval`
+the manifest at least schema 3, so a deliverable publishes the approval with
+the task and reviewers see it in the pull request. An infrastructure manifest
+keeps it private. Every publication commit also carries a `Cloud-Usage-Approval`
 trailer while the manifest records an approval; the trailer is written for
 review only and is never read back. The usage gate, the reminder, and
 `task status` read the approval from the manifest alone. Each task's private
@@ -133,10 +134,12 @@ release, a repository declares the oldest compatible release in
   raises.
 - Product policy maps each task manifest schema to the oldest release that
   reads it: top-level manifests with schemas 1 and 2 need no declaration, and
-  schema 3 needs 0.4.0. A nested archive task manifest needs 0.5.0 regardless
+  schema 3 needs 0.4.0 and schema 4 completion evidence needs 0.7.0.
+  A nested archive task manifest needs at least 0.5.0 regardless
   of its schema; publication uses the higher schema or path requirement.
   Writers use the lowest schema that represents a manifest, so only a task that
-  records a cloud-usage approval produces schema 3.
+  records a cloud-usage approval without a checkpoint produces schema 3, and a
+  task retaining a checkpoint stays at schema 4 even after approval reset.
 - Publication reconciles the declaration. Each private publication index (the
   preview, the pre-upload validation, and the final index) is scanned for task
   manifests at the top level and in nested archived task directories, excluding
@@ -276,11 +279,26 @@ follows bounded mappings only after an exact original version is missing,
 preserving hash and size checks. Planned local pointers can read their original
 exact versions before publication.
 
-Completion verification follows published stable-ID manifest and full task-tree
-history. Every transition must have a reachable, matching merged review;
-commit-to-PR associations connect repository-wide migrations with historical
-task branches. The explicit `task adopt` transition adds review and tree evidence
-for a pre-manifest directory, and that transition itself needs merged review.
+Completion verification never reads historical task configuration blobs.
+Current validated task identity and stored review metadata provide ownership;
+old files are opaque members of Git directory trees, regardless of their format.
+The verifier inspects only the current known directory and a saved checkpoint
+path, using tree IDs, commit ancestry, and hosting commit-to-PR associations.
+It cannot discover old paths or branches from old configuration formats.
+Missing or ambiguous provenance fails closed, and shallow history is refused.
+
+`task upgrade` can bootstrap relevant tree transitions once against verified
+merged reviews and store a schema 4 `[archive_completion]` checkpoint in the
+current manifest. The record binds repository, base branch, task ID,
+checkpoint commit/path/tree, and verified review and branch facts. It is local
+metadata until a scoped infrastructure review publishes and merges it.
+Subsequent archive verification revalidates that binding and the saved reviews
+against live provider facts, checks open reviews and retained local/remote refs,
+and examines directory changes only from checkpoint to fetched base. The
+record is immutable provenance, not a cached completed flag. A current manifest
+without it uses the same opaque-tree bootstrap checks. The explicit `task adopt`
+transition adds review and tree evidence for a manifestless directory, and that
+transition itself needs merged review.
 
 Before a local archive move, `.workspace-mgr/local/archive-attempts/` saves
 original tool-mutated metadata, modes, verified Git relocation references, owner
@@ -343,8 +361,9 @@ native Signature Version 4 and explicit checksum/conditional headers. The
 production path does not install or invoke Python or DVC.
 
 `task rename` is a local identity-preserving transition. It moves an ordinary
-task directory as one filesystem unit and atomically rewrites manifest schema
-2, or rewrites only private metadata for infrastructure. Existing schema 1
+task directory as one filesystem unit and atomically rewrites the lowest schema
+that preserves its fields, including schema 4 completion evidence, or rewrites
+only private metadata for infrastructure. Existing schema 1
 manifests remain readable and are upgraded by rename. The immutable task ID
 keeps private state and commit ownership stable, while the unchanged target
 branch preserves the existing pull request. When a published deliverable path

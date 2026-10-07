@@ -620,7 +620,7 @@ workspace-mgr publish -m "Publish the training checkpoints"
 
 Recording an approval documents the user's decision; it never creates one. The
 command writes the approved limit and the user's note into the task manifest,
-which becomes schema 3, and the next publication carries that change, so
+which requires at least schema 3, and the next publication carries that change, so
 reviewers see it in the pull request. Each publication commit also names the
 approval in a `Cloud-Usage-Approval` trailer; for an infrastructure task, whose
 manifest is private, the trailer is the only published record. A user may also
@@ -766,6 +766,53 @@ pending S3 purge retry may proceed when a removed branch was the last live
 reference protecting an already queued path. Directory organization remains a
 separate user-requested infrastructure task.
 
+### Upgrade task configuration before organization
+
+In a new clone, refresh the configured shared branch before upgrading current
+task configuration. Preview a completed task's evidence, declare its exact
+manifest path in a user-authorized infrastructure task, then apply and publish
+the change through that review:
+
+```sh
+workspace-mgr refresh
+task_config=20260918-120000-example/.workspace-mgr-task.toml
+workspace-mgr task upgrade --manifest "$task_config" --dry-run
+workspace-mgr task create task-config-upgrade --kind infrastructure \
+  --title "Upgrade completed task configuration" \
+  --purpose "Retain verified review provenance before organization" \
+  --scope "$task_config" \
+  --scope-note "The user requested this task configuration upgrade"
+upgrade_manifest=/absolute/path/reported/by/task-create
+workspace-mgr task upgrade --manifest "$task_config"
+workspace-mgr plan --manifest "$upgrade_manifest"
+workspace-mgr publish --manifest "$upgrade_manifest" \
+  -m "Retain verified task completion evidence"
+```
+
+Review and merge that infrastructure pull request, then run `refresh` before
+the archive preview. Upgrade is idempotent and writes only current local task
+metadata; it writes no S3 data or Git remote. The current task configuration
+must already be published and have no unrelated staged or unpublished edits.
+Task metadata, declared scopes and cloud-usage approval are retained.
+
+The schema 4 checkpoint requires workspace-mgr 0.7.0. It binds the current
+identity to repository/base, a Git commit and directory tree at a known path,
+and verified review and branch facts. Bootstrap examines relevant trees at
+the current known path; a saved checkpoint also supplies its recorded path.
+It never reads historical task configuration blobs or discovers paths and
+branches from their fields. Old historical configuration may even be non-TOML:
+its bytes remain opaque members of the Git tree. The current configuration
+still must satisfy the current schema; missing identity or unverifiable path
+and review provenance cannot be guessed.
+
+Archive without a saved checkpoint can perform the same bootstrap verification.
+Publishing upgrade first makes the result durable for other clones. Later
+archive checks only directory changes from the checkpoint to the fetched base,
+while revalidating its original tree and reviews and checking live open PRs
+and retained local/remote refs. A checkpoint does not permanently mark a task
+complete. Both bootstrap and subsequent verification require complete Git
+history; a shallow clone must fetch its missing history before proceeding.
+
 Active deliverable task directories remain at the repository's top level.
 After a task is done and its pull request is confirmed merged, the user may
 explicitly request that old task directories be organized under time folders.
@@ -817,8 +864,8 @@ returned to tracked storage before organization.
 
 To hydrate a historical Git checkout after source cleanup, use
 `workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
-the archive registry. Publishing nested archived task state raises the minimum
-CLI requirement to 0.5.0 for any supported manifest schema. Removing a
+the archive registry. Publishing nested archived task state requires at least
+0.5.0; schema 4 completion evidence raises the requirement to 0.7.0. Removing a
 cloud-usage approval does not clear this path requirement; an older CLI needs
 an update.
 
@@ -855,6 +902,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
+| `task upgrade` | Rewrites current configuration and verified completion evidence; dry-run changes no task content | Fetches the shared branch and verifies Git trees and hosting review records | None |
 | `archive` | Moves completed directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads GitHub merge evidence, Git refs, and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |

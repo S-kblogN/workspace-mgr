@@ -10,14 +10,24 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 ### Added
 
 - Explicit `task adopt` for reviewed legacy directories without manifests.
+- Previewable, idempotent `task upgrade` for current task configuration and
+  durable verified review provenance. Its optional schema 4
+  `[archive_completion]` checkpoint requires workspace-mgr 0.7.0 and preserves
+  task metadata, scopes and cloud-usage approval.
 - Previewable, idempotent `archive --cancel` with durable local metadata and Git
   reference snapshots, preserving ignored/hydrated content and other task edits.
 
 ### Fixed
 
-- Archive completion follows reviewed identity and content history across
-  schema/branch migrations and accepts branch tips behind a verified PR head.
-  Open reviews, unreviewed changes, divergent refs, and identity ambiguity fail.
+- Archive completion uses current identity, stored review metadata, opaque Git
+  directory trees and hosting commit-to-PR associations, without reading or
+  parsing historical task configuration blobs or inferring old paths/branches
+  from their format. Bootstrap verifies relevant known-path history once;
+  published checkpoints retain original provenance and limit later tree checks
+  to checkpoint through fetched base. Live reviews and retained refs are still
+  rechecked, and branch tips behind a verified PR head are accepted. Open
+  reviews, unreviewed changes, divergent refs, missing path continuity and
+  ambiguous identity fail; shallow history remains refused.
 - Archive retirement completes only after a full S3 history scan finds no data
   versions or delete markers under the original task prefix. Protected history
   reports `cleanup_pending`; unmapped concurrent writes report
@@ -65,6 +75,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Upgrading
 
+- In a refreshed clone, preview and apply `task upgrade` for a task's current
+  manifest, then publish it through a scoped infrastructure review, merge and
+  refresh before archive. Upgrade writes no S3 data or Git remote. Current
+  manifests without a checkpoint remain compatible through opaque-tree
+  bootstrap; unknown historical config formats need no adapter, while missing
+  identity/path provenance is never guessed.
 - Lossless `archive --cancel` requires an attempt journal created by this
   release, including its copy reservation nonce. Old receipts alone cannot
   reconstruct ownership and all original local metadata.

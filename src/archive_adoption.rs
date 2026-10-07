@@ -122,7 +122,8 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
     if original_tree.is_empty()
         || repo
             .run_unchecked([
-                "show",
+                "cat-file",
+                "-e",
                 &format!("{}:{path}/{TASK_MANIFEST_NAME}", review.merge_commit),
             ])?
             .success()
@@ -147,6 +148,7 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
         purpose: one_line(&options.purpose, "adoption purpose")?,
         additional_scopes: Vec::new(),
         cloud_usage_approval: None,
+        archive_completion: None,
     };
     let record = LegacyRecord {
         schema_version: 1,
@@ -223,7 +225,8 @@ pub(crate) fn verify_record(
     if !raw.success() {
         if repo
             .run_unchecked([
-                "show",
+                "cat-file",
+                "-e",
                 &format!("{adoption_commit}:{adoption_path}/{LEGACY_RECORD}"),
             ])?
             .success()

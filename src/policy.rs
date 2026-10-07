@@ -16,6 +16,8 @@ pub const INSTRUCTION_POLICY_VERSION: u32 = 12;
 /// The first workspace-mgr release that reads task manifest schema 3, which
 /// adds the optional `[cloud_usage_approval]` table.
 pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 0);
+/// The first release that preserves verified task completion checkpoints.
+pub const TASK_SCHEMA_4_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 7, 0);
 /// The first release that reads task manifests below date-grouping directories.
 pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 
@@ -32,6 +34,7 @@ pub const REVIEW_SYNC_CADENCE: &str = "before-every-turn-end";
 pub fn minimum_cli_version_for_task_schema(schema_version: u32) -> Option<semver::Version> {
     match schema_version {
         3 => Some(TASK_SCHEMA_3_MINIMUM_CLI_VERSION),
+        4 => Some(TASK_SCHEMA_4_MINIMUM_CLI_VERSION),
         _ => None,
     }
 }
@@ -41,12 +44,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_task_manifest_schema_3_raises_the_minimum_cli_version() {
+    fn optional_task_metadata_schemas_raise_the_minimum_cli_version() {
         assert_eq!(minimum_cli_version_for_task_schema(1), None);
         assert_eq!(minimum_cli_version_for_task_schema(2), None);
         assert_eq!(
             minimum_cli_version_for_task_schema(3).map(|version| version.to_string()),
             Some("0.4.0".to_owned())
+        );
+        assert_eq!(
+            minimum_cli_version_for_task_schema(4).map(|version| version.to_string()),
+            Some("0.7.0".to_owned())
         );
     }
 

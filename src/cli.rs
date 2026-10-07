@@ -141,12 +141,26 @@ pub enum TaskCommand {
     Adopt(TaskAdoptArgs),
     /// Change a task's current slug while preserving its identity and review branch.
     Rename(TaskRenameArgs),
+    /// Upgrade task configuration and retain verified archive completion evidence.
+    Upgrade(TaskUpgradeArgs),
     /// Inspect the resolved task scope and working changes.
     Status(TaskStatusArgs),
     /// Permanently discard an unmerged task after its pull request is closed.
     Discard(TaskDiscardArgs),
     /// Record the user's explicit approval of a cloud-usage limit for this task.
     ApproveCloudUsage(TaskApproveCloudUsageArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskUpgradeArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -487,6 +501,13 @@ mod tests {
             &["--format", "json", "instructions", "publish"],
             &["doctor", "--repo", "/tmp/repository"],
             &["config", "show", "--repo", "/tmp/repository"],
+            &[
+                "task",
+                "upgrade",
+                "--manifest",
+                "/tmp/task/.workspace-mgr-task.toml",
+                "--dry-run",
+            ],
             &[
                 "task",
                 "create",

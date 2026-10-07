@@ -36,6 +36,7 @@ mod scaffold;
 mod storage;
 mod task_approval;
 mod task_rename;
+mod task_upgrade;
 mod transaction;
 mod update;
 
@@ -156,6 +157,14 @@ fn run(cli: Cli) -> Result<()> {
                     start: args.repo,
                     manifest: args.manifest,
                     new_slug: args.new_slug,
+                    dry_run: args.dry_run,
+                })?,
+                cli.format,
+            ),
+            TaskCommand::Upgrade(args) => emit(
+                &task_upgrade::upgrade(&task_upgrade::TaskUpgradeOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
                     dry_run: args.dry_run,
                 })?,
                 cli.format,

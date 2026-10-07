@@ -311,8 +311,9 @@ task directory from `<timestamp>-<old-slug>` to
 `<timestamp>-<new-slug>`. Its README, retained content, S3 pointers, placement
 sidecars, and manifest move together. The manifest is atomically rewritten with
 the new current slug and path; it keeps every other field, including a
-cloud-usage approval, and uses schema 2, or schema 3 when it records an
-approval. Infrastructure tasks keep
+cloud-usage approval and archive completion checkpoint. It writes the lowest
+schema representing those fields: schema 2, schema 3 with an approval, or
+schema 4 with a checkpoint. Infrastructure tasks keep
 their identity-owned private manifest path and update only the private current
 slug metadata.
 
@@ -342,6 +343,55 @@ workspace-mgr plan
 workspace-mgr publish -m "Rename the task for its current topic"
 ```
 
+## `workspace-mgr task upgrade`
+
+Upgrade current task configuration and backfill verified archive review
+provenance without moving task contents or writing a remote.
+
+```text
+workspace-mgr task upgrade
+  [--repo <path>] [--manifest <path>] [--dry-run]
+```
+
+Run from the configured shared checkout after refreshing a clone. Without
+`--manifest`, the current deliverable task is discovered from `--repo` or the
+working directory. Select another task's current configuration explicitly with
+`--manifest`. When backfilling a deliverable, pass its tracked manifest here;
+the separate private infrastructure manifest selects the publication owner.
+
+For a deliverable, upgrade fetches the shared branch, requires its current
+published manifest to match the local configuration, and refuses staged or
+unpublished edits apart from an idempotent retry of the verified checkpoint.
+It preserves task metadata, declared scopes, and cloud-usage approval.
+`--dry-run` verifies the same evidence but does not rewrite the manifest.
+The report gives `previous_schema_version`, `schema_version`,
+`completion_recorded`, and `remote_writes: false`; applying reports `upgraded`
+or `no_changes`. `completion_recorded` reports the presence of provenance, not
+current archive eligibility. Deliverable review verification requires readable
+GitHub evidence through `gh` and complete Git history.
+
+Completion evidence uses only the current identity, current known task path,
+any saved `checkpoint_path`, opaque Git directory tree IDs, commit ancestry,
+and hosting-provider commit-to-PR associations. Historical task configuration
+blobs are never read or parsed, even if they are not TOML. No old-format adapter
+discovers a path or branch. Bootstrap verifies the relevant history once and
+stores the repository, base branch, task ID, checkpoint commit/path/tree, and
+all verified branches and reviews in `[archive_completion]`. The current
+manifest then uses schema 4, which requires workspace-mgr 0.7.0. Current
+manifest validation remains strict; unknown current fields or schemas are not
+guessed or rewritten.
+
+Publish the upgraded manifest through an infrastructure task whose declared
+scope covers that exact file. Review and merge this publication, then refresh
+before archiving. Repeating upgrade with the same verified inputs is
+idempotent. It writes no S3 data or Git remote. A saved checkpoint is provenance,
+not a boolean assertion that the task is still complete: later archive checks
+live PR state and retained refs and verifies only directory changes after the
+checkpoint against the fetched base. Missing or ambiguous identity, path or
+review evidence is refused. A current task without a checkpoint can still
+bootstrap this evidence during archive; upgrade makes that evidence durable
+and reviewable before organization.
+
 ## `workspace-mgr archive`
 
 Organize completed deliverable task directories through a user-requested
@@ -356,13 +406,19 @@ workspace-mgr archive [<source-or-destination> ...]
 
 With no paths, inspect top-level deliverable directories and skip tasks without
 a verified merged pull request. An explicitly named active or unverified task
-is refused. Verification uses GitHub pull-request evidence for the task's
-current and historical branches, immutable identity, configured base branch,
-and reachable merge commits. Each published identity or tracked-content
-transition needs matching merged review evidence. Reviewed schema migrations
-and branch changes preserve continuity; retained branch tips may lag behind a
-reviewed head but must be its ancestors. Open reviews, new or divergent commits,
-identity gaps, and ambiguous evidence remain ineligible;
+is refused. Verification uses the current task configuration, saved review
+provenance, Git directory tree IDs and commit ancestry, and GitHub review
+associations. Historical task configuration blobs are never read or parsed;
+their bytes are opaque members of the verified trees. Only the current known
+path and a saved checkpoint path are inspected. Actual PR head names and saved
+review branches provide branch history; old configurations cannot supply it.
+Without a checkpoint, relevant directory changes must each have matching
+merged review evidence. With a published schema 4 checkpoint, archive binds
+its original tree and immutable review facts again and checks subsequent
+directory changes through the fetched base. It still reads live PR states and
+checks local and remote refs. Retained branch tips may lag behind a reviewed
+head but must be its ancestors. Open reviews, new or divergent commits,
+unknown path continuity, and ambiguous evidence remain ineligible;
 `gh` must be installed and able to read the repository. Active task directories
 stay at the top level, and merge or turn-end synchronization never runs archive
 automatically.
@@ -602,12 +658,13 @@ bytes, the largest integer the manifest can hold. `--note` is required, must be
 one line, and records the user's decision.
 
 The approval is written into the task manifest as a `[cloud_usage_approval]`
-table with `limit_bytes` and `note`, which makes it a schema 3 manifest; the
+table with `limit_bytes` and `note`, which requires at least schema 3; the
 [configuration reference](configuration.md#task-manifests) describes the
 format. The command rewrites the manifest atomically, validates the result, and
 restores the previous manifest if validation fails. It replaces any earlier
-approval, and a limit equal to the threshold removes the table and returns the
-manifest to schema 2. `task rename` keeps the approval, and confirmed
+approval, and a limit equal to the threshold removes the table. The manifest
+returns to schema 2 only when it has no archive completion checkpoint;
+otherwise it remains schema 4. `task rename` keeps the approval, and confirmed
 `task discard` removes it with the task. The command reads no remote and
 reports `remote_writes: false`.
 
@@ -931,7 +988,8 @@ the published tree, as the
 [configuration reference](configuration.md#minimum-workspace-mgr-version)
 describes: a task that needs no newer release keeps the configuration of the
 point where its branch left the base branch, a schema 3 manifest that records
-a cloud-usage approval raises the declaration to at least 0.4.0, a nested
+a cloud-usage approval raises the declaration to at least 0.4.0, schema 4
+completion evidence requires 0.7.0, a nested
 archived task manifest of any supported schema requires at least 0.5.0, a branch
 whose manifests no longer need its earlier raise withdraws it but never below
 the fetched base branch's declaration, and a branch whose configuration

@@ -1022,6 +1022,7 @@ pub fn create_task(options: &TaskCreateOptions) -> Result<TaskCreateReport> {
         purpose: purpose.clone(),
         additional_scopes,
         cloud_usage_approval: None,
+        archive_completion: None,
     };
     let readme = task_readme(&title, &purpose);
     let manifest_path = match options.kind {

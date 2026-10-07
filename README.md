@@ -93,8 +93,19 @@ and destination scopes, then apply `archive` in that infrastructure task.
 The command moves local directories; normal publication copies and verifies
 their complete retained S3 history, rewrites storage metadata, and records
 durable exact-version mappings before obsolete source objects are purged.
-Reviewed schema/branch migrations preserve completion evidence, and manifestless
-legacy tasks use explicit `task adopt` before archive. Preview or undo an
+Archive verifies current task identity against opaque Git directory trees,
+commit ancestry, and hosting review records; it never reads historical task
+configuration blobs or infers old paths or branches from their format.
+`task upgrade --manifest <task-config> --dry-run` previews a one-time backfill
+of verified review evidence into a schema 4 completion checkpoint. Apply and
+publish that metadata through a scoped infrastructure review, merge and refresh
+it, then archive. The checkpoint requires 0.7.0 and is revalidated against live
+reviews and subsequent changes; it is not a permanent completed flag. A current
+manifest without a checkpoint remains eligible for the same bootstrap checks
+at its known path. Unverifiable ownership or path continuity is refused, and
+manifestless legacy tasks use explicit `task adopt` before archive.
+See the [task upgrade command](docs/commands.md#workspace-mgr-task-upgrade).
+Preview or undo an
 unpublished local attempt with `archive --cancel --manifest <owner> --dry-run`;
 cancel preserves ignored and hydrated local content while removing this
 attempt's S3 copies and registry records. Archive completion requires the old
