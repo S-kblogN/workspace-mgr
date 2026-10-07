@@ -104,6 +104,11 @@ reviews and subsequent changes; it is not a permanent completed flag. A current
 manifest without a checkpoint remains eligible for the same bootstrap checks
 at its known path. Unverifiable ownership or path continuity is refused, and
 manifestless legacy tasks use explicit `task adopt` before archive.
+For a direct import, the reviewed adoption commit becomes the history boundary;
+later changes still need review. Empty `.git` cache markers are preserved.
+Before movement, archive reports literal old paths in scripts and README files
+and refuses external Git administration, stale registrations and location-bound
+Python environments; the command reference explains repair steps.
 See the [task upgrade command](docs/commands.md#workspace-mgr-task-upgrade).
 Preview or undo an
 unpublished local attempt with `archive --cancel --manifest <owner> --dry-run`;
@@ -114,6 +119,8 @@ history remains explicitly pending. A Git control tag binds each canonical
 receipt, allowing B2-compatible publication without permanently retaining
 duplicate source history. See the [archive command](docs/commands.md#workspace-mgr-archive)
 for review, conflict, and cancellation guarantees.
+Every archive publication requires 0.7.0 independently of task schema; private
+purge/copy journals use schema 2 so 0.6.0 refuses protected retry state.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.
 

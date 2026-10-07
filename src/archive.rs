@@ -141,6 +141,13 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
     };
     let _lock = RepositoryLock::acquire(&repo)?;
     let config = Config::load_compatible(&repo)?;
+    let installed = crate::config::installed_cli_version();
+    let required = crate::policy::ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION;
+    if !crate::config::cli_version_satisfies(&installed, &required) {
+        return Err(Error::message(format!(
+            "archive protocol requires workspace-mgr {required} or newer; this is workspace-mgr {installed}; update the CLI before preparing an archive"
+        )));
+    }
     repo.validate_remote_name(&config.git.remote)?;
     repo.validate_branch(&config.git.branch)?;
     // Validate the template before inspecting tasks or contacting a host.
@@ -272,6 +279,12 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         validate_materialized(&repo, source)?;
         let relocation =
             crate::relocation::prepare(&source_dir, &resolved_under(&repo.root, &destination))?;
+        crate::runtime_references::validate(
+            &source_dir,
+            &resolved_under(&repo.root, &destination),
+            source,
+            &relocation.reference_paths(),
+        )?;
         let original_manifest = fs::read_to_string(&manifest_path).at(&manifest_path)?;
         let mut next: TaskManifest =
             toml::from_str(&original_manifest).map_err(|source| Error::Toml {
@@ -537,10 +550,6 @@ fn merged_pull_request(
     let checkpoint_snapshot = checkpoint
         .map(|record| verify_checkpoint_binding(repo, host, base, task, record))
         .transpose()?;
-    let history = task_tree_history(repo, base, task, checkpoint)?;
-    if history.is_empty() && checkpoint.is_none() {
-        return Ok(None);
-    }
     // Only the current configuration and hosting reviews describe ownership.
     // Old configuration files remain opaque members of Git directory trees.
     let mut branches = BTreeSet::new();
@@ -571,13 +580,27 @@ fn merged_pull_request(
                 base,
                 task,
                 (commit, path),
-            )?,
+            )?
+            .map(|review| (commit.to_owned(), review)),
             None => None,
         }
     } else {
         None
     };
-    if let Some((branch, _)) = &legacy {
+    // Immutable adoption evidence covers the imported content. Its own
+    // introducing change must still have a merged review, but commits from
+    // before that adoption do not need to be retroactively reviewed.
+    let history = task_tree_history(
+        repo,
+        base,
+        task,
+        checkpoint,
+        legacy.as_ref().map(|(commit, _)| commit.as_str()),
+    )?;
+    if history.is_empty() && checkpoint.is_none() {
+        return Ok(None);
+    }
+    if let Some((_, (branch, _))) = &legacy {
         branches.insert(branch.clone());
     }
     let mut requests = Vec::new();
@@ -683,8 +706,8 @@ fn merged_pull_request(
         }
         reviewed.push((branch, proof));
     }
-    if let Some(legacy) = legacy {
-        reviewed.push(legacy);
+    if let Some((_, review)) = legacy {
+        reviewed.push(review);
     }
     for branch in &branches {
         // A migration's own review branch is part of the verified lifecycle,
@@ -1074,9 +1097,13 @@ fn task_tree_history(
     base: &str,
     task: &ResolvedTask,
     checkpoint: Option<&ArchiveCompletion>,
+    adoption_commit: Option<&str>,
 ) -> Result<Vec<ReviewedTaskTree>> {
     let range = checkpoint
         .map(|record| format!("{}..{base}", record.checkpoint_commit))
+        // Include the adoption itself so it cannot become a completion
+        // boundary until its metadata has been reviewed on the base branch.
+        .or_else(|| adoption_commit.map(|commit| format!("{commit}^..{base}")))
         .unwrap_or_else(|| base.to_owned());
     let mut directories = BTreeSet::from([task.task_path.clone().expect("a deliverable path")]);
     if let Some(record) = checkpoint {

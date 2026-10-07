@@ -12,7 +12,9 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
 
-const STATE_SCHEMA: u32 = 1;
+// 0.6.0 checks this field before invoking its destructive adapter, but ignores
+// additional fields. An extra protection field in schema 1 cannot fence it.
+const STATE_SCHEMA: u32 = 2;
 const STATE_NAME: &str = "s3-purge.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -243,6 +245,9 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
             ..PurgeReport::default()
         });
     }
+    // A legacy queue may be read for preview, but any retry must first fence
+    // old clients durably, even when no prefix promotion is necessary.
+    write_state(repo, &state)?;
     dvc::ensure_ready(repo, config)?;
     dvc::verify_object_versioning(repo, config)?;
     let base = repo.fetch_branch(remote, &config.git.branch)?;
@@ -726,11 +731,12 @@ fn read_state(repo: &GitRepo) -> Result<PurgeState> {
     let raw = fs::read_to_string(&path).at(&path)?;
     let mut state: PurgeState = serde_json::from_str(&raw)
         .map_err(|error| Error::message(format!("invalid private S3 purge state: {error}")))?;
-    if state.schema_version != STATE_SCHEMA {
+    if !matches!(state.schema_version, 1 | STATE_SCHEMA) {
         return Err(Error::message(
             "private S3 purge state has an unsupported schema",
         ));
     }
+    state.schema_version = STATE_SCHEMA;
     state.pending.sort();
     state.pending.dedup();
     for (source, receipt) in &state.pending_prefixes {
@@ -755,16 +761,20 @@ fn write_state(repo: &GitRepo, state: &PurgeState) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::message("private S3 purge state has no parent"))?;
     fs::create_dir_all(parent).at(parent)?;
-    let encoded = serde_json::to_vec_pretty(state)
+    let mut upgraded = state.clone();
+    upgraded.schema_version = STATE_SCHEMA;
+    let encoded = serde_json::to_vec_pretty(&upgraded)
         .map_err(|error| Error::message(format!("failed to encode S3 purge state: {error}")))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     temporary.write_all(&encoded).at(&path)?;
     temporary.write_all(b"\n").at(&path)?;
     temporary.flush().at(&path)?;
+    temporary.as_file().sync_all().at(&path)?;
     temporary.persist(&path).map_err(|error| Error::Io {
-        path,
+        path: path.clone(),
         source: error.error,
     })?;
+    fs::File::open(parent).at(parent)?.sync_all().at(parent)?;
     Ok(())
 }
 
@@ -912,12 +922,28 @@ mod tests {
             fs::read(state_path(&repo).unwrap()).unwrap(),
             original_bytes
         );
+        let mut legacy: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
+        legacy["schema_version"] = 1.into();
+        fs::write(
+            state_path(&repo).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
         cancel_archive(&repo, "empty-task", "2026/07/empty-task", &[], &prior).unwrap();
         assert_eq!(
             archive_prefixes(&repo).unwrap(),
             BTreeMap::from([("other-task".to_owned(), other)])
         );
         assert!(has_pending(&repo).unwrap());
+        // Restoring a prior snapshot must never reintroduce a schema 1
+        // queue that an old client could consume without prefix protection.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(state_path(&repo).unwrap()).unwrap()
+            )
+            .unwrap()["schema_version"],
+            2
+        );
     }
 
     #[test]
@@ -929,9 +955,100 @@ mod tests {
         repo.run(["init", "-q", "-b", "main"]).unwrap();
         let path = state_path(&repo).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, r#"{"schema_version":1,"pending":[]}"#).unwrap();
+        fs::write(&path, r#"{"schema_version":1,"pending":[]}"#).unwrap();
         assert!(archive_prefixes(&repo).unwrap().is_empty());
         assert!(!has_pending(&repo).unwrap());
+        // Preview is a read only operation, even for a legacy queue.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["schema_version"],
+            1
+        );
+    }
+
+    #[test]
+    fn protected_prefix_queue_fences_the_actual_0_6_reader() {
+        // This is the released 0.6.0 PurgeState/read_state contract at
+        // 2e6f5d6:src/s3_purge.rs. Serde ignores new fields, so only the
+        // incompatible schema check prevents its all-version deletion path.
+        #[derive(Deserialize)]
+        struct LegacyState {
+            schema_version: u32,
+            pending: Vec<ObjectVersion>,
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: fixture.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        let unmapped = archive_version("task", "new", "concurrent-marker");
+        let state = PurgeState {
+            schema_version: STATE_SCHEMA,
+            pending: vec![unmapped.clone()],
+            pending_prefixes: BTreeMap::from([("task".into(), empty_receipt("task"))]),
+        };
+        write_state(&repo, &state).unwrap();
+        let raw = fs::read(state_path(&repo).unwrap()).unwrap();
+        let legacy: LegacyState = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(legacy.pending, [unmapped]);
+        assert_ne!(
+            legacy.schema_version, 1,
+            "0.6.0 must reject before its delete adapter"
+        );
+        assert_eq!(
+            read_state(&repo).unwrap().pending_prefixes,
+            state.pending_prefixes
+        );
+    }
+
+    #[test]
+    fn legacy_retry_is_fenced_before_even_a_failed_remote_preflight() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: fixture.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        let path = state_path(&repo).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let pending = archive_version("task", "new", "unmapped-payload");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version":1,"pending":[pending],
+                "pending_prefixes":{"task":empty_receipt("task")}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        preview(&repo).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // This repository has no initialized storage or remote. Its retry
+        // cannot reach any S3 endpoint, yet the old-client fence must persist.
+        assert!(purge_pending(&repo, &Config::default(), "missing-remote").is_err());
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["schema_version"], STATE_SCHEMA);
+        assert_eq!(after["pending"][0]["version_id"], "unmapped-payload");
+        assert_eq!(after["pending_prefixes"]["task"], empty_receipt("task"));
+    }
+
+    #[test]
+    fn unknown_purge_schema_is_rejected_without_rewriting() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: fixture.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        let path = state_path(&repo).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = br#"{"schema_version":3,"pending":[],"pending_prefixes":{}}"#;
+        fs::write(&path, raw).unwrap();
+        assert!(
+            preview(&repo)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schema")
+        );
+        assert_eq!(fs::read(&path).unwrap(), raw);
     }
 
     #[test]

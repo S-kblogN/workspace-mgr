@@ -79,9 +79,17 @@ pub(crate) fn prepare(source: &Path, destination: &Path) -> Result<RelocationPla
 }
 
 impl RelocationPlan {
+    pub(crate) fn reference_paths(&self) -> Vec<PathBuf> {
+        self.references
+            .iter()
+            .map(|reference| reference.before_path.clone())
+            .collect()
+    }
+
     /// Call immediately after the directory move. A partial application can
     /// always be reversed using the saved plan.
     pub(crate) fn apply(&self) -> Result<()> {
+        self.validate_scope()?;
         for reference in &self.references {
             reference.validate(&reference.after_path)?;
         }
@@ -94,6 +102,7 @@ impl RelocationPlan {
     /// Restore before reversing the directory move. Also succeeds after an
     /// already completed reversal, so interrupted cancel is resumable.
     pub(crate) fn restore(&self) -> Result<()> {
+        self.validate_scope()?;
         let paths = self
             .references
             .iter()
@@ -109,8 +118,35 @@ impl RelocationPlan {
     }
 
     pub(crate) fn validate_applied(&self) -> Result<()> {
+        self.validate_scope()?;
         for reference in &self.references {
             reference.validate(&reference.existing_path()?)?;
+        }
+        Ok(())
+    }
+
+    fn validate_scope(&self) -> Result<()> {
+        for reference in &self.references {
+            let relative = reference.before_path.strip_prefix(&self.source).ok();
+            if normalize(&reference.before_path) != reference.before_path
+                || normalize(&reference.after_path) != reference.after_path
+                || relative
+                    .is_none_or(|relative| self.destination.join(relative) != reference.after_path)
+            {
+                return Err(Error::message(format!(
+                    "saved relocation plan would modify Git control files outside the task scope: {} -> {}; repair this old attempt's external Git layout separately before retrying",
+                    reference.before_path.display(),
+                    reference.after_path.display()
+                )));
+            }
+            for (path, root) in [
+                (&reference.before_path, &self.source),
+                (&reference.after_path, &self.destination),
+            ] {
+                if path.exists() {
+                    require_within_task(path, root, "saved Git control file")?;
+                }
+            }
         }
         Ok(())
     }
@@ -190,6 +226,7 @@ impl Builder {
     }
 
     fn snapshot(&mut self, path: &Path, after: Vec<u8>) -> Result<()> {
+        require_within_task(path, &self.source, "Git control file")?;
         ordinary_file(path)?;
         let before = fs::read(path).at(path)?;
         if before == after {
@@ -221,7 +258,15 @@ impl Builder {
 
     fn inspect_pointer(&mut self, pointer: &Path) -> Result<()> {
         ordinary_file(pointer)?;
-        let raw = fs::read_to_string(pointer).at(pointer)?;
+        let contents = fs::read(pointer).at(pointer)?;
+        if contents.is_empty() {
+            // uv and other caches use empty .git files as repository-discovery
+            // boundaries. They have no Git administrative paths to relocate.
+            return Ok(());
+        }
+        let raw = std::str::from_utf8(&contents).map_err(|_| {
+            Error::message(format!("invalid nested Git pointer: {}", pointer.display()))
+        })?;
         let value = raw.trim_end().strip_prefix("gitdir: ").ok_or_else(|| {
             Error::message(format!("invalid nested Git pointer: {}", pointer.display()))
         })?;
@@ -233,6 +278,7 @@ impl Builder {
                 directory.display()
             )));
         }
+        require_within_task(&directory, &self.source, "Git administrative directory")?;
         let relocated = self.relocated(&directory);
         let new_parent = self.relocated(parent);
         if resolve(&new_parent, Path::new(value)) != relocated {
@@ -252,6 +298,7 @@ impl Builder {
     }
 
     fn inspect_git_directory(&mut self, directory: &Path) -> Result<()> {
+        require_within_task(directory, &self.source, "Git administrative directory")?;
         self.inspect_core_worktree(&directory.join("config"))?;
         self.inspect_core_worktree(&directory.join("config.worktree"))?;
         let worktrees = directory.join("worktrees");
@@ -269,6 +316,7 @@ impl Builder {
     }
 
     fn inspect_backlink(&mut self, backlink: &Path, expected: Option<&Path>) -> Result<()> {
+        require_within_task(backlink, &self.source, "Git worktree registration")?;
         ordinary_file(backlink)?;
         let raw = fs::read_to_string(backlink).at(backlink)?;
         let pointer = resolve(
@@ -281,6 +329,14 @@ impl Builder {
                 backlink.display()
             )));
         }
+        if !pointer.exists() {
+            return Err(Error::message(format!(
+                "stale nested Git worktree registration at {} points to missing {}; use git worktree repair for an existing checkout, or git worktree prune if it was removed, before moving",
+                backlink.display(),
+                pointer.display()
+            )));
+        }
+        require_within_task(&pointer, &self.source, "Git linked checkout")?;
         ordinary_file(&pointer)?;
         let forward = fs::read_to_string(&pointer).at(&pointer)?;
         let forward = forward.trim_end().strip_prefix("gitdir: ").ok_or_else(|| {
@@ -329,6 +385,7 @@ impl Builder {
         ordinary_file(&common)?;
         let raw = fs::read_to_string(&common).at(&common)?;
         let target = resolve(directory, Path::new(raw.trim_end()));
+        require_within_task(&target, &self.source, "Git common administrative directory")?;
         if resolve(&self.relocated(directory), Path::new(raw.trim_end())) != self.relocated(&target)
         {
             self.snapshot(
@@ -367,6 +424,7 @@ impl Builder {
         }
         let original = Path::new(output.stdout.trim_end());
         let target = resolve(parent, original);
+        require_within_task(&target, &self.source, "Git core.worktree checkout")?;
         if resolve(&self.relocated(parent), original) == self.relocated(&target) {
             return Ok(());
         }
@@ -425,6 +483,19 @@ impl Builder {
         }
         Ok(())
     }
+}
+
+fn require_within_task(path: &Path, root: &Path, description: &str) -> Result<()> {
+    let canonical_path = path.canonicalize().at(path)?;
+    let canonical_root = root.canonicalize().at(root)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(Error::message(format!(
+            "nested {description} lies outside the task scope: {} (resolves to {}); move both the checkout and its Git administrative directory inside the task, or create an independent clone inside it before moving",
+            path.display(),
+            canonical_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn ordinary_file(path: &Path) -> Result<()> {
@@ -507,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_checkout_with_external_admin_is_repaired_and_exactly_restored() {
+    fn linked_checkout_with_external_admin_is_rejected_without_external_changes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let repository_path = root.join("origin");
@@ -522,26 +593,14 @@ mod tests {
         let git_directory = PathBuf::from(git(&checkout, &["rev-parse", "--absolute-git-dir"]));
         let backlink = git_directory.join("gitdir");
         let original = fs::read(&backlink).unwrap();
-        fs::write(checkout.join("ignored-cache.bin"), [0, 0xff, 42]).unwrap();
-        let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
-        let plan: RelocationPlan =
-            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
-        move_forward(&plan);
-        let relocated = plan.destination.join("ignored/worktree");
-        assert_eq!(
-            git(&relocated, &["rev-parse", "--show-toplevel"]),
-            relocated.to_str().unwrap()
-        );
-        assert!(
-            git(&repository_path, &["worktree", "list", "--porcelain"])
-                .contains(relocated.to_str().unwrap())
-        );
-        assert_eq!(
-            fs::read(relocated.join("ignored-cache.bin")).unwrap(),
-            [0, 0xff, 42]
-        );
-        move_back(&plan);
+        let pointer = fs::read(checkout.join(".git")).unwrap();
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert!(error.contains(git_directory.to_str().unwrap()), "{error}");
         assert_eq!(fs::read(backlink).unwrap(), original);
+        assert_eq!(fs::read(checkout.join(".git")).unwrap(), pointer);
+        assert!(!destination.exists());
         assert_eq!(
             git(&checkout, &["rev-parse", "--show-toplevel"]),
             checkout.to_str().unwrap()
@@ -549,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_a_nested_primary_repository_repairs_its_external_linked_checkout() {
+    fn nested_primary_repository_with_external_linked_checkout_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let source = root.join("task");
@@ -562,18 +621,12 @@ mod tests {
         );
         let pointer = external.join(".git");
         let original = fs::read(&pointer).unwrap();
-        let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
-        move_forward(&plan);
-        let main = plan.destination.join("nested-repository");
-        assert_eq!(
-            git(&external, &["rev-parse", "--git-common-dir"]),
-            main.join(".git").to_str().unwrap()
-        );
-        assert!(
-            git(&main, &["worktree", "list", "--porcelain"]).contains(external.to_str().unwrap())
-        );
-        move_back(&plan);
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert!(error.contains(pointer.to_str().unwrap()), "{error}");
         assert_eq!(fs::read(pointer).unwrap(), original);
+        assert!(!destination.exists());
         git(&external, &["status", "--porcelain"]);
     }
 
@@ -590,7 +643,10 @@ mod tests {
             &["worktree", "add", "--detach", linked.to_str().unwrap()],
         );
         let original_pointer = fs::read(linked.join(".git")).unwrap();
+        fs::write(linked.join("ignored-cache.bin"), [0, 0xff, 42]).unwrap();
         let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
+        let plan: RelocationPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         move_forward(&plan);
         let moved_main = plan.destination.join("nested-main");
         let moved_linked = plan.destination.join("nested-linked");
@@ -598,12 +654,16 @@ mod tests {
             git(&moved_linked, &["rev-parse", "--git-common-dir"]),
             moved_main.join(".git").to_str().unwrap()
         );
+        assert_eq!(
+            fs::read(moved_linked.join("ignored-cache.bin")).unwrap(),
+            [0, 0xff, 42]
+        );
         move_back(&plan);
         assert_eq!(fs::read(linked.join(".git")).unwrap(), original_pointer);
     }
 
     #[test]
-    fn relative_external_git_pointer_becomes_valid_at_the_new_depth() {
+    fn relative_external_git_pointer_is_rejected_before_move() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let main = root.join("main");
@@ -622,15 +682,16 @@ mod tests {
         );
         let original = format!("gitdir: {relative}\n");
         fs::write(linked.join(".git"), &original).unwrap();
-        let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
-        move_forward(&plan);
-        git(&plan.destination.join("linked"), &["status", "--porcelain"]);
-        move_back(&plan);
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert!(error.contains(admin.to_str().unwrap()), "{error}");
         assert_eq!(fs::read_to_string(linked.join(".git")).unwrap(), original);
+        assert!(!destination.exists());
     }
 
     #[test]
-    fn separate_git_directory_core_worktree_keeps_working_and_restores_config_bytes() {
+    fn separate_external_git_directory_is_rejected_before_changing_config() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let source = root.join("task");
@@ -647,6 +708,32 @@ mod tests {
         );
         let config = external.join("config");
         let original = fs::read(&config).unwrap();
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert!(error.contains(external.to_str().unwrap()), "{error}");
+        assert_eq!(fs::read(config).unwrap(), original);
+        assert!(!destination.exists());
+        git(&checkout, &["status", "--porcelain"]);
+    }
+
+    #[test]
+    fn internal_separate_git_directory_core_worktree_is_repaired_and_restored() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        let checkout = source.join("separate-git-checkout");
+        repository(&checkout);
+        let admin = source.join("separate-admin");
+        git(
+            &checkout,
+            &["init", "--separate-git-dir", admin.to_str().unwrap()],
+        );
+        git(
+            &checkout,
+            &["config", "core.worktree", checkout.to_str().unwrap()],
+        );
+        let original = fs::read(admin.join("config")).unwrap();
         let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
         move_forward(&plan);
         let moved = plan.destination.join("separate-git-checkout");
@@ -655,27 +742,28 @@ mod tests {
             moved.to_str().unwrap()
         );
         move_back(&plan);
-        assert_eq!(fs::read(config).unwrap(), original);
-        git(&checkout, &["status", "--porcelain"]);
+        assert_eq!(fs::read(admin.join("config")).unwrap(), original);
     }
 
     #[test]
-    fn independent_external_git_changes_block_restore_without_overwriting_them() {
+    fn independent_internal_git_changes_block_restore_without_overwriting_them() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let main = root.join("main");
-        repository(&main);
         let source = root.join("task");
-        fs::create_dir_all(&source).unwrap();
+        let main = source.join("main");
+        repository(&main);
         let linked = source.join("linked");
         git(
             &main,
             &["worktree", "add", "--detach", linked.to_str().unwrap()],
         );
         let admin = PathBuf::from(git(&linked, &["rev-parse", "--absolute-git-dir"]));
-        let backlink = admin.join("gitdir");
         let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
         move_forward(&plan);
+        let backlink = plan
+            .destination
+            .join(admin.strip_prefix(&source).unwrap())
+            .join("gitdir");
         fs::write(&backlink, "independent edit\n").unwrap();
         assert!(
             plan.restore()
@@ -685,6 +773,229 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(backlink).unwrap(), "independent edit\n");
         assert!(plan.destination.is_dir());
+    }
+
+    #[test]
+    fn empty_git_cache_markers_move_and_restore_without_becoming_git_pointers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        let cache = source.join(".cache/uv/archive-v0/cache-entry");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(".git"), []).unwrap();
+        fs::write(cache.join("payload.bin"), [0xff, 0, 42]).unwrap();
+        let plan = prepare(&source, &root.join("2026/07/task")).unwrap();
+        assert!(plan.references.is_empty());
+        move_forward(&plan);
+        let relocated = plan.destination.join(".cache/uv/archive-v0/cache-entry");
+        assert_eq!(fs::metadata(relocated.join(".git")).unwrap().len(), 0);
+        assert_eq!(
+            fs::read(relocated.join("payload.bin")).unwrap(),
+            [0xff, 0, 42]
+        );
+        move_back(&plan);
+        assert_eq!(fs::metadata(cache.join(".git")).unwrap().len(), 0);
+        assert_eq!(fs::read(cache.join("payload.bin")).unwrap(), [0xff, 0, 42]);
+    }
+
+    #[test]
+    fn nonempty_malformed_git_control_files_are_still_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        fs::create_dir_all(&source).unwrap();
+        let destination = root.join("2026/07/task");
+        for contents in [
+            b"not a Git pointer\n".as_slice(),
+            b" \n",
+            b"gitdir: \n",
+            &[0xff],
+        ] {
+            fs::write(source.join(".git"), contents).unwrap();
+            let error = prepare(&source, &destination).unwrap_err().to_string();
+            assert!(error.contains("invalid nested Git pointer"), "{error}");
+            assert_eq!(fs::read(source.join(".git")).unwrap(), contents);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn stale_internal_worktree_registration_is_rejected_with_repair_instructions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        let main = source.join("main");
+        repository(&main);
+        let linked = source.join("linked");
+        git(
+            &main,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        let admin = PathBuf::from(git(&linked, &["rev-parse", "--absolute-git-dir"]));
+        let original = fs::read(admin.join("gitdir")).unwrap();
+        fs::remove_dir_all(&linked).unwrap();
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(
+            error.contains("stale nested Git worktree registration"),
+            "{error}"
+        );
+        assert!(error.contains("git worktree repair"), "{error}");
+        assert!(error.contains("git worktree prune"), "{error}");
+        assert_eq!(fs::read(admin.join("gitdir")).unwrap(), original);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn external_common_git_directory_is_rejected_before_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        let main = source.join("main");
+        repository(&main);
+        let linked = source.join("linked");
+        git(
+            &main,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        let admin = PathBuf::from(git(&linked, &["rev-parse", "--absolute-git-dir"]));
+        let external = root.join("external");
+        repository(&external);
+        let contents = format!("{}\n", external.join(".git").display());
+        fs::write(admin.join("commondir"), &contents).unwrap();
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(
+            error.contains("Git common administrative directory"),
+            "{error}"
+        );
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert_eq!(
+            fs::read_to_string(admin.join("commondir")).unwrap(),
+            contents
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn external_core_worktree_is_rejected_before_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        let main = source.join("main");
+        repository(&main);
+        let external = root.join("external-checkout");
+        fs::create_dir_all(&external).unwrap();
+        git(
+            &main,
+            &["config", "core.worktree", external.to_str().unwrap()],
+        );
+        let original = fs::read(main.join(".git/config")).unwrap();
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("Git core.worktree checkout"), "{error}");
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert_eq!(fs::read(main.join(".git/config")).unwrap(), original);
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_external_admin_cannot_bypass_task_scope() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        let checkout = source.join("checkout");
+        repository(&checkout);
+        let internal_admin = source.join("admin");
+        git(
+            &checkout,
+            &[
+                "init",
+                "--separate-git-dir",
+                internal_admin.to_str().unwrap(),
+            ],
+        );
+        let external_admin = root.join("external-admin");
+        fs::rename(&internal_admin, &external_admin).unwrap();
+        symlink(&external_admin, &internal_admin).unwrap();
+        let pointer = fs::read(checkout.join(".git")).unwrap();
+        let config = fs::read(external_admin.join("config")).unwrap();
+        let destination = root.join("2026/07/task");
+        let error = prepare(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("outside the task scope"), "{error}");
+        assert!(error.contains(external_admin.to_str().unwrap()), "{error}");
+        assert_eq!(fs::read(checkout.join(".git")).unwrap(), pointer);
+        assert_eq!(fs::read(external_admin.join("config")).unwrap(), config);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn saved_plan_external_controls_are_refused_by_apply_restore_and_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        fs::create_dir_all(&source).unwrap();
+        let external = root.join("external-gitdir");
+        let contents = b"independent external bytes\n";
+        fs::write(&external, contents).unwrap();
+        let plan = RelocationPlan {
+            source,
+            destination: root.join("2026/07/task"),
+            references: vec![ReferenceSnapshot {
+                before_path: external.clone(),
+                after_path: external.clone(),
+                before: contents.to_vec(),
+                after: b"rewritten external bytes\n".to_vec(),
+                unix_mode: None,
+            }],
+        };
+        let plan: RelocationPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        for result in [plan.apply(), plan.restore(), plan.validate_applied()] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("saved relocation plan"), "{error}");
+            assert!(error.contains("outside the task scope"), "{error}");
+            assert!(error.contains(external.to_str().unwrap()), "{error}");
+        }
+        assert_eq!(fs::read(external).unwrap(), contents);
+        assert!(plan.source.is_dir());
+        assert!(!plan.destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_plan_canonical_scope_rejects_symlinked_control_parent() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("task");
+        fs::create_dir_all(&source).unwrap();
+        let external = root.join("external-admin");
+        fs::create_dir_all(&external).unwrap();
+        let contents = b"independent external bytes\n";
+        fs::write(external.join("config"), contents).unwrap();
+        symlink(&external, source.join("admin")).unwrap();
+        let destination = root.join("2026/07/task");
+        let plan = RelocationPlan {
+            source: source.clone(),
+            destination: destination.clone(),
+            references: vec![ReferenceSnapshot {
+                before_path: source.join("admin/config"),
+                after_path: destination.join("admin/config"),
+                before: contents.to_vec(),
+                after: b"rewritten external bytes\n".to_vec(),
+                unix_mode: None,
+            }],
+        };
+        for result in [plan.apply(), plan.restore(), plan.validate_applied()] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("outside the task scope"), "{error}");
+            assert!(error.contains(external.to_str().unwrap()), "{error}");
+        }
+        assert_eq!(fs::read(external.join("config")).unwrap(), contents);
+        assert!(!destination.exists());
     }
 
     #[test]

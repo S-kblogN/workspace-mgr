@@ -31,6 +31,7 @@ mod process;
 mod refresh;
 mod relocation;
 mod runtime;
+mod runtime_references;
 mod s3_purge;
 mod scaffold;
 mod storage;

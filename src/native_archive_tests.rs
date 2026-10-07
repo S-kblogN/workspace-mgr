@@ -1,5 +1,6 @@
 use super::*;
 use std::cell::RefCell;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 struct Version {
@@ -20,6 +21,7 @@ struct State {
     rejected_header: Option<String>,
     versioning: Option<String>,
     remove_claim_after: Option<(String, String, String)>,
+    require_fenced_journal: Option<PathBuf>,
 }
 struct Memory {
     state: RefCell<State>,
@@ -379,6 +381,25 @@ impl Storage for Memory {
         body: Option<&[u8]>,
     ) -> std::result::Result<S3Response, S3Error> {
         assert_eq!(args["Bucket"], "fixture");
+        if matches!(
+            method,
+            "copy_object"
+                | "create_multipart_upload"
+                | "upload_part_copy"
+                | "complete_multipart_upload"
+                | "abort_multipart_upload"
+                | "delete_object"
+                | "put_object"
+                | "put_object_tagging"
+        ) {
+            if let Some(path) = &self.state.borrow().require_fenced_journal {
+                let private: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(
+                    private["schema_version"], 2,
+                    "private fence must precede {method}"
+                );
+            }
+        }
         {
             let mut state = self.state.borrow_mut();
             state.calls.push((method.to_owned(), args.clone()));
@@ -502,6 +523,13 @@ fn complete_history_preserves_null_versions_retired_keys_markers_and_flat_suffix
     let receipt = fixture.run("copy").unwrap();
     assert_eq!(rows(&receipt).unwrap().len(), 4);
     assert_eq!(receipt["status"], "copied");
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(fixture.journal()["schema_version"], 2);
+    assert_eq!(public_receipt(&fixture.journal(), None).unwrap(), receipt);
+    assert_eq!(
+        crate::archive_reservation::normalized_receipt(&fixture.journal()).unwrap()["schema_version"],
+        1
+    );
     assert_eq!(fixture.store.versions("storage/task/").len(), 4);
     assert_eq!(fixture.store.versions("storage/2026/07/task/").len(), 4);
     fixture.run("verify").unwrap();
@@ -510,6 +538,125 @@ fn complete_history_preserves_null_versions_retired_keys_markers_and_flat_suffix
     fixture.run("cancel").unwrap();
     assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
     assert_eq!(fixture.store.versions("storage/task/").len(), 4);
+}
+
+#[test]
+fn legacy_copy_retry_and_cancel_fence_0_6_without_changing_the_public_receipt() {
+    let mut fixture = Fixture::new();
+    fixture
+        .store
+        .source("data", "payload-version", b"payload", false);
+    fixture.store.source("data", "marker-version", b"", true);
+    fixture.reserve();
+    let receipt = fixture.run("copy").unwrap();
+    let mut legacy = fixture.journal();
+    legacy["schema_version"] = 1.into();
+    let state = Path::new(fixture.payload["state_path"].as_str().unwrap());
+    fs::write(state, canonical(&legacy).unwrap()).unwrap();
+    let before = fs::read(state).unwrap();
+    fixture.run("cancel-preview").unwrap();
+    assert_eq!(fs::read(state).unwrap(), before);
+    let copies = fixture.store.count("copy_object");
+    assert_eq!(fixture.run("copy").unwrap(), receipt);
+    assert_eq!(fixture.store.count("copy_object"), copies);
+    let private = fixture.journal();
+    assert_eq!(private["schema_version"], 2);
+    // Released 0.6.0 assets/dvc_version_archive.py validates the complete
+    // context, including schema_version == 1, before resuming copy.
+    let mut old_context = receipt_context(&private);
+    old_context["schema_version"] = private["schema_version"].clone();
+    assert_ne!(
+        old_context,
+        context(&fixture.store, &fixture.payload).unwrap()
+    );
+    let proof = fixture.claim_registry(&receipt);
+    fixture.registry("publish", &receipt, &proof).unwrap();
+    fixture.registry("cancel", &receipt, &proof).unwrap();
+    fixture.run("cancel").unwrap();
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 2);
+    assert_eq!(fixture.journal()["schema_version"], 2);
+}
+
+#[test]
+fn registry_withdrawal_fences_a_legacy_journal_before_deleting_exact_versions() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("data", "source", b"payload", false);
+    fixture.reserve();
+    let receipt = fixture.run("copy").unwrap();
+    let proof = fixture.claim_registry(&receipt);
+    fixture.registry("publish", &receipt, &proof).unwrap();
+    let mut legacy = fixture.journal();
+    legacy["schema_version"] = 1.into();
+    let state = Path::new(fixture.payload["state_path"].as_str().unwrap());
+    fs::write(state, canonical(&legacy).unwrap()).unwrap();
+    let preview_before = fs::read(state).unwrap();
+    fixture
+        .registry("cancel-preview", &receipt, &proof)
+        .unwrap();
+    assert_eq!(fs::read(state).unwrap(), preview_before);
+    fixture.store.state.borrow_mut().require_fenced_journal = Some(state.to_owned());
+    fixture.registry("cancel", &receipt, &proof).unwrap();
+    assert_eq!(fixture.journal()["schema_version"], 2);
+    assert!(
+        registry_read_with(&fixture.store, "task")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.store.versions("storage/task/").len(), 1);
+}
+
+#[test]
+fn partial_legacy_copy_cancel_is_fenced_before_payload_and_marker_deletion() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("data", "payload", b"payload", false);
+    fixture.store.source("data", "marker", b"", true);
+    fixture.reserve();
+    fixture
+        .store
+        .state
+        .borrow_mut()
+        .fail
+        .insert("delete_object".into(), 1);
+    assert!(fixture.run("copy").is_err());
+    let mut journal = fixture.journal();
+    assert_eq!(journal["status"], "copying");
+    journal["schema_version"] = 1.into();
+    let state = Path::new(fixture.payload["state_path"].as_str().unwrap());
+    fs::write(state, canonical(&journal).unwrap()).unwrap();
+    fixture.store.state.borrow_mut().require_fenced_journal = Some(state.to_owned());
+    fixture.run("cancel").unwrap();
+    assert_eq!(fixture.journal()["schema_version"], 2);
+    assert_eq!(fixture.journal()["status"], "cancelled");
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 2);
+}
+
+#[test]
+fn future_private_copy_journal_fails_before_remote_copy_or_delete() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("data", "source", b"payload", false);
+    fixture.reserve();
+    fixture.run("copy").unwrap();
+    let mut journal = fixture.journal();
+    journal["schema_version"] = 3.into();
+    let state = Path::new(fixture.payload["state_path"].as_str().unwrap());
+    fs::write(state, canonical(&journal).unwrap()).unwrap();
+    let before = fs::read(state).unwrap();
+    let copies = fixture.store.count("copy_object");
+    let deletes = fixture.store.count("delete_object");
+    for operation in ["copy", "cancel", "cancel-preview"] {
+        assert!(
+            fixture
+                .run(operation)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schema")
+        );
+    }
+    assert_eq!(fixture.store.count("copy_object"), copies);
+    assert_eq!(fixture.store.count("delete_object"), deletes);
+    assert_eq!(fs::read(state).unwrap(), before);
 }
 
 #[test]
@@ -813,6 +960,29 @@ fn terminal_cancel_resumes_after_source_retirement_and_preserves_new_owner_histo
         fs::read(fixture.payload["state_path"].as_str().unwrap()).unwrap()
     );
     assert_eq!(fixture.store.count("delete_object"), 1);
+}
+
+#[test]
+fn terminal_legacy_cancel_upgrades_only_on_apply_without_source_access() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("data", "source", b"payload", false);
+    fixture.reserve();
+    fixture.run("copy").unwrap();
+    fixture.run("cancel").unwrap();
+    let mut journal = fixture.journal();
+    journal["schema_version"] = 1.into();
+    let state = Path::new(fixture.payload["state_path"].as_str().unwrap());
+    fs::write(state, canonical(&journal).unwrap()).unwrap();
+    fixture.store.state.borrow_mut().versions.clear();
+    let before = fs::read(state).unwrap();
+    let heads = fixture.store.count("head_object");
+    let deletes = fixture.store.count("delete_object");
+    fixture.run("cancel-preview").unwrap();
+    assert_eq!(fs::read(state).unwrap(), before);
+    fixture.run("cancel").unwrap();
+    assert_eq!(fixture.journal()["schema_version"], 2);
+    assert_eq!(fixture.store.count("head_object"), heads);
+    assert_eq!(fixture.store.count("delete_object"), deletes);
 }
 
 #[test]

@@ -841,6 +841,30 @@ task. It changes no repository content or remote. In the shared checkout, run
 `--layout '{year}'` and `--layout '{year}{month}'` select the other example
 structures; the default `{year}/{month}` uses each task's creation timestamp.
 
+Resolve relocation preflight failures before applying. Ordinary scripts and
+README commands with literal old absolute or repository-relative paths are
+reported by file and line, including ignored text; use script-relative inputs
+or run README commands from the task directory, review tracked repairs, then
+refresh and preview again. The scan cannot prove dynamically constructed paths
+or references outside the task; run the documented reproduction commands too.
+Zero-byte `.git` cache markers are retained. Real malformed Git pointers,
+stale worktree registrations, and Git administration or linked checkouts
+outside the task refuse. Consolidate the Git layout inside the task without
+losing refs or local content. Repair live registrations with `git worktree
+repair`; use `git worktree prune --dry-run` to inspect intentionally retired
+registrations before pruning. A Python environment bound to the old location
+also refuses: preserve its specification and local content, keep the old
+environment outside the task, rebuild outside the archive, and repair its
+callers. The [command reference](commands.md#workspace-mgr-archive) gives the
+preflight repair steps. Neither archive nor cancel deletes these runtimes.
+
+For a manifestless directory imported directly into main, explicitly adopt
+its reviewed current tree and merge the adoption PR. The immutable adoption
+record's introducing commit becomes the review boundary; that commit and
+subsequent changes need merged reviews, while the earlier direct import does
+not need a retroactive PR. Open PRs and unmerged or divergent commits still
+block archive.
+
 Archive moves the local directory and manifest together. Publication copies
 the complete retained S3 history, including old versions, delete markers, and
 retired paths, verifies it, and rewrites storage metadata automatically. Its
@@ -865,7 +889,7 @@ returned to tracked storage before organization.
 To hydrate a historical Git checkout after source cleanup, use
 `workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
 the archive registry. Publishing nested archived task state requires at least
-0.5.0; schema 4 completion evidence raises the requirement to 0.7.0. Removing a
+0.5.0; the new archive protocol and schema 4 completion evidence require 0.7.0. Removing a
 cloud-usage approval does not clear this path requirement; an older CLI needs
 an update.
 

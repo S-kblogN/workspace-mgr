@@ -49,7 +49,21 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   After the copied receipt merges, historical tags hydrate mapped versions
   through the registry without retaining duplicate source history.
 - Moving ignored nested Git worktrees repairs verifiable absolute/relative Git
-  control paths. Non-relocatable runtime references are refused before moving.
+  control paths within the task. Zero-byte `.git` cache markers no longer
+  count as malformed Git pointers. External Git administration and linked
+  checkouts refuse before mutation, including when loading saved plans.
+- Verified legacy adoption establishes a new review boundary for directly
+  imported tasks; its introducing commit and later changes still need merged
+  reviews, while pre-adoption imports no longer require retroactive PRs.
+- Archive preflight reports literal old-path references in ordinary scripts
+  and README files by file and line before moving, including ignored text.
+  Documentation explains how to repair these references, location-bound
+  Python environments, and stale Git worktree registrations.
+- Archive receipts independently raise the publication requirement to 0.7.0,
+  including schema 2/3 tasks and empty S3 histories. Private purge and copy
+  journals use schema 2 so 0.6.0 rejects them before deleting protected versions.
+  Legacy private state is durably upgraded before a destructive retry or
+  cancellation; previews preserve it and public receipts remain schema 1.
 - Legacy adoption review records remain in Git and are protected from
   automatic S3 placement, explicit storage changes, and untracking.
 

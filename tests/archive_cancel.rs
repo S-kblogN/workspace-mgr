@@ -170,19 +170,19 @@ fn cancel_preserves_ignored_content_metadata_permissions_index_and_other_tasks()
 #[test]
 fn cancel_repairs_nested_absolute_git_worktree_and_restores_exact_control_bytes() {
     let (f, gh, manifest) = fixture();
-    let external = f.root.join("nested-origin");
+    let primary = f.shared.join(SOURCE).join("cache/nested-origin");
     command(
         &f.root,
         "git",
-        ["init", "-b", "main", external.to_str().unwrap()],
+        ["init", "-b", "main", primary.to_str().unwrap()],
     );
-    configure_git(&external);
-    std::fs::write(external.join("content"), "nested repository").unwrap();
-    git(&external, ["add", "."]);
-    git(&external, ["commit", "-m", "Nested"]);
+    configure_git(&primary);
+    std::fs::write(primary.join("content"), "nested repository").unwrap();
+    git(&primary, ["add", "."]);
+    git(&primary, ["commit", "-m", "Nested"]);
     let nested = f.shared.join(SOURCE).join("nested");
     git(
-        &external,
+        &primary,
         ["worktree", "add", "--detach", nested.to_str().unwrap()],
     );
     let pointer = std::fs::read(nested.join(".git")).unwrap();

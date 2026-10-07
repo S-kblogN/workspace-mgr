@@ -298,7 +298,26 @@ and examines directory changes only from checkpoint to fetched base. The
 record is immutable provenance, not a cached completed flag. A current manifest
 without it uses the same opaque-tree bootstrap checks. The explicit `task adopt`
 transition adds review and tree evidence for a manifestless directory, and that
-transition itself needs merged review.
+transition itself needs merged review. Its introducing record commit establishes
+a review boundary for directly imported legacy content: commits before adoption
+are not retrospectively required to have PRs. The adoption commit and all later
+changes are still verified without opening historical task configuration blobs.
+
+Relocation prepares only task-contained Git controls. Empty `.git` cache files
+are inert; nonempty malformed controls refuse. Administrative files, common Git
+directories and registered worktrees must resolve inside the task, including
+symlink resolution, and serialized plans are checked again before applying or
+restoring them. External Git files are never silently included in task scopes.
+Location-bound Python environments and stale Git registrations fail preflight
+with repair guidance. A separate bounded streaming scan checks ordinary text,
+including ignored scripts and README files, for literal absolute or
+repository-relative source paths and reports every matching file/line before
+movement. Diagnostics are bounded to 200 references per invocation, with a
+truncation notice; Git hook scripts are included while Git object stores stay
+opaque. Verified Git rewrites and workspace-mgr controls are excluded;
+ordinary references require reviewed repair to script/task-relative paths.
+Dynamic references, custom Git-config commands and references outside the task still need reproduction
+validation; archive does not claim to statically resolve every command.
 
 Before a local archive move, `.workspace-mgr/local/archive-attempts/` saves
 original tool-mutated metadata, modes, verified Git relocation references, owner
@@ -353,6 +372,16 @@ empty; only a published-receipt scan confirming no versions or markers clears
 that intent. Native DVC does not interpret the
 canonical archive mappings, so old revisions use workspace-mgr hydration after
 their original versions have been retired.
+
+Private purge queues and copy journals use schema 2, fencing the released
+0.6.0 reader's schema-1 deletion/resume path. New clients read old schema 1
+journals for preview, then durably persist schema 2 before any copy,
+registry mutation, source deletion or remote cancellation. Restoring an old
+purge snapshot through cancel also writes schema 2. Public receipt/registry
+contexts normalize to schema 1 so immutable receipt bindings and old data
+formats remain stable. Any archive receipt in the publication index requires
+workspace-mgr 0.7.0 independently of task schema or S3 inventory size, and the
+managed repository declaration rises before uploads.
 
 The executable, local storage engine, S3 transport, archive registry, and
 history copy/cancel adapters are Rust. DVC-compatible pointer and cache formats

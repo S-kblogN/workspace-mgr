@@ -28,10 +28,10 @@ use crate::manifest::{
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
-    ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES,
-    BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB, REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE,
-    REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME,
-    TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
+    ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION,
+    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
+    REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
+    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
@@ -2458,7 +2458,7 @@ fn raise_staged_requirement(
         },
         minimum_cli_version: Some(target.to_string()),
         previous_minimum_cli_version: declared.map(|version| version.to_string()),
-        task_manifest_schema: required.map(|(_, schema)| schema),
+        task_manifest_schema: required.and_then(|(_, schema)| schema),
     }))
 }
 
@@ -2467,7 +2467,7 @@ fn raise_staged_requirement(
 fn describe_requirement_change(
     previous: Option<Version>,
     published: Option<Version>,
-    trigger: Option<(Version, u32)>,
+    trigger: Option<(Version, Option<u32>)>,
 ) -> Option<RepositoryRequirement> {
     let ordering = match (&previous, &published) {
         (None, None) => return None,
@@ -2490,7 +2490,7 @@ fn describe_requirement_change(
                 } else {
                     RequirementChange::Follow
                 },
-                trigger.map(|(_, schema)| schema),
+                trigger.and_then(|(_, schema)| schema),
             )
         }
         std::cmp::Ordering::Less => (RequirementChange::Withdraw, None),
@@ -2514,6 +2514,13 @@ fn require_publishable(
     needs: &ManifestNeeds,
     declaration: &Version,
 ) -> Result<()> {
+    if let Some(path) = &needs.archive_protocol {
+        if !cli_version_satisfies(installed, &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION) {
+            return Err(Error::message(format!(
+                "this build (workspace-mgr {installed}) cannot publish archive receipt {path}, because safe archive coordination and protected source retirement require workspace-mgr {ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION} or newer; update workspace-mgr"
+            )));
+        }
+    }
     if let Some(other) = &needs.others {
         if !cli_version_satisfies(installed, &other.version) {
             if other.archived {
@@ -2556,7 +2563,16 @@ fn require_publishable(
     Ok(())
 }
 
-fn missing_configuration(required: &Version, schema: u32, needs: &ManifestNeeds) -> Error {
+fn missing_configuration(required: &Version, schema: Option<u32>, needs: &ManifestNeeds) -> Error {
+    let Some(schema) = schema else {
+        return Error::message(format!(
+            "archive storage protocol for {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
+            needs
+                .archive_protocol
+                .as_deref()
+                .unwrap_or("archive receipts")
+        ));
+    };
     if let Some(need) = needs.highest_need().filter(|need| need.archived) {
         return Error::message(format!(
             "reading archived task manifest {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
@@ -2586,14 +2602,26 @@ struct ManifestNeeds {
     /// The most demanding other task manifest, such as one merged on the base
     /// branch.
     others: Option<ManifestNeed>,
+    /// Archive receipts use a storage protocol newer than their task manifest
+    /// and public data schemas. This floor must not depend on schema 4.
+    archive_protocol: Option<String>,
 }
 
 impl ManifestNeeds {
     /// The newest workspace-mgr any manifest needs, with that manifest
     /// instance's schema.
-    fn highest(&self) -> Option<(Version, u32)> {
-        self.highest_need()
-            .map(|need| (need.version.clone(), need.schema))
+    fn highest(&self) -> Option<(Version, Option<u32>)> {
+        let manifest = self.highest_need();
+        if self.archive_protocol.is_some()
+            && manifest.is_none_or(|need| {
+                ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION
+                    .cmp_precedence(&need.version)
+                    .is_gt()
+            })
+        {
+            return Some((ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, None));
+        }
+        manifest.map(|need| (need.version.clone(), Some(need.schema)))
     }
 
     fn highest_need(&self) -> Option<&ManifestNeed> {
@@ -2637,7 +2665,17 @@ fn manifest_requirement(
         }
         Ok(())
     })?;
-    let mut needs = ManifestNeeds::default();
+    let mut needs = ManifestNeeds {
+        archive_protocol: index_entries(
+            repo,
+            index,
+            &format!(":(glob)**/{}", archive_migration::RECEIPT_NAME),
+        )?
+        .into_iter()
+        .find(IndexEntry::is_regular_file)
+        .map(|entry| entry.path),
+        ..ManifestNeeds::default()
+    };
     for entry in manifests {
         let Some(schema) = schemas.get(&entry.oid).copied() else {
             continue;
@@ -3280,6 +3318,86 @@ mod tests {
             .to_string();
         assert!(error.contains("reading archived task manifest"), "{error}");
         assert!(error.contains("requires workspace-mgr 0.5.0"), "{error}");
+        assert!(
+            error.contains("publication has no .workspace-mgr.toml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn archive_receipts_require_0_7_independently_of_manifest_schema_or_storage() {
+        for schema in [2, 3] {
+            let fixture = Fixture::new(Some(PLAIN_CONFIG));
+            let main = fixture.main.clone();
+            let directory = "2026/09/20260918-120000-completed";
+            fixture.manifest(directory, schema);
+            let path = format!("{directory}/{}", archive_migration::RECEIPT_NAME);
+            // No bucket or completion checkpoint: public schema 1 does not
+            // imply old clients can safely implement the archive protocol.
+            fixture.write(
+                &path,
+                &serde_json::json!({
+                    "schema_version":1,"task_id":"20260918-120000-completed",
+                    "source":"20260918-120000-completed","destination":directory,
+                    "status":"copied","versions":[]
+                })
+                .to_string(),
+            );
+            fixture.stage(&main, &["2026"]);
+            let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+            assert_eq!(needs.highest(), Some((Version::new(0, 7, 0), None)));
+            let error = fixture
+                .reconcile(&main, &main, None, false, "0.6.0")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("archive receipt"), "{error}");
+            assert!(error.contains("require workspace-mgr 0.7.0"), "{error}");
+            assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
+            assert_eq!(
+                fixture
+                    .reconcile(&main, &main, None, false, "0.7.0")
+                    .unwrap(),
+                Some(requirement(
+                    RequirementChange::Raise,
+                    Some("0.7.0"),
+                    None,
+                    None
+                ))
+            );
+            assert_eq!(
+                fixture.staged_config().unwrap(),
+                declaring("0.7.0", PLAIN_CONFIG)
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
+                PLAIN_CONFIG
+            );
+            let tip = fixture.publish(&main);
+            fixture.stage(&tip, &["2026"]);
+            assert!(
+                fixture
+                    .reconcile(&tip, &main, None, false, "0.7.0")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_protocol_floor_requires_a_repository_configuration() {
+        let fixture = Fixture::new(None);
+        let main = fixture.main.clone();
+        let directory = "2026/09/20260918-120000-completed";
+        fixture.write(
+            &format!("{directory}/{}", archive_migration::RECEIPT_NAME),
+            "{}",
+        );
+        fixture.stage(&main, &["2026"]);
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.7.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("archive storage protocol"), "{error}");
         assert!(
             error.contains("publication has no .workspace-mgr.toml"),
             "{error}"

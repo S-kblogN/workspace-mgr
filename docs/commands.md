@@ -413,7 +413,10 @@ their bytes are opaque members of the verified trees. Only the current known
 path and a saved checkpoint path are inspected. Actual PR head names and saved
 review branches provide branch history; old configurations cannot supply it.
 Without a checkpoint, relevant directory changes must each have matching
-merged review evidence. With a published schema 4 checkpoint, archive binds
+merged review evidence. For a verified legacy adoption, the introducing
+adoption-record commit is the review boundary: it must have a merged adoption
+PR, and subsequent changes still need review, while earlier direct imports
+do not need retroactive PRs. With a published schema 4 checkpoint, archive binds
 its original tree and immutable review facts again and checks subsequent
 directory changes through the fetched base. It still reads live PR states and
 checks local and remote refs. Retained branch tips may lag behind a reviewed
@@ -442,6 +445,50 @@ Git nor S3 remotes. It refuses destination collisions, source state that differs
 from the shared branch, staged or untracked overlays, changed materialized S3
 payloads, and materialized local-only content that must first be preserved or
 returned to tracked storage.
+
+Preflight also scans ordinary UTF-8 text inside the task, including ignored
+scripts and README files, for literal absolute and repository-relative source
+paths. It reports matching files and lines (up to 200 detailed references per
+invocation, with a truncation notice) and refuses both preview and
+apply until those potential stale references are repaired. Binary payloads,
+Git controls handled by the verified relocation plan, and workspace-mgr task,
+receipt and storage-pointer controls are excluded. This is a literal scan;
+dynamically assembled paths, custom Git-config commands, and references outside the task still require a
+reproduction check. No ordinary content is automatically rewritten.
+
+Prefer deriving inputs from the script's directory, for example
+`Path(__file__).resolve().parent / "data"` in Python, or
+`cd -- "$(dirname -- "$0")"` in a shell script. README commands can run from
+the task directory and use `./run.sh` and `data/input.tsv`. Publish tracked
+repairs through review and refresh before retrying; repair ignored local
+scripts directly. Do not replace a working source path with a future absolute
+destination before the move.
+
+Zero-byte `.git` files in ordinary caches are inert markers and are retained.
+Nonempty malformed Git pointers still refuse. Absolute nested Git controls
+are repaired only when the repository, administrative directory, and all
+registered linked worktrees are inside the task. External Git administration
+or checkouts refuse before moving and name the offending path; archive does
+not expand its declared scopes or edit external repositories. Preserve all
+refs and local content while making the nested checkout independent inside
+the task, or consolidate all linked checkouts and their administration inside
+it, then retry preview.
+
+Two genuine relocation limits need preparation:
+
+- A Python environment with launchers or activation scripts bound to its old
+  absolute directory cannot safely move. Preserve its lockfile/specification
+  and any local content, relocate the old environment outside the task for
+  safekeeping, rebuild an environment outside the archive from that
+  specification, and repair task commands to use it before retrying. Archive
+  and cancel never delete or rebuild it for you.
+- A stale Git worktree registration cannot be verified. Inspect
+  `git -C <nested-primary> worktree list --porcelain`, repair live registrations
+  with `git -C <nested-primary> worktree repair <actual-checkout>`, and rerun
+  preview. For intentionally retired checkouts, inspect
+  `git -C <nested-primary> worktree prune --dry-run` and prune registrations
+  only after confirming and preserving their local content. Live external
+  worktrees still need the layout change described above.
 
 The normal `plan` and `publish` flow handles the migration. Publication copies
 every retained data version and delete marker under the source task prefix,
@@ -475,6 +522,18 @@ preserves source history and retry journals. Historical Git checkouts use
 `workspace-mgr storage hydrate` to resolve the durable registry and verify their
 original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
 resolve the changed keys and version IDs.
+
+Archive publication requires `minimum_cli_version = "0.7.0"` regardless of
+the task manifest schema, including archives with an empty S3 inventory.
+The CLI reconciles this declaration in its private publication index before
+upload. Private S3 purge queues and archive copy journals use schema 2; 0.6.0
+rejects them before deletion rather than ignoring newer protection fields.
+The new CLI can read legacy schema 1 private state, but a destructive retry
+durably upgrades it first. Preview leaves old bytes unchanged. Public copied
+receipts and the immutable registry remain schema 1, so exact historical
+version mappings keep their data format. Cancellation also upgrades restored
+cleanup state; do not remove the repository version declaration or downgrade
+private journals to resume with an older CLI.
 
 Before copying, an immutable source reservation under
 `refs/tags/workspace-mgr/archive-copy/` chooses one attempt by Git

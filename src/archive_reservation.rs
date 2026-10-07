@@ -27,6 +27,12 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 
 pub(crate) fn normalized_receipt(receipt: &Value) -> Result<Value> {
     let mut planned = receipt.clone();
+    if !matches!(planned["schema_version"].as_u64(), Some(1 | 2)) {
+        return Err(Error::message(
+            "archive reservation receipt has an unsupported schema",
+        ));
+    }
+    planned["schema_version"] = 1.into();
     let object = planned
         .as_object_mut()
         .ok_or_else(|| Error::message("invalid archive reservation receipt"))?;

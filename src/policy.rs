@@ -12,7 +12,7 @@ pub const BULK_PUBLICATION_BYTES: u64 = 268_435_456;
 /// in, derived from the threshold itself so the two cannot disagree.
 pub const BULK_PUBLICATION_MIB: u64 = BULK_PUBLICATION_BYTES / 1_048_576;
 pub const CLOUD_USAGE_APPROVAL_BYTES: u64 = 1_073_741_824;
-pub const INSTRUCTION_POLICY_VERSION: u32 = 12;
+pub const INSTRUCTION_POLICY_VERSION: u32 = 13;
 /// The first workspace-mgr release that reads task manifest schema 3, which
 /// adds the optional `[cloud_usage_approval]` table.
 pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 0);
@@ -20,6 +20,13 @@ pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::
 pub const TASK_SCHEMA_4_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 7, 0);
 /// The first release that reads task manifests below date-grouping directories.
 pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 5, 0);
+/// The first release that fences archive copies and preserves protected,
+/// unmapped source generations through complete-prefix retirement retries.
+pub const ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION: semver::Version =
+    semver::Version::new(0, 7, 0);
+/// Private copy journals are deliberately incompatible with 0.6.0's
+/// uncoordinated resume path. Public, immutable archive receipts remain schema 1.
+pub const ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 pub const REVIEW_PULL_REQUEST: &str = "required";
 pub const REVIEW_INITIAL_STATE: &str = "draft";
@@ -85,6 +92,13 @@ mod tests {
         assert!(
             crate::config::cli_version_satisfies(&package, &ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION),
             "package version {package} is below the workspace-mgr {ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION} that archived task paths require"
+        );
+        assert!(
+            crate::config::cli_version_satisfies(
+                &package,
+                &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION
+            ),
+            "package version {package} is below the workspace-mgr {ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION} that archive storage coordination requires"
         );
     }
 }

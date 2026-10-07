@@ -222,6 +222,12 @@ pub(crate) fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bo
     };
     let mut journal: Value = serde_json::from_str(&raw)
         .map_err(|error| Error::message(format!("invalid private archive journal: {error}")))?;
+    if !matches!(journal["schema_version"].as_u64(), Some(1 | 2)) {
+        return Err(Error::message(
+            "private archive copy journal has an unsupported schema",
+        ));
+    }
+    journal["schema_version"] = 1.into();
     if [
         "schema_version",
         "remote",

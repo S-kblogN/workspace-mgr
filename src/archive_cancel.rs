@@ -490,6 +490,7 @@ pub fn cancel(
             let preview =
                 crate::dvc::version_archive_adapter(&repo, "cancel-preview", &transport_request)?;
             let mut receipt: Value = read(&journal)?;
+            normalize_copy_schema(&mut receipt)?;
             terminal_remote |= receipt["status"] == "cancelled";
             if attempt.remote_cleanup_complete && receipt["status"] != "cancelled" {
                 return Err(Error::message(
@@ -755,6 +756,7 @@ fn validate_current_receipt(repo: &GitRepo, attempt: &Attempt, receipt: &Value) 
         return Err(receipt_edit_error());
     }
     let mut generated: Value = read(&journal_path)?;
+    normalize_copy_schema(&mut generated)?;
     if !matches!(
         generated["status"].as_str(),
         Some("copied" | "canceling" | "cancelled")
@@ -807,6 +809,16 @@ fn frozen_receipt(receipt: &Value) -> Result<Value> {
         }
     }
     Ok(value)
+}
+
+fn normalize_copy_schema(receipt: &mut Value) -> Result<()> {
+    if !matches!(receipt["schema_version"].as_u64(), Some(1 | 2)) {
+        return Err(Error::message(
+            "private archive copy journal has an unsupported schema",
+        ));
+    }
+    receipt["schema_version"] = 1.into();
+    Ok(())
 }
 
 fn receipt_edit_error() -> Error {
@@ -1072,6 +1084,36 @@ mod tests {
         let restored: Attempt = serde_json::from_value(legacy).unwrap();
         assert!(!restored.remote_cleanup_complete);
         assert!(restored.previous_purge_prefixes.is_empty());
+    }
+
+    #[test]
+    fn private_schema_2_preserves_receipt_review_and_cancel_provenance() {
+        let (_temporary, repo, attempt, copied, mut journal) = copied_receipt_fixture();
+        journal["schema_version"] = crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION.into();
+        journal["status"] = "canceling".into();
+        journal["versions"][0]["cancel_owned_versions"] = json!([
+            {"version_id":"sdk-retry-copy","delete_marker":false,"etag":"copied-etag"}
+        ]);
+        fs::write(
+            copy_journal(&repo, &attempt.source, &attempt.destination).unwrap(),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        validate_current_receipt(&repo, &attempt, &copied).unwrap();
+        assert!(crate::archive_migration::trusted_copy_journal(&repo, &copied).unwrap());
+        let mut reconstructed = journal.clone();
+        normalize_copy_schema(&mut reconstructed).unwrap();
+        assert_eq!(reconstructed["schema_version"], 1);
+        assert_eq!(journal["schema_version"], 2);
+        let mut unknown = journal;
+        unknown["schema_version"] = 3.into();
+        fs::write(
+            copy_journal(&repo, &attempt.source, &attempt.destination).unwrap(),
+            serde_json::to_vec(&unknown).unwrap(),
+        )
+        .unwrap();
+        assert!(validate_current_receipt(&repo, &attempt, &copied).is_err());
+        assert!(crate::archive_migration::trusted_copy_journal(&repo, &copied).is_err());
     }
 
     #[test]

@@ -217,7 +217,7 @@ fn context(store: &impl Storage, payload: &Value) -> Result<Value> {
     )
 }
 fn receipt_context(receipt: &Value) -> Value {
-    [
+    let mut context: Value = [
         "schema_version",
         "remote",
         "bucket",
@@ -228,7 +228,15 @@ fn receipt_context(receipt: &Value) -> Value {
     .into_iter()
     .map(|name| (name.to_owned(), receipt[name].clone()))
     .collect::<Map<String, Value>>()
-    .into()
+    .into();
+    if supported_copy_schema(receipt) {
+        context["schema_version"] = 1.into();
+    }
+    context
+}
+fn supported_copy_schema(receipt: &Value) -> bool {
+    receipt["schema_version"] == 1
+        || receipt["schema_version"] == crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION
 }
 fn validate_receipt(receipt: &Value, context: &Value) -> Result<()> {
     if !receipt.is_object() || receipt_context(receipt) != *context {
@@ -314,6 +322,18 @@ fn load_journal(path: &Path) -> Result<Option<Value>> {
         .map(Some)
         .map_err(|error| message(format!("invalid archive journal: {error}")))
 }
+fn load_copy_journal(path: &Path) -> Result<Option<Value>> {
+    let journal = load_journal(path)?;
+    if journal
+        .as_ref()
+        .is_some_and(|value| !supported_copy_schema(value))
+    {
+        return Err(message(
+            "private archive copy journal has an unsupported schema",
+        ));
+    }
+    Ok(journal)
+}
 fn save_journal(path: &Path, journal: &Value) -> Result<()> {
     if !path.is_absolute() || path.is_symlink() {
         return Err(message(
@@ -323,10 +343,17 @@ fn save_journal(path: &Path, journal: &Value) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| message("archive journal has no parent"))?;
+    if !supported_copy_schema(journal) {
+        return Err(message(
+            "private archive copy journal has an unsupported schema",
+        ));
+    }
+    let mut upgraded = journal.clone();
+    upgraded["schema_version"] = crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION.into();
     fs::create_dir_all(parent).at(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     let mut body =
-        serde_json::to_vec_pretty(journal).map_err(|error| message(error.to_string()))?;
+        serde_json::to_vec_pretty(&upgraded).map_err(|error| message(error.to_string()))?;
     body.push(b'\n');
     temporary.write_all(&body).at(path)?;
     temporary.as_file().sync_all().at(path)?;
@@ -487,7 +514,13 @@ fn metadata_key(journal: &Value) -> Result<String> {
     ))
 }
 fn public_receipt(journal: &Value, status: Option<&str>) -> Result<Value> {
+    if !supported_copy_schema(journal) {
+        return Err(message(
+            "private archive copy journal has an unsupported schema",
+        ));
+    }
     let mut receipt = journal.clone();
+    receipt["schema_version"] = 1.into();
     for row in receipt["versions"]
         .as_array_mut()
         .ok_or_else(|| message("archive journal has no rows"))?
@@ -1258,6 +1291,11 @@ fn cancel_copy(
                 "completed archive cancellation unexpectedly contains owned versions or uploads",
             ));
         }
+        if !preview
+            && journal["schema_version"] != crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION
+        {
+            save_journal(state, journal)?;
+        }
         return Ok(
             json!({"status":"cancelled","already_cancelled":true,"deleted_versions":[],"delete_versions":[],"retained_versions":version_report(&unrelated),"uploads":[],"retained_uploads":unrelated_uploads}),
         );
@@ -1341,6 +1379,7 @@ fn cancel_copy(
 }
 
 pub(crate) fn execute(repo: &GitRepo, operation: &str, payload: &Value) -> Result<Value> {
+    require_archive_protocol()?;
     let client = S3Client::from_repo(repo)?;
     require_versioning(&client)?;
     execute_with(&client, repo, operation, payload)
@@ -1382,7 +1421,7 @@ fn execute_with(
     }
     let state = payload["state_path"].as_str().map(Path::new);
     let mut journal = if let Some(state) = state {
-        load_journal(state)?
+        load_copy_journal(state)?
     } else {
         None
     };
@@ -1445,6 +1484,10 @@ fn execute_with(
                 ));
             }
             journal = None;
+        } else if current["schema_version"] != crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION {
+            // Even an already-copied retry must fence 0.6.0's resume path;
+            // validation and ownership checks precede this durable upgrade.
+            save_journal(state, current)?;
         }
     }
     if let Some(current) = journal
@@ -1496,6 +1539,7 @@ fn execute_with(
         // the persisted token key round-trips through HTTP exactly.
         let transaction = digest(nonce.as_bytes());
         let mut receipt = context.clone();
+        receipt["schema_version"] = crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION.into();
         receipt["status"] = "copying".into();
         receipt["transaction_id"] = transaction.into();
         receipt["versions"] = current.clone().into();
@@ -1690,9 +1734,10 @@ fn verify_coordination_with(
             ));
         }
     } else {
-        let journal = load_journal(Path::new(text(proof, "state_path")?))?.ok_or_else(|| {
-            message("archive registry mutation requires its private copy journal")
-        })?;
+        let journal =
+            load_copy_journal(Path::new(text(proof, "state_path")?))?.ok_or_else(|| {
+                message("archive registry mutation requires its private copy journal")
+            })?;
         let transaction = text(proof, "transaction_id")?;
         if journal["transaction_id"] != transaction || receipt["transaction_id"] != transaction {
             return Err(message(
@@ -1895,7 +1940,7 @@ fn authorize_publish(
 ) -> Result<()> {
     verify_coordination_with(store, repo, receipt, proof, true)?;
     if proof["publication_oid"].as_str().is_none_or(str::is_empty) {
-        let journal = load_journal(Path::new(text(proof, "state_path")?))?
+        let journal = load_copy_journal(Path::new(text(proof, "state_path")?))?
             .ok_or_else(|| message("archive publication has no copy journal"))?;
         if journal["status"] != "copied"
             || rows(&journal)?.iter().any(|row| {
@@ -1930,6 +1975,7 @@ fn registry_publish(
 ) -> Result<Value> {
     validate_registry_receipt(store, receipt)?;
     authorize_publish(store, repo, receipt, proof)?;
+    fence_owner_journal(proof)?;
     let object = registry_key(store, text(receipt, "source")?)?;
     if registry_matches(store, receipt)? {
         authorize_publish(store, repo, receipt, proof)?;
@@ -2023,6 +2069,7 @@ fn registry_cancel(
             json!({"status":"would_cancel","registry_key":object,"delete_registry_versions":versions}),
         );
     }
+    fence_owner_journal(proof)?;
     let mut deleted = Vec::new();
     let mut absent = Vec::new();
     for version in &versions {
@@ -2058,9 +2105,37 @@ fn registry_cancel(
     )
 }
 pub(crate) fn registry(repo: &GitRepo, operation: &str, payload: &Value) -> Result<Value> {
+    require_archive_protocol()?;
     let client = S3Client::from_repo(repo)?;
     require_versioning(&client)?;
     registry_with(&client, repo, operation, payload)
+}
+fn require_archive_protocol() -> Result<()> {
+    let installed = crate::config::installed_cli_version();
+    let required = crate::policy::ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION;
+    if !crate::config::cli_version_satisfies(&installed, &required) {
+        return Err(message(format!(
+            "archive storage coordination requires workspace-mgr {required} or newer; this build is workspace-mgr {installed}"
+        )));
+    }
+    Ok(())
+}
+// Owner evidence is checked first. Persist the incompatible private protocol
+// before any registry write or withdrawal; published evidence has no journal.
+fn fence_owner_journal(proof: &Value) -> Result<()> {
+    if proof["publication_oid"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(());
+    }
+    let path = Path::new(text(proof, "state_path")?);
+    let journal = load_copy_journal(path)?
+        .ok_or_else(|| message("archive registry mutation requires its private copy journal"))?;
+    if journal["schema_version"] != crate::policy::ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION {
+        save_journal(path, &journal)?;
+    }
+    Ok(())
 }
 fn require_versioning(store: &impl Storage) -> Result<()> {
     let versioning = store
