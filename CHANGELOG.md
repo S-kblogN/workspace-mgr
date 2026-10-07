@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-07
+
+### Added
+
+- Regression coverage for multi-megabyte S3 purge requests through the native
+  adapter, including retry histories, exact version and delete-marker cleanup,
+  and rejection of malformed candidates before deletion. The in-process Rust
+  path introduced in 0.7.0 avoids the operating-system argument-size limit that
+  stopped large purge journals in 0.6.0.
+
 ## [0.7.0] - 2026-10-06
 
 ### Added
