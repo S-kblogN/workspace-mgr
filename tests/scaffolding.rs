@@ -52,27 +52,52 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
         model < rules,
         "management model must precede operational rules"
     );
-    assert!(text.contains("one writable conversation (chat) = one task"));
-    assert!(text.contains("Effective repository instructions"));
-    assert!(text.contains("shared checkout"));
-    assert!(text.contains("Repository-wide reading is allowed"));
-    assert!(text.contains("default write boundary is its own task directory"));
-    assert!(text.contains("another chat's task directory"));
-    assert!(text.contains("explicitly authorize the exact path and action"));
-    assert!(text.contains("they do not create authorization"));
-    assert!(text.contains("write boundary is instead the exact user-authorized paths"));
-    assert!(text.contains("is limited to 1 GiB (1073741824 bytes)"));
-    assert!(text.contains("stop this task's work immediately"));
-    assert!(text.contains("records the user's explicit answer from this chat"));
-    assert!(text.contains("this repository requires a newer workspace-mgr"));
-    assert!(text.contains("Never add, edit, or remove either by hand"));
-    // The cloud-usage pause and the curation habits share one turn end.
-    assert!(text.contains("The pause outranks the turn-end reconciliation"));
-    assert!(text.contains("decide their structural refusals before they measure cloud usage"));
-    assert!(text.contains("if it reports `cloud_usage.status: approval_required`, stop there"));
-    assert!(text.contains("the `changed_paths` that remain unpublished"));
-    assert!(text.contains("Publish that reduction on its own"));
-    assert!(text.contains("policy="));
+    let normalized_text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for global in [
+        "one writable conversation (chat) = one task",
+        "Effective repository instructions",
+        "shared checkout",
+        "Reading and ownership are separate",
+        "default write boundary is its own task directory",
+        "another chat's task directory",
+        "explicit user authorization for the exact path and action",
+        "do not manufacture it",
+        "cloud-usage approval, CLI installation and updates",
+        "before every writable-task turn",
+        "task create --help",
+        "archive --help",
+        "policy=",
+    ] {
+        assert!(
+            normalized_text.contains(global),
+            "global instructions omit {global:?}"
+        );
+    }
+    assert!(
+        text.len() < 10_000,
+        "default output grew into an operation manual"
+    );
+    for operation_detail in [
+        "## Task lifecycle",
+        "## Publication",
+        "## Artifact hygiene",
+        "## Storage placement",
+        "## Repository infrastructure",
+        "--historical-record",
+        "small-s3-boundary",
+        "source retirement",
+        "1.25 GiB (1342177280 bytes)",
+    ] {
+        assert!(
+            !text.contains(operation_detail),
+            "default output leaked {operation_detail:?}"
+        );
+    }
+    let explicit_all = workspace(
+        &fixture.shared,
+        ["--format", "human", "instructions", "all"],
+    );
+    assert_eq!(explicit_all.stdout, text.as_bytes());
 
     let model_only = workspace(
         &fixture.shared,
@@ -493,14 +518,12 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
 
     let all = workspace(&fixture.shared, ["--format", "human", "instructions"]);
     let text = String::from_utf8(all.stdout).unwrap();
-    assert!(text.contains("Operating model"));
-    assert!(text.contains("Task lifecycle"));
-    assert!(text.contains("\n## Publication\n"));
-    assert!(text.contains("\n## Pull request responsibility\n"));
-    assert!(text.contains("\n## Artifact hygiene\n"));
-    assert!(text.contains("\n## Storage placement\n"));
-    assert!(text.contains("\n## Shared checkout\n"));
-    assert!(text.contains("\n## Repository infrastructure\n"));
+    assert!(text.contains("## Mental model"));
+    assert!(text.contains("## Session-wide constraints"));
+    assert!(text.contains("## Find the next operation"));
+    assert!(!text.contains("\n## Artifact hygiene\n"));
+    assert!(!text.contains("\n## Storage placement\n"));
+    assert!(!text.contains("\n## Publication\n"));
 
     for topic in [
         "task",
@@ -1230,4 +1253,43 @@ fn a_repository_module_may_not_carry_the_products_own_block_markers() {
     let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
     assert!(stderr.contains("managed block markers"), "{stderr}");
     assert!(!fixture.shared.join(".gitignore").exists());
+}
+
+#[test]
+fn global_instructions_index_repository_policy_without_leaking_its_body() {
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    workspace(&fixture.shared, ["init"]);
+    let module = fixture
+        .shared
+        .join(".workspace-mgr/instructions/repository.md");
+    std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+    let first = "  User-owned specific procedure: keep exact spacing.\n\n";
+    std::fs::write(&module, first).unwrap();
+    let all = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions"],
+    ));
+    let markdown = all["markdown"].as_str().unwrap();
+    assert!(markdown.contains("workspace-mgr instructions repository"));
+    assert!(markdown.contains("Read it before task work"));
+    assert!(!markdown.contains("keep exact spacing"));
+    let detailed = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions", "repository"],
+    ));
+    assert!(detailed["markdown"].as_str().unwrap().contains(first));
+    let next = "Changed user-owned procedure, not product policy.\n";
+    std::fs::write(&module, next).unwrap();
+    let changed = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions", "all"],
+    ));
+    assert_ne!(all["policy_hash"], changed["policy_hash"]);
+    assert!(!changed["markdown"].as_str().unwrap().contains(next));
+    let explicit = json(&workspace(
+        &fixture.shared,
+        ["--format", "json", "instructions", "repository"],
+    ));
+    assert!(explicit["markdown"].as_str().unwrap().contains(next));
 }

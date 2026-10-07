@@ -1,523 +1,87 @@
 # How this workspace works
 
-## What this repository is for
+## Mental model
 
 This repository is a durable workspace for conversations between a user and
-coding agents. `workspace-mgr` exists to make that kind of workspace practical:
-it lets the user treat a coding agent as a general-purpose collaborator, not
-only as a tool for editing an existing software project.
-
-The user can start a chat and ask for any kind of work the agent can perform:
-research a question, compare products, study a paper, write a report, analyze
-data, prepare media, build software, organize records, or combine several of
-those activities. The chat is the user-facing interface. The repository gives
-that conversation a place to retain inputs, working materials, outputs, and
-reproducibility evidence when the result should outlive the chat. The tools the
-agent writes, the process it followed, and the conclusions the conversation
-reached are retained regardless, because they are what makes the result
-understandable later.
-
-The user should normally describe the desired outcome rather than plan task
-directories, branches, commits, or storage mechanics. The agent translates the
-request into repository operations and reports the resulting task, artifacts,
-and review state. The user may still make repository-level choices when they
-matter, such as explicitly asking for an artifact to be stored in Git or S3,
-requesting a shared repository change, or deciding when a pull request should
-be merged.
-
-`workspace-mgr` is the management interface behind this workspace. It gives the
-agent a consistent way to create a task, bound its scope, place retained
-content, publish a reviewable result, and coexist with other chats. It is not
-the subject of the user's work; it is the mechanism that keeps the workspace
-safe and understandable while the agent carries out that work.
-
-The product applies the same management strategy to every initialized
-repository. Repositories provide different Git and optional S3 locations, but
-they do not select different task layouts, storage thresholds, cloud-usage
-limits, review models, or agent responsibilities. This makes behavior portable:
-a user and agent can move between managed repositories without relearning their
-operating contract.
-
-A chat that remains purely conversational or read-only does not need to create
-repository state. As soon as a chat needs to create, change, download,
-generate, or retain files, it becomes a writable conversation and owns exactly
-one task in this workspace. This includes files it would otherwise create
-outside the repository.
-
-## From a chat to a task
-
-For repository-writing work, the central relationship is:
+coding agents. The chat is the user-facing interface: the user asks for outcomes
+and treats the agent as a general-purpose collaborator. workspace-mgr supplies
+the control plane for doing that work in a shared repository.
 
 ```text
 one writable conversation (chat) = one task = one target branch = one draft pull request
 ```
 
-These are four views of one reviewable intention:
+A task groups one work item's identity, current name, authorized paths, branch,
+review association and storage state. Deliverable tasks have timestamped
+repository directories; infrastructure tasks have explicit shared-path scopes
+and private manifests. Infrastructure is a kind of task, not an ownership bypass.
+The current slug is a mutable topic label; task ID and review branch remain
+stable when its directory changes.
 
-- The **conversation** contains the user's goal, decisions, and authorization.
-- The **task** is the durable workspace for that conversation.
-- The **target branch** is the task's publication lane.
-- The **draft pull request** is the task's review and merge record.
+Task scope answers which task may mutate a path. Storage placement answers where
+its retained bytes are transported: Git, versioned S3, or explicit local-only
+state. Neither changes the other. The shared checkout remains on its configured
+main branch; tasks publish through private indexes to unmounted task branches.
+Several chats can therefore retain independent overlays without switching the
+checkout or staging one another's files.
 
-An ordinary deliverable task directory holds the conversation's retained
-inputs, working files, tools, evidence, and deliverables. It is where the work
-happens, not only where finished results are filed: the agent writes its
-scripts, runs its analyses, and keeps its intermediate materials inside it
-rather than in a temporary directory elsewhere on the machine. Its README
-explains the task's current purpose and important outputs; it is not a
-transcript or chronological log. Its other files carry the durable record: the
-decisions the conversation reached, the process it followed, the tools it
-wrote, and the results that would be expensive or impossible to reproduce. The
-product does not prescribe their names or layout, only that they are Markdown
-files the README's directory map names. Its manifest records the task
-identity, declared scope, target branch, and any higher cloud-usage limit the
-user approved. An infrastructure task has a private manifest because its
-content belongs at shared repository paths rather than inside a timestamped
-deliverable directory. Both kinds work in the same shared checkout, which stays
-on the configured main branch, and publish to an unmounted task branch.
+A task README describes its purpose and provides the repository entrypoint.
+Task contents belong to the user. workspace-mgr manages repository control,
+publication and byte transport; it does not certify payload correctness or
+runtime usability. Operation-specific behavior and consequences are explained by that command's
+help and relevant execution output.
 
-Active deliverable task directories stay at the repository's top level. A
-completed task directory may be grouped under time folders only after its pull
-request is confirmed merged. The structure is flexible: `YYYY/<task-dir>`,
-`YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>` are all allowed. Organize old
-tasks only on the user's explicit request, through a repository-infrastructure
-task with the affected paths in scope. Merge and turn-end synchronization never
-trigger this organization automatically. When the user requests organization
-without specifying a structure, use `YYYY/MM/<task-dir>` from each directory's
-timestamp, unless the user specifies another date basis. Preserve the task
-directory's basename, retained contents, immutable task ID, and target branch.
-Use `workspace-mgr archive --dry-run` for the candidate and scope preview,
-then `workspace-mgr archive --manifest <path>` in the shared checkout, selecting
-the scoped infrastructure task, and the normal plan/publish flow. The CLI moves
-the directories and migrates complete
-S3 version histories with new storage bindings and durable historical mappings;
-agents do not perform those moves manually. After verified Git publication,
-cleanup retires verified source versions after the complete receipt merges
-into the shared branch. Historical branches and tags remain readable through
-the mapping; newer referenced generations without mappings stay protected.
-Completion requires the old S3 prefix to contain no data
-versions or delete markers. Protected history remains explicitly pending;
-unmapped concurrent additions remain intact, block completion, and stay queued
-for reconciliation and retry.
+## Session-wide constraints
 
-An unpublished archive attempt can be previewed and cancelled with
-`archive --cancel`. Cancellation preserves all local contents and restores the
-original metadata, removes only the attempt's copied S3 versions, markers,
-registry records and unfinished uploads, and verifies remote cleanup before
-restoring the directory. It releases its exact copy reservation and canonical
-Git binding after local restoration and records terminal completion last.
-Conflicting or foreign history blocks initial remote cleanup without deleting
-unrelated data. After that cleanup is durably verified, retries can finish local
-undo while preserving later foreign writes and newer owners' claims.
+Reading and ownership are separate. Reading a path does not transfer ownership
+or authorize mutation. Repository-wide reading is allowed for context,
+including another chat's task directory. A deliverable task's default write
+boundary is its own task directory. Shared or additional paths require explicit
+user authorization for the exact path and action; scope declarations record
+that authorization and do not manufacture it. Infrastructure manifest scopes
+are its write boundary. Untracked does not mean unowned.
 
-Archive and task rename inspect ignored local content before moving it. Nested
-Git worktree pointers, administrative backlinks, and `core.worktree` locations
-are repaired together; cancellation restores their exact original bytes and
-permissions. A Python virtual environment whose launchers or activation scripts
-embed the task's absolute location is refused before any move. Preserve its
-environment specification and rebuild it outside the task first. An absolute
-symlink into the moving task, or a relative symlink that leaves the task, is
-also refused because moving can invalidate its target. Relative symlinks whose
-targets stay inside the task remain valid.
+Use workspace-mgr for managed lifecycle, placement and publication operations.
+Do not bypass a refusal with lower-level Git or object-store mutation commands.
+Preserve other tasks' staged, modified and untracked overlays. Do not hand-edit
+product-owned control files or private state in `.workspace-mgr/local/`.
 
-Reading and ownership are separate. Any chat may inspect any repository path
-when useful for context, including another chat's task directory. Reading a
-path does not transfer ownership or authorize mutation.
+The user controls cloud-usage approval, CLI installation and updates, merge and
+other PR state transitions. The agent owns the task's draft PR and must reconcile
+its authorized local, remote and review state before every writable-task turn
+ends. A blocker is reported as exact unsynchronized state. Repository-management
+requirements still apply; their operational details are loaded at the relevant
+command, rather than repeated throughout every session.
 
-For a deliverable task, its task directory is the default write boundary. The
-agent must have explicit user authorization for the exact path and action
-before it creates, edits, moves, or deletes anything outside that directory,
-including a shared root path or another chat's task directory. If the current
-request does not provide that authorization, the agent asks and waits before
-writing. An additional-scope declaration records the approval and its reason;
-it does not manufacture approval.
+## Find the next operation
 
-An infrastructure task is the structural exception to the task-directory
-boundary because it has no deliverable directory. Its exact, user-authorized
-manifest scopes are its write boundary. It may read elsewhere for context, but
-it does not gain permission to mutate undeclared shared paths or another task's
-directory. This makes the user's request auditable without turning
-infrastructure work into permission to modify unrelated repository state.
+Read the relevant command's `--help` before an operation. It gives that
+operation's prerequisites, retained repository policies, scope rules, safety
+consequences and next steps. Command output reports facts and guidance that
+only become relevant once the operation runs.
 
-`task create` establishes the local task, README, manifest, scope, and branch
-identity. It does not publish a remote branch or create a pull request.
-For a deliverable task, the agent immediately follows creation with an initial
-plan and publication of that scaffold, then creates and verifies the draft pull
-request before substantial task work. This is one automatic task-creation
-checkpoint, not an extra action the user must remember to request.
-`task status` resolves the current task and reports its scoped state without
-publishing. `task rename` changes the current human-readable slug when the
-conversation's topic evolves. For a deliverable it moves the complete task
-directory, including Git and S3 placement metadata, while preserving the
-immutable task ID and target branch. The next normal publication removes the
-old remote tree and publishes the new path. For infrastructure it updates the
-current slug in private task metadata while its manifest location remains
-stable. `task discard` is the explicit opposite endpoint: after the user
-decides that an unmerged task should not be retained and the agent closes or
-verifies absence of its pull request, it removes that task's branch and local
-workspace instead of publishing or merging it.
+| Need | Entry point |
+| --- | --- |
+| Start a writable repository task | `workspace-mgr task create --help` |
+| Find an existing task or current directory | `workspace-mgr task list --help`, `task path --help`, `task show --help` |
+| Inspect resolved task state | `workspace-mgr task status --help` |
+| Rename, adopt or upgrade current task metadata | `workspace-mgr task rename --help`, `task adopt --help`, `task upgrade --help` |
+| Choose or inspect placement and retrieve bytes | `workspace-mgr storage --help` and the relevant leaf command |
+| Preview and publish one task | `workspace-mgr plan --help`, `publish --help` |
+| Respond to a measured resource decision | `workspace-mgr task approve-cloud-usage --help` and the blocking report |
+| Move, remove or stop publishing selected paths | `workspace-mgr move --help`, `remove --help`, `untrack --help` |
+| Group closed-PR tasks or cancel an unpublished attempt | `workspace-mgr archive --help` |
+| Explicitly abandon an unmerged task | `workspace-mgr task discard --help` |
+| Synchronize the shared checkout after merge | `workspace-mgr refresh --help` |
+| Install dependencies, initialize or diagnose control state | `workspace-mgr setup --help`, `init --help`, `doctor --help`, `config show --help` |
 
-The same chat continues using the same task for its lifetime. Continue using
-the same branch and pull request when refining that same intention. Start a new
-task when work should be reviewed or merged independently. Unrelated chats must
-not share a task, branch, or pull request.
+Default `instructions` and explicit `instructions all` return this mental model,
+operation directory and session-wide constraints. `instructions model` returns
+only this document. Existing detailed topics remain available on demand for
+compatibility; they are not appended to the default output.
 
-The current slug is a mutable topic label; the task ID and target branch are
-stable publication identities. This distinction preserves the one-PR contract:
-renaming an open pull request's head branch can close that request on hosting
-providers. After a task rename, the agent reuses the existing pull request and
-updates its title and living description instead of replacing it.
-
-A repository-infrastructure change follows the same relationship. It is still
-one task with one branch and one pull request, but `task create --kind
-infrastructure` gives it private task metadata, no timestamped repository task
-directory, and an explicitly declared scope of shared policy, root entrypoints,
-CI, or other repository-wide mechanisms.
-It works in the shared checkout on the configured main branch. Creation reports
-the private manifest path; pass that path with `--manifest` to task-scoped
-commands. Publication uses a private index without switching branches or
-staging another chat's paths in the shared index.
-Infrastructure is a kind of task, not a bypass around task ownership.
-
-The draft-pull-request relationship is the review model for every managed
-repository. It is part of the product strategy, not a per-repository option.
-
-## Where the work happens
-
-The task directory is the workplace, not only the filing cabinet. A chat that
-builds its scratch workspace in a system temporary directory, a `mktemp`
-directory, or the home directory keeps its polished output and loses everything
-that explains it: the scripts it wrote, the commands it actually ran, the dead
-ends, and the reason it chose one option over another. The agent therefore
-creates those materials inside the task directory in the first place, rather
-than producing them elsewhere and copying a result back.
-
-Ephemeral output that is reproducible and will be discarded may live wherever
-the environment puts it: package caches, virtual environments, build trees, and
-throwaway command output are not task materials. The dividing line is whether
-the task would want to consult the content later.
-
-Two cases otherwise push work outside the repository, so each needs an explicit
-answer. The first is content too large or too private to publish. It still
-belongs in the task directory, where `storage set` and `untrack` decide what
-leaves the machine; moving it out of the repository is not a way to avoid that
-decision. The second is credentials. They are the single exception to the rule:
-they stay outside the repository entirely, and the task records how to
-regenerate them rather than their values.
-
-Keeping the work inside the task directory is one half of the rule; curating
-what leaves it is the other. Every file under a task is in one of two states.
-It is selected — published in Git, or placement-recorded for S3 or local-only
-retention — or it is ignored by a rule this repository tracks. There is no
-third state in which a file simply sits in the task directory while everyone
-remembers not to commit it. Publication stages the whole declared scope, so an
-unignored file is published by the next publication whether or not anyone
-intended it.
-
-The by-products of the work are therefore not published by default. Build
-output, caches, per-run logs and checkpoints, scratch copies of inputs, and
-intermediate data that can be regenerated cheaply from the retained inputs and
-tools are not what a reviewer or a later reader needs. The tools themselves,
-the results that were expensive or impossible to reproduce, and the evidence
-behind a claim are.
-
-Ignore rules are layered so that each one sits where its audience can see it.
-Rules that matter to one task belong in that task's own `.gitignore`, as the
-narrowest rule that covers the junk, where they travel with the task, are
-visible in its review, and stay inside the task's own write boundary. This
-repository's own rules live in `.workspace-mgr/repository.gitignore`. Git has
-no include directive, so `workspace-mgr` owns the root `.gitignore` as a whole
-and generates it from that module plus a small fixed set of product rules for
-output that is regenerated rather than retained and for private product state;
-the root file is never hand-edited, and `init` reconciles it like any other
-product-owned path. That
-second layer is a pair of shared root paths, so reaching for it costs what any
-change outside the task directory costs: the user's explicit authorization,
-normally an infrastructure task, and a publication of its own before the rule
-means anything in another clone. Routing bulk by-products to S3 is not a
-substitute for either layer: S3 keeps Git small, it does not keep the workspace
-curated.
-
-Private product state lives in the primary checkout's `.workspace-mgr/local/`,
-ignored by the fixed `/.workspace-mgr/local/` rule. All linked worktrees share
-its repository lock, infrastructure manifests, private indexes, and pending
-transaction records. The rest of `.workspace-mgr/` remains available for the
-repository's tracked modules. Pending journals and private manifests are
-working state to preserve, not merely caches that can all be deleted.
-
-Because no command can observe an agent writing to a temporary directory,
-publication enforces only what reaches the index. It refuses a deliverable
-publication that adds or changes content inside the task directory while that
-directory documents nothing, refuses a symbolic link whose target is outside
-the repository, and reports the ignored paths it found inside the task so the
-agent can confirm that each one is reproducible output rather than work that
-should have been retained. It refuses content that only a machine-local
-ignore rule hides — the user's global excludes, `.git/info/exclude`, or an
-ignore file whose matching bytes the publication does not carry — because such
-a rule keeps the file out of every other clone and out of review. These
-refusals come before the cloud-usage measurement described below, so the user
-is asked about usage only for a publication that passes them. It reports
-`bulk-publication` when one publication adds more than two hundred new files or
-more than 256 MiB (268435456 bytes) of new content inside the task, as a check
-rather than a refusal. Content placed
-in S3 is judged by its pointer, so routing an expensive result out of Git does
-not exempt it. A symbolic link inside a boundary already placed in S3 or kept
-local with `untrack` is outside what publication can see, because that content
-never reaches the index.
-
-## Where task content lives
-
-Task scope answers **which conversation owns a path**. Storage placement answers
-**where the retained bytes live**. These are independent properties: putting an
-artifact in S3 does not remove it from the task, and putting it in Git does not
-broaden the task's scope.
-
-Every retained path has one storage placement:
-
-- **Git is the collaboration and control plane.** It is appropriate when
-  content should be present in ordinary clones and its value comes from direct
-  review, diff, merge, or joint evolution with repository source.
-- **S3 is the artifact and data plane.** It is appropriate when content is
-  consumed as an exact object, changes atomically, or should be hydrated on
-  demand.
-- **Local-only content stays on the current machine.** `untrack` preserves its
-  bytes and records an explicit `local` placement plus a managed ignore rule.
-  Git retains these small control records but excludes the payload; S3 content
-  is cleaned after publication when no remote branch or tag still references
-  it. New clones do not receive the payload.
-
-The agent understands why content exists, so it makes the semantic choice when
-that intent is clear and records the reason with `storage set`. The CLI does not
-guess from filename extensions. A user's explicit placement instruction takes
-priority at any size.
-
-Size is a fallback for new content whose semantics have not been selected. A
-new boundary below 1 MiB strongly defaults to Git. From 1 through 10 MiB, Git
-remains the fallback but the agent is asked to review whether collaboration or
-artifact history is actually intended. Above 10 MiB, S3 is the fallback. A
-standalone S3 boundary below 1 MiB is normally inefficient because its metadata
-and remote operations may outweigh the payload; an explicit selection still
-succeeds with a warning. A meaningful directory may instead be selected as one
-boundary, whose reported size is the aggregate size of its materialized regular
-files. Automatic evaluation treats unclassified files independently; selecting
-a directory boundary is an intentional semantic operation and does not promise
-that the storage backend packs it into one remote object.
-
-Published placement is stable. Content does not silently move between Git and
-S3 merely because its size changes. An explicit placement remains in force
-until it is reset. A directory placed in S3 is one recursive boundary whose
-descendants inherit that placement; overlapping boundaries are rejected so a
-path never has competing placement owners.
-
-Placement operations describe or change local intent:
-
-- `storage status` explains the target, boundary, selection basis, semantic
-  reason, payload size/file count, and any structured warning.
-- `storage set` records an explicit Git or S3 choice.
-- `storage reset` removes that choice and returns the path to fixed policy.
-- `untrack` explicitly keeps a file or complete boundary local only. Repeated
-  publication does not track it again, and post-merge `refresh` preserves any
-  existing local bytes. Re-track it with `storage set --to git|s3`; a local-only
-  choice cannot be cleared with `storage reset`.
-- `move` changes a path while preserving its placement.
-- `storage hydrate` retrieves exact S3 content into the local workspace.
-
-None of these operations publishes a task. Placement and publication are
-separate so the agent can organize the proposed result before making it visible
-remotely.
-
-Retained content also costs the user cloud storage, so every task has a
-cloud-usage limit: 1 GiB (1073741824 bytes) unless the user approves a higher
-limit for that task. Cloud usage is what the task keeps on the remotes: the Git
-history its branch adds beyond the base branch, including Git LFS objects,
-every retained S3 object version of its paths, and the uploads its next
-publication would add. Content kept local only is not uploaded and does not add
-to it. The limit is the user's decision, not a placement choice: moving content
-into another task, location, or service does not change who must approve it.
-
-## From local work to review
-
-Files in the task directory and local placement choices are proposed task
-state. `plan` explains what the task would publish: its exact scope, placement
-decisions, and Git changes. It may inspect remote state, but it does not upload
-task content, create a revision, or advance a remote branch.
-
-`publish` is the remote visibility boundary. It is the only repository command
-that writes a task state to remotes. For S3-placed content, it uploads and
-verifies the exact object versions first. It then constructs a Git commit from
-only the task's declared scopes, advances the target branch, and verifies the
-remote revision. The Git revision is the publication point for the combined
-state: a published branch must never refer to missing S3 content.
-
-Publication is also where the cloud-usage limit is enforced. `plan` reports
-the task's published and projected Git and S3 usage, its limit, and the largest
-contributors. `publish` refuses a publication that would take the task past its
-limit before it places, commits, or uploads anything, and checks again before
-the upload and before the Git commit because content can change while it runs.
-A publication that only removes content, apart from at most 1 MiB
-(1048576 bytes) of new workspace-mgr control-file content per publication,
-where metadata that only drops entries is free, remains allowed while the task
-is over its limit.
-
-When a task would exceed its limit, it waits for the user's decision. The agent
-stops all work on the task, reports the published and projected usage with the
-largest contributors, proposes one specific higher limit, names the cleanup
-alternatives, and ends its turn. Only the user's answer in that chat can
-approve a higher limit. `task approve-cloud-usage` records that answer in the
-task manifest; recording an approval documents the user's decision and never
-creates it. The next publication carries that manifest change, so the pull
-request shows the approved limit, and each publication commit also names it in
-a `Cloud-Usage-Approval` trailer. If the user declines, the agent performs only
-the cleanup the user chooses and publishes the reduction on its own: while the
-task is over its limit, a task that documents nothing may still remove or
-untrack content, and a record added to that publication would be growth the
-limit refuses, so the record follows in the first publication the limit allows.
-Published Git history cannot shrink, so when it alone exceeds the limit, only an
-approval or discarding the task resolves the decision.
-
-Publishing makes the target branch ready for review; it does not merge it. The
-agent maintains the corresponding pull request through the repository's hosting
-workflow. `workspace-mgr` does not create, edit, approve, or merge that pull
-request through a hosting-provider API. Merging remains an explicit authorized
-action.
-
-Immediately after the initial scaffold publication, the agent must query by
-head branch, reuse an existing open pull request or create exactly one draft
-pull request, and never create a duplicate. Infrastructure tasks do this after
-their first safe scoped publication because their creation has no repository
-content to publish. The agent owns the title and living description and updates
-them whenever the goal, scope, deliverables, validation, or known limitations
-materially change. It then verifies the base branch, head branch, review state,
-and that the pull-request head revision equals the revision reported by
-`publish`.
-Provider failures are blockers to full synchronization. The agent must not
-merge, enable auto-merge, approve, close, or mark the request ready without the
-user explicitly authorizing that exact transition. A user request to discard a
-specific unmerged task is exact authorization for the agent to close that
-task's pull request, verify it is closed, and then run confirmed task cleanup.
-
-A task is fully synchronized when its local and remote branch revisions match,
-its pull-request description reflects the same intention, and a final plan
-reports no remaining task changes.
-
-Before ending every turn in a writable task, the agent automatically reconciles
-that state. It records the turn's decisions, process, tools, and
-hard-to-reproduce results in the task's own files when the turn produced any,
-plans the task, publishes all safe retained in-scope changes even when the
-deliverable is still work in progress, updates and verifies the draft pull
-request, and finishes with a no-change plan. A turn with no publishable
-change still verifies that the local task revision, remote branch, and
-pull-request head already match. The user does not need to request this
-turn-ending synchronization. If publication or provider verification is
-blocked, the agent reports the exact unsynchronized state rather than claiming
-the task is current. A task waiting for the user's cloud-usage decision is such
-a blocker: reconciliation stops at the plan, before the turn is recorded or
-any by-product is curated, and the agent reports the paused state, its
-question, and the changes that remain unpublished instead of publishing. The
-record of that turn follows once the user has answered.
-
-If Git publication fails after an S3 upload, an unreferenced S3 object version
-may remain, but no remote Git revision should point to missing content.
-Retrying the same publication is safe. After Git publication succeeds, the CLI
-permanently deletes every version at S3 object paths removed by deletion, move,
-rename, untrack, or S3-to-Git placement. A current remote branch or tag defers deletion
-until a later publish, refresh, or discard observes that the reference is gone.
-
-Discard is deliberately a two-step destructive operation. Its dry run records
-the observed local task ref, remote task ref, and shared-branch revisions in
-private confirmation state and reports every local action plus the current S3
-version references. Confirmation from the shared checkout is accepted only for
-the exact task ID and unchanged revisions. The CLI then deletes the remote task
-branch with an exact lease, deletes the local task ref, removes a deliverable
-directory when present, and restores declared shared paths to
-the local shared-branch tree. A remote failure restores quarantined local state.
-Merged tasks are refused. Versioned S3 object paths are queued before branch
-deletion, then permanently purged when no current remote branch or tag protects
-them.
-
-## How multiple chats share the workspace
-
-The checkout remains on its shared branch while multiple chats may have
-independent task directories and working-tree overlays.
-A task publishes to its own branch without checking that branch out and without
-staging paths owned by other tasks in the shared Git index.
-
-An unrelated untracked or modified path may therefore be valid state owned by
-another active conversation. Broad stash, clean, reset, or deletion operations
-could erase another task's work and are not routine synchronization tools.
-Agents may read that state for context, but must not mutate it without explicit
-user approval for the exact path and action. Untracked does not mean unowned.
-
-After the user merges a task, `refresh` safely advances the shared branch,
-preserves unrelated overlays, and materializes incoming Git and S3 content. One
-stored boundary the storage engine cannot address does not hold that up: refresh
-advances the branch, hydrates everything else, and names the boundary it left
-unhydrated together with the rename that recovers it, because refusing inbound
-synchronization for every checkout is the larger harm. Refresh is inbound
-synchronization; it does not publish a task.
-
-After successful synchronization, including when the shared branch was already
-current, refresh automatically cleans local and configured-remote branch refs
-whose heads still match verified merged same-repository GitHub pull requests.
-Protected branches, new local commits, and branches checked out in any legacy
-or custom worktree are preserved. A dry-run reports planned cleanup.
-Unavailable merge evidence
-or cleanup failures produce a report without undoing synchronization.
-
-Removing an obsolete branch ref leaves task and worktree directories, every
-file, and retained payloads intact. Directory
-organization remains a user-requested infrastructure
-task; an existing pending purge may run after a removed ref releases its last
-protection of a queued S3 path.
-
-## The workspace lifecycle
-
-The complete story is:
-
-1. A repository owner uses `setup` and `init` to establish the managed
-   workspace, tracked repository facts, and thin agent bootstrap.
-2. The user starts a chat and describes the outcome they want.
-3. The agent loads `instructions` and decides whether the conversation is
-   read-only or needs a writable task.
-4. For writable work, `task create` gives the chat one durable workspace,
-   scope, branch identity, and pull-request identity.
-5. For a deliverable task, the agent immediately publishes the initial scaffold
-   and creates the matching draft pull request. Infrastructure creates it after
-   the first safe scoped publication.
-6. The agent performs the requested work inside that task and keeps its README
-   aligned with the current purpose and outputs. If the topic changes, `task
-   rename` updates its current slug without replacing its branch or review.
-7. Retained artifacts are placed in Git or S3 automatically or by an explicit
-   user or agent choice. An explicit `untrack` choice keeps content local only.
-8. At every turn end, the agent records what the turn decided, did, wrote, and
-   produced in the task's own files, `plan` explains the proposed reviewable
-   state, `publish` advances the task branch when needed, and the agent updates
-   and verifies the matching draft pull request.
-9. If a publication would take the task past its cloud-usage limit, the task
-   pauses. The agent asks the user, who approves a higher limit or chooses
-   cleanup, and no further task work happens until the user answers.
-10. The matching draft pull request carries review, and the user or maintainer
-    decides whether to merge it or explicitly abandon the task.
-11. After merge, `refresh` brings the result into the shared workspace without
-    disturbing other active chats and cleans verified obsolete branch refs.
-    After abandonment, the agent closes the
-    unmerged pull request and `task discard` removes the task workspace and
-    branch, permanently purging its unreferenced S3 object paths.
-
-`config show` reports the repository's Git and S3 facts, and `doctor` diagnoses
-the CLI, repository, Git, and storage environment without changing repository
-state.
-
-The repository also records the oldest `workspace-mgr` release that can read its
-task state. `workspace-mgr` maintains that declaration itself: when a
-publication introduces task state that older releases cannot read, such as a
-manifest that records a cloud-usage approval or uses a nested archive path,
-the publication raises it, and nothing lowers it once it is merged. An older
-release refuses the repository instead of misreading it, and the agent tells
-the user both versions and asks before updating, just as it does for an update
-notice.
-
-The intended division of responsibility is simple: the user asks for outcomes,
-the agent performs the work inside one task, and `workspace-mgr` preserves the
-workspace boundaries that make the result durable, reviewable, and safe to
-combine with other conversations.
+Repository-owned `.workspace-mgr/instructions/repository.md` remains additional
+user guidance. When present, default output points to it; read the file directly
+or use `workspace-mgr instructions repository` before task work. This on-demand
+view reproduces its text rather than mixing it into every global instruction
+response.

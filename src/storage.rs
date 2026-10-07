@@ -70,6 +70,8 @@ pub struct StorageOperationReport {
     pub paths: Vec<String>,
     pub placements: Vec<PlacementStatus>,
     pub remote_writes: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::relocation::RelocationNotice>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +109,7 @@ pub fn status(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -206,6 +209,7 @@ pub fn set(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -332,6 +336,7 @@ pub fn untrack(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -392,6 +397,7 @@ pub fn reset(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 
@@ -511,6 +517,11 @@ pub fn move_path(
         paths: vec![old_path, new_path.clone()],
         placements: vec![placement],
         remote_writes: false,
+        notices: if dry_run {
+            Vec::new()
+        } else {
+            vec![crate::relocation::RelocationNotice::moved_path()]
+        },
     })
 }
 
@@ -589,6 +600,7 @@ pub fn remove_paths(
         paths,
         placements,
         remote_writes: false,
+        notices: Vec::new(),
     })
 }
 

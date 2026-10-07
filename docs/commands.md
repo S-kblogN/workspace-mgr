@@ -184,15 +184,24 @@ workspace-mgr init --dry-run
 Render the shared workspace model and effective agent policy.
 
 ```text
-workspace-mgr instructions [all|model|core|task|publish|artifacts|storage|shared-checkout|infrastructure]
+workspace-mgr instructions [all|model|core|task|publish|artifacts|storage|shared-checkout|infrastructure|repository]
   [--repo <path>]
 ```
 
-With no topic, `all` is used. It renders the canonical workspace model first,
-then the effective operational rules. `model` returns only that
-shared conceptual document. The output includes a CLI version, product policy
-version, topic, and policy hash. Every topic is always available.
-Repository-specific additions are appended only to `all`.
+With no topic, `all` is used. Both default and explicit `all` return the short
+mental model, operation directory, session-wide constraints and current
+repository control facts. They do not concatenate operation-specific sections.
+`model` returns only the short conceptual document. Other existing topics remain
+available as detailed on-demand compatibility views with the same applicable
+repository policies. The relevant command's `--help` is the primary operation
+entrypoint; execution output contains outcome-specific guidance.
+
+When `.workspace-mgr/instructions/repository.md` exists, default output indexes
+it and requires reading it before task work. `instructions repository`
+reproduces the user-owned module; it is not silently dropped. Its current bytes
+still affect `all`'s policy hash. Every response includes CLI version, product
+policy version, topic and hash. Product-owned default wording remains compact
+regardless of that module's length.
 
 ```sh
 workspace-mgr instructions
@@ -456,50 +465,42 @@ workspace-mgr plan
 workspace-mgr publish -m "Rename the task for its current topic"
 ```
 
+A successful deliverable directory move reports a `notices` entry with code
+`manual-content-audit-after-relocation`, reminding the user to manually inspect
+and repair affected links or path references. The tool neither checks nor
+repairs those payload dependencies. Dry-run, no-change and infrastructure
+metadata-only rename do not emit this success notice.
+
 ## `workspace-mgr task upgrade`
 
-Upgrade current task configuration and backfill verified review
-provenance without moving task contents or writing a remote.
+Upgrade supported current task configuration without moving content or writing
+a remote.
 
 ```text
 workspace-mgr task upgrade
   [--repo <path>] [--manifest <path>] [--dry-run]
 ```
 
-Run from the configured shared checkout after refreshing a clone. Without
-`--manifest`, the current deliverable task is discovered from `--repo` or the
-working directory. Select another task's current configuration explicitly with
-`--manifest`. When backfilling a deliverable, pass its tracked manifest here;
-the separate private infrastructure manifest selects the publication owner.
+Without `--manifest`, discover the current deliverable task from `--repo` or the
+working directory. Select another current task explicitly with `--manifest`.
+Current manifest loading is strict: unknown fields or unsupported schemas are
+not guessed. Upgrade preserves identity, scopes, cloud-usage approval and
+compatible saved review metadata, including existing schema 4 fields.
 
-For a deliverable, upgrade fetches the shared branch, requires its current
-published manifest to match the local configuration, and refuses staged or
-unpublished edits apart from an idempotent retry of the verified checkpoint.
-It preserves task metadata, declared scopes, and cloud-usage approval.
-`--dry-run` verifies the same evidence but does not rewrite the manifest.
-The report gives `previous_schema_version`, `schema_version`,
-`completion_recorded`, and `remote_writes: false`; applying reports `upgraded`
-or `no_changes`. `completion_recorded` reports the presence of provenance, not
-current archive eligibility. Deliverable review verification requires readable
-GitHub evidence through `gh` and complete Git history.
+The operation is local and idempotent. It fetches the configured shared branch
+and validates current published manifest identity, staged manifest state and
+client compatibility. It does not query PRs, inspect historical configuration,
+compare ordinary task directory trees or require ordinary staged, modified or
+untracked payloads to be clean.
+`--dry-run` previews the same current-metadata change without rewriting it.
+Reports retain `previous_schema_version`, `schema_version`,
+`completion_recorded` and `remote_writes: false`; `completion_recorded` indicates
+compatible saved metadata, not verified task-content history or live eligibility.
+No new completion checkpoint is synthesized. A changed current manifest must
+still be published within its authorized scope.
 
-Completion evidence uses only the current identity, current known task path,
-any saved `checkpoint_path`, opaque Git directory tree IDs, commit ancestry,
-and hosting-provider commit-to-PR associations. Historical task configuration
-blobs are never read or parsed, even if they are not TOML. No old-format adapter
-discovers a path or branch. Bootstrap verifies the relevant history once and
-stores the repository, base branch, task ID, checkpoint commit/path/tree, and
-all verified branches and reviews in `[archive_completion]`. The current
-manifest then uses schema 4, which requires workspace-mgr 0.7.0. Current
-manifest validation remains strict; unknown current fields or schemas are not
-guessed or rewritten.
-
-Publish the upgraded manifest through an infrastructure task whose declared
-scope covers that exact file. Repeating upgrade with the same verified inputs
-is idempotent. It writes no S3 data or Git remote. These review-provenance
-checks belong to `task upgrade`; archive does not require upgrade or use its
-saved checkpoint to decide eligibility. A supported current manifest and its
-corresponding closed PR suffice for archive's task-state verification.
+Archive is independent of upgrade: it checks supported current metadata and
+current associated PR closure, not old directory history or saved proof.
 
 ## `workspace-mgr archive`
 
@@ -680,18 +681,27 @@ did not save the local attempt journal cannot provide a verified lossless cancel
 
 Legacy directories without a manifest appear in `skipped` with an adoption
 instruction. First adopt explicitly through an infrastructure task scoped to
-that directory, selecting its merged PR. Adoption checks the exact published
-legacy tree and all retained branch tips, then creates the manifest and
-`.workspace-mgr-legacy.json` review record. Publish and merge that adoption
-before running archive; neither inventory nor archive invents legacy ownership.
+that directory, selecting its merged PR. Adoption verifies current PR and
+branch/ref control association, then creates the manifest and
+`.workspace-mgr-legacy.json` review record. It does not compare historical or
+current payload trees, inspect earlier content imports or require ordinary task
+payloads to be clean. Publish and review that new control metadata through the normal task flow;
+its separate adoption PR need not merge before archive. Archive verifies the
+current associated PR, and neither inventory nor archive invents legacy ownership.
 
 ```sh
 workspace-mgr task adopt <legacy-task-path> --pull-request <number> \
   --title "Retained task" --purpose "Retain reviewed work" \
   --manifest "$task_manifest" --dry-run
-# Repeat without --dry-run, publish, and merge the adoption review.
-workspace-mgr archive <task-path> --cancel --manifest "$task_manifest" --dry-run
-workspace-mgr archive <task-path> --cancel --manifest "$task_manifest"
+# Repeat without --dry-run; publish the adopted control metadata through its normal review.
+```
+
+Cancel only an archive attempt that has already moved locally and remains
+unpublished. Adoption alone does not create such an attempt:
+
+```sh
+workspace-mgr archive <source-or-destination> --cancel --manifest "$task_manifest" --dry-run
+workspace-mgr archive <source-or-destination> --cancel --manifest "$task_manifest"
 ```
 
 ```sh
@@ -703,6 +713,12 @@ workspace-mgr archive --manifest "$task_manifest"
 workspace-mgr plan --manifest "$task_manifest"
 workspace-mgr publish --manifest "$task_manifest" -m "Organize completed tasks"
 ```
+
+After a successful directory move, `notices` includes
+`manual-content-audit-after-relocation`. It requests a manual audit of the moved
+payload's links and path references; archive itself never inspects or repairs
+them. Preview, cancellation and invocations with no move do not emit the
+success-only reminder. This notice is not a runtime precondition or refusal.
 
 ## `workspace-mgr task status`
 
@@ -886,6 +902,12 @@ operates on its files independently. Query without paths to inspect those files.
 Each row includes `target`, `basis`, effective `boundary`, available
 `payload_bytes` and `payload_files`, an explicit semantic `reason` when one
 exists, and structured `warnings`. It never writes a remote.
+
+`semantic-placement-review` reports an automatic Git size fallback from
+1 through 10 MiB: review whether collaboration or artifact semantics warrant an
+explicit choice. `small-s3-boundary` reports a materialized S3 boundary below
+1 MiB, measured by aggregate regular-file bytes. These are placement advice,
+not refusals; an explicit user choice still succeeds at any size.
 
 ```sh
 workspace-mgr storage status

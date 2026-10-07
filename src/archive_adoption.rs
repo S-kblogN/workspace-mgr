@@ -10,9 +10,7 @@ use crate::config::{Config, require_supported_cli_at};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{
-    ResolvedTask, TaskKind, TaskManifest, build_task_branch, parse_task_identity,
-};
+use crate::manifest::{TaskKind, TaskManifest, build_task_branch, parse_task_identity};
 use crate::path::{allowed, reject_symlink_traversal, repo_path};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::process;
@@ -44,14 +42,12 @@ pub struct AdoptionReport {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct LegacyRecord {
     pub schema_version: u32,
     pub task_id: String,
     pub path: String,
     pub branch: String,
     pub pull_request: MergedPullRequest,
-    pub tree: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,25 +114,6 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
     let host = archive::hosting_repository(&repo, &config.git.remote)?;
     let (review, legacy_branch) =
         legacy_review(&repo, &config, &host, options.pull_request, &base)?;
-    let original_tree = task_tree(&repo, &review.merge_commit, &path)?;
-    if original_tree.is_empty()
-        || repo
-            .run_unchecked([
-                "cat-file",
-                "-e",
-                &format!("{}:{path}/{TASK_MANIFEST_NAME}", review.merge_commit),
-            ])?
-            .success()
-    {
-        return Err(Error::message(
-            "legacy adoption PR must contain the selected directory without a task manifest",
-        ));
-    }
-    if original_tree != task_tree(&repo, &base, &path)? {
-        return Err(Error::message(
-            "legacy task content differs from its reviewed merge; its ownership or newer work cannot be verified",
-        ));
-    }
     let next = TaskManifest {
         schema_version: 2,
         kind: TaskKind::Deliverable,
@@ -156,7 +133,6 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
         path: path.clone(),
         branch: legacy_branch.clone(),
         pull_request: review.clone(),
-        tree: original_tree,
     };
     let manifest_path = directory.join(TASK_MANIFEST_NAME);
     let record_path = directory.join(LEGACY_RECORD);
@@ -173,22 +149,24 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
     })? + "\n";
     let already = manifest_path.exists() || record_path.exists();
     if already {
-        if fs::read_to_string(&manifest_path).at(&manifest_path)? != next_raw
-            || fs::read_to_string(&record_path).at(&record_path)? != record_raw
+        let existing: LegacyRecord = serde_json::from_str(
+            &fs::read_to_string(&record_path).at(&record_path)?,
+        )
+        .map_err(|error| {
+            Error::message(format!("invalid current legacy adoption metadata: {error}"))
+        })?;
+        if fs::read_to_string(&manifest_path).at(&manifest_path)? != next_raw || existing != record
         {
             return Err(Error::message(
                 "legacy adoption metadata already exists with different evidence; preserve it before retrying",
             ));
         }
-    } else {
-        archive::validate_clean_paths(&repo, &base, &path, &path)?;
-        if !options.dry_run {
-            // Create both files without replacing any existing local content.
-            create_new(&manifest_path, &next_raw)?;
-            if let Err(error) = create_new(&record_path, &record_raw) {
-                let _ = fs::remove_file(&manifest_path);
-                return Err(error);
-            }
+    } else if !options.dry_run {
+        // Create both files without replacing any existing local content.
+        create_new(&manifest_path, &next_raw)?;
+        if let Err(error) = create_new(&record_path, &record_raw) {
+            let _ = fs::remove_file(&manifest_path);
+            return Err(error);
         }
     }
     Ok(AdoptionReport {
@@ -209,64 +187,6 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
         review_required_before_archive: false,
         remote_writes: false,
     })
-}
-
-pub(crate) fn verify_record(
-    repo: &GitRepo,
-    config: &Config,
-    host: &str,
-    base: &str,
-    task: &ResolvedTask,
-    adoption: (&str, &str),
-) -> Result<Option<(String, MergedPullRequest)>> {
-    let path = task.task_path.as_deref().expect("a deliverable task path");
-    let (adoption_commit, adoption_path) = adoption;
-    let raw = repo.run_unchecked(["show", &format!("{base}:{path}/{LEGACY_RECORD}")])?;
-    if !raw.success() {
-        if repo
-            .run_unchecked([
-                "cat-file",
-                "-e",
-                &format!("{adoption_commit}:{adoption_path}/{LEGACY_RECORD}"),
-            ])?
-            .success()
-        {
-            return Err(Error::message(
-                "legacy adoption record was removed; historical review ownership must remain verifiable",
-            ));
-        }
-        return Ok(None);
-    }
-    let record: LegacyRecord = serde_json::from_str(&raw.stdout)
-        .map_err(|error| Error::message(format!("invalid legacy adoption record: {error}")))?;
-    if record.schema_version != 1 || record.task_id != task.task_id {
-        return Err(Error::message(
-            "legacy adoption record has an unverifiable task identity",
-        ));
-    }
-    let original = repo.run([
-        "show",
-        &format!("{adoption_commit}:{adoption_path}/{LEGACY_RECORD}"),
-    ])?;
-    let original: LegacyRecord = serde_json::from_str(&original.stdout).map_err(|error| {
-        Error::message(format!("invalid original legacy adoption record: {error}"))
-    })?;
-    if original != record {
-        return Err(Error::message(
-            "legacy adoption evidence changed after adoption; original review ownership must remain immutable",
-        ));
-    }
-    let (review, branch) = legacy_review(repo, config, host, record.pull_request.number, base)?;
-    if review != record.pull_request
-        || branch != record.branch
-        || task_tree(repo, &review.merge_commit, &record.path)? != record.tree
-        || task_tree(repo, adoption_commit, adoption_path)? != record.tree
-    {
-        return Err(Error::message(
-            "legacy adoption does not match its immutable review or adopted task content",
-        ));
-    }
-    Ok(Some((branch, review)))
 }
 
 fn legacy_review(
@@ -388,28 +308,6 @@ fn legacy_review(
 
 fn valid_oid(oid: &str) -> bool {
     oid.len() == 40 && oid.bytes().all(|c| c.is_ascii_hexdigit())
-}
-
-pub(crate) fn task_tree(repo: &GitRepo, oid: &str, directory: &str) -> Result<Vec<String>> {
-    let raw = repo
-        .run(["ls-tree", "-r", "-z", oid, "--", directory])?
-        .stdout;
-    let prefix = format!("{directory}/");
-    let mut entries = Vec::new();
-    for row in raw.split('\0').filter(|row| !row.is_empty()) {
-        let (metadata, path) = row
-            .split_once('\t')
-            .ok_or_else(|| Error::message("invalid legacy task tree"))?;
-        let relative = path
-            .strip_prefix(&prefix)
-            .ok_or_else(|| Error::message("legacy task tree escapes selected directory"))?;
-        if relative == TASK_MANIFEST_NAME || relative == LEGACY_RECORD {
-            continue;
-        }
-        entries.push(format!("{metadata}\t{relative}"));
-    }
-    entries.sort();
-    Ok(entries)
 }
 
 fn one_line(raw: &str, label: &str) -> Result<String> {

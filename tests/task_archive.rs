@@ -310,6 +310,29 @@ fn forbid_archive_history_operations(fixture: &GitFixture) {
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn forbid_task_payload_tree_history(fixture: &GitFixture) {
+    let guard = fixture.root.join("historical-config-guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    let real_git = String::from_utf8(command(&fixture.root, "which", ["git"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let real_git = serde_json::to_string(&real_git).unwrap();
+    let marker = serde_json::to_string(
+        fixture
+            .root
+            .join("payload-tree-history-read")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let program = guard.join("git");
+    std::fs::write(&program, format!(
+        "#!/usr/bin/env python3\nimport os, sys\nargs = sys.argv[1:]\nif 'log' in args or '--first-parent' in args or ('ls-tree' in args and any(arg == '{DONE}' or arg.startswith('{DONE}/') for arg in args)):\n    open({marker}, 'w').write(' '.join(args))\n    sys.exit('Task payload tree/history reads are forbidden')\nos.execv({real_git}, [{real_git}, *args])\n"
+    )).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_task() {
     let (fixture, merged) = managed_fixture(true);
@@ -330,6 +353,7 @@ fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_
     );
     let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
     assert_eq!(preview["status"], "dry_run");
+    assert!(preview.get("notices").is_none());
     assert_eq!(preview["remote_writes"], false);
     assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(preview["tasks"][0]["source"], DONE);
@@ -371,6 +395,16 @@ fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_
     assert_eq!(output["status"], "archived");
     assert_eq!(output["task_id"], "infra-archive-completed");
     assert_eq!(output["remote_writes"], false);
+    assert_eq!(
+        output["notices"][0]["code"],
+        "manual-content-audit-after-relocation"
+    );
+    assert!(
+        output["notices"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Archive directory move succeeded.")
+    );
     assert!(!worktree.join(DONE).exists());
     assert!(worktree.join(DESTINATION).join("result.md").is_file());
     assert!(worktree.join(ACTIVE).is_dir());
@@ -404,6 +438,17 @@ fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_
     let status = json(&workspace(&worktree.join(DESTINATION), ["task", "status"]));
     assert_eq!(status["task_id"], DONE);
     assert_eq!(status["scopes"][0], DESTINATION);
+    let unchanged = json(&archive(
+        &worktree,
+        &gh,
+        &[
+            "archive",
+            "--manifest",
+            infrastructure_manifest.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(unchanged["status"], "no_changes");
+    assert!(unchanged.get("notices").is_none());
 }
 
 #[test]
@@ -1005,6 +1050,18 @@ fn migrated_fixture(reviewed: bool) -> (GitFixture, PathBuf) {
         );
         requests.insert(&key, vec![migration_review.clone()]);
         requests.insert("codex/infra-schema", vec![migration_review]);
+        // The current task control association is supplied by its own closed
+        // PR; no history walk should rediscover which migration wrote files.
+        requests.insert(
+            "codex/completed",
+            vec![pr(
+                "MERGED",
+                2,
+                "codex/completed",
+                &migration_merge,
+                &migration_head,
+            )],
+        );
     }
     let gh = write_gh(&fixture, &requests);
     (fixture, gh)
@@ -1079,124 +1136,95 @@ impl CompletionFixture {
 }
 
 fn completion_fixture() -> CompletionFixture {
-    let (fixture, gh) = migrated_fixture(true);
+    let (fixture, _) = migrated_fixture(true);
     let original_merge = oid(&fixture.seed, "codex/infra-schema^");
     let original_head = oid(&fixture.seed, "historical/completed");
     let migration_merge = oid(&fixture.seed, "main");
     let migration_head = oid(&fixture.seed, "codex/infra-schema");
     let manifest = fixture.shared.join(DONE).join(MANIFEST);
+    // Simulate a record already published by an older client. The current
+    // branch hints remain useful even though their old tree proof is opaque.
+    let mut current: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    current["schema_version"] = 4.into();
+    let completion = toml::Value::try_from(value!({
+        "schema_version": 1,
+        "task_id": DONE,
+        "repository": "example.invalid/owner/archive-fixture",
+        "base_branch": "main",
+        "checkpoint_commit": migration_merge,
+        "checkpoint_path": DONE,
+        "checkpoint_tree": "0".repeat(40),
+        "branches": ["historical/completed", "codex/completed", "codex/infra-schema"],
+        "reviews": [
+            {"branch":"historical/completed", "number":1, "url":"https://example.invalid/1", "merged_at":"2026-07-12T20:00:00Z", "merge_commit":original_merge, "head_commit":original_head},
+            {"branch":"codex/infra-schema", "number":2, "url":"https://example.invalid/2", "merged_at":"2026-07-12T20:00:00Z", "merge_commit":migration_merge, "head_commit":migration_head}
+        ],
+    })).unwrap();
+    current
+        .as_table_mut()
+        .unwrap()
+        .insert("archive_completion".to_owned(), completion);
+    std::fs::write(
+        fixture.seed.join(DONE).join(MANIFEST),
+        toml::to_string_pretty(&current).unwrap(),
+    )
+    .unwrap();
+    fixture.commit_seed("Retain existing task control association metadata");
+    git(&fixture.shared, ["pull", "--ff-only", "origin", "main"]);
+    let before = std::fs::read(&manifest).unwrap();
+    let requests = BTreeMap::from([
+        (
+            "historical/completed".to_owned(),
+            vec![pr(
+                "MERGED",
+                1,
+                "historical/completed",
+                &original_merge,
+                &original_head,
+            )],
+        ),
+        (
+            "codex/infra-schema".to_owned(),
+            vec![pr(
+                "MERGED",
+                2,
+                "codex/infra-schema",
+                &migration_merge,
+                &migration_head,
+            )],
+        ),
+    ]);
+    let borrowed = requests
+        .iter()
+        .map(|(branch, rows)| (branch.as_str(), rows.clone()))
+        .collect();
+    let gh = write_gh_without_historical_queries(
+        &fixture,
+        &borrowed,
+        &[original_merge.clone(), migration_merge.clone()],
+    );
     archive(
         &fixture.shared,
         &gh,
         &["task", "upgrade", "--manifest", manifest.to_str().unwrap()],
     );
-    let upgraded: toml::Value =
-        toml::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(upgraded["schema_version"].as_integer(), Some(4));
-    let checkpoint = &upgraded["archive_completion"];
-    assert_eq!(checkpoint["schema_version"].as_integer(), Some(1));
-    assert_eq!(checkpoint["task_id"].as_str(), Some(DONE));
     assert_eq!(
-        checkpoint["checkpoint_commit"].as_str(),
-        Some(migration_merge.as_str())
+        toml::from_str::<toml::Value>(&std::fs::read_to_string(&manifest).unwrap()).unwrap(),
+        toml::from_str::<toml::Value>(std::str::from_utf8(&before).unwrap()).unwrap(),
+        "upgrade must preserve already-current association metadata",
     );
-    assert_eq!(checkpoint["checkpoint_path"].as_str(), Some(DONE));
-    assert_eq!(checkpoint["reviews"].as_array().unwrap().len(), 2);
-    for branch in [
-        "historical/completed",
-        "codex/completed",
-        "codex/infra-schema",
-    ] {
-        assert!(
-            checkpoint["branches"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|stored| { stored.as_str() == Some(branch) })
-        );
-    }
-
-    // Completion metadata becomes shared evidence through its own review,
-    // just as the historical format migration did. No historical manifest
-    // has to acquire fields introduced by a future tool release.
-    git(&fixture.seed, ["switch", "-c", "codex/infra-completion"]);
-    std::fs::copy(&manifest, fixture.seed.join(DONE).join(MANIFEST)).unwrap();
-    git(&fixture.seed, ["add", DONE]);
-    git(
-        &fixture.seed,
-        [
-            "commit",
-            "-m",
-            "Retain verified task completion information",
-        ],
-    );
-    let completion_head = oid(&fixture.seed, "HEAD");
-    git(&fixture.seed, ["push", "origin", "codex/infra-completion"]);
-    git(&fixture.seed, ["switch", "main"]);
-    git(
-        &fixture.seed,
-        ["merge", "--squash", "codex/infra-completion"],
-    );
-    git(
-        &fixture.seed,
-        ["commit", "-m", "Merge the reviewed completion checkpoint"],
-    );
-    let completion_merge = oid(&fixture.seed, "HEAD");
-    git(&fixture.seed, ["push", "origin", "main"]);
-    let path = format!("{DONE}/{MANIFEST}");
-    git(&fixture.shared, ["restore", "--", &path]);
-    git(&fixture.shared, ["pull", "--ff-only", "origin", "main"]);
     CompletionFixture {
         git: fixture,
-        requests: BTreeMap::from([
-            (
-                "historical/completed".to_owned(),
-                vec![pr(
-                    "MERGED",
-                    1,
-                    "historical/completed",
-                    &original_merge,
-                    &original_head,
-                )],
-            ),
-            (
-                "codex/infra-schema".to_owned(),
-                vec![pr(
-                    "MERGED",
-                    2,
-                    "codex/infra-schema",
-                    &migration_merge,
-                    &migration_head,
-                )],
-            ),
-            (
-                "codex/infra-completion".to_owned(),
-                vec![pr(
-                    "MERGED",
-                    3,
-                    "codex/infra-completion",
-                    &completion_merge,
-                    &completion_head,
-                )],
-            ),
-            (
-                format!("commit:{completion_merge}"),
-                vec![pr(
-                    "MERGED",
-                    3,
-                    "codex/infra-completion",
-                    &completion_merge,
-                    &completion_head,
-                )],
-            ),
-        ]),
+        requests,
         historical_commits: vec![original_merge, migration_merge],
     }
 }
 
 #[test]
-fn task_upgrade_preserves_current_metadata_and_backfills_completion_once() {
+fn task_upgrade_preserves_current_metadata_without_generating_content_proofs() {
     let (fixture, gh) = migrated_fixture(true);
+    forbid_task_payload_tree_history(&fixture);
     let manifest = fixture.shared.join(DONE).join(MANIFEST);
     let before = std::fs::read(&manifest).unwrap();
     let remote_before = oid(&fixture.remote, "refs/heads/main");
@@ -1224,19 +1252,11 @@ fn task_upgrade_preserves_current_metadata_and_backfills_completion_once() {
         &["task", "upgrade", "--manifest", manifest.to_str().unwrap()],
     );
     let upgraded = std::fs::read(&manifest).unwrap();
-    let mut modern: toml::Value = toml::from_str(std::str::from_utf8(&upgraded).unwrap()).unwrap();
-    assert_eq!(modern["schema_version"].as_integer(), Some(4));
-    assert!(
-        modern
-            .as_table_mut()
-            .unwrap()
-            .remove("archive_completion")
-            .is_some()
-    );
-    modern["schema_version"] = original["schema_version"].clone();
+    let modern: toml::Value = toml::from_str(std::str::from_utf8(&upgraded).unwrap()).unwrap();
+    assert!(modern.get("archive_completion").is_none());
     assert_eq!(
         modern, original,
-        "upgrade must retain task identity, scopes, and approval"
+        "upgrade must retain task identity, scopes, and approval without content proofs"
     );
     archive(
         &fixture.shared,
@@ -1246,6 +1266,99 @@ fn task_upgrade_preserves_current_metadata_and_backfills_completion_once() {
     assert_eq!(std::fs::read(&manifest).unwrap(), upgraded);
     assert_eq!(oid(&fixture.remote, "refs/heads/main"), remote_before);
     assert!(!fixture.root.join("historical-config-read").exists());
+    assert!(!fixture.root.join("payload-tree-history-read").exists());
+}
+
+#[test]
+fn adoption_accepts_dirty_payloads_without_comparing_reviewed_task_trees() {
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["init"]);
+    let task = fixture.seed.join(DONE);
+    std::fs::create_dir_all(&task).unwrap();
+    std::fs::write(task.join("README.md"), "Original description\n").unwrap();
+    std::fs::write(task.join("input.bin"), b"original\n").unwrap();
+    fixture.commit_seed("Directly import legacy directory");
+    let head = oid(&fixture.seed, "HEAD");
+    git(&fixture.seed, ["push", "origin", "HEAD:legacy/completed"]);
+    fixture.clone_shared();
+    let (workplace, infrastructure_manifest) = organizer(&fixture, &[DONE]);
+    let task = fixture.shared.join(DONE);
+    let description = b"User description with [broken link](/old/missing/input)\n\xff";
+    std::fs::write(task.join("README.md"), description).unwrap();
+    std::fs::write(task.join("input.bin"), b"staged payload\n").unwrap();
+    git(&fixture.shared, ["add", &format!("{DONE}/input.bin")]);
+    let payload = b"\0current unstaged bytes\xff\n";
+    std::fs::write(task.join("input.bin"), payload).unwrap();
+    std::fs::write(task.join("new.log"), "untracked historical /old/path\n").unwrap();
+    let index = git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout;
+    let rows = BTreeMap::from([(
+        "legacy/completed",
+        vec![pr("MERGED", 1, "legacy/completed", &head, &head)],
+    )]);
+    let gh = write_gh_without_historical_queries(&fixture, &rows, std::slice::from_ref(&head));
+    forbid_task_payload_tree_history(&fixture);
+    let result = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "task",
+            "adopt",
+            DONE,
+            "--pull-request",
+            "1",
+            "--title",
+            "Imported task",
+            "--purpose",
+            "Register the current control association",
+            "--manifest",
+            infrastructure_manifest.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(result["status"], "adopted");
+    assert_eq!(std::fs::read(task.join("README.md")).unwrap(), description);
+    assert_eq!(std::fs::read(task.join("input.bin")).unwrap(), payload);
+    assert_eq!(
+        git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
+        index
+    );
+    assert_eq!(
+        std::fs::read_to_string(task.join("new.log")).unwrap(),
+        "untracked historical /old/path\n"
+    );
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(task.join(".workspace-mgr-legacy.json")).unwrap())
+            .unwrap();
+    assert!(record.get("tree").is_none());
+    // A previous client's opaque tree field is neither validated nor rewritten
+    // by a retry; the current identity and PR association remain unchanged.
+    let mut old_record = record;
+    old_record["tree"] = value!(["opaque legacy snapshots unrelated to current payload"]);
+    let old_bytes = serde_json::to_vec_pretty(&old_record).unwrap();
+    std::fs::write(task.join(".workspace-mgr-legacy.json"), &old_bytes).unwrap();
+    let retry = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "task",
+            "adopt",
+            DONE,
+            "--pull-request",
+            "1",
+            "--title",
+            "Imported task",
+            "--purpose",
+            "Register the current control association",
+            "--manifest",
+            infrastructure_manifest.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(retry["status"], "no_changes");
+    assert_eq!(
+        std::fs::read(task.join(".workspace-mgr-legacy.json")).unwrap(),
+        old_bytes
+    );
+    assert!(!fixture.root.join("payload-tree-history-read").exists());
+    assert!(!fixture.root.join("blocked-historical-query").exists());
 }
 
 #[test]

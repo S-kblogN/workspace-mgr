@@ -741,7 +741,11 @@ mod tests {
         let source = fixture.repo.root.join("task");
         let destination = fixture.repo.root.join("archive/task");
         let plan = crate::relocation::RelocationPlan::opaque(&source, &destination).unwrap();
-        assert!(plan.reference_paths().is_empty());
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["references"],
+            serde_json::json!([]),
+            "an opaque move must never journal payload rewrites",
+        );
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::rename(&source, &destination).unwrap();
         plan.apply().unwrap();

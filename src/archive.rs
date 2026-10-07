@@ -11,10 +11,7 @@ use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
-use crate::manifest::{
-    ArchiveCompletion, ArchiveCompletionReview, ResolvedTask, TaskKind, TaskManifest,
-    build_task_path, parse_task_identity,
-};
+use crate::manifest::{ResolvedTask, TaskKind, TaskManifest, build_task_path, parse_task_identity};
 use crate::path::{allowed, reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::process;
@@ -41,6 +38,8 @@ pub struct ArchiveReport {
     pub skipped: Vec<SkippedTask>,
     pub required_scopes: Vec<String>,
     pub remote_writes: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::relocation::RelocationNotice>,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,43 +89,7 @@ struct HostingPullRequest {
     merge_commit: Option<HostingCommit>,
     head_ref_name: String,
     head_ref_oid: String,
-    base_ref_name: String,
     is_cross_repository: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssociatedPullRequest {
-    number: u64,
-    html_url: String,
-    state: String,
-    merged_at: Option<String>,
-    merge_commit_sha: Option<String>,
-    head: AssociatedRef,
-    base: AssociatedRef,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssociatedRef {
-    #[serde(rename = "ref")]
-    name: String,
-    sha: String,
-    repo: Option<AssociatedRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssociatedRepository {
-    full_name: String,
-}
-
-#[derive(Debug)]
-struct ReviewedTaskTree {
-    commit: String,
-    directory: String,
-    tree: String,
-}
-
-struct CompletionProof {
-    checkpoint: ArchiveCompletion,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +312,11 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
     if !options.dry_run {
         apply(&repo, &config, &prepared, owner.as_ref())?;
     }
+    let notices = if !options.dry_run && !prepared.is_empty() {
+        vec![crate::relocation::RelocationNotice::archived_directory()]
+    } else {
+        Vec::new()
+    };
     Ok(ArchiveReport {
         status: if prepared.is_empty() {
             "no_changes"
@@ -365,6 +333,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         skipped,
         required_scopes: required_scopes.into_iter().collect(),
         remote_writes: false,
+        notices,
     })
 }
 
@@ -501,21 +470,6 @@ pub(crate) fn hosting_repository(repo: &GitRepo, remote: &str) -> Result<String>
     Ok(format!("{host}/{path}"))
 }
 
-/// Used by manifest upgrades to persist verified review provenance once. A
-/// live open review or newer unmerged work does not erase an existing record.
-pub(crate) fn completion_checkpoint(
-    repo: &GitRepo,
-    config: &Config,
-    task: &ResolvedTask,
-    base: &str,
-) -> Result<Option<ArchiveCompletion>> {
-    let host = hosting_repository(repo, &config.git.remote)?;
-    Ok(
-        merged_pull_request(repo, &config.git.remote, &host, task, base)?
-            .map(|proof| proof.checkpoint),
-    )
-}
-
 /// Archive eligibility depends on current configuration and live PR state.
 /// Saved branch names are lookup hints, not assertions about historical trees.
 fn closed_pull_request(
@@ -639,494 +593,6 @@ fn current_branch_requests(
         .collect())
 }
 
-fn merged_pull_request(
-    repo: &GitRepo,
-    remote: &str,
-    host: &str,
-    task: &ResolvedTask,
-    base: &str,
-) -> Result<Option<CompletionProof>> {
-    if repo
-        .run(["rev-parse", "--is-shallow-repository"])?
-        .stdout
-        .trim()
-        == "true"
-    {
-        return Err(Error::message(
-            "archive requires complete Git history to verify task trees and reviews; fetch the repository with --unshallow before archiving",
-        ));
-    }
-    let checkpoint = task.archive_completion.as_ref();
-    let checkpoint_snapshot = checkpoint
-        .map(|record| verify_checkpoint_binding(repo, host, base, task, record))
-        .transpose()?;
-    // Only the current configuration and hosting reviews describe ownership.
-    // Old configuration files remain opaque members of Git directory trees.
-    let mut branches = BTreeSet::new();
-    branches.insert(task.branch.clone());
-    if let Some(record) = checkpoint {
-        branches.extend(record.branches.iter().cloned());
-        branches.extend(record.reviews.iter().map(|review| review.branch.clone()));
-    }
-    let legacy = if checkpoint.is_none() {
-        let path = task.task_path.as_deref().expect("deliverable path");
-        let record_path = format!("{path}/{}", crate::archive_adoption::LEGACY_RECORD);
-        let introductions = repo
-            .run([
-                "log",
-                "--first-parent",
-                "--diff-filter=A",
-                "--format=%H",
-                base,
-                "--",
-                &record_path,
-            ])?
-            .stdout;
-        match introductions.lines().last() {
-            Some(commit) => crate::archive_adoption::verify_record(
-                repo,
-                &Config::load_compatible(repo)?,
-                host,
-                base,
-                task,
-                (commit, path),
-            )?
-            .map(|review| (commit.to_owned(), review)),
-            None => None,
-        }
-    } else {
-        None
-    };
-    // Immutable adoption evidence covers the imported content. Its own
-    // introducing change must still have a merged review, but commits from
-    // before that adoption do not need to be retroactively reviewed.
-    let history = task_tree_history(
-        repo,
-        base,
-        task,
-        checkpoint,
-        legacy.as_ref().map(|(commit, _)| commit.as_str()),
-    )?;
-    if history.is_empty() && checkpoint.is_none() {
-        return Ok(None);
-    }
-    if let Some((_, (branch, _))) = &legacy {
-        branches.insert(branch.clone());
-    }
-    let mut requests = Vec::new();
-    for branch in &branches {
-        let rows = branch_pull_requests(repo, host, branch)?;
-        if rows.iter().any(|pr| pr.state == "OPEN") {
-            return Ok(None);
-        }
-        requests.extend(rows);
-    }
-    let mut reviewed = Vec::new();
-    if let Some(record) = checkpoint {
-        for saved in &record.reviews {
-            let matching = requests
-                .iter()
-                .filter(|request| {
-                    request.number == saved.number && request.head_ref_name == saved.branch
-                })
-                .collect::<Vec<_>>();
-            if matching.len() != 1 {
-                return Ok(None);
-            }
-            let Some(proof) = verified_review(repo, task, base, matching[0])? else {
-                return Ok(None);
-            };
-            if proof != saved_review(saved) {
-                return Err(Error::message(
-                    "archive completion review no longer matches its immutable provider evidence",
-                ));
-            }
-            reviewed.push((saved.branch.clone(), proof));
-        }
-        let snapshot = checkpoint_snapshot.as_ref().expect("a bound checkpoint");
-        let mut checkpoint_reviewed = false;
-        for (_, proof) in &reviewed {
-            if repo
-                .optional_oid(&format!("{}:{}", proof.merge_commit, snapshot.directory))?
-                .as_ref()
-                == Some(&snapshot.tree)
-            {
-                checkpoint_reviewed = true;
-                break;
-            }
-        }
-        if !checkpoint_reviewed {
-            return Ok(None);
-        }
-    }
-    let mut newest_review = None;
-    for (index, snapshot) in history.iter().enumerate() {
-        // Most task creation commits are the recorded PR merge itself. Other
-        // directory changes require the hosting provider's commit-to-PR
-        // association, so an unrelated later review cannot bless a direct edit.
-        let mut matching = requests
-            .iter()
-            .filter(|pr| {
-                pr.merge_commit
-                    .as_ref()
-                    .is_some_and(|merge| merge.oid == snapshot.commit)
-            })
-            .collect::<Vec<_>>();
-        let associated;
-        if matching.is_empty() {
-            associated = associated_pull_requests(repo, host, &snapshot.commit)?;
-            if associated.iter().any(|pr| pr.state == "OPEN") {
-                return Ok(None);
-            }
-            matching = associated.iter().collect();
-        }
-        let mut proofs = Vec::new();
-        for request in matching {
-            let Some(proof) = verified_review(repo, task, base, request)? else {
-                continue;
-            };
-            let merged = task_tree_at(repo, &proof.merge_commit, &snapshot.directory)?;
-            if merged.as_ref().is_none_or(|merged| {
-                (index == 0 || proof.merge_commit == snapshot.commit)
-                    && merged.tree != snapshot.tree
-            }) {
-                continue;
-            }
-            // Squash commits are the merge itself. A commit associated with a
-            // regular/fast-forward PR must be part of its reviewed head.
-            if snapshot.commit != proof.merge_commit {
-                ensure_review_head(repo, remote, &proof)?;
-            }
-            if snapshot.commit != proof.merge_commit
-                && !ancestor(repo, &snapshot.commit, &proof.head_commit)?
-            {
-                continue;
-            }
-            branches.insert(request.head_ref_name.clone());
-            proofs.push((request.head_ref_name.clone(), proof));
-        }
-        proofs.sort_by_key(|(_, proof)| proof.number);
-        proofs.dedup_by_key(|(_, proof)| proof.number);
-        if proofs.len() != 1 {
-            return Ok(None);
-        }
-        let (branch, proof) = proofs.remove(0);
-        if newest_review.is_none() {
-            newest_review = Some(proof.clone());
-        }
-        reviewed.push((branch, proof));
-    }
-    if let Some((_, review)) = legacy {
-        reviewed.push(review);
-    }
-    for branch in &branches {
-        // A migration's own review branch is part of the verified lifecycle,
-        // even when the task's manifest retains a different canonical branch.
-        if !requests
-            .iter()
-            .any(|request| &request.head_ref_name == branch)
-        {
-            let rows = branch_pull_requests(repo, host, branch)?;
-            if rows.iter().any(|request| request.state == "OPEN") {
-                return Ok(None);
-            }
-            requests.extend(rows);
-        }
-    }
-    // Repeated reviews may change only task contents. They still establish
-    // that a newer retained branch head was merged. Every accepted review
-    // must contain a verified directory tree on the synchronized base.
-    for request in &requests {
-        let Some(proof) = verified_review(repo, task, base, request)? else {
-            continue;
-        };
-        // Cached immutable facts above are checked live, but their old
-        // manifest formats are irrelevant to post-checkpoint changes.
-        if let Some(record) = checkpoint {
-            if ancestor(repo, &proof.merge_commit, &record.checkpoint_commit)? {
-                continue;
-            }
-        }
-        if current_task_tree_at(repo, &proof.merge_commit, task, checkpoint)?.is_some_and(
-            |merged| {
-                history.iter().any(|snapshot| {
-                    snapshot.directory == merged.directory && snapshot.tree == merged.tree
-                })
-            },
-        ) {
-            reviewed.push((request.head_ref_name.clone(), proof));
-        }
-    }
-    // A retained ref may lag behind its merged review; it must never contain
-    // commits that the review did not contain. Check both current and historic
-    // names against the reviewed head for that identity state.
-    for branch in &branches {
-        let local = repo.optional_oid(&format!("refs/heads/{branch}"))?;
-        let remote_oid = repo.remote_branch_oid(remote, branch)?;
-        if let Some(oid) = &remote_oid {
-            repo.fetch_branch_objects(remote, branch, oid)?;
-        }
-        for oid in local.iter().chain(remote_oid.iter()) {
-            let mut contained = false;
-            for (_, proof) in &reviewed {
-                ensure_review_head(repo, remote, proof)?;
-                if ancestor(repo, oid, &proof.head_commit)? {
-                    contained = true;
-                    break;
-                }
-            }
-            if !contained {
-                return Ok(None);
-            }
-        }
-    }
-    let _pull_request = match newest_review {
-        Some(proof) => proof,
-        None => {
-            let snapshot = checkpoint_snapshot.as_ref().expect("a verified checkpoint");
-            let mut matching = None;
-            for (_, proof) in &reviewed {
-                if repo
-                    .optional_oid(&format!("{}:{}", proof.merge_commit, snapshot.directory))?
-                    .as_ref()
-                    == Some(&snapshot.tree)
-                {
-                    matching = Some(proof.clone());
-                    break;
-                }
-            }
-            let Some(proof) = matching else {
-                return Ok(None);
-            };
-            proof
-        }
-    };
-    let mut saved_reviews = reviewed
-        .iter()
-        .map(|(branch, proof)| ArchiveCompletionReview {
-            branch: branch.clone(),
-            number: proof.number,
-            url: proof.url.clone(),
-            merged_at: proof.merged_at.clone(),
-            merge_commit: proof.merge_commit.clone(),
-            head_commit: proof.head_commit.clone(),
-        })
-        .collect::<Vec<_>>();
-    saved_reviews.sort_by_key(|review| review.number);
-    saved_reviews.dedup_by_key(|review| review.number);
-    let checkpoint = match checkpoint {
-        Some(record) => record.clone(),
-        None => {
-            let path = task.task_path.as_deref().expect("deliverable path");
-            ArchiveCompletion {
-                schema_version: 1,
-                task_id: task.task_id.clone(),
-                repository: host.to_owned(),
-                base_branch: task.base_branch.clone(),
-                checkpoint_commit: base.to_owned(),
-                checkpoint_path: path.to_owned(),
-                checkpoint_tree: repo
-                    .optional_oid(&format!("{base}:{path}"))?
-                    .ok_or_else(|| Error::message("archive completion task tree is unavailable"))?,
-                branches: branches.into_iter().collect(),
-                reviews: saved_reviews,
-            }
-        }
-    };
-    Ok(Some(CompletionProof { checkpoint }))
-}
-
-fn saved_review(review: &ArchiveCompletionReview) -> MergedPullRequest {
-    MergedPullRequest {
-        number: review.number,
-        url: review.url.clone(),
-        merged_at: review.merged_at.clone(),
-        merge_commit: review.merge_commit.clone(),
-        head_commit: review.head_commit.clone(),
-    }
-}
-
-fn verify_checkpoint_binding(
-    repo: &GitRepo,
-    host: &str,
-    base: &str,
-    task: &ResolvedTask,
-    record: &ArchiveCompletion,
-) -> Result<ReviewedTaskTree> {
-    if record.schema_version != 1
-        || record.task_id != task.task_id
-        || record.repository != host
-        || record.base_branch != task.base_branch
-        || record.reviews.is_empty()
-        || !ancestor(repo, &record.checkpoint_commit, base)?
-    {
-        return Err(Error::message(
-            "archive completion checkpoint has an unverifiable identity or base",
-        ));
-    }
-    let first_parent = repo.run(["rev-list", "--first-parent", base])?.stdout;
-    if !first_parent
-        .lines()
-        .any(|commit| commit == record.checkpoint_commit)
-    {
-        return Err(Error::message(
-            "archive completion checkpoint is not on the shared first-parent history",
-        ));
-    }
-    let snapshot = task_tree_at(repo, &record.checkpoint_commit, &record.checkpoint_path)?
-        .ok_or_else(|| {
-            Error::message("archive completion checkpoint task identity is unavailable")
-        })?;
-    if snapshot.directory != record.checkpoint_path
-        || snapshot.tree != record.checkpoint_tree
-        || record
-            .reviews
-            .iter()
-            .any(|review| !record.branches.contains(&review.branch))
-    {
-        return Err(Error::message(
-            "archive completion checkpoint does not match its published task tree or branches",
-        ));
-    }
-    Ok(snapshot)
-}
-
-fn branch_pull_requests(
-    repo: &GitRepo,
-    host: &str,
-    branch: &str,
-) -> Result<Vec<HostingPullRequest>> {
-    let output = process::run(
-        &hosting_command(),
-        [
-            "pr",
-            "list",
-            "--repo",
-            host,
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            "100",
-            "--json",
-            "number,url,state,mergedAt,mergeCommit,headRefName,headRefOid,baseRefName,isCrossRepository",
-        ],
-        &repo.root,
-    )?;
-    let requests: Vec<HostingPullRequest> =
-        serde_json::from_str(&output.stdout).map_err(|error| {
-            Error::message(format!(
-                "archive pull-request verification returned invalid JSON: {error}"
-            ))
-        })?;
-    if requests.len() >= 100 {
-        return Err(Error::message(
-            "archive pull-request query reached its limit; resolve ambiguous task branch history first",
-        ));
-    }
-    Ok(requests
-        .into_iter()
-        .filter(|pr| pr.head_ref_name == branch && !pr.is_cross_repository)
-        .collect())
-}
-
-fn associated_pull_requests(
-    repo: &GitRepo,
-    host: &str,
-    commit: &str,
-) -> Result<Vec<HostingPullRequest>> {
-    let (hostname, repository) = host
-        .split_once('/')
-        .ok_or_else(|| Error::message("invalid archive hosting repository"))?;
-    let endpoint = format!("repos/{repository}/commits/{commit}/pulls?per_page=100");
-    let output = process::run(
-        &hosting_command(),
-        ["api", "--hostname", hostname, &endpoint],
-        &repo.root,
-    )?;
-    let rows: Vec<AssociatedPullRequest> =
-        serde_json::from_str(&output.stdout).map_err(|error| {
-            Error::message(format!(
-                "archive commit review verification returned invalid JSON: {error}"
-            ))
-        })?;
-    if rows.len() >= 100 {
-        return Err(Error::message(
-            "archive commit review query reached its limit; review history is ambiguous",
-        ));
-    }
-    Ok(rows
-        .into_iter()
-        .filter_map(|pr| {
-            let same_repository = pr
-                .head
-                .repo
-                .as_ref()
-                .zip(pr.base.repo.as_ref())
-                .is_some_and(|(head, base)| {
-                    head.full_name == repository && base.full_name == repository
-                });
-            same_repository.then(|| HostingPullRequest {
-                number: pr.number,
-                url: pr.html_url,
-                state: if pr.merged_at.is_some() {
-                    "MERGED".to_owned()
-                } else {
-                    pr.state.to_ascii_uppercase()
-                },
-                merged_at: pr.merged_at,
-                merge_commit: pr.merge_commit_sha.map(|oid| HostingCommit { oid }),
-                head_ref_name: pr.head.name,
-                head_ref_oid: pr.head.sha,
-                base_ref_name: pr.base.name,
-                is_cross_repository: false,
-            })
-        })
-        .collect())
-}
-
-fn verified_review(
-    repo: &GitRepo,
-    task: &ResolvedTask,
-    base: &str,
-    request: &HostingPullRequest,
-) -> Result<Option<MergedPullRequest>> {
-    if request.state != "MERGED"
-        || request.base_ref_name != task.base_branch
-        || request.is_cross_repository
-    {
-        return Ok(None);
-    }
-    let (Some(merged_at), Some(commit)) = (&request.merged_at, &request.merge_commit) else {
-        return Err(Error::message(
-            "archive merged pull request lacks a merge timestamp or commit",
-        ));
-    };
-    if chrono::DateTime::parse_from_rfc3339(merged_at).is_err()
-        || !commit_oid(&commit.oid)
-        || !commit_oid(&request.head_ref_oid)
-    {
-        return Err(Error::message(
-            "archive merged pull request contains invalid merge evidence",
-        ));
-    }
-    if !ancestor(repo, &commit.oid, base)? {
-        return Ok(None);
-    }
-    Ok(Some(MergedPullRequest {
-        number: request.number,
-        url: request.url.clone(),
-        merged_at: merged_at.clone(),
-        merge_commit: commit.oid.clone(),
-        head_commit: request.head_ref_oid.clone(),
-    }))
-}
-
-fn commit_oid(oid: &str) -> bool {
-    oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 pub(crate) fn ensure_review_head(
     repo: &GitRepo,
     remote: &str,
@@ -1192,97 +658,6 @@ pub(crate) fn ancestor(repo: &GitRepo, commit: &str, descendant: &str) -> Result
     }
 }
 
-fn task_tree_history(
-    repo: &GitRepo,
-    base: &str,
-    task: &ResolvedTask,
-    checkpoint: Option<&ArchiveCompletion>,
-    adoption_commit: Option<&str>,
-) -> Result<Vec<ReviewedTaskTree>> {
-    let range = checkpoint
-        .map(|record| format!("{}..{base}", record.checkpoint_commit))
-        // Include the adoption itself so it cannot become a completion
-        // boundary until its metadata has been reviewed on the base branch.
-        .or_else(|| adoption_commit.map(|commit| format!("{commit}^..{base}")))
-        .unwrap_or_else(|| base.to_owned());
-    let mut directories = BTreeSet::from([task.task_path.clone().expect("a deliverable path")]);
-    if let Some(record) = checkpoint {
-        directories.insert(record.checkpoint_path.clone());
-    }
-    let mut args = vec!["log", "--first-parent", "--format=%H", &range, "--"];
-    args.extend(directories.iter().map(String::as_str));
-    let commits = repo.run(args)?.stdout;
-    let mut history: Vec<ReviewedTaskTree> = Vec::new();
-    let mut gap = false;
-    for commit in commits.lines() {
-        let Some(snapshot) = current_task_tree_at(repo, commit, task, checkpoint)? else {
-            if !history.is_empty() {
-                gap = true;
-            }
-            continue;
-        };
-        if gap {
-            return Err(Error::message(
-                "archive task identity disappeared and was reintroduced; historical ownership cannot be verified",
-            ));
-        }
-        if let Some(previous) = history.last_mut().filter(|previous| {
-            previous.directory == snapshot.directory && previous.tree == snapshot.tree
-        }) {
-            previous.commit = snapshot.commit;
-        } else {
-            history.push(snapshot);
-        }
-    }
-    if gap && checkpoint.is_some() {
-        return Err(Error::message(
-            "archive task identity disappeared and was reintroduced after its completion checkpoint",
-        ));
-    }
-    Ok(history)
-}
-
-/// Read a directory's immutable tree ID. Its files, including any historical
-/// task configuration, are never read or deserialized.
-fn task_tree_at(repo: &GitRepo, commit: &str, directory: &str) -> Result<Option<ReviewedTaskTree>> {
-    let object = format!("{commit}:{directory}");
-    let Some(tree) = repo.optional_oid(&object)? else {
-        return Ok(None);
-    };
-    if repo.run(["cat-file", "-t", &object])?.stdout.trim() != "tree" {
-        return Err(Error::message(
-            "archive reviewed task directory is not a Git tree",
-        ));
-    }
-    Ok(Some(ReviewedTaskTree {
-        commit: commit.to_owned(),
-        directory: directory.to_owned(),
-        tree,
-    }))
-}
-
-fn current_task_tree_at(
-    repo: &GitRepo,
-    commit: &str,
-    task: &ResolvedTask,
-    checkpoint: Option<&ArchiveCompletion>,
-) -> Result<Option<ReviewedTaskTree>> {
-    let path = task.task_path.as_deref().expect("deliverable path");
-    let current = task_tree_at(repo, commit, path)?;
-    if let Some(record) = checkpoint.filter(|record| record.checkpoint_path != path) {
-        let previous = task_tree_at(repo, commit, &record.checkpoint_path)?;
-        match (current, previous) {
-            (Some(_), Some(_)) => Err(Error::message(
-                "archive completion paths contain multiple task directories; resolve current ownership first",
-            )),
-            (Some(tree), None) | (None, Some(tree)) => Ok(Some(tree)),
-            (None, None) => Ok(None),
-        }
-    } else {
-        Ok(current)
-    }
-}
-
 fn reject_overlapping_moves(sources: &[String], destination: &str) -> Result<()> {
     if sources.iter().any(|source| {
         destination == source
@@ -1314,41 +689,6 @@ fn validate_destination(repo: &GitRepo, base: &str, destination: &str) -> Result
     {
         return Err(Error::message(format!(
             "archive destination already exists on the fetched shared branch: {destination}"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_clean_paths(
-    repo: &GitRepo,
-    base: &str,
-    source: &str,
-    destination: &str,
-) -> Result<()> {
-    validate_overlays(repo, source, destination)?;
-    let difference = repo.run_unchecked(["diff", "--quiet", base, "HEAD", "--", source])?;
-    if difference.code != 0 {
-        return Err(Error::message(format!(
-            "archive source {source} differs from the fetched shared branch; refresh or preserve those changes first"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_overlays(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
-    let status = repo.run([
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-        "--",
-        source,
-        destination,
-    ])?;
-    if !status.stdout.is_empty() {
-        return Err(Error::message(format!(
-            "archive refuses staged, modified, or untracked overlays in {source} or {destination} at {}; preserve those changes first",
-            repo.root.display()
         )));
     }
     Ok(())
@@ -1566,8 +906,11 @@ mod tests {
                 original_manifest: original,
                 next_manifest,
                 original_receipt: None,
-                relocation: crate::relocation::prepare(&directory, &repo.root.join(&destination))
-                    .unwrap(),
+                relocation: crate::relocation::RelocationPlan::opaque(
+                    &directory,
+                    &repo.root.join(&destination),
+                )
+                .unwrap(),
             });
         }
         let error = apply(&repo, &Config::default(), &prepared, None)

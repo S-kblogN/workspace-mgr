@@ -732,6 +732,7 @@ class Harness:
             "storage",
             "shared-checkout",
             "infrastructure",
+            "repository",
         ):
             document = self.wm(self.shared, "instructions", topic)
             self.check(document["topic"] == topic, "instruction topic renders", topic=topic)
@@ -752,31 +753,43 @@ class Harness:
             "instructions explain the workspace purpose before its mechanics",
         )
         self.check(
-            "The agent owns pull-request operations" in all_instructions["markdown"]
-            and "must not merge" in all_instructions["markdown"]
-            and "Before ending every turn" in all_instructions["markdown"],
+            "The user controls" in all_instructions["markdown"]
+            and "draft PR" in all_instructions["markdown"]
+            and "before every writable-task turn" in all_instructions["markdown"],
             "instructions fix agent PR ownership and user merge authority",
         )
+        core = self.wm(self.shared, "instructions", "core")["markdown"]
         self.check(
-            "deterministic scaffold reconciliation and upgrade operation"
-            in all_instructions["markdown"]
-            and "never by their old contents" in all_instructions["markdown"],
-            "instructions define structural scaffold ownership and upgrade behavior",
+            "deterministic scaffold reconciliation and upgrade operation" in core
+            and "never by their old contents" in core
+            and "never by their old contents" not in all_instructions["markdown"],
+            "scaffold details are available on demand rather than globally",
         )
+        storage_rules = self.wm(self.shared, "instructions", "storage")["markdown"]
         self.check(
-            "collaboration and control plane" in all_instructions["markdown"]
-            and "artifact and data plane" in all_instructions["markdown"]
-            and "small-s3-boundary" in all_instructions["markdown"],
-            "instructions teach semantic placement and tiny-boundary economics",
+            "collaboration and control plane" in storage_rules
+            and "artifact and data plane" in storage_rules
+            and "small-s3-boundary" in storage_rules
+            and "small-s3-boundary" not in all_instructions["markdown"],
+            "preserved placement policy is loaded only when relevant",
         )
+        repository_rules = self.wm(self.shared, "instructions", "repository")["markdown"]
         self.check(
-            "Preserve this repository-specific rule" in all_instructions["markdown"],
-            "repository-specific instructions are composed into output",
+            "Preserve this repository-specific rule" in repository_rules
+            and "Preserve this repository-specific rule" not in all_instructions["markdown"]
+            and "instructions repository" in all_instructions["markdown"],
+            "global instructions index the accessible repository-owned module",
         )
         self.check(
             "They do not change the fixed task, storage, publication, or review policy"
-            in all_instructions["markdown"],
+            in repository_rules,
             "repository-specific content cannot redefine workspace strategy",
+        )
+        self.check(
+            "workspace-mgr archive --help" in all_instructions["markdown"]
+            and "many broken links" not in all_instructions["markdown"]
+            and "manually audit and repair" not in all_instructions["markdown"],
+            "global instructions route operations without unconditional relocation reminders",
         )
         human = self.run([self.binary, "instructions"], cwd=self.shared)
         self.check("Effective repository instructions" in human.stdout, "human instructions render")

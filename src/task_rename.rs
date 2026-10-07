@@ -15,7 +15,7 @@ use crate::manifest::{
 };
 use crate::path::{reject_symlink_traversal, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
-use crate::relocation::RelocationPlan;
+use crate::relocation::{RelocationNotice, RelocationPlan};
 use crate::transaction::validate_remote_task_identity;
 
 #[derive(Debug, Clone)]
@@ -46,6 +46,8 @@ pub struct TaskRenameReport {
     pub remote_branch_oid: Option<String>,
     pub local_actions: Vec<TaskRenameAction>,
     pub remote_writes: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<RelocationNotice>,
     pub review: TaskRenameReview,
 }
 
@@ -111,10 +113,13 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         remote_branch_oid.as_deref(),
     )?;
     let relocation = match (&task.task_path, &new_task_path) {
-        (Some(old), Some(new)) => Some(crate::relocation::prepare(
-            &resolved_under(&task_repo.root, old),
-            &resolved_under(&task_repo.root, new),
-        )?),
+        (Some(old), Some(new)) => {
+            crate::nested_git::validate_move(&task_repo, old, new)?;
+            Some(RelocationPlan::opaque(
+                &resolved_under(&task_repo.root, old),
+                &resolved_under(&task_repo.root, new),
+            )?)
+        }
         _ => None,
     };
 
@@ -181,6 +186,11 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         remote_branch_oid,
         local_actions,
         remote_writes: false,
+        notices: if !options.dry_run && relocation.is_some() {
+            vec![RelocationNotice::renamed_directory()]
+        } else {
+            Vec::new()
+        },
         review: TaskRenameReview {
             head_branch_unchanged: true,
             pull_request: "reuse-existing-draft",

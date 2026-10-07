@@ -234,9 +234,11 @@ reset` does not undo a local-only choice. Git commit history remains available.
 `workspace-mgr init` installs a deliberately small `AGENTS.md` that tells the
 agent to run `workspace-mgr instructions --repo .`. The generated document
 begins with the same [workspace model](docs/management-model.md) read by users,
-then renders the complete product-owned policy using the repository's Git and
-S3 facts and appends an optional repository-specific content module. Every
-initialized repository gets the same management strategy; policy evolves with
+then gives the operation directory, session-wide constraints and current Git/S3
+control facts. It does not append every operation's policy. Read the relevant
+command's `--help` before acting; detailed compatibility topics remain available
+through `instructions <topic>`. A repository-specific instruction module is
+indexed by default and read with `instructions repository`. Every initialized repository gets the same management strategy; policy evolves with
 the CLI rather than through per-repository switches. Re-running `init` after a
 CLI update deterministically replaces product-owned scaffold files with the
 current versions; their ownership comes from the initialized repository and
@@ -322,3 +324,10 @@ and a network Git server. Neither test path reads developer cloud credentials.
 ## License
 
 MIT
+
+Repository-development changes must keep information near its point of use.
+Global instructions contain mental model, operation discovery and genuinely
+session-wide constraints; prerequisites and procedures belong in the relevant
+command help, while outcome-specific reminders belong only in that command's
+execution report. See [contributing](CONTRIBUTING.md) and the
+[information-routing audit](docs/control-plane-audit.md).

@@ -1069,7 +1069,7 @@ mod tests {
             previous_remote: None,
             status: "moved".to_owned(),
             metadata: Vec::new(),
-            relocation: crate::relocation::prepare(
+            relocation: crate::relocation::RelocationPlan::opaque(
                 &repo.root.join(source),
                 &repo.root.join(destination),
             )

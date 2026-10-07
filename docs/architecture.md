@@ -107,6 +107,26 @@ authority are compiled product policy. They
 are intentionally absent from repository configuration so different
 repositories cannot drift into different management strategies.
 
+## Information routing
+
+Default and explicit `instructions all` load a short mental model, operation
+index and session-wide constraints, plus current repository facts. Detailed
+policy remains in `guidance::topic` for explicit compatibility views. Command
+help is rendered by `command_guidance::command` and is available without
+repository configuration or network access. Conditions and outcomes that only
+become known at execution are reported by that operation; relocation success
+reminders never appear unconditionally in global instructions.
+
+The user-owned repository instruction module is indexed globally and exposed
+through `instructions repository`. Default rendering validates its path, size
+and encoding and includes its current bytes in the policy hash without printing
+the body. This preserves effective-policy change detection while avoiding a
+second global operation manual.
+
+New policy and guidance follow the durable information locality requirement in
+[CONTRIBUTING.md](../CONTRIBUTING.md). The routing and retained-policy audit is
+[control-plane-audit.md](control-plane-audit.md).
+
 ## Repository compatibility
 
 Tracked task state evolves with the CLI. Releases parse task manifests
@@ -190,9 +210,11 @@ release, a repository declares the oldest compatible release in
 ## Update observation boundary
 
 Update discovery is advisory and user-scoped, not repository configuration.
-Before parsing any command, the executable reads a small cache in the user's
-cache directory. A successful crates.io result is reused for six hours and a
-failed attempt for one hour. Refresh uses a nonblocking process lock, a 750 ms
+Arguments are parsed before update discovery. Help, argument errors and offline
+`task list`, `task path` and `task show` skip the update cache and network check.
+Other invocations, including explicit `--version`, read a small cache in the
+user's cache directory. A successful crates.io result is reused for six hours
+and a failed attempt for one hour. Refresh uses a nonblocking process lock, a 750 ms
 request deadline, a 1 MiB response limit, and an atomic cache replacement. Lock
 contention, unavailable cache storage, malformed responses, and all network
 failures are ignored.
@@ -279,49 +301,27 @@ follows bounded mappings only after an exact original version is missing,
 preserving hash and size checks. Planned local pointers can read their original
 exact versions before publication.
 
-Completion verification never reads historical task configuration blobs.
-Current validated task identity and stored review metadata provide ownership;
-old files are opaque members of Git directory trees, regardless of their format.
-The verifier inspects only the current known directory and a saved checkpoint
-path, using tree IDs, commit ancestry, and hosting commit-to-PR associations.
-It cannot discover old paths or branches from old configuration formats.
-Missing or ambiguous provenance fails closed, and shallow history is refused.
+Archive completion uses supported current task identity and current associated
+PR state. Saved review branch metadata is a lookup hint, never replayed content
+proof. Historical configuration, directory-tree transitions, commit-to-PR
+coverage, full-history availability and branch-tip ancestry do not determine
+eligibility. `task upgrade` locally preserves compatible current metadata rather
+than creating a new historical checkpoint. `task adopt` verifies the supplied
+live PR control association without inspecting ordinary payload trees or dirty
+content.
 
-`task upgrade` can bootstrap relevant tree transitions once against verified
-merged reviews and store a schema 4 `[archive_completion]` checkpoint in the
-current manifest. The record binds repository, base branch, task ID,
-checkpoint commit/path/tree, and verified review and branch facts. It is local
-metadata until a scoped infrastructure review publishes and merges it.
-Subsequent archive verification revalidates that binding and the saved reviews
-against live provider facts, checks open reviews and retained local/remote refs,
-and examines directory changes only from checkpoint to fetched base. The
-record is immutable provenance, not a cached completed flag. A current manifest
-without it uses the same opaque-tree bootstrap checks. The explicit `task adopt`
-transition adds review and tree evidence for a manifestless directory, and that
-transition itself needs merged review. Its introducing record commit establishes
-a review boundary for directly imported legacy content: commits before adoption
-are not retrospectively required to have PRs. The adoption commit and all later
-changes are still verified without opening historical task configuration blobs.
-
-Relocation prepares only task-contained Git controls. Empty `.git` cache files
-are inert; nonempty malformed controls refuse. Administrative files, common Git
-directories and registered worktrees must resolve inside the task, including
-symlink resolution, and serialized plans are checked again before applying or
-restoring them. External Git files are never silently included in task scopes.
-Location-bound Python environments and stale Git registrations fail preflight
-with repair guidance. A separate bounded streaming scan checks ordinary text,
-including ignored scripts and README files, for literal absolute or
-repository-relative source paths and reports every matching file/line before
-movement. Diagnostics are bounded to 200 references per invocation, with a
-truncation notice; Git hook scripts are included while Git object stores stay
-opaque. Verified Git rewrites and workspace-mgr controls are excluded;
-ordinary references require reviewed repair to script/task-relative paths.
-Dynamic references, custom Git-config commands and references outside the task still need reproduction
-validation; archive does not claim to statically resolve every command.
+Archive and task rename move ordinary directory contents unchanged. They do not
+parse Git worktree pointers or administration, inspect environment launchers,
+follow ordinary links, scan script paths, or repair runtime dependencies. Nested
+Git remains governed by shared-ignore and no-outer-tracking control rules.
+Zero-byte `.git` cache markers remain ordinary payloads. New relocation plans
+contain no runtime rewrite references. Old attempt journals retain their saved
+reference snapshots for backward-compatible cancellation.
 
 Before a local archive move, `.workspace-mgr/local/archive-attempts/` saves
-original tool-mutated metadata, modes, verified Git relocation references, owner
-refs, and retirement records. It records generated publication commits before
+original tool-mutated metadata, modes, directory relocation facts, owner refs,
+and retirement records. Older journals may also hold saved Git rewrite
+snapshots, which remain readable for lossless cancellation. It records generated publication commits before
 their ref update and verified pushes before cleanup. `archive --cancel` restores
 only an unpublished attempt, preserving whole local directories by rename.
 Cancel phases and generated undo commits are durable, so interruption can be

@@ -208,18 +208,20 @@ instructions --repo .`. An unapproved or failed installation remains a
 blocker; the agent does not substitute lower-level repository or storage
 commands.
 
-`instructions` is intentionally different from `help`: help explains command
-syntax, while instructions first establishes the shared workspace model and
-then renders the repository's actual operating policy. The output combines the
-canonical model document, the complete built-in policy, `.workspace-mgr.toml`
-facts, and the optional repository-specific content module. Run
-`workspace-mgr doctor` before work
-if the installation or repository state may be inconsistent.
+Default `instructions` and explicit `instructions all` provide the mental
+model, operation directory, genuinely session-wide constraints and current
+repository facts. They do not print every operation's detailed policy. Read
+`workspace-mgr <command> --help` before that operation for its prerequisites,
+applicable repository-management rules and next steps. Execution reports supply
+facts and reminders that become relevant only after the operation runs.
 
-The default `all` document contains the model followed by the complete fixed
-policy. `instructions model` returns only the conceptual model. Every
-operational topic is always available; a repository cannot disable selected
-rules and thereby give an agent an incomplete management contract.
+`instructions model` returns only the short conceptual document. Existing
+`core`, `task`, `publish`, `artifacts`, `storage`, `shared-checkout` and
+`infrastructure` topics remain detailed on-demand compatibility views; this
+changes where policy appears, not the policy itself. The user's
+`.workspace-mgr/instructions/repository.md` is indexed by default; read it before
+task work, either directly or with `instructions repository`. Its bytes still
+contribute to the effective policy hash even when its body is not printed.
 
 ### 4. Create one task
 
@@ -813,49 +815,25 @@ separate user-requested infrastructure task.
 
 ### Upgrade current task configuration
 
-In a new clone, refresh the configured shared branch before upgrading current
-task configuration. Preview a completed task's evidence, declare its exact
-manifest path in a user-authorized infrastructure task, then apply and publish
-the change through that review:
+`task upgrade` upgrades supported current task metadata locally and idempotently.
+It preserves task identity, scopes, cloud-usage approval and compatible saved
+review metadata. It fetches the configured shared branch to validate current task control
+identity and compatibility, and guards staged manifest edits. It does not query
+PRs, compare ordinary historical directory trees or require task payloads to be
+clean. Preview first, then publish
+the authorized current manifest change through its scoped task.
 
 ```sh
-workspace-mgr refresh
 task_config=20260918-120000-example/.workspace-mgr-task.toml
 workspace-mgr task upgrade --manifest "$task_config" --dry-run
-workspace-mgr task create task-config-upgrade --kind infrastructure \
-  --title "Upgrade completed task configuration" \
-  --purpose "Retain verified review provenance in current metadata" \
-  --scope "$task_config" \
-  --scope-note "The user requested this task configuration upgrade"
-upgrade_manifest=/absolute/path/reported/by/task-create
 workspace-mgr task upgrade --manifest "$task_config"
-workspace-mgr plan --manifest "$upgrade_manifest"
-workspace-mgr publish --manifest "$upgrade_manifest" \
-  -m "Retain verified task completion evidence"
 ```
 
-Review and merge that infrastructure pull request, then run `refresh` to
-receive the updated metadata. Upgrade is idempotent and writes only current
-local task metadata; it writes no S3 data or Git remote. The current task configuration
-must already be published and have no unrelated staged or unpublished edits.
-Task metadata, declared scopes and cloud-usage approval are retained.
-
-The schema 4 checkpoint requires workspace-mgr 0.7.0. It binds the current
-identity to repository/base, a Git commit and directory tree at a known path,
-and verified review and branch facts. Bootstrap examines relevant trees at
-the current known path; a saved checkpoint also supplies its recorded path.
-It never reads historical task configuration blobs or discovers paths and
-branches from their fields. Old historical configuration may even be non-TOML:
-its bytes remain opaque members of the Git tree. The current configuration
-still must satisfy the current schema; missing identity or unverifiable path
-and review provenance cannot be guessed.
-
-These review-provenance checks belong to `task upgrade`, which requires
-complete Git history. Archive is independent of that operation: it uses the
-current task configuration and its associated PR state, without inspecting
-configuration or directory-tree history or replaying a saved checkpoint's
-historical proof. Saved metadata can supply PR associations after a branch
-change. Upgrade is not an archive prerequisite.
+Older schema 4 completion checkpoints remain readable. Their current review
+branch associations can help find live PRs after a branch change; the tool
+neither produces new historical content proofs nor replays existing trees,
+ancestry or commit-to-PR coverage. Current manifest validation remains strict.
+Upgrade is not an archive prerequisite.
 
 Active deliverable task directories remain at the repository's top level.
 After a task's corresponding pull request is closed, the user may
@@ -913,9 +891,10 @@ content. The
 [command reference](commands.md#workspace-mgr-archive) describes this boundary.
 
 For a manifestless directory, use `task adopt` to establish current task
-metadata before archiving. Adoption has its own review checks; archive does
-not trace earlier imports or the adoption record's introducing commit. It
-checks the resulting current manifest and corresponding closed PR state.
+metadata before archiving. Adoption has current PR/ref control checks but no
+ordinary content-tree proof. Its separate adoption PR need not merge before
+archive. Archive checks the resulting current manifest and associated closed PR,
+without tracing earlier imports or the adoption record's introducing commit.
 
 Archive moves the local directory and manifest together. Publication copies
 the complete retained S3 history, including old versions, delete markers, and
@@ -979,7 +958,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `task list`, `task path`, `task show` | Read-only local discovery; no cache writes or state migration | None, including no update check | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
-| `task upgrade` | Rewrites current configuration and verified completion evidence; dry-run changes no task content | Fetches the shared branch and verifies Git trees and hosting review records | None |
+| `task upgrade` | Upgrades current task metadata while preserving compatible saved fields; dry-run changes nothing | Fetches the configured shared branch for current manifest identity and version control | None |
 | `archive` | Moves closed-PR task directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads current GitHub PR states, current task/storage metadata, and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
@@ -1025,3 +1004,9 @@ guard to investigate, not a signal to invoke internal version-control or storage
 commands directly.
 
 For exact syntax and every option, see the [command reference](commands.md).
+
+Relocation execution reports contain a success-only notice with code
+`manual-content-audit-after-relocation` after an actual directory move. It asks
+the user to manually inspect links and path references; the tool does not
+validate or repair them. The notice is absent from global instructions,
+dry-runs, no-change operations, metadata-only rename and archive cancellation.

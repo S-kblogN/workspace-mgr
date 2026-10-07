@@ -15,10 +15,9 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   resolution refuses ambiguous selectors instead of guessing. Legacy task
   candidates and malformed current metadata remain visible with diagnostics.
 - Explicit `task adopt` for reviewed legacy directories without manifests.
-- Previewable, idempotent `task upgrade` for current task configuration and
-  durable verified review provenance. Its optional schema 4
-  `[archive_completion]` checkpoint requires workspace-mgr 0.7.0 and preserves
-  task metadata, scopes and cloud-usage approval.
+- Previewable, idempotent `task upgrade` for supported current task metadata,
+  preserving identity, scopes, cloud-usage approval and compatible saved schema 4
+  review fields. It no longer produces historical task-content proofs.
 - Previewable, idempotent `archive --cancel` with durable local metadata and Git
   reference snapshots, preserving ignored/hydrated content and other task edits.
 
@@ -72,6 +71,22 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Changed
 
+- Default and explicit `instructions all` now provide the short mental model,
+  operation directory and session-wide constraints. Operation prerequisites and
+  retained policies live in command help and on-demand compatibility topics;
+  outcome-specific guidance lives in execution reports. The user-owned
+  repository instruction module remains accessible through `instructions
+  repository`, and its bytes still affect the effective policy hash.
+- Directory relocation no longer validates or repairs ordinary runtime content,
+  Python environments, symlinks or nested Git administrative references. Actual
+  successful moves report a manual-content-audit notice; global instructions and
+  dry-runs do not issue unconditional broken-link warnings. Existing cancel
+  journals remain readable for lossless undo.
+- Task upgrade/adoption no longer require proof about ordinary historical task
+  content, directory-tree transitions or earlier imports. Current task/PR/ref
+  control checks remain. Other repository-management policies, including task
+  documentation, whitespace, storage semantics, ignore, symlink publication and
+  cloud-usage requirements, are retained and relocated rather than removed.
 - Managed storage runs entirely in Rust, including DVC-compatible local pointer
   and cache handling, streaming exact-version S3 reads, Signature Version 4,
   full-history archive copy, immutable registry publication, and lossless cancel.
@@ -92,10 +107,11 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ### Upgrading
 
-- `task upgrade` remains a separate operation for current manifest metadata
-  and verified review provenance, with its own history checks. Archive needs
-  no checkpoint or upgrade: it validates a supported current manifest and
-  corresponding closed PRs without consulting historical task configuration.
+- `task upgrade` remains a separate operation for current manifest control
+  metadata, with current published identity and client compatibility checks.
+  It preserves old checkpoint fields without synthesizing or replaying payload
+  history proof. Archive needs no checkpoint or upgrade: supported current
+  metadata and corresponding closed PRs suffice.
   Manifestless directories still require explicit `task adopt` to establish
   current metadata; archive does not trace their pre-adoption imports.
 - Lossless `archive --cancel` requires an attempt journal created by this

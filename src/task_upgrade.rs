@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::archive;
 use crate::config::{Config, require_supported_cli_at};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
@@ -72,8 +71,8 @@ pub fn upgrade(options: &TaskUpgradeOptions) -> Result<TaskUpgradeReport> {
         let published: TaskManifest = toml::from_str(&published.stdout).map_err(|error| {
             Error::message(format!("invalid current published task manifest: {error}"))
         })?;
-        // Permit an idempotent retry of a local upgrade, but no ordinary
-        // manifest edits. Derive all evidence from the fetched shared version.
+        // Permit an idempotent retry of a local upgrade, but no independent
+        // control metadata edits. Validate against the current shared manifest.
         let mut local_identity = previous.clone();
         let mut published_identity = published.clone();
         local_identity.archive_completion = None;
@@ -97,18 +96,15 @@ pub fn upgrade(options: &TaskUpgradeOptions) -> Result<TaskUpgradeReport> {
                 ));
             }
         }
-        let mut verification_task = task.clone();
-        verification_task.archive_completion = published.archive_completion;
-        let verified = archive::completion_checkpoint(&repo, &config, &verification_task, &base)?;
-        // A reopened task keeps its previous lifecycle evidence. The record
-        // is a checkpoint, not a cached assertion that the task remains done.
-        next.archive_completion = verified.or_else(|| verification_task.archive_completion.clone());
+        // Only current shared control metadata supplies branch association
+        // hints. Upgrade never evaluates ordinary task trees or reconstructs
+        // completion proofs from their history.
+        next.archive_completion = published.archive_completion;
         if previous.archive_completion.is_some()
             && previous.archive_completion != next.archive_completion
-            && previous.archive_completion != verification_task.archive_completion
         {
             return Err(Error::message(
-                "task upgrade refuses unverified local completion evidence; preserve and review the conflicting manifest first",
+                "task upgrade refuses unpublished completion metadata changes; publish or refresh them first",
             ));
         }
     }
@@ -133,9 +129,9 @@ pub fn upgrade(options: &TaskUpgradeOptions) -> Result<TaskUpgradeReport> {
         completion_recorded: next.archive_completion.is_some(),
         remote_writes: false,
         next_step: if changed {
-            "Publish the upgraded task manifest through a scoped infrastructure review before archiving."
+            "Publish the upgraded task manifest through its declared scope."
         } else {
-            "Task configuration is current; archive will recheck live reviews and unmerged work."
+            "Task configuration is current; archive will check current associated pull-request state."
         },
     })
 }

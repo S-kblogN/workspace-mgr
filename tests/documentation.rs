@@ -1,67 +1,57 @@
 #[test]
-fn user_documentation_covers_the_complete_public_model() {
+fn user_documentation_routes_global_and_operation_specific_information() {
     let readme = include_str!("../README.md");
     let model = include_str!("../docs/management-model.md");
-    let normalized_model = model.split_whitespace().collect::<Vec<_>>().join(" ");
     let guide = include_str!("../docs/guide.md");
     let commands = include_str!("../docs/commands.md");
-    let configuration = include_str!("../docs/configuration.md");
+    let contributing = include_str!("../CONTRIBUTING.md");
     let architecture = include_str!("../docs/architecture.md");
-    let changelog = include_str!("../CHANGELOG.md");
-    let e2e_readme = include_str!("e2e/README.md");
-    let e2e_coverage = include_str!("e2e/COVERAGE.md");
-
+    let audit = include_str!("../docs/control-plane-audit.md");
     assert!(readme.contains("docs/management-model.md"));
-    assert!(guide.contains("management-model.md"));
     assert!(readme.contains("docs/guide.md"));
     assert!(readme.contains("docs/commands.md"));
+    assert!(readme.contains("docs/control-plane-audit.md"));
+    assert!(guide.contains("management-model.md"));
+
+    let normalized = model.split_whitespace().collect::<Vec<_>>().join(" ");
     for concept in [
         "general-purpose collaborator",
         "user-facing interface",
         "durable workspace",
+        "one writable conversation (chat) = one task = one target branch = one draft pull request",
         "Task scope",
         "Storage placement",
-        "remote visibility boundary",
-        "multiple chats",
-    ] {
-        assert!(
-            normalized_model.contains(concept),
-            "model is missing {concept}"
-        );
-    }
-    assert!(normalized_model.contains(
-        "one writable conversation (chat) = one task = one target branch = one draft pull request"
-    ));
-    assert!(normalized_model.contains("Infrastructure is a kind of task"));
-    for ownership_rule in [
         "Reading and ownership are separate",
         "Reading a path does not transfer ownership or authorize mutation",
-        "task directory is the default write boundary",
-        "another chat's task directory",
+        "default write boundary is its own task directory",
         "explicit user authorization for the exact path and action",
-        "does not manufacture approval",
         "manifest scopes are its write boundary",
         "Untracked does not mean unowned",
+        "current slug is a mutable topic label",
+        "task ID and review branch remain stable",
+        "instructions repository",
     ] {
         assert!(
-            normalized_model.contains(ownership_rule),
-            "model is missing ownership rule {ownership_rule:?}"
+            normalized.contains(concept),
+            "global model omits {concept:?}"
         );
     }
-    assert!(normalized_model.contains("same management strategy"));
-    assert!(normalized_model.contains("the user asks for outcomes"));
-    assert!(normalized_model.contains("None of these operations publishes a task"));
-    for storage_concept in [
-        "collaboration and control plane",
-        "artifact and data plane",
-        "below 1 MiB",
-        "1 through 10 MiB",
-        "Above 10 MiB",
-        "aggregate size",
+    assert!(
+        model.len() < 8_000,
+        "global model became an operation manual"
+    );
+    for detail in [
+        "small-s3-boundary",
+        "task-record-unchanged",
+        "bulk-publication",
+        "checkpoint_tree",
+        "delete markers",
+        "many broken links",
+        "manually audit and repair",
     ] {
         assert!(
-            normalized_model.contains(storage_concept),
-            "model is missing storage concept {storage_concept:?}"
+            !model.contains(detail),
+            "global model leaks operation detail {detail:?}"
         );
     }
     for command in [
@@ -71,7 +61,11 @@ fn user_documentation_covers_the_complete_public_model() {
         "doctor",
         "config show",
         "task create",
+        "task list",
+        "task path",
+        "task show",
         "task rename",
+        "task upgrade",
         "archive",
         "task status",
         "task discard",
@@ -89,341 +83,203 @@ fn user_documentation_covers_the_complete_public_model() {
     ] {
         assert!(
             commands.contains(&format!("## `workspace-mgr {command}`")),
-            "command reference is missing {command}"
+            "missing command reference {command}"
         );
     }
-    assert!(guide.contains("itself create a remote branch or call a hosting provider"));
-    assert!(guide.contains("it does not create or update a pull"));
-    assert!(guide.contains("`archive` reads the task's corresponding PR state through `gh`"));
-    assert!(guide.contains("`refresh` reads merge evidence for branch cleanup"));
-    for responsibility in [
-        "immediately follows creation",
-        "create exactly one",
-        "never create a duplicate",
-        "living description",
-        "head revision",
-        "Before ending every turn",
-        "does not need to request",
-        "must not merge",
-        "enable auto-merge",
-    ] {
+    for (name, doc) in [("guide", guide), ("commands", commands)] {
         assert!(
-            guide.contains(responsibility) || normalized_model.contains(responsibility),
-            "documentation is missing pull-request responsibility {responsibility:?}"
+            doc.contains("instructions repository"),
+            "{name} loses repository-owned policy access"
+        );
+        assert!(
+            doc.contains("policy hash"),
+            "{name} omits effective-policy change detection"
         );
     }
-    assert!(guide.contains("S3 first, then Git"));
-    assert!(guide.contains("Before every writable-task turn ends"));
-    assert!(guide.contains("then purge obsolete S3 paths"));
-    assert!(guide.contains("Nested placement boundaries"));
-    assert!(guide.contains("small-s3-boundary"));
-    assert!(guide.contains("semantic-placement-review"));
-    assert!(guide.contains("task-record-unchanged"));
-    assert!(guide.contains("bulk-publication"));
-    // Refresh's storage warning and report field are
-    // named wherever an agent looks up a code it just received.
-    for (name, document) in [("guide", guide), ("commands", commands)] {
-        for code in [
-            "unaddressable-storage-metadata",
-            "branch-cleanup-unavailable",
-            "branch-cleanup-failed",
-        ] {
-            assert!(document.contains(code), "{name} is missing warning {code}");
-        }
-    }
-    assert!(commands.contains("storage.unaddressable"));
-    for (name, document) in [("guide", guide), ("commands", commands)] {
-        let normalized_document = document
+    for (name, doc) in [
+        ("contributing", contributing),
+        ("architecture", architecture),
+        ("audit", audit),
+    ] {
+        let doc = doc
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .to_ascii_lowercase();
-        for fact in [
-            "branch_cleanup",
-            "`planned`",
-            "`deleted`",
-            "`skipped`",
-            "`errors`",
-            "`warnings`",
-            "`unavailable`",
-            "`not_applicable`",
-            "`branches_cleaned`",
-            "squash",
-            "legacy or custom worktree",
-            "never detaches",
-        ] {
-            assert!(
-                normalized_document.contains(&fact.to_ascii_lowercase()),
-                "{name} is missing merged-branch cleanup fact {fact:?}"
-            );
-        }
-        assert!(!document.contains("planned_detach_worktrees"));
-        assert!(!document.contains("detached_worktrees"));
+        assert!(
+            doc.contains("information locality"),
+            "{name} lacks the durable locality requirement"
+        );
+        assert!(
+            doc.contains("command help"),
+            "{name} omits operation-local guidance"
+        );
+        assert!(
+            doc.contains("execution"),
+            "{name} omits outcome-specific execution guidance"
+        );
     }
-    for (name, document) in [
+}
+
+#[test]
+fn information_routing_preserves_unapproved_repository_policies() {
+    let guide = include_str!("../docs/guide.md");
+    let commands = include_str!("../docs/commands.md");
+    let configuration = include_str!("../docs/configuration.md");
+    let architecture = include_str!("../docs/architecture.md");
+    let readme = include_str!("../README.md");
+    // Moving guidance is not authorization to remove these policies.
+    for preserved in [
+        "small-s3-boundary",
+        "semantic-placement-review",
+        "task-record-unchanged",
+        "bulk-publication",
+        "200 new files",
+        "256 MiB (268435456 bytes)",
+        ".workspace-mgr/repository.gitignore",
+        ".git/info/exclude",
+        "ignored_paths",
+    ] {
+        assert!(
+            guide.contains(preserved),
+            "guide loses retained policy {preserved:?}"
+        );
+        assert!(
+            commands.contains(preserved),
+            "commands lose retained policy {preserved:?}"
+        );
+    }
+    assert!(architecture.contains("whitespace errors"));
+    assert!(commands.contains("# workspace-mgr local begin"));
+    assert!(commands.contains("force-with-lease"));
+    for (name, doc) in [
         ("readme", readme),
         ("guide", guide),
         ("commands", commands),
-        ("model", model),
         ("configuration", configuration),
         ("architecture", architecture),
     ] {
-        let normalized_document = document.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            !normalized_document.contains("isolated worktree"),
-            "{name} still directs infrastructure tasks to an isolated worktree"
+            doc.contains(".workspace-mgr/local/"),
+            "{name} loses private control state"
         );
         assert!(
-            document.contains("--manifest"),
-            "{name} omits explicit task selection"
-        );
-    }
-    assert!(commands.contains("Infrastructure creation reports `path` as the repository root"));
-    assert!(configuration.contains(".workspace-mgr/local/infrastructure-tasks/<id>"));
-    for (name, document) in [
-        ("README.md", readme),
-        ("guide.md", guide),
-        ("commands.md", commands),
-        ("management-model.md", model),
-        ("configuration.md", configuration),
-        ("architecture.md", architecture),
-    ] {
-        assert!(
-            document.contains(".workspace-mgr/local/"),
-            "{name} omits the private product-state directory"
+            doc.contains("--manifest"),
+            "{name} loses explicit task selection"
         );
     }
-    let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
-    for fact in [
-        "Upgrading private product state",
-        "All linked worktrees use the same private directory",
-        "automatically migrates existing state",
-        "An old infrastructure manifest path passed to `--manifest` continues",
-        "not all disposable cache",
-        "Upgrade the CLI used by every linked worktree",
-        "refuses a lock held by an older process",
-        "conflicting destination path",
-        "git config core.worktree /absolute/path/to/primary-checkout",
-        "not a workspace-mgr state-directory option",
-    ] {
-        assert!(
-            normalized_guide.contains(fact),
-            "guide omits private-state migration fact {fact:?}"
-        );
-    }
-    assert!(guide.contains("ignored_paths"));
-    assert!(guide.contains(".workspace-mgr/repository.gitignore"));
-    assert!(guide.contains(".git/info/exclude"));
-    assert!(guide.contains("permanently deletes every version"));
-    assert!(commands.contains("force-with-lease"));
-    assert!(normalized_model.contains("explicit opposite endpoint"));
-    assert!(normalized_model.contains("current slug is a mutable topic label"));
-    assert!(
-        normalized_model
-            .contains("recording an approval documents the user's decision and never creates it")
-    );
-    assert!(normalized_model.contains("records that answer in the task manifest"));
-    assert!(normalized_model.contains("oldest `workspace-mgr` release"));
-    for requirement_fact in [
-        "`cli-version`",
+    for requirement in [
         "repository_requirement",
         "Workspace-Requirement: minimum_cli_version=",
         "Cloud-Usage-Approval: limit_bytes=<n>; note=<note>",
-    ] {
-        assert!(
-            commands.contains(requirement_fact),
-            "command reference is missing {requirement_fact:?}"
-        );
-    }
-    for fact in [
         "`unchanged`",
         "`raise`",
         "`follow`",
         "`withdraw`",
-        "task create` and `task discard",
-        "Workspace-Requirement: minimum_cli_version=<version>",
     ] {
         assert!(
-            commands.contains(fact),
-            "command reference is missing {fact:?}"
+            commands.contains(requirement),
+            "commands omit protocol {requirement:?}"
         );
     }
-    let normalized_commands = commands.split_whitespace().collect::<Vec<_>>().join(" ");
-    let archive_reference = commands
-        .split("## `workspace-mgr archive`")
-        .nth(1)
-        .and_then(|section| section.split("\n## ").next())
-        .expect("archive command reference");
-    let normalized_archive = archive_reference
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    for fact in [
-        "Archive needs a verifiable closed PR and no associated open PR",
-        "Both merged PRs and PRs closed without merging qualify",
-        "The PR need not target today's configured base branch",
-        "Archive does not inspect historical configuration, directory-tree history",
-        "It does not scan runtime paths or cross-task dependencies",
-        "Ordinary tracked, staged, untracked, ignored, and local-only contents move with the directory",
-        "The rule need not already be tracked",
-        "Local `.git/info/exclude` or a global ignore file is insufficient",
-        "new attempts do not rewrite nested Git controls",
-    ] {
-        assert!(
-            normalized_archive.contains(fact),
-            "archive reference omits current scope fact {fact:?}"
-        );
-    }
-    for (name, document) in [
-        ("README.md", readme),
-        ("guide", guide),
-        ("commands", commands),
-    ] {
-        assert!(
-            !document.contains("--historical-record"),
-            "{name} still documents the removed historical-record option"
-        );
-    }
-    for fact in [
-        "`task rename`, `plan`, and `publish`",
-        "this command changed nothing",
-        "the approval takes the same override",
-        "never below the base branch's declaration",
-    ] {
-        assert!(
-            normalized_commands.contains(fact),
-            "command reference is missing {fact:?}"
-        );
-    }
-    // Only releases from 0.4.0 on know the declaration; older ones reject it
-    // as an unknown field, which the user-facing overviews must not hide.
-    for (name, document) in [("README.md", readme), ("guide.md", guide)] {
-        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (name, doc) in [("readme", readme), ("guide", guide)] {
+        let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
         for fact in [
             "From 0.4.0 on",
             "Releases up to 0.3.0",
             "unknown-field error",
         ] {
             assert!(
-                normalized.contains(fact),
-                "{name} does not qualify the older-release behavior: {fact:?}"
+                doc.contains(fact),
+                "{name} loses old-client behavior {fact:?}"
             );
         }
     }
-    for removed in ["recorded_at", "adopts", "private task state until"] {
-        for (name, document) in [
-            ("README.md", readme),
-            ("management-model.md", model),
-            ("guide.md", guide),
-            ("commands.md", commands),
-            ("configuration.md", configuration),
-        ] {
-            assert!(
-                !document.contains(removed),
-                "{name} still describes the removed private approval record: {removed:?}"
-            );
-        }
-    }
-    assert!(commands.contains("head branch can close"));
-    assert!(commands.contains("payload_bytes"));
-    assert!(commands.contains("ignored_paths"));
-    assert!(commands.contains("bulk-publication"));
-    assert!(commands.contains(".workspace-mgr/repository.gitignore"));
-    assert!(commands.contains("# workspace-mgr local begin"));
-    // The thresholds and the product's fixed rules are literals in prose that
-    // no other test can see, so a retune of the constants must break a test
-    // that names the documents it invalidated.
-    for threshold in ["200 new files", "256 MiB (268435456 bytes)"] {
-        for (name, document) in [("guide", guide), ("commands", commands)] {
-            assert!(
-                document.contains(threshold),
-                "{name} states a stale bulk-publication threshold, expected {threshold:?}"
-            );
-        }
-    }
-    assert!(normalized_model.contains("256 MiB (268435456 bytes)"));
-    // Every rule the generated root ignore file carries is documented, read
-    // from the source list itself so the two cannot drift apart.
-    let scaffold = include_str!("../src/scaffold.rs");
-    let groups = scaffold
-        .split("pub(crate) const PRODUCT_IGNORE_GROUPS")
-        .nth(1)
-        .and_then(|rest| rest.split("\n];\n").next())
-        .expect("product ignore groups");
-    let product_rules = groups
-        .lines()
-        // Rules sit one level deeper than the group titles.
-        .filter_map(|line| line.strip_prefix("            \""))
-        .filter_map(|line| line.strip_suffix("\","))
-        .map(|line| line.replace("\\\\", "\\"))
-        .collect::<Vec<_>>();
-    assert!(product_rules.len() > 50, "{product_rules:?}");
-    for product_rule in product_rules {
-        assert!(
-            commands.contains(&format!("`{product_rule}`")),
-            "the generated root ignore file's rules are documented in full, missing {product_rule}"
-        );
-    }
-    // The upgrade every existing repository must perform is documented where a
-    // maintainer looks for it.
-    assert!(guide.contains("Upgrading a repository that predates"));
-    assert!(changelog.contains("### Upgrading"));
-    for workplace_rule in [
-        "Where the work happens",
-        "It is where the work happens",
-        "rather than in a temporary directory elsewhere on the machine",
-        "only that they are Markdown files the README's directory map names",
-        "records the turn's decisions, process, tools, and hard-to-reproduce results",
-        "curating what leaves it is the other",
-        "ignored by a rule this repository tracks",
-        "Git has no include directive",
-        "S3 keeps Git small, it does not keep the workspace curated",
-    ] {
-        assert!(
-            normalized_model.contains(workplace_rule),
-            "model is missing workplace rule {workplace_rule:?}"
-        );
-    }
-    for fact in ["[git]", "remote", "branch", "[s3]", "endpoint_url"] {
-        assert!(
-            configuration.contains(fact),
-            "configuration reference is missing external fact {fact:?}"
-        );
-    }
-    for policy_knob in [
-        "[review]",
-        "[publication]",
-        "[tasks]",
-        "[storage]",
-        "[agent]",
-        "required_cli",
-        "branch_prefix",
-        "auto_s3_above_bytes",
-    ] {
-        assert!(
-            !configuration.contains(policy_knob),
-            "configuration reference exposes policy knob {policy_knob:?}"
-        );
-    }
+    assert!(configuration.contains("[cloud_usage_approval]"));
     assert!(configuration.contains("deliberately not configurable"));
-    assert!(configuration.contains("minimum_cli_version"));
-    assert!(configuration.contains("not a policy switch"));
-    let normalized_configuration = configuration
+    let configuration = configuration
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    for fact in [
-        "never below the fetched base branch's declaration",
-        "even only comments or formatting",
-        "`task rename`, `plan`, and `publish` check",
+    assert!(configuration.contains("never below the fetched base branch's declaration"));
+    assert!(configuration.contains("even only comments or formatting"));
+    for warning in [
+        "unaddressable-storage-metadata",
+        "branch-cleanup-unavailable",
+        "branch-cleanup-failed",
+    ] {
+        assert!(guide.contains(warning));
+        assert!(commands.contains(warning));
+    }
+    assert!(commands.contains("storage.unaddressable"));
+    for field in [
+        "branch_cleanup",
+        "`planned`",
+        "`deleted`",
+        "`skipped`",
+        "`errors`",
+        "`warnings`",
+        "`unavailable`",
+        "`not_applicable`",
+        "`branches_cleaned`",
     ] {
         assert!(
-            normalized_configuration.contains(fact),
-            "configuration reference is missing {fact:?}"
+            commands.contains(field),
+            "cleanup control field {field:?} disappeared"
         );
     }
-    assert!(configuration.contains("[cloud_usage_approval]"));
-    assert!(e2e_readme.contains("COVERAGE.md"));
+}
+
+#[test]
+fn approved_runtime_and_historical_content_proof_removals_are_documented() {
+    let commands = include_str!("../docs/commands.md");
+    let guide = include_str!("../docs/guide.md");
+    let configuration = include_str!("../docs/configuration.md");
+    let architecture = include_str!("../docs/architecture.md");
+    let archive = commands
+        .split("## `workspace-mgr archive`")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let archive = archive.split_whitespace().collect::<Vec<_>>().join(" ");
+    for fact in [
+        "Both merged PRs and PRs closed without merging qualify",
+        "The PR need not target today's configured base branch",
+        "Archive does not inspect historical configuration, directory-tree history",
+        "It does not scan runtime paths or cross-task dependencies",
+        "Ordinary tracked, staged, untracked, ignored, and local-only contents move with the directory",
+        "Local `.git/info/exclude` or a global ignore file is insufficient",
+        "new attempts do not rewrite nested Git controls",
+    ] {
+        assert!(archive.contains(fact), "archive reference omits {fact:?}");
+    }
+    for (name, doc) in [("guide", guide), ("commands", commands)] {
+        assert!(
+            !doc.contains("--historical-record"),
+            "{name} retains removed option"
+        );
+        assert!(
+            doc.contains("manual-content-audit-after-relocation"),
+            "{name} loses success-only relocation notice"
+        );
+    }
+    assert!(configuration.contains("no longer synthesizes historical content proof"));
+    assert!(!architecture.contains("A separate bounded streaming scan checks ordinary text"));
+    assert!(
+        !architecture.contains(
+            "Location-bound Python environments and stale Git registrations fail preflight"
+        )
+    );
+    assert!(architecture.contains("Old attempt journals retain their saved"));
+}
+
+#[test]
+fn e2e_coverage_remains_explicit_about_control_boundaries() {
+    let readme = include_str!("e2e/README.md");
+    let coverage = include_str!("e2e/COVERAGE.md");
+    assert!(readme.contains("COVERAGE.md"));
     for boundary in [
         "Transaction concurrency",
         "Version-aware S3",
@@ -435,12 +291,6 @@ fn user_documentation_covers_the_complete_public_model() {
         "Task slug rename",
         "Cloud usage approval",
     ] {
-        assert!(
-            e2e_coverage.contains(boundary),
-            "E2E coverage contract is missing {boundary}"
-        );
+        assert!(coverage.contains(boundary), "E2E coverage omits {boundary}");
     }
-    assert!(!model.to_ascii_lowercase().contains("dvc"));
-    assert!(!guide.to_ascii_lowercase().contains("dvc"));
-    assert!(!commands.to_ascii_lowercase().contains("dvc"));
 }

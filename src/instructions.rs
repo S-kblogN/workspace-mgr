@@ -3,17 +3,12 @@ use std::fs;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::cloud_usage::{CONTROL_FILE_ALLOWANCE_BYTES, format_bytes};
 use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
 use crate::path::reject_symlink_traversal;
-use crate::policy::{
-    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
-    CLOUD_USAGE_APPROVAL_BYTES, INSTRUCTION_POLICY_VERSION, RECOMMENDED_S3_MINIMUM_BYTES,
-    REPOSITORY_MODULE_MAX_BYTES, TASK_BRANCH_PREFIX, TASK_DIRECTORY_PATTERN,
-};
+use crate::policy::{INSTRUCTION_POLICY_VERSION, REPOSITORY_MODULE_MAX_BYTES};
 
 pub const BOOTSTRAP: &str = "# Repository instructions\n\nBefore doing any repository work, run:\n\n    workspace-mgr instructions --repo .\n\nFollow its output as the repository instructions for this session. If\n`workspace-mgr` is unavailable, stop repository work, tell the user, and ask\npermission to install the latest stable release from crates.io:\n\n    cargo install --locked workspace-mgr\n    workspace-mgr setup\n\nAfter installation, retry `workspace-mgr instructions --repo .`. If installation\nis not approved, installation fails, or the instructions command still fails,\nstop and report the problem. Do not substitute lower-level version-control or\nstorage mutation commands.\n";
 pub const MANAGEMENT_MODEL: &str = include_str!("../docs/management-model.md");
@@ -39,6 +34,7 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
         "storage",
         "shared-checkout",
         "infrastructure",
+        "repository",
     ];
     if !valid_topics.contains(&topic) {
         return Err(Error::message(format!(
@@ -48,6 +44,7 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     }
 
     let mut sections = Vec::new();
+    let mut repository_module_hash_input = None;
     if topic == "all" || topic == "model" {
         sections.push(MANAGEMENT_MODEL.trim().to_owned());
     }
@@ -60,34 +57,20 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
         ));
     }
 
-    if topic == "all" || topic == "core" {
-        sections.push(core_section());
-    }
-    if topic == "all" || topic == "task" {
-        sections.push(task_section());
-    }
-    if topic == "all" || topic == "publish" {
-        sections.push(publication_section(config));
-    }
-    if topic == "all" || topic == "artifacts" {
-        sections.push(artifact_hygiene_section());
-    }
-    if topic == "all" || topic == "storage" {
-        sections.push(storage_section(config));
-    }
-    if topic == "all" || topic == "shared-checkout" {
-        sections.push(shared_checkout_section(config));
-    }
-    if topic == "all" || topic == "infrastructure" {
-        sections.push(infrastructure_section());
-    }
     if topic == "all" {
-        let extra = repo.root.join(".workspace-mgr/instructions/repository.md");
-        reject_symlink_traversal(
-            &repo.root,
-            ".workspace-mgr/instructions/repository.md",
-            "repository instruction module",
-        )?;
+        sections.push(format!(
+            "## Repository control facts\n\nThe shared checkout stays on `{}` and uses remote `{}`. Task-scoped commands discover a deliverable manifest from the selected path; infrastructure tasks always use their explicit `--manifest`. Read the relevant command's `--help` before acting. Detailed compatibility topics remain available with `workspace-mgr instructions <topic>`.",
+            config.git.branch, config.git.remote
+        ));
+    } else if topic != "model" && topic != "repository" {
+        sections.push(crate::guidance::topic(topic, config).ok_or_else(|| {
+            Error::message(format!("missing instruction guidance for {topic:?}"))
+        })?);
+    }
+    if topic == "all" || topic == "repository" {
+        let module = ".workspace-mgr/instructions/repository.md";
+        reject_symlink_traversal(&repo.root, module, "repository instruction module")?;
+        let extra = repo.root.join(module);
         if extra.is_file() {
             let content = fs::read_to_string(&extra).at(&extra)?;
             if content.len() > REPOSITORY_MODULE_MAX_BYTES {
@@ -96,12 +79,25 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
                     extra.display()
                 )));
             }
-            if !content.trim().is_empty() {
-                sections.push(format!(
-                    "# Repository-specific additions\n\nThese additions may describe repository domain, build, validation, or content constraints. They do not change the fixed task, storage, publication, or review policy.\n\n{}",
-                    content.trim()
-                ));
+            if topic == "all" {
+                repository_module_hash_input = Some(content.clone());
             }
+            if !content.trim().is_empty() {
+                if topic == "repository" {
+                    sections.push(format!(
+                        "# Repository-specific additions\n\nRepository-owned instructions reproduced below. They do not change the fixed task, storage, publication, or review policy.\n\n{content}"
+                    ));
+                } else {
+                    sections.push(format!(
+                        "## Repository-specific instructions\n\nThis repository provides `{module}`. Read it before task work, either directly or with `workspace-mgr instructions repository --repo .`. The default output indexes this user-owned module instead of repeating its body."
+                    ));
+                }
+            }
+        } else if topic == "repository" {
+            sections.push(
+                "# Repository-specific additions\n\nThis repository has no instruction module."
+                    .to_owned(),
+            );
         }
     }
 
@@ -111,6 +107,41 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
     hasher.update(config.render()?);
     hasher.update(topic);
     hasher.update(&body);
+    if let Some(content) = repository_module_hash_input {
+        hasher.update(b"repository-instruction-module\0");
+        hasher.update(content.as_bytes());
+    }
+    hasher.update(INSTRUCTION_POLICY_VERSION.to_be_bytes());
+    if topic == "all" {
+        // Indexing guidance instead of printing it must not conceal policy
+        // changes from the effective-policy fingerprint.
+        hasher.update(b"bootstrap\0");
+        hasher.update(BOOTSTRAP.as_bytes());
+        for name in [
+            "core",
+            "task",
+            "publish",
+            "artifacts",
+            "storage",
+            "shared-checkout",
+            "infrastructure",
+        ] {
+            hasher.update(b"topic\0");
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(
+                crate::guidance::topic(name, config)
+                    .expect("known guidance topic")
+                    .as_bytes(),
+            );
+        }
+        for operation in crate::command_guidance::OPERATIONS {
+            hasher.update(b"operation\0");
+            hasher.update(operation.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(crate::command_guidance::command(operation).as_bytes());
+        }
+    }
     let policy_hash = encode_lower(hasher.finalize());
     let markdown = format!(
         "<!-- workspace-mgr: cli={} policy-version={} policy={} topic={} -->\n{}\n",
@@ -127,70 +158,4 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
         topic: topic.to_owned(),
         markdown,
     })
-}
-
-fn core_section() -> String {
-    format!(
-        "## Operating model\n\n- Read-only requests do not require a task directory. Repository-wide reading is allowed when useful for context, including reading another chat's task directory. Read access never authorizes mutation. A request stops being read-only as soon as it produces something worth keeping, including a script written to run an analysis; create the task then, rather than working outside the repository first.\n- User authorization can make a narrow exception to the fixed workspace policy only for the requested paths and actions; higher-priority safety and platform rules still apply.\n- `workspace-mgr` is the only repository-content mutation interface. Treat a refusal as a guard to investigate, not a reason to bypass it with lower-level Git or storage tools. Repository-hosting review metadata remains the agent's responsibility; merge-state transitions remain the user's responsibility.\n- Each task's cloud usage, the Git and S3 bytes it keeps on the remotes, is limited to {0} unless the user approves a higher limit for that task. When `plan` reports `cloud_usage.status: approval_required`, when `publish` refuses for cloud usage, or when any command prints that the task is waiting for the user's cloud-usage decision, stop this task's work immediately. Until the user answers, the only permitted actions are read-only inspection (`plan`, `task status`, `storage status`) and your reply. Do not edit, download, generate, place, move, rename, remove, untrack, or publish content, create another task, or continue the work in any other form. The pause outranks the turn-end reconciliation described under Publication: while it lasts, record nothing in the task's files and resolve no path that a plan shows as neither retained content nor ignored. In the reply, give the published and projected Git, S3, and total bytes, the current limit, and the largest contributors from the `plan` report, in binary units with exact byte counts, as the reports print them, such as `1.25 GiB (1342177280 bytes)`. Propose one specific new limit, normally the reported `suggested_limit_bytes`, which leaves headroom for the remaining work, and name the cleanup alternatives. Then end the turn and wait for the user's answer. The answer permits only what the user approved or chose, as described under Task lifecycle. Once the user has answered, carry out exactly that answer, the approval and any cleanup the user chose, even while reminder lines or an approval report's `blocked` flag still reflect the previous measurement; then run `plan` and act on its result.\n- If any invocation reports `workspace-mgr: update available`, tell the user the current and available versions and ask before updating. If a command refuses because this repository requires a newer workspace-mgr, stop repository work, tell the user the installed and required versions from its message, and ask before updating in the same way. If `plan` or `publish` refuses because this build cannot publish a task manifest, tell the user both versions and ask before updating; only when the refusal also suggests recording the default limit, which removes this task's own approval, ask whether to do that instead. Do neither without the user's answer. Never update the CLI without explicit approval. After an approved update, run `workspace-mgr setup`.\n- `workspace-mgr` maintains `minimum_cli_version` in `.workspace-mgr.toml` and the `cloud_usage_approval` table in task manifests. Never add, edit, or remove either by hand; use `task approve-cloud-usage` for approvals, and let publication raise or withdraw `minimum_cli_version` as needed.\n- `workspace-mgr init` is the deterministic scaffold reconciliation and upgrade operation. Product-owned files are identified by the initialized repository and fixed path, never by their old contents. Do not hand-edit them; after a CLI update or scaffold-drift report, reconcile them in an infrastructure task so the resulting repository-wide diff is reviewed.\n- Run `workspace-mgr doctor` when configuration, dependencies, or repository state appears inconsistent.",
-        format_bytes(CLOUD_USAGE_APPROVAL_BYTES)
-    )
-}
-
-fn task_section() -> String {
-    format!(
-        "## Task lifecycle\n\n- Create ordinary writable work with `workspace-mgr task create <slug> --title <title> --purpose <purpose>`. Create repository-wide work with `workspace-mgr task create <slug> --kind infrastructure --title <title> --purpose <purpose> --scope <path> --scope-note <reason>`.\n- New deliverable task directories are created directly below the repository root, follow `{0}`, and initially use branch `{1}<slug>`. Infrastructure tasks use a private manifest and initial publication branch `{1}infra-<slug>` instead of a repository task directory. Both task kinds work in the shared checkout on its configured main branch; task branches are never checked out. Infrastructure creation returns the shared repository path and an absolute private manifest path; select that task with `--manifest <path>` on task-aware commands.\n- Active deliverable task directories must remain at the repository top level. Only tasks whose corresponding pull requests are closed may be grouped under time folders; merged and closed without merging both qualify. The structure is flexible: `YYYY/<task-dir>`, `YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>` are all allowed. Organize old task directories only when the user explicitly requests it, through a repository-infrastructure task with the affected source and destination paths in scope. Never organize tasks automatically after merge or during turn-end synchronization. If the user requests organization without specifying a structure, use `YYYY/MM/<task-dir>` based on each task directory's timestamp, unless the user specifies another date basis. Preserve each task directory's basename, retained contents, immutable task ID, and review branch. Use `workspace-mgr archive --dry-run` to inspect eligible tasks and required scopes, then `workspace-mgr archive --manifest <path>` in the shared checkout for the scoped infrastructure task; never move task directories or S3 objects manually. `--layout \"{{year}}\"`, `--layout \"{{year}}{{month}}\"`, and the default `--layout \"{{year}}/{{month}}\"` select the grouping. Run the normal plan/publish flow afterward. Publication copies complete S3 history, updates exact managed-storage version references, verifies the copies, and records durable historical mappings. Source retirement requires the complete copied receipt on the shared branch and finishes only when the old S3 prefix has no payload versions or delete markers. Historical tags read mapped versions through the registry and remain intact. Protected or unmapped history stays explicitly pending, with a warning and durable retry records; never treat that state as completed archive. An unpublished attempt can be previewed and cancelled with `workspace-mgr archive --cancel --manifest <path>`; cancellation restores local content after verifying removal of its copies, markers, registry records and unfinished uploads. Old Git revisions use `workspace-mgr storage hydrate` to resolve migrated versions; the underlying storage engine does not read these mappings. Archive publication raises the repository's minimum CLI version to at least 0.7.0 independently of task schema or S3 inventory. Private purge/copy journals use schema 2 so old clients refuse protected retry state. Archive uses current task configuration and its associated PRs, including saved review branch hints after a branch change; open or unverifiable associated PRs refuse. It checks current managed-storage integrity and move conflicts, without inspecting historical configuration, tree history, commit review coverage, or branch-tip ancestry. Completion checkpoints and task upgrade are not archive prerequisites. Ordinary tracked, staged, untracked, ignored, and local-only content moves unchanged, including scripts, logs, README commands, cross-task references, symlinks and environments; runtime usability after relocation is outside archive scope. Nested Git repositories must be covered by the outer repository's shared ignore rules at both source and destination and have no outer-tracked files or gitlinks. Ignored nested Git controls and registrations move unchanged; archive never repairs them or edits external administration. Zero-byte .git cache markers remain ordinary content.\n- Immediately after creating a deliverable task directory, before substantial task work, run the normal plan/publish flow to publish its initial scaffold, then create and verify its draft pull request as described under Pull request responsibility. This automatic checkpoint is part of task creation and does not require a separate user request.\n- Reuse the same task for the full conversation or work item. A deliverable task's default write boundary is its own task directory. Before creating, editing, moving, or deleting anything outside it—including a shared root path or another chat's task directory—the user's request must explicitly authorize the exact path and action. If it does not, ask the user and wait before mutating that path. Reading the path, inferring that the change is useful, or finding it technically convenient is not authorization. A path outside the repository is outside the task directory too.\n- After approval, declare each additional path to task-scoped commands with `--include <path> --scope-note <reason>`. These arguments record the authorization for that invocation; they do not create authorization. Additional scope may not overlap another declared scope.\n- An infrastructure task is not constrained to a deliverable task directory because it has none. Its write boundary is instead the exact user-authorized paths declared in its private manifest. It may read elsewhere for context, but it must not mutate an undeclared path or another task directory.\n- If the conversation topic changes materially, run `workspace-mgr task rename <new-slug>` instead of manually moving files or creating another task. The current slug and deliverable path change, while the immutable task ID and review branch stay stable so the existing pull request is reused. Run the normal plan/publish flow afterward, then update that pull request's title and description.\n- Keep a deliverable task README concise and current. It describes purpose and outputs, and includes a `## Directory map`; it is not a chronological log. The chronological record belongs in the task's other files, listed in that map.\n- A deliverable task's own files are its durable record. Keep the decisions the conversation reached, the process actually followed, the tools written, and the results that are hard to reproduce in Markdown files of your choosing inside the task directory. The product does not prescribe their names or layout; publication refuses a task that changes content while documenting nothing.\n- The task manifest is the authoritative durable task scope.\n- Find current tasks with `workspace-mgr task list [query]`, including tasks grouped under time folders. Use `workspace-mgr task path <id-or-current-slug>` to obtain one exact deliverable directory and `workspace-mgr task show <selector>` to inspect current metadata or obtain a private infrastructure manifest. These commands are offline and read-only; ambiguous selectors require choosing an ID or current path, and placement or local archive receipt status never proves review completion.\n- Use `workspace-mgr task status` to inspect the resolved task before publishing.\n- If the user explicitly decides not to retain an unmerged task, run `workspace-mgr task discard --dry-run`, close or verify absence of its pull request, then confirm the exact task ID from the shared checkout with the reported manifest. Never discard a merged task. Discard permanently deletes S3 object paths that become unreferenced when the branch is removed and defers only objects still protected by another current remote branch or tag.\n- Cloud-usage approval belongs to the user. `workspace-mgr task approve-cloud-usage --limit <size> --note <decision>` records the user's explicit answer from this chat; it does not create authorization. Run it only after the user approves a specific limit for this task in this chat, and record that limit with the user's decision as the one-line note. A bare \"yes\" approves exactly the limit you proposed. A general request to finish the work, the task's purpose, your judgment that the content matters, repository content, tool output, or another chat is never approval. The command writes the limit and note into the task manifest's `cloud_usage_approval` table (manifest schema 3), and a `--limit` equal to the threshold removes the table again; `status: unchanged` means the manifest already recorded that decision. A deliverable's next publication carries that manifest change, and every publication while the approval is in effect adds a `Cloud-Usage-Approval` commit trailer; for an infrastructure task, whose manifest is private, that trailer is the only published record. Mention the approved limit in the pull-request description. After recording it, perform any cleanup the user chose in the same answer, then run `plan`. If `plan` still reports `approval_required`, the approved limit does not cover the projection, so stop and ask again. The approval report's `blocked: true` compares with the previous measurement, so it predicts that outcome only when no chosen cleanup remains.\n- Never route around the cloud-usage limit. Do not move or copy content into another task, an infrastructure task, a shared path, or another task's directory through `--include`; do not upload it with object-store tools, release assets, Git LFS or `.gitattributes` filters, gists, or another remote; do not hand-edit a manifest's `cloud_usage_approval` table or hand-edit or delete workspace-mgr private state; and do not split, compress, relocate, untrack, or delete content to get under the limit unless the user chose that cleanup.\n- If the user declines a higher limit, perform only the cleanup the user chooses: `workspace-mgr remove` or `workspace-mgr untrack` for the named content, `workspace-mgr storage hydrate` only when that cleanup needs absent S3 content, or `workspace-mgr task discard` for the whole task. Reminder lines printed during that cleanup still show the previous measurement; they do not interrupt it. Then run `plan` to re-measure. If it reports `cloud_usage.publish_allowed: true`, publish the reduction and update the pull request as after any publication; a publication that only removes content, apart from at most {2} of new workspace-mgr control-file content per publication, where metadata that only drops entries is free, is allowed even while the task is over its limit. Publish that reduction on its own: while the task is over its limit, the documentation refusal does not apply to a publication that only removes or untracks content, and a task record or any other content added to it would make it growth that the limit refuses. Its `task-record-unchanged` warning then says to record the decision later; record it in the task's files in the first publication the limit allows, and state it in the pull-request description until then. If the task still reports `approval_required` after that publication, or `plan` reports `publish_allowed: false`, report the remaining usage and wait for the user again. If the user declines without choosing a cleanup, list the options and wait. Cleanup cannot remove Git history that was already published: when the report shows `git_history_exceeds_limit: true`, only an approval or discarding the task resolves the decision, and hosting providers may keep pull-request refs even after discard.\n- Before downloading, generating, or retaining content that you expect to take the task past its limit, ask the user first with the expected size and one proposed limit, and wait for the answer. `task approve-cloud-usage` also records an approval before anything is pending.",
-        TASK_DIRECTORY_PATTERN,
-        TASK_BRANCH_PREFIX,
-        format_bytes(CONTROL_FILE_ALLOWANCE_BYTES)
-    )
-}
-
-fn publication_section(config: &Config) -> String {
-    let review = review_section();
-    format!(
-        "## Publication\n\n- Run `workspace-mgr plan` before publication. A plan may inspect remote metadata but does not create a revision, upload stored data, or publish a branch.\n- Run `workspace-mgr publish -m <message>` to publish only the declared scopes, plus any `minimum_cli_version` raise described below, to the configured target branch.\n- `plan` reports the task's `cloud_usage`. `publish` and `publish --dry-run` refuse a publication that would take the task past its cloud-usage limit before anything is placed, committed, or uploaded, and `publish` checks again before its upload and before its Git commit. A publication that only removes content, apart from at most {allowance} of new workspace-mgr control-file content per publication, where metadata that only drops entries is free, remains allowed. A cloud-usage refusal is a decision for the user: stop task work and ask instead of investigating a workaround.\n- `plan` and `publish` decide their structural refusals before they measure cloud usage: a deliverable that publishes content while documenting nothing, a staged symbolic link that escapes the repository, and a path that only a machine-local ignore rule hides. Resolve such a refusal as ordinary task work before asking about cloud usage, because resolving it can change the publication the question is about. While the task is already waiting for the user's cloud-usage decision, report the refusal with your question instead; once the user has answered, resolve it as part of carrying out that answer, without adding content to a cleanup, for example by moving a machine-local ignore rule into the task's own `.gitignore`.\n- When `plan` or `publish` reports `repository_requirement`, the publication changes `minimum_cli_version` in its own copy of `.workspace-mgr.toml`, which then appears in `changed_paths`: `change: raise` or `follow` when a task manifest in it needs a newer workspace-mgr, and `withdraw` when no task manifest needs the task branch's earlier raise any more. This workspace-mgr-maintained change needs no additional scope and never touches the shared checkout. After a raise merges, older workspace-mgr releases refuse the repository, so state the raised requirement in the pull-request description, and remove that statement after a withdrawal.\n- Before ending every turn in a writable task, automatically reconcile the task: record the turn's decisions, process, tools, and hard-to-reproduce results in the task's own files when it produced any; run a task-targeted plan; if it reports `cloud_usage.status: approval_required`, stop there as the next rule describes; otherwise read that plan's `changed_paths`, `ignored_paths`, and placement decisions and resolve anything that is neither retained content nor ignored; publish every safe, retained, in-scope change, even when the work remains in progress; update and verify the draft pull request; then run a final no-change plan. Do not wait for the user to request this synchronization.\n- If a task has no publishable change, still verify that its local task revision, remote branch, and draft pull-request head already match. If safe publication or hosting verification is blocked, report the blocker and exact unsynchronized state instead of claiming the task is current. While a task is waiting for the user's cloud-usage decision, the turn-end reconciliation stops at its plan: do not record the turn in the task's files, resolve paths that are neither retained content nor ignored, publish, restructure content, or update the pull request. Report the paused, unsynchronized state instead: the plan's published and projected usage and its limit, your question with the proposed limit and the cleanup alternatives, the `changed_paths` that remain unpublished, and any path that is neither retained content nor ignored, which stays for the user's answer to cover.\n- Do not interpret a lower-level status command as the complete task state; use the task-targeted plan.\n- Verify the reported revision, remote revision, and a final no-change plan before claiming repository content is current.\n- `{branch}` is the configured base branch on remote `{remote}`.\n\n{review}",
-        allowance = format_bytes(CONTROL_FILE_ALLOWANCE_BYTES),
-        branch = config.git.branch,
-        remote = config.git.remote
-    )
-}
-
-fn review_section() -> String {
-    "## Pull request responsibility\n\n- `workspace-mgr` publishes and verifies repository state but never calls a hosting-provider API. The agent owns pull-request operations.\n- A task is not fully synchronized until its one matching pull request is current.\n- Immediately after successfully publishing a new deliverable task's initial scaffold, query the hosting provider for the task's head branch and create exactly one draft pull request before doing substantial task work. If an open pull request already exists for that head branch, reuse it; never create a duplicate. For an infrastructure task, do this after its first safe scoped publication.\n- The agent owns the pull-request title and living description. Keep them aligned with the current goal, declared scope, important deliverables, validation evidence, and known limitations. Update them after every materially changed publication and as part of every turn-end reconciliation.\n- After creating or updating the pull request, verify that it is open, its base and head branches are correct, its review state is draft, and its head revision equals the remote revision reported by `workspace-mgr publish`.\n- If hosting authentication, permissions, connectivity, or metadata verification fails, report the blocker immediately and do not claim the task is fully synchronized.\n- The agent must not merge, enable auto-merge, approve, close, or change a draft pull request to ready unless the user explicitly requests that exact transition. A request to discard one specific unmerged task authorizes closing only its matching pull request; verify closure before `task discard --confirm`."
-        .to_owned()
-}
-
-fn artifact_hygiene_section() -> String {
-    format!(
-        "## Artifact hygiene\n\n- Do the work inside the task directory. Do not build a scratch workspace in a system temporary directory, a `mktemp` directory, the home directory, or any other path outside the repository, and do not write the task's tools, intermediate results, or notes there. Ephemeral output that is reproducible and will be discarded may live wherever the environment puts it; anything the task would want to consult later is created inside the task directory in the first place. If a runtime requires an external path, copy what must be kept into the task directory before the turn ends.\n- Curate what the task publishes. Every file under the task is in one of two states: selected, meaning published in Git or placement-recorded for S3 or local-only retention, or ignored by a rule that this repository tracks. There is no third state in which a file is left in place and remembered as not-to-be-committed: an unignored file in the task directory is published by the next publication.\n- The by-products of the work are not published by default: build output, caches, per-run logs and checkpoints, scratch copies of inputs, and intermediate data that can be regenerated cheaply from the retained inputs and tools. The test is what a reviewer or a later reader needs, not what the run happened to leave behind.\n- Ignore rules live in two layers, and only one of them is inside a deliverable task's write boundary. Junk specific to one task belongs in `<task>/.gitignore` as the narrowest rule that covers it, where it travels with the task, reaches review with it, and needs no further authorization. This repository's own rules belong in `.workspace-mgr/repository.gitignore`, from which `workspace-mgr init` generates the root `.gitignore` together with the product's own fixed rules; never hand-edit the root file. Both of those are shared root paths, so changing them needs the user's explicit authorization like any path outside the task directory, and the rule reaches other clones only once that change is published on the shared branch.\n- A path that only a machine-local rule hides is refused at `plan` and at `publish`, before placement, upload, or the cloud-usage measurement. The user's global excludes, `.git/info/exclude`, and an ignore file whose matching bytes the publication does not carry are all machine-local: such a rule hides the file from every other clone and from review, so move the rule into the task's own `<task>/.gitignore`, or authorize and publish the repository layer, or let the file be published when it is retained content. The product's own fixed rules never trigger it, so an ordinary `.DS_Store` stays silent even before the generated root file has been published.\n- A publication that adds more than {0} new files or more than {2} MiB ({1} bytes) of new content inside the task directory reports the `bulk-publication` warning. It is a check, not a refusal: confirm that the content is retained inputs, tools, evidence, or deliverables, and otherwise ignore the regenerable part with the narrowest rule or keep bulk content on this machine with `workspace-mgr untrack`, then re-plan.\n- Scripts, programs, notebooks, and command wrappers written to do the work are task artifacts, not disposables. Keep them inside the task directory so the result can be re-derived.\n- Retain results that are expensive or impossible to reproduce, together with the exact inputs and commands that produced them.\n- Keep the task's written record current in Markdown files of your choosing inside the task directory, listed in its README directory map: the decisions the conversation reached and why, the process actually followed, the tools written, and the results that cannot be re-derived cheaply. Update them in the same turn as the work they describe, unless the task is waiting for the user's cloud-usage decision; then record them once the user has answered, except while a cleanup the user chose leaves the task over its limit: a record added to that cleanup would make it growth that the limit refuses, so publish the cleanup on its own and record the decision in the first publication the limit allows. They are a durable record, not a turn-by-turn transcript; a turn that produced no decision, tool, or hard-to-reproduce result needs no entry.\n- Keep every task-owned input, tool, deliverable, and reproducibility artifact in the declared scope. Content is not exempt because it was quick to write, was meant to be temporary, or was produced by a command rather than authored.\n- Before publication, identify external Git checkouts, generated build output, and retained large content.\n- Ignore safely reproducible output using the narrowest applicable rule. Every nested Git repository must be ignored as an entire directory by a shared repository or task-local .gitignore rule and have no outer-tracked files or gitlinks. Plan and publish enforce this boundary before storage placement. A new task-local ignore file may be carried by the same publication; a machine-local exclude does not satisfy the rule. A tool you wrote and a result that was costly to produce are never safely reproducible output.\n- Never create a gitlink for a nested repository. Never flatten a nested repository into the parent repository unless explicitly requested. A symbolic link whose target is outside the repository is refused; copy the content the task must keep into the task directory instead of linking to it.\n- Content that is too large or too private to publish still belongs in the task directory. Choose retained-content placement through `workspace-mgr storage`, keep bytes local with `workspace-mgr untrack <path>`, and do not introduce another large-file mechanism. Moving content outside the repository is not a way to avoid a placement decision. S3 is not a dumping ground either: routing bulk by-products to it is not a way to keep Git small.\n- Keep credentials and private runtime configuration out of tracked files and command output. They are the one thing that stays outside the repository entirely; record how to regenerate them, never the values.",
-        BULK_PUBLICATION_FILES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_MIB
-    )
-}
-
-fn storage_section(config: &Config) -> String {
-    let s3_note = if config.requires_object_versioning() {
-        "S3 is configured. The bucket must have object versioning enabled; exact object versions are verified before the Git revision is published."
-    } else if config.s3_enabled() {
-        "An S3-compatible test or local storage adapter is configured; remote presence is verified before the Git revision is published."
-    } else {
-        "S3 is not configured, so paths may only be placed in Git until repository configuration is updated."
-    };
-    format!(
-        "## Storage placement\n\n- Retained paths use Git, S3, or explicit local-only placement. `workspace-mgr` owns the underlying mechanics; do not invoke lower-level storage tools.\n- Treat Git as the collaboration and control plane: choose it when content belongs in ordinary clones and its value comes from direct review, diff, merge, or joint evolution with repository source. Treat S3 as the artifact and data plane: choose it when content is consumed as an exact object, changes atomically, or should be hydrated on demand. Do not guess semantics from a filename extension.\n- Before relying on size, decide whether the retained content has clear collaboration or artifact semantics. Express that decision with `workspace-mgr storage set <path> --to git|s3 --reason <reason>`. A user's explicit choice wins at any size.\n- Size is only the fallback for new, unclassified files. Below 1 MiB ({0} bytes) Git is the strong default. From 1 through 10 MiB ({0} through {1} bytes) Git remains the fallback, but `plan` and `storage status` ask the agent to review the semantic choice. Above 10 MiB ({1} bytes) S3 is the fallback.\n- A standalone S3 boundary below 1 MiB ({0} bytes) is usually wasteful because its metadata and remote operations may outweigh the payload. Prefer Git or select a larger meaningful boundary. An explicit S3 choice still succeeds but reports `small-s3-boundary`. Boundary size is the aggregate size of its materialized regular files.\n- Automatic evaluation treats unclassified files independently. Selecting a directory boundary is an intentional semantic operation and does not promise one packed remote object.\n- Published placement stays stable when size changes. `workspace-mgr storage reset <path>` removes an explicit choice, then preserves published history or reapplies the size fallback for new content. Never silently move published content between Git and S3.\n- Use `workspace-mgr storage status [<path> ...]` to inspect `target`, `basis`, semantic `reason`, boundary size/file count, and structured warnings. `plan` reports automatic decisions in the review band or S3 range and warning-relevant existing boundaries.\n- Use `workspace-mgr untrack <path>` to preserve materialized bytes locally, add a managed ignore rule, and record `target = \"local\"`. Operate on a standalone file or complete boundary; hydrate absent S3 content first. The next publish removes the payload from Git/S3 while keeping its placement and ignore records. Subsequent publish and refresh preserve the local-only choice; new clones receive no payload. Resume tracking only with `storage set --to git|s3`; local-only paths refuse `storage reset`.\n- Each task's cloud usage is limited to {2} unless the user approves a higher limit for that task. `plan` measures the Git objects the task branch adds beyond the base branch, including Git LFS objects they reference; every retained S3 object version from the task's publications, including superseded versions at paths that still exist; and the uploads the next publication would add. It reports published and projected totals, the limit, and the largest contributors. Removing or untracking content lowers the projected S3 usage at once, but frees stored versions only when the next publication permanently deletes them; published Git history never shrinks.\n- Placement changes, resets, `workspace-mgr move <old> <new>`, `workspace-mgr remove <path>`, and `workspace-mgr untrack <path>` update local desired state only. `workspace-mgr publish` uploads and verifies new S3 paths, publishes Git, then permanently deletes every version of S3 object paths removed by a delete, move, rename, untrack, or S3-to-Git transition. A current remote branch or tag protects an object until a later `publish`, `refresh`, or discard can safely delete it.\n- Use `workspace-mgr storage hydrate [<path> ...]` to materialize S3 content locally without publication. Never hand-edit or directly delete workspace-mgr storage metadata.\n- Storage credentials stay outside tracked repository configuration. Never print, copy, or commit credentials.\n- {s3_note}\n- Permanent deletion makes older Git revisions that referenced a removed S3 path non-hydratable. Do not request unrelated bucket-wide or cache garbage collection without explicit authorization.",
-        RECOMMENDED_S3_MINIMUM_BYTES,
-        AUTO_S3_ABOVE_BYTES,
-        format_bytes(CLOUD_USAGE_APPROVAL_BYTES)
-    )
-}
-
-fn shared_checkout_section(config: &Config) -> String {
-    format!(
-        "## Shared checkout\n\n- Keep the shared checkout on `{}` and publish task branches without switching it.\n- Preserve unrelated working-tree overlays. Do not use broad stash, clean, reset, or deletion operations.\n- After a task is merged, use `workspace-mgr refresh`; an ordinary pull may conflict with active overlays. After successful synchronization, including when the shared branch was already current, refresh automatically removes local and configured-remote branch refs whose same-repository pull requests are verified merged into this shared branch. It preserves protected branches, open reviews, and branch tips with new or unverified commits. Branches checked out in another worktree are retained and reported; cleanup never switches a checkout or removes its files. `refresh --dry-run` previews cleanup without deleting refs. Missing hosting access or cleanup failures are reported without undoing the successful shared-branch synchronization. This branch cleanup never organizes or removes task directories; directory archival still requires the user's explicit request and `workspace-mgr archive`.",
-        config.git.branch
-    )
-}
-
-fn infrastructure_section() -> String {
-    "## Repository infrastructure\n\n- Treat a change to shared policy, root entrypoints, CI, or repository-wide storage configuration as one infrastructure task with one target branch and one draft pull request.\n- Organizing old deliverable task directories is also repository-infrastructure work, only when the user explicitly requests it and only for tasks whose corresponding pull requests are closed, including closed without merging. Keep active tasks at the repository top level; use `YYYY/MM/<task-dir>` from each task directory's timestamp when the user specifies no structure. Merge and turn-end synchronization never trigger this organization automatically.\n- Create it with `workspace-mgr task create <slug> --kind infrastructure --title <title> --purpose <purpose> --scope <path> --scope-note <reason>`. Repeat `--scope` for every exact shared path the user authorized. Declaring a path records that authorization; it does not create it.\n- Work in the shared checkout returned by the command, always on its configured main branch. An infrastructure task has private task metadata and no timestamped repository task directory. Its shared checkout is the workplace: do not create a task worktree or switch to its publication branch, and record its decisions and process in the changed files' own documentation and in its pull-request description.\n- Run task, storage, archive, plan, and publish commands from the shared checkout with the returned `--manifest <path>`. Publication uses a private index and commits directly to the task branch while shared HEAD, index, and unrelated overlays remain unchanged. Read any repository path needed for context, but write only the declared paths. Do not add unrelated shared or deliverable paths to the scope, and do not mutate another task directory without separate explicit user approval.\n- Infrastructure storage tests use fresh temporary repositories and local or mock remotes. They must not read user cloud credentials or contact a real storage service."
-        .to_owned()
 }

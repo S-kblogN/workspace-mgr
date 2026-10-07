@@ -31,45 +31,59 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Verify the native storage engine and Git installation.
+    #[command(long_about = crate::command_guidance::command("setup"))]
     Setup(SetupArgs),
 
     /// Initialize or reconcile repository facts and managed scaffolding.
+    #[command(long_about = crate::command_guidance::command("init"))]
     Init(InitArgs),
 
     /// Print the shared workspace model and effective repository instructions.
+    #[command(long_about = crate::command_guidance::command("instructions"))]
     Instructions(InstructionsArgs),
 
     /// Diagnose dependencies, configuration, and repository state.
+    #[command(long_about = crate::command_guidance::command("doctor"))]
     Doctor(RepoArgs),
 
     /// Inspect repository configuration.
+    #[command(long_about = crate::command_guidance::command("config"))]
     Config(ConfigArgs),
 
     /// Manage task scaffolding and lifecycle.
+    #[command(long_about = crate::command_guidance::command("task"))]
     Task(TaskArgs),
 
     /// Preview a scoped repository transaction without publishing.
+    #[command(long_about = crate::command_guidance::command("plan"))]
     Plan(PlanArgs),
 
     /// Publish a scoped repository transaction.
+    #[command(long_about = crate::command_guidance::command("publish"))]
     Publish(PublishCommandArgs),
 
     /// Inspect or change whether content is stored in Git or S3.
+    #[command(long_about = crate::command_guidance::command("storage"))]
     Storage(StorageArgs),
 
     /// Move a path while preserving its storage placement.
+    #[command(long_about = crate::command_guidance::command("move"))]
     Move(MoveArgs),
 
-    /// Organize merged task directories in a reviewed infrastructure task.
+    /// Organize tasks with closed pull requests in an infrastructure task.
+    #[command(long_about = crate::command_guidance::command("archive"))]
     Archive(ArchiveArgs),
 
     /// Delete a path and permanently purge obsolete S3 versions after publication.
+    #[command(long_about = crate::command_guidance::command("remove"))]
     Remove(RemoveArgs),
 
     /// Keep content locally, ignore it, and remove it from Git/S3 after publication.
+    #[command(long_about = crate::command_guidance::command("untrack"))]
     Untrack(UntrackArgs),
 
     /// Safely update a shared checkout and hydrate incoming stored data.
+    #[command(long_about = crate::command_guidance::command("refresh"))]
     Refresh(RefreshArgs),
 }
 
@@ -108,7 +122,7 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct InstructionsArgs {
-    /// Optional topic: model, core, task, publish, artifacts, storage, shared-checkout, or infrastructure.
+    /// Optional topic: model, core, task, publish, artifacts, storage, shared-checkout, infrastructure, or repository.
     pub topic: Option<String>,
 
     #[arg(long, default_value = ".")]
@@ -124,6 +138,7 @@ pub struct ConfigArgs {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Print and validate the effective repository configuration.
+    #[command(long_about = crate::command_guidance::command("config show"))]
     Show(RepoArgs),
 }
 
@@ -136,24 +151,34 @@ pub struct TaskArgs {
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
     /// List current tasks, including grouped directories and legacy candidates.
+    #[command(long_about = crate::command_guidance::command("task list"))]
     List(TaskListArgs),
     /// Resolve an exact task ID, current name, slug, or path to its directory.
+    #[command(long_about = crate::command_guidance::command("task path"))]
     Path(TaskPathArgs),
     /// Show a task's current metadata, manifest, and declared scopes.
+    #[command(long_about = crate::command_guidance::command("task show"))]
     Show(TaskShowArgs),
     /// Create a deliverable directory or a private infrastructure manifest on the shared branch.
+    #[command(long_about = crate::command_guidance::command("task create"))]
     Create(TaskCreateArgs),
-    /// Adopt a reviewed legacy task that has no manifest; publish before archiving.
+    /// Attach current task metadata to a legacy directory with a reviewed PR.
+    #[command(long_about = crate::command_guidance::command("task adopt"))]
     Adopt(TaskAdoptArgs),
     /// Change a task's current slug while preserving its identity and review branch.
+    #[command(long_about = crate::command_guidance::command("task rename"))]
     Rename(TaskRenameArgs),
-    /// Upgrade task configuration and retain verified archive completion evidence.
+    /// Upgrade current task configuration without inspecting historical payloads.
+    #[command(long_about = crate::command_guidance::command("task upgrade"))]
     Upgrade(TaskUpgradeArgs),
     /// Inspect the resolved task scope and working changes.
+    #[command(long_about = crate::command_guidance::command("task status"))]
     Status(TaskStatusArgs),
     /// Permanently discard an unmerged task after its pull request is closed.
+    #[command(long_about = crate::command_guidance::command("task discard"))]
     Discard(TaskDiscardArgs),
     /// Record the user's explicit approval of a cloud-usage limit for this task.
+    #[command(long_about = crate::command_guidance::command("task approve-cloud-usage"))]
     ApproveCloudUsage(TaskApproveCloudUsageArgs),
 }
 
@@ -398,12 +423,16 @@ pub struct StorageArgs {
 #[derive(Debug, Subcommand)]
 pub enum StorageCommand {
     /// Show the effective Git/S3 placement of paths in the task scope.
+    #[command(long_about = crate::command_guidance::command("storage status"))]
     Status(StorageStatusArgs),
     /// Explicitly place paths in Git or S3. This changes local desired state only.
+    #[command(long_about = crate::command_guidance::command("storage set"))]
     Set(StorageSetArgs),
     /// Remove an explicit choice and reapply the repository's automatic policy.
+    #[command(long_about = crate::command_guidance::command("storage reset"))]
     Reset(StorageResetArgs),
     /// Materialize S3 content without publishing anything.
+    #[command(long_about = crate::command_guidance::command("storage hydrate"))]
     Hydrate(StorageHydrateArgs),
 }
 

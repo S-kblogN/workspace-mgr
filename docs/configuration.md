@@ -292,9 +292,9 @@ manifest stays private, so its approval is published only as the
 `Cloud-Usage-Approval` commit trailer and never raises the declaration.
 
 Schema 4 adds an optional `[archive_completion]` table for deliverable tasks.
-`task upgrade` backfills it from verified Git and hosting-provider evidence;
-archive retains this provenance when it rewrites the current task path. Publish
-an upgrade through a scoped infrastructure review and merge it before archive.
+Existing checkpoints remain readable and are preserved by current metadata
+operations; `task upgrade` no longer synthesizes historical content proof.
+Archive uses saved current branch associations as hints, not proof replay.
 Do not create or edit the evidence by hand. The table contains:
 
 | Fields | Meaning |
@@ -305,14 +305,11 @@ Do not create or edit the evidence by hand. The table contains:
 | `branches` | Verified review branches and the current canonical branch |
 | `reviews` | Immutable PR number/URL, branch, merge timestamp, merge commit and head commit facts |
 
-The record is a checkpoint, not a trusted completed flag. Archive verifies its
-binding and live PR facts again, checks retained refs for new or divergent work,
-and verifies directory changes from the checkpoint to the fetched base.
-Historical task configuration blobs are never read or parsed, and no old
-configuration format supplies paths or branches. Only the current known path
-and saved checkpoint path participate; unavailable or ambiguous provenance
-fails. Without a checkpoint, archive can bootstrap the same evidence at the
-known path. Current manifest loading remains strict and rejects unknown fields
-or unsupported schemas. Rename, approval changes and archive rewrites preserve
-the checkpoint; clearing an approval therefore does not remove the schema 4
-requirement. Publishing schema 4 raises `minimum_cli_version` to at least 0.7.0.
+The record is compatible saved control metadata, not a trusted completed flag.
+Archive queries live PR facts for current associated branches, without verifying
+historical directory-tree changes, branch ancestry or commit review coverage.
+Neither upgrade nor archive reads historical task configuration. Current
+manifest validation remains strict and rejects unknown fields or unsupported
+schemas. Rename, approval changes and archive preserve compatible checkpoint
+fields; clearing an approval therefore does not remove the schema 4 requirement.
+Publishing schema 4 raises `minimum_cli_version` to at least 0.7.0.
