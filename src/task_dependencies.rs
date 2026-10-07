@@ -1589,7 +1589,13 @@ mod tests {
             record.to_str().unwrap(),
             &format!("old input {B}/input.tsv\n"),
         );
-        validate(&fixture.root, &fixture.tasks, &[], &[record.clone()]).unwrap();
+        validate(
+            &fixture.root,
+            &fixture.tasks,
+            &[],
+            std::slice::from_ref(&record),
+        )
+        .unwrap();
         fixture.write(
             &format!("{A}/run.py"),
             "exec(Path('history.log').read_text())\n",
