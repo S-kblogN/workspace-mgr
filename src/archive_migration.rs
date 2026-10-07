@@ -15,6 +15,15 @@ use crate::s3_purge::ObjectVersion;
 
 pub const RECEIPT_NAME: &str = ".workspace-mgr-archive.json";
 
+/// Rust-owned review metadata is retained beside the transport mapping. Keep
+/// reconstruction and comparison in publish/cancel on the same field list.
+pub(crate) const RECEIPT_METADATA_FIELDS: [&str; 4] = [
+    "task_id",
+    "previous_receipt",
+    "completion_reviews",
+    "historical_records",
+];
+
 pub fn plan(repo: &GitRepo, config: &Config, source: &str, destination: &str) -> Result<Value> {
     if !config.s3_enabled() {
         return Ok(
@@ -174,7 +183,7 @@ pub fn prepare(
                 // Keep task identity and earlier receipts, which the transport
                 // intentionally does not interpret.
                 let mut next = copied;
-                for key in ["task_id", "previous_receipt", "completion_reviews"] {
+                for key in RECEIPT_METADATA_FIELDS {
                     if let Some(value) = receipt.get(key) {
                         next.as_object_mut()
                             .ok_or_else(|| Error::message("archive copy did not return an object"))?

@@ -400,6 +400,7 @@ repository-infrastructure task.
 ```text
 workspace-mgr archive [<task-path> ...]
   [--layout <template>] [--repo <path>] [--manifest <path>] [--dry-run]
+  [--historical-record <exact-repository-relative-file> ...]
 workspace-mgr archive [<source-or-destination> ...]
   --cancel --manifest <owning-infrastructure-manifest> [--dry-run]
 ```
@@ -446,15 +447,50 @@ from the shared branch, staged or untracked overlays, changed materialized S3
 payloads, and materialized local-only content that must first be preserved or
 returned to tracked storage.
 
-Preflight also scans ordinary UTF-8 text inside the task, including ignored
-scripts and README files, for literal absolute and repository-relative source
-paths. It reports matching files and lines (up to 200 detailed references per
-invocation, with a truncation notice) and refuses both preview and
-apply until those potential stale references are repaired. Binary payloads,
-Git controls handled by the verified relocation plan, and workspace-mgr task,
-receipt and storage-pointer controls are excluded. This is a literal scan;
-dynamically assembled paths, custom Git-config commands, and references outside the task still require a
-reproduction check. No ordinary content is automatically rewritten.
+Preflight scans ordinary UTF-8 text, including ignored scripts and README files,
+for literal absolute and repository-relative source paths. It also checks
+cross-task references throughout the repository against the entire proposed
+batch, including stationary tasks and already grouped task directories. It
+reports files and lines (up to 200 detailed references per scan, with a
+truncation notice) and refuses preview and apply when a dependency would break
+or its anchor cannot be verified. For example, a script using
+`Path(__file__).resolve().parents[1] / "<other-task>" / "input.tsv"` must be
+repaired if the tasks will reside in different months; moving only one end of
+the dependency also requires repair. No ordinary content is automatically
+rewritten. Binary payloads, verified Git controls, workspace-mgr metadata and
+storage pointers are excluded. Recognized outward dynamic path expressions
+are refused when they cannot be resolved; this static check does not execute
+arbitrary language expressions, so also run the reproduction commands.
+Links from stationary tasks to moved data are checked without following the
+repository traversal through symlinks. Known source files whose encoding
+cannot be checked refuse explicitly instead of being treated as binary data.
+Unsupported anchor reassignment or working-directory changes cannot establish
+a preserved dependency.
+
+Historical logs and previous execution reports can keep the paths they record.
+Inspect each exact file and confirm it as inert historical evidence with the
+repeatable `--historical-record <repository-relative-file>` option, in both
+preview and apply:
+
+```bash
+workspace-mgr archive <task-path> --dry-run \
+  --historical-record <task-path>/logs/previous-run.log
+workspace-mgr archive <task-path> --manifest "$task_manifest" \
+  --historical-record <task-path>/logs/previous-run.log
+```
+
+The confirmation covers that file's current bytes, not a directory, glob, or
+extension. `historical_records` in the preview and migration receipt records
+its path, SHA-256 digest, mode, and historical role. Files are retained without
+rewriting; content or permission changes during preflight invalidate the
+confirmation. Historical records elsewhere in the repository can also be
+confirmed without editing them. Scripts, executable files, shebangs, symlinks,
+Git hooks and repository control files cannot be confirmed this way. Recognized
+commands that execute or source an acknowledged record still refuse. Use this
+option only for records of previous events, never to suppress a live input,
+configuration, or command dependency.
+Reading an acknowledged log or JSON report as historical data is allowed;
+executing its contents requires resolving its operational role first.
 
 Prefer deriving inputs from the script's directory, for example
 `Path(__file__).resolve().parent / "data"` in Python, or

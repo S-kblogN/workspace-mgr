@@ -1748,7 +1748,7 @@ fn verify_coordination_with(
         public["status"] = receipt["status"].clone();
         let mut expected = receipt.clone();
         for value in [&mut public, &mut expected] {
-            for name in ["task_id", "previous_receipt", "completion_reviews"] {
+            for name in crate::archive_migration::RECEIPT_METADATA_FIELDS {
                 object_mut(value)?.remove(name);
             }
         }

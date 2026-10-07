@@ -17,6 +17,7 @@ pub fn validate(
     destination: &Path,
     repository_path: &str,
     git_controls: &[PathBuf],
+    historical_records: &[PathBuf],
 ) -> Result<()> {
     let canonical = source.canonicalize().at(source)?;
     let mut replacements = BTreeSet::from([
@@ -67,6 +68,9 @@ pub fn validate(
         if !entry.file_type().is_file()
             || control_file(entry.path())
             || git_controls.contains(entry.path())
+            || historical_records
+                .iter()
+                .any(|record| record == entry.path())
             || (!git_controls.is_empty()
                 && entry
                     .path()
@@ -82,6 +86,12 @@ pub fn validate(
         if sample.contains(&0)
             || std::str::from_utf8(sample).is_err_and(|error| error.error_len().is_some())
         {
+            if crate::historical_records::is_source_file(entry.path()) {
+                return Err(Error::message(format!(
+                    "cannot verify path dependencies in non-UTF-8 source file {}; convert this source to UTF-8 or explicitly repair its encoding before archive",
+                    entry.path().display()
+                )));
+            }
             continue;
         }
         let mut line = 1;
@@ -141,7 +151,7 @@ pub fn validate(
     if truncated {
         message.push_str("  Additional matching locations omitted after 200 references; repair these and repeat preview for the remaining locations.\n");
     }
-    message.push_str("Derive task-local inputs and commands from the script's own directory, or use paths relative to the task directory in README instructions. Review and publish tracked repairs, refresh, then rerun archive --dry-run. Local ignored scripts need the same repair. No file has been rewritten.");
+    message.push_str("Derive task-local inputs and commands from the script's own directory, or use paths relative to the task directory in README instructions. Review and publish tracked repairs, refresh, then rerun archive --dry-run. Local ignored scripts need the same repair. For an inert historical log or report, inspect the exact file and explicitly confirm --historical-record <repository-relative-file> to preserve its bytes unchanged. No file has been rewritten.");
     Err(Error::message(message))
 }
 
@@ -165,7 +175,7 @@ fn contains_path(text: &[u8], path: &[u8], text_boundary: bool, eof: bool) -> bo
     text.windows(path.len())
         .enumerate()
         .any(|(index, candidate)| {
-            candidate == path
+            candidate.eq_ignore_ascii_case(path)
                 && (if index == 0 {
                     text_boundary
                 } else {
@@ -206,7 +216,7 @@ mod tests {
             "# Run\npython 20260712-120000-task/train.py\n",
         )
         .unwrap();
-        let error = validate(&source, &destination, "20260712-120000-task", &[])
+        let error = validate(&source, &destination, "20260712-120000-task", &[], &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains("run.sh:2"), "{error}");
@@ -250,7 +260,7 @@ mod tests {
             [source.to_string_lossy().as_bytes(), &[0, 0xff]].concat(),
         )
         .unwrap();
-        validate(&source, &destination, "20260712-120000-task", &[]).unwrap();
+        validate(&source, &destination, "20260712-120000-task", &[], &[]).unwrap();
     }
 
     #[test]
@@ -259,7 +269,7 @@ mod tests {
         fs::create_dir(source.join(".cache")).unwrap();
         let text = format!("{} '{}/input'\n", " ".repeat(65_530), source.display());
         fs::write(source.join(".cache/local-script"), text).unwrap();
-        let error = validate(&source, &destination, "20260712-120000-task", &[])
+        let error = validate(&source, &destination, "20260712-120000-task", &[], &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains(".cache/local-script:1"), "{error}");
@@ -297,10 +307,10 @@ mod tests {
             format!("{prefix}{old}-backup/input\n"),
         )
         .unwrap();
-        validate(&source, &destination, old, &[]).unwrap();
+        validate(&source, &destination, old, &[], &[]).unwrap();
         fs::write(source.join("README.md"), format!("{prefix}{old}")).unwrap();
         assert!(
-            validate(&source, &destination, old, &[])
+            validate(&source, &destination, old, &[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("README.md:1")
@@ -319,7 +329,7 @@ mod tests {
         .unwrap();
         // The task ID inside this non-path token is also prefixed by a
         // component character so neither spelling is a standalone source path.
-        validate(&source, &destination, "no-repository-path", &[]).unwrap();
+        validate(&source, &destination, "no-repository-path", &[], &[]).unwrap();
     }
 
     #[test]
@@ -331,7 +341,7 @@ mod tests {
             format!("#!/bin/sh\ncd '{}'\n", source.display()),
         )
         .unwrap();
-        let error = validate(&source, &destination, "20260712-120000-task", &[])
+        let error = validate(&source, &destination, "20260712-120000-task", &[], &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains(".git/hooks/pre-commit:2"), "{error}");
@@ -345,7 +355,7 @@ mod tests {
             "20260712-120000-task/input\n".repeat(5_000),
         )
         .unwrap();
-        let error = validate(&source, &destination, "20260712-120000-task", &[])
+        let error = validate(&source, &destination, "20260712-120000-task", &[], &[])
             .unwrap_err()
             .to_string();
         assert!(

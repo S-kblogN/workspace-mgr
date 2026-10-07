@@ -8,10 +8,15 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use serde_json::{Value, json as value};
+use sha2::{Digest, Sha256};
 
 const DONE: &str = "20260712-120000-completed";
 const ACTIVE: &str = "20260712-120100-active";
 const DESTINATION: &str = "2026/07/20260712-120000-completed";
+const RELATED: &str = "20260812-120000-related";
+const RELATED_DESTINATION: &str = "2026/08/20260812-120000-related";
+const RELATED_SAME_MONTH: &str = "20260712-121000-related";
+const RELATED_SAME_MONTH_DESTINATION: &str = "2026/07/20260712-121000-related";
 const MANIFEST: &str = ".workspace-mgr-task.toml";
 const RECEIPT: &str = ".workspace-mgr-archive.json";
 
@@ -61,6 +66,58 @@ fn managed_fixture(active: bool) -> (GitFixture, String) {
     git(&fixture.seed, ["push", "origin", "main"]);
     fixture.clone_shared();
     (fixture, merged)
+}
+
+fn related_completed_fixture() -> (GitFixture, PathBuf) {
+    related_completed_fixture_for(RELATED)
+}
+
+fn related_completed_fixture_for(related: &str) -> (GitFixture, PathBuf) {
+    let (fixture, first_merge) = managed_fixture(false);
+    let first_head = oid(&fixture.remote, "refs/heads/codex/completed");
+    git(&fixture.seed, ["switch", "-c", "codex/related"]);
+    write_task(&fixture.seed, related, "related", false);
+    std::fs::write(fixture.seed.join(related).join("input.tsv"), "value\n17\n").unwrap();
+    git(&fixture.seed, ["add", related]);
+    git(&fixture.seed, ["commit", "-m", "Complete the related task"]);
+    let head = oid(&fixture.seed, "HEAD");
+    git(&fixture.seed, ["push", "origin", "codex/related"]);
+    git(&fixture.seed, ["switch", "main"]);
+    git(&fixture.seed, ["merge", "--squash", "codex/related"]);
+    git(&fixture.seed, ["commit", "-m", "Merge related task review"]);
+    let merged = oid(&fixture.seed, "HEAD");
+    git(&fixture.seed, ["push", "origin", "main"]);
+    git(&fixture.shared, ["pull", "--ff-only", "origin", "main"]);
+    let gh = write_gh(
+        &fixture,
+        &BTreeMap::from([
+            (
+                "codex/completed",
+                vec![pr(
+                    "MERGED",
+                    1,
+                    "codex/completed",
+                    &first_merge,
+                    &first_head,
+                )],
+            ),
+            (
+                "codex/related",
+                vec![pr("MERGED", 2, "codex/related", &merged, &head)],
+            ),
+        ]),
+    );
+    (fixture, gh)
+}
+
+fn ignore_fixture_paths(repo: &Path, paths: &[String]) {
+    let exclude = repo.join(".git/info/exclude");
+    let original = std::fs::read_to_string(&exclude).unwrap();
+    let rules = paths
+        .iter()
+        .map(|path| format!("/{path}\n"))
+        .collect::<String>();
+    std::fs::write(exclude, format!("{original}\n{rules}")).unwrap();
 }
 
 fn pr(state: &str, number: u64, branch: &str, merged: &str, head: &str) -> Value {
@@ -465,6 +522,595 @@ fn archive_and_cancel_preserve_ordinary_uv_cache_git_markers_and_ignored_bytes()
         original_manifest
     );
     assert!(!workplace.join(DESTINATION).exists());
+}
+
+#[test]
+fn archive_historical_records_require_explicit_acknowledgment_and_preserve_exact_bytes() {
+    let (fixture, merged) = managed_fixture(false);
+    let gh = fake_gh(&fixture, &merged, false);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let history_path = format!("{DONE}/logs/history.log");
+    let root_history_path = "import-history.json";
+    let history = format!(
+        "2026-07-12 completed run\nrecorded cwd: {}\nrecorded input: {DONE}/result.md\nretained output: 中文\n",
+        workplace.join(DONE).display(),
+    )
+    .into_bytes();
+    let root_history =
+        format!("{{\"past_task\":\"{DONE}\",\"status\":\"completed\"}}\n").into_bytes();
+    std::fs::create_dir(workplace.join(DONE).join("logs")).unwrap();
+    std::fs::write(workplace.join(&history_path), &history).unwrap();
+    std::fs::write(workplace.join(root_history_path), &root_history).unwrap();
+    std::fs::set_permissions(
+        workplace.join(&history_path),
+        std::fs::Permissions::from_mode(0o440),
+    )
+    .unwrap();
+    ignore_fixture_paths(
+        &workplace,
+        &[format!("{DONE}/logs/"), root_history_path.to_owned()],
+    );
+    let original_manifest = std::fs::read(workplace.join(DONE).join(MANIFEST)).unwrap();
+    for dry_run in [true, false] {
+        let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        rejected(&workplace, &gh, &args, "path references");
+        assert!(!workplace.join(DESTINATION).exists());
+        assert_eq!(
+            std::fs::read(workplace.join(&history_path)).unwrap(),
+            history
+        );
+    }
+    let mut final_records = Value::Null;
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--historical-record",
+            history_path.as_str(),
+            "--historical-record",
+            root_history_path,
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let report = json(&archive(&workplace, &gh, &args));
+        assert_eq!(
+            report["status"],
+            if dry_run { "dry_run" } else { "archived" }
+        );
+        let records = report["historical_records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        for (path, bytes) in [
+            (history_path.as_str(), &history),
+            (root_history_path, &root_history),
+        ] {
+            let record = records
+                .iter()
+                .find(|record| record["path"] == path)
+                .unwrap();
+            assert_eq!(record["role"], "historical-record");
+            let digest = Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(record["sha256"], digest);
+            assert!(record["unix_mode"].as_u64().is_some());
+        }
+        if dry_run {
+            assert!(!workplace.join(DESTINATION).exists());
+            assert_eq!(
+                std::fs::read(workplace.join(&history_path)).unwrap(),
+                history
+            );
+        } else {
+            final_records = report["historical_records"].clone();
+        }
+    }
+    let archived_history = workplace.join(DESTINATION).join("logs/history.log");
+    assert_eq!(std::fs::read(&archived_history).unwrap(), history);
+    assert_eq!(
+        std::fs::metadata(&archived_history)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o440
+    );
+    assert_eq!(
+        std::fs::read(workplace.join(root_history_path)).unwrap(),
+        root_history
+    );
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(workplace.join(DESTINATION).join(RECEIPT)).unwrap())
+            .unwrap();
+    assert_eq!(receipt["historical_records"], final_records);
+    let cancelled = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--cancel",
+        ],
+    ));
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(
+        std::fs::read(workplace.join(&history_path)).unwrap(),
+        history
+    );
+    assert_eq!(
+        std::fs::metadata(workplace.join(&history_path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o440
+    );
+    assert_eq!(
+        std::fs::read(workplace.join(root_history_path)).unwrap(),
+        root_history
+    );
+    assert_eq!(
+        std::fs::read(workplace.join(DONE).join(MANIFEST)).unwrap(),
+        original_manifest
+    );
+    assert!(!workplace.join(DESTINATION).exists());
+}
+
+#[test]
+fn archive_historical_acknowledgments_cannot_exempt_scripts_controls_or_invalid_paths() {
+    for case in [
+        "missing",
+        "directory",
+        "source",
+        "executable",
+        "shebang",
+        "manifest",
+        "git-ignore",
+        "uppercase-git-control",
+        "uppercase-workspace-control",
+        "git-hook",
+        "symlink",
+        "escape",
+    ] {
+        let (fixture, merged) = managed_fixture(false);
+        let gh = fake_gh(&fixture, &merged, false);
+        let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+        let source = workplace.join(DONE);
+        let cache = source.join(".cache");
+        std::fs::create_dir(&cache).unwrap();
+        ignore_fixture_paths(
+            &workplace,
+            &[format!("{DONE}/.cache/"), format!("{DONE}/.git/")],
+        );
+        let mut record = format!("{DONE}/.cache/history.log");
+        let contents = format!("historical cwd: {}\n", source.display());
+        match case {
+            "missing" => (),
+            "directory" => std::fs::create_dir(workplace.join(&record)).unwrap(),
+            "source" => {
+                record = format!("{DONE}/.cache/run.py");
+                std::fs::write(
+                    workplace.join(&record),
+                    format!("data = '{}/result.md'\n", source.display()),
+                )
+                .unwrap();
+            }
+            "executable" => {
+                std::fs::write(workplace.join(&record), &contents).unwrap();
+                std::fs::set_permissions(
+                    workplace.join(&record),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            "shebang" => std::fs::write(
+                workplace.join(&record),
+                format!("#!/bin/sh\ncat '{}/result.md'\n", source.display()),
+            )
+            .unwrap(),
+            "manifest" => record = format!("{DONE}/{MANIFEST}"),
+            "git-ignore" => record = ".gitignore".to_owned(),
+            "uppercase-git-control" | "uppercase-workspace-control" => {
+                use std::os::unix::fs::MetadataExt;
+                let original = if case == "uppercase-git-control" {
+                    ".gitignore"
+                } else {
+                    ".workspace-mgr.toml"
+                };
+                record = original.to_ascii_uppercase();
+                let alias = workplace.join(&record);
+                if alias.exists() {
+                    let original = std::fs::metadata(workplace.join(original)).unwrap();
+                    let alias = std::fs::metadata(&alias).unwrap();
+                    assert_eq!((alias.dev(), alias.ino()), (original.dev(), original.ino()));
+                } else {
+                    // Case-sensitive hosts exercise the same protected spelling;
+                    // macOS also verifies the real same-inode alias above.
+                    std::fs::write(&alias, &contents).unwrap();
+                }
+            }
+            "git-hook" => {
+                record = format!("{DONE}/.git/hooks/history.log");
+                std::fs::create_dir_all(source.join(".git/hooks")).unwrap();
+                std::fs::write(workplace.join(&record), &contents).unwrap();
+            }
+            "symlink" => {
+                let external = fixture.root.join("external-history.log");
+                std::fs::write(&external, &contents).unwrap();
+                std::os::unix::fs::symlink(&external, workplace.join(&record)).unwrap();
+            }
+            "escape" => {
+                std::fs::write(fixture.root.join("external-history.log"), &contents).unwrap();
+                record = "../external-history.log".to_owned();
+            }
+            _ => unreachable!(),
+        }
+        let before = std::fs::read(source.join(MANIFEST)).unwrap();
+        let index = git(&workplace, ["write-tree"]).stdout;
+        for dry_run in [true, false] {
+            let mut args = vec![
+                "archive",
+                DONE,
+                "--manifest",
+                manifest.to_str().unwrap(),
+                "--historical-record",
+                &record,
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let env = archive_environment(&gh);
+            let env = env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            let output = workspace_env_unchecked(&workplace, &args, &env);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "case {case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!workplace.join(DESTINATION).exists(), "case {case}");
+            assert!(!source.join(RECEIPT).exists(), "case {case}");
+            assert_eq!(
+                std::fs::read(source.join(MANIFEST)).unwrap(),
+                before,
+                "case {case}"
+            );
+            assert_eq!(git(&workplace, ["write-tree"]).stdout, index, "case {case}");
+        }
+    }
+}
+
+#[test]
+fn archive_cannot_acknowledge_a_historical_record_executed_through_a_script_variable() {
+    let (fixture, merged) = managed_fixture(false);
+    let gh = fake_gh(&fixture, &merged, false);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let source = workplace.join(DONE);
+    std::fs::create_dir(source.join(".cache")).unwrap();
+    let record_path = format!("{DONE}/.cache/history.log");
+    let record = format!(
+        "from pathlib import Path\nprint(Path('{}/result.md').read_text())\n",
+        source.display()
+    );
+    let script = "from pathlib import Path\nrecord = Path(__file__).parent / '.cache/history.log'\nexec(record.read_text())\n";
+    std::fs::write(workplace.join(&record_path), &record).unwrap();
+    std::fs::write(source.join("run.py"), script).unwrap();
+    ignore_fixture_paths(
+        &workplace,
+        &[format!("{DONE}/.cache/"), format!("{DONE}/run.py")],
+    );
+    let original = std::fs::read(source.join(MANIFEST)).unwrap();
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--historical-record",
+            &record_path,
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        rejected(&workplace, &gh, &args, "historical record");
+        assert_eq!(std::fs::read(source.join(MANIFEST)).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(workplace.join(&record_path)).unwrap(),
+            record
+        );
+        assert!(!workplace.join(DESTINATION).exists());
+        assert!(!source.join(RECEIPT).exists());
+    }
+}
+
+#[test]
+fn archive_checks_cross_task_dependencies_against_the_entire_move_graph() {
+    for (label, script, paths) in [
+        (
+            "pathlib sibling across months",
+            format!(
+                "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED}' / 'input.tsv'\n"
+            ),
+            vec![DONE, RELATED],
+        ),
+        (
+            "root-derived sibling across months",
+            format!(
+                "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\ninput_path = ROOT / '{RELATED}/input.tsv'\n"
+            ),
+            vec![DONE, RELATED],
+        ),
+        (
+            "relative sibling across months",
+            format!("from pathlib import Path\ninput_path = Path('../{RELATED}/input.tsv')\n"),
+            vec![DONE, RELATED],
+        ),
+        (
+            "moving owner with stationary dependency",
+            format!(
+                "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED}' / 'input.tsv'\n"
+            ),
+            vec![DONE],
+        ),
+        (
+            "stationary owner with moving dependency",
+            format!(
+                "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED}' / 'input.tsv'\n"
+            ),
+            vec![RELATED],
+        ),
+    ] {
+        let (fixture, gh) = related_completed_fixture();
+        let (workplace, manifest) =
+            organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
+        let script_path = workplace.join(DONE).join("run.py");
+        std::fs::write(&script_path, &script).unwrap();
+        ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
+        let manifests =
+            [DONE, RELATED].map(|path| std::fs::read(workplace.join(path).join(MANIFEST)).unwrap());
+        let index = git(&workplace, ["write-tree"]).stdout;
+        for dry_run in [true, false] {
+            let mut args = vec!["archive"];
+            args.extend(paths.iter().copied());
+            args.extend(["--manifest", manifest.to_str().unwrap()]);
+            if dry_run {
+                args.push("--dry-run");
+            }
+            rejected(&workplace, &gh, &args, "cross-task path dependencies");
+            for (path, before) in [DONE, RELATED].into_iter().zip(&manifests) {
+                assert_eq!(
+                    std::fs::read(workplace.join(path).join(MANIFEST)).unwrap(),
+                    *before,
+                    "{label}"
+                );
+                assert!(!workplace.join(path).join(RECEIPT).exists(), "{label}");
+            }
+            assert!(!workplace.join(DESTINATION).exists(), "{label}");
+            assert!(!workplace.join(RELATED_DESTINATION).exists(), "{label}");
+            assert_eq!(
+                std::fs::read_to_string(&script_path).unwrap(),
+                script,
+                "{label}"
+            );
+            assert_eq!(git(&workplace, ["write-tree"]).stdout, index, "{label}");
+        }
+    }
+}
+
+#[test]
+fn archive_preserves_stationary_task_symlink_dependencies_when_refusing_a_target_move() {
+    let (fixture, gh) = related_completed_fixture();
+    let (workplace, manifest) = organizer(&fixture, &[RELATED, RELATED_DESTINATION]);
+    let link_relative = format!("{DONE}/input-link");
+    let link = workplace.join(&link_relative);
+    let target = PathBuf::from(format!("../{RELATED}/input.tsv"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    ignore_fixture_paths(&workplace, &[link_relative]);
+    let original_index = git(&workplace, ["write-tree"]).stdout;
+    let original_manifests =
+        [DONE, RELATED].map(|path| std::fs::read(workplace.join(path).join(MANIFEST)).unwrap());
+    let input = std::fs::read(workplace.join(RELATED).join("input.tsv")).unwrap();
+    assert_eq!(std::fs::read(&link).unwrap(), input);
+    for dry_run in [true, false] {
+        let mut args = vec!["archive", RELATED, "--manifest", manifest.to_str().unwrap()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        rejected(&workplace, &gh, &args, "cross-task path dependencies");
+        for (path, original) in [DONE, RELATED].into_iter().zip(&original_manifests) {
+            assert!(workplace.join(path).is_dir());
+            assert_eq!(
+                std::fs::read(workplace.join(path).join(MANIFEST)).unwrap(),
+                *original
+            );
+            assert!(!workplace.join(path).join(RECEIPT).exists());
+        }
+        assert!(!workplace.join(DESTINATION).exists());
+        assert!(!workplace.join(RELATED_DESTINATION).exists());
+        assert_eq!(git(&workplace, ["write-tree"]).stdout, original_index);
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(std::fs::read(&link).unwrap(), input);
+        assert_eq!(
+            std::fs::read(workplace.join(RELATED).join("input.tsv")).unwrap(),
+            input
+        );
+    }
+}
+
+#[test]
+fn archive_batch_preserves_provable_file_relative_sibling_dependencies_in_the_same_month() {
+    let (fixture, gh) = related_completed_fixture_for(RELATED_SAME_MONTH);
+    let (workplace, manifest) = organizer(
+        &fixture,
+        &[
+            DONE,
+            DESTINATION,
+            RELATED_SAME_MONTH,
+            RELATED_SAME_MONTH_DESTINATION,
+        ],
+    );
+    let script = format!(
+        "from pathlib import Path\ninput_path = Path(__file__).resolve().parents[1] / '{RELATED_SAME_MONTH}' / 'input.tsv'\n",
+    );
+    std::fs::write(workplace.join(DONE).join("run.py"), &script).unwrap();
+    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "archive",
+            DONE,
+            RELATED_SAME_MONTH,
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let report = json(&archive(&workplace, &gh, &args));
+        assert_eq!(
+            report["status"],
+            if dry_run { "dry_run" } else { "archived" }
+        );
+        assert_eq!(report["tasks"].as_array().unwrap().len(), 2);
+    }
+    assert_eq!(
+        std::fs::read_to_string(workplace.join(DESTINATION).join("run.py")).unwrap(),
+        script,
+    );
+    let after_anchor = workplace
+        .join(DESTINATION)
+        .parent()
+        .unwrap()
+        .join(RELATED_SAME_MONTH)
+        .join("input.tsv");
+    assert_eq!(
+        std::fs::read_to_string(after_anchor).unwrap(),
+        "value\n17\n"
+    );
+}
+
+#[test]
+fn archive_does_not_reuse_a_file_relative_anchor_after_an_inline_reassignment() {
+    let (fixture, gh) = related_completed_fixture_for(RELATED_SAME_MONTH);
+    let (workplace, manifest) = organizer(
+        &fixture,
+        &[
+            DONE,
+            DESTINATION,
+            RELATED_SAME_MONTH,
+            RELATED_SAME_MONTH_DESTINATION,
+        ],
+    );
+    let script = format!(
+        "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\nif True: ROOT = Path('{}')\ninput_path = ROOT / '{RELATED_SAME_MONTH}' / 'input.tsv'\n",
+        workplace.display(),
+    );
+    std::fs::write(workplace.join(DONE).join("run.py"), &script).unwrap();
+    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "archive",
+            DONE,
+            RELATED_SAME_MONTH,
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        rejected(&workplace, &gh, &args, "cross-task path dependencies");
+        assert!(workplace.join(DONE).is_dir());
+        assert!(workplace.join(RELATED_SAME_MONTH).is_dir());
+        assert!(!workplace.join(DESTINATION).exists());
+        assert!(!workplace.join(RELATED_SAME_MONTH_DESTINATION).exists());
+        assert!(!workplace.join(DONE).join(RECEIPT).exists());
+        assert!(!workplace.join(RELATED_SAME_MONTH).join(RECEIPT).exists());
+        assert_eq!(
+            std::fs::read_to_string(workplace.join(DONE).join("run.py")).unwrap(),
+            script
+        );
+    }
+}
+
+#[test]
+fn archive_refuses_uncertain_dynamic_cross_task_paths_without_a_literal_task_basename() {
+    let (fixture, gh) = related_completed_fixture();
+    let (workplace, manifest) =
+        organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
+    let script = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\nTARGET = ''.join(['20260812', '-120000-', 'related'])\ninput_path = ROOT / TARGET / 'input.tsv'\n";
+    assert!(!script.contains(RELATED));
+    std::fs::write(workplace.join(DONE).join("run.py"), script).unwrap();
+    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
+    let index = git(&workplace, ["write-tree"]).stdout;
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "archive",
+            DONE,
+            RELATED,
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        rejected(&workplace, &gh, &args, "cross-task path dependencies");
+        assert!(workplace.join(DONE).is_dir());
+        assert!(workplace.join(RELATED).is_dir());
+        assert!(!workplace.join(DESTINATION).exists());
+        assert!(!workplace.join(RELATED_DESTINATION).exists());
+        assert!(!workplace.join(DONE).join(RECEIPT).exists());
+        assert!(!workplace.join(RELATED).join(RECEIPT).exists());
+        assert_eq!(git(&workplace, ["write-tree"]).stdout, index);
+    }
+}
+
+#[test]
+fn archive_batch_accepts_repaired_task_local_dependencies_without_rewriting_scripts() {
+    let (fixture, gh) = related_completed_fixture();
+    let (workplace, manifest) =
+        organizer(&fixture, &[DONE, DESTINATION, RELATED, RELATED_DESTINATION]);
+    let script =
+        "from pathlib import Path\ninput_path = Path(__file__).resolve().parent / 'result.md'\n";
+    std::fs::write(workplace.join(DONE).join("run.py"), script).unwrap();
+    ignore_fixture_paths(&workplace, &[format!("{DONE}/run.py")]);
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "archive",
+            DONE,
+            RELATED,
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let report = json(&archive(&workplace, &gh, &args));
+        assert_eq!(
+            report["status"],
+            if dry_run { "dry_run" } else { "archived" }
+        );
+        assert_eq!(report["tasks"].as_array().unwrap().len(), 2);
+    }
+    assert_eq!(
+        std::fs::read_to_string(workplace.join(DESTINATION).join("run.py")).unwrap(),
+        script
+    );
+    assert_eq!(
+        std::fs::read_to_string(workplace.join(RELATED_DESTINATION).join("input.tsv")).unwrap(),
+        "value\n17\n"
+    );
+    assert!(!workplace.join(DONE).exists());
+    assert!(!workplace.join(RELATED).exists());
 }
 
 #[test]

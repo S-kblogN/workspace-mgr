@@ -107,8 +107,11 @@ manifestless legacy tasks use explicit `task adopt` before archive.
 For a direct import, the reviewed adoption commit becomes the history boundary;
 later changes still need review. Empty `.git` cache markers are preserved.
 Before movement, archive reports literal old paths in scripts and README files
-and refuses external Git administration, stale registrations and location-bound
-Python environments; the command reference explains repair steps.
+and checks cross-task dependencies against the whole move batch. Explicit
+`--historical-record <file>` confirmation preserves inert historical logs and
+reports unchanged, with content digests retained in the preview and receipt.
+Archive refuses external Git administration, stale registrations and
+location-bound Python environments; the command reference explains repair steps.
 See the [task upgrade command](docs/commands.md#workspace-mgr-task-upgrade).
 Preview or undo an
 unpublished local attempt with `archive --cancel --manifest <owner> --dry-run`;

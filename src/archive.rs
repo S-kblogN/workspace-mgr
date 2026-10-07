@@ -28,6 +28,7 @@ pub struct ArchiveOptions {
     pub paths: Vec<String>,
     pub layout: String,
     pub dry_run: bool,
+    pub historical_records: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +43,7 @@ pub struct ArchiveReport {
     pub skipped: Vec<SkippedTask>,
     pub required_scopes: Vec<String>,
     pub remote_writes: bool,
+    pub historical_records: Vec<crate::historical_records::HistoricalRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +162,9 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         &format!("{}/{}", config.git.remote, config.git.branch),
     )?;
     let sources = task_sources(&repo, &options.paths)?;
+    let historical_records =
+        crate::historical_records::prepare(&repo.root, &options.historical_records)?;
+    let historical_paths = crate::historical_records::paths(&repo.root, &historical_records);
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
     let mut destinations = BTreeSet::new();
@@ -284,6 +289,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             &resolved_under(&repo.root, &destination),
             source,
             &relocation.reference_paths(),
+            &historical_paths,
         )?;
         let original_manifest = fs::read_to_string(&manifest_path).at(&manifest_path)?;
         let mut next: TaskManifest =
@@ -332,6 +338,16 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             .ok_or_else(|| Error::message("archive migration plan must be an object"))?;
         object.insert("task_id".to_owned(), task.task_id.clone().into());
         object.insert("status".to_owned(), "planned".into());
+        if !historical_records.is_empty() {
+            object.insert(
+                "historical_records".to_owned(),
+                serde_json::to_value(&historical_records).map_err(|error| {
+                    Error::message(format!(
+                        "failed to render historical record attestations: {error}"
+                    ))
+                })?,
+            );
+        }
         object.insert(
             "completion_reviews".to_owned(),
             serde_json::to_value(&completion.reviews).map_err(|error| {
@@ -359,6 +375,22 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             relocation,
         });
     }
+    if !prepared.is_empty() {
+        let locations = dependency_locations(&repo, &prepared)?;
+        let git_controls = prepared
+            .iter()
+            .flat_map(|task| task.relocation.reference_paths())
+            .collect::<Vec<_>>();
+        crate::task_dependencies::validate(
+            &repo.root,
+            &locations,
+            &git_controls,
+            &historical_paths,
+        )?;
+        // Host and storage inspection can take time; bind the exemption to the
+        // exact bytes and mode inspected before allowing any directory move.
+        crate::historical_records::revalidate(&repo.root, &historical_records)?;
+    }
     if !options.dry_run {
         apply(&repo, &config, &prepared, owner.as_ref())?;
     }
@@ -378,6 +410,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         skipped,
         required_scopes: required_scopes.into_iter().collect(),
         remote_writes: false,
+        historical_records,
     })
 }
 
@@ -438,6 +471,55 @@ fn task_sources(repo: &GitRepo, selected: &[String]) -> Result<Vec<String>> {
         }
     }
     Ok(sources.into_iter().collect())
+}
+
+/// Inspect only current locations. Neither identity nor dependency discovery
+/// reads old task configuration bodies from Git history.
+fn dependency_locations(
+    repo: &GitRepo,
+    prepared: &[PreparedTask],
+) -> Result<Vec<crate::task_dependencies::TaskLocation>> {
+    let mut paths = prepared
+        .iter()
+        .map(|task| task.report.source.clone())
+        .collect::<BTreeSet<_>>();
+    let mut walker = walkdir::WalkDir::new(&repo.root)
+        .follow_links(false)
+        .into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = entry.map_err(|error| {
+            Error::message(format!("cannot inspect current task locations: {error}"))
+        })?;
+        if !entry.file_type().is_dir() || entry.path() == repo.root {
+            continue;
+        }
+        let name = entry.file_name().to_str().unwrap_or("");
+        if matches!(name, ".git" | ".dvc" | ".workspace-mgr") {
+            walker.skip_current_dir();
+            continue;
+        }
+        if parse_task_identity(TaskKind::Deliverable, name).is_ok()
+            || entry.path().join(TASK_MANIFEST_NAME).is_file()
+        {
+            let path = crate::path::relative_to(entry.path(), &repo.root, "current task location")?;
+            paths.insert(path);
+            walker.skip_current_dir();
+        }
+    }
+    Ok(paths
+        .into_iter()
+        .map(|source| {
+            let destination = prepared
+                .iter()
+                .find(|task| task.report.source == source)
+                .map(|task| task.report.destination.clone())
+                .unwrap_or_else(|| source.clone());
+            crate::task_dependencies::TaskLocation {
+                source: PathBuf::from(source),
+                destination: PathBuf::from(destination),
+            }
+        })
+        .collect())
 }
 
 fn grouping(layout: &str, timestamp: &str) -> Result<String> {

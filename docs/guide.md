@@ -845,8 +845,15 @@ Resolve relocation preflight failures before applying. Ordinary scripts and
 README commands with literal old absolute or repository-relative paths are
 reported by file and line, including ignored text; use script-relative inputs
 or run README commands from the task directory, review tracked repairs, then
-refresh and preview again. The scan cannot prove dynamically constructed paths
-or references outside the task; run the documented reproduction commands too.
+refresh and preview again. Cross-task references are checked against the
+whole batch, including dependencies from unselected tasks. A parent-relative
+reference to a sibling task needs repair when the tasks move to different
+months. Unverifiable recognized outward path expressions refuse. The static
+scan does not execute arbitrary language expressions; run the reproduction
+commands too. For an inert historical log or previous execution report, use
+`--historical-record <exact-repository-relative-file>` in preview and apply.
+This explicit confirmation records its content digest and mode and preserves
+the original bytes; scripts and control files cannot use this exemption.
 Zero-byte `.git` cache markers are retained. Real malformed Git pointers,
 stale worktree registrations, and Git administration or linked checkouts
 outside the task refuse. Consolidate the Git layout inside the task without

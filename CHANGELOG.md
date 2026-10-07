@@ -16,6 +16,9 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   task metadata, scopes and cloud-usage approval.
 - Previewable, idempotent `archive --cancel` with durable local metadata and Git
   reference snapshots, preserving ignored/hydrated content and other task edits.
+- Explicit `archive --historical-record <file>` confirmations bind inert logs
+  and previous execution reports to their exact bytes and modes. Preview,
+  receipts, S3 publication and cancellation preserve this evidence unchanged.
 
 ### Fixed
 
@@ -28,6 +31,10 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   rechecked, and branch tips behind a verified PR head are accepted. Open
   reviews, unreviewed changes, divergent refs, missing path continuity and
   ambiguous identity fail; shallow history remains refused.
+- Archive path preflight checks cross-task dependencies against the complete
+  move batch, including unselected and previously grouped tasks. Different-month
+  parent-relative references and unverifiable outward dynamic paths refuse
+  before any local move; explicitly confirmed historical records are preserved.
 - Archive retirement completes only after a full S3 history scan finds no data
   versions or delete markers under the original task prefix. Protected history
   reports `cleanup_pending`; unmapped concurrent writes report

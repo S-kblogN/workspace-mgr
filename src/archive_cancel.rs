@@ -521,7 +521,7 @@ pub fn cancel(
                     }
                 }
                 if let Some(expected) = &attempt.expected_receipt {
-                    for key in ["task_id", "previous_receipt", "completion_reviews"] {
+                    for key in crate::archive_migration::RECEIPT_METADATA_FIELDS {
                         if let Some(value) = expected.get(key) {
                             receipt[key] = value.clone();
                         }
@@ -776,7 +776,7 @@ fn validate_current_receipt(repo: &GitRepo, attempt: &Attempt, receipt: &Value) 
         object.remove("cancel_owned_versions");
     }
     generated["source_cleanup"] = "after_verified_git_publication".into();
-    for key in ["task_id", "previous_receipt", "completion_reviews"] {
+    for key in crate::archive_migration::RECEIPT_METADATA_FIELDS {
         if let Some(value) = expected.get(key) {
             generated[key] = value.clone();
         }
@@ -992,6 +992,7 @@ mod tests {
             "status":"planned","source_cleanup":"after_verified_git_publication",
             "task_id":source,"previous_receipt":{"retained_note":"original historical evidence"},
             "completion_reviews":[{"number":1,"head_commit":"reviewed-head"}],
+            "historical_records":[{"path":format!("{source}/logs/history.log"),"sha256":"original-digest","unix_mode":33060,"role":"historical-record"}],
             "versions":[
                 {"source_object":format!("{source}/payload.bin"),"destination_object":format!("{destination}/payload.bin"),
                  "source_version_id":"source-payload","source_last_modified":"2026-07-12T20:00:00+00:00",
@@ -1016,6 +1017,7 @@ mod tests {
             "task_id",
             "previous_receipt",
             "completion_reviews",
+            "historical_records",
             "source_cleanup",
         ] {
             journal.as_object_mut().unwrap().remove(key);
@@ -1138,6 +1140,11 @@ mod tests {
             {
                 let mut value = copied.clone();
                 value["previous_receipt"]["retained_note"] = "independent edit".into();
+                value
+            },
+            {
+                let mut value = copied.clone();
+                value["historical_records"][0]["sha256"] = "independent edit".into();
                 value
             },
         ] {

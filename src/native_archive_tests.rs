@@ -1033,6 +1033,43 @@ fn multipart_preserves_properties_tags_and_recovers_lost_completion() {
 }
 
 #[test]
+fn registry_publish_and_cancel_preserve_explicit_historical_record_metadata() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("data", "source", b"payload", false);
+    fixture.store.source("data", "marker", b"", true);
+    let mut planned = fixture.run("plan").unwrap();
+    planned["task_id"] = "task".into();
+    planned["historical_records"] = json!([{
+        "path":"task/logs/history.log", "sha256":"reviewed-original-record",
+        "unix_mode":33060, "role":"historical-record"
+    }]);
+    fixture.payload["reservation"] =
+        crate::archive_reservation::reserve(&fixture.repo, &planned).unwrap();
+    fixture.payload["planned"] = planned.clone();
+    let mut receipt = fixture.run("copy").unwrap();
+    for key in crate::archive_migration::RECEIPT_METADATA_FIELDS {
+        if let Some(value) = planned.get(key) {
+            receipt[key] = value.clone();
+        }
+    }
+    let proof = fixture.claim_registry(&receipt);
+    assert_eq!(
+        fixture.registry("publish", &receipt, &proof).unwrap()["status"],
+        "published"
+    );
+    let stored = registry_read_with(&fixture.store, "task").unwrap().unwrap();
+    assert_eq!(stored["historical_records"], receipt["historical_records"]);
+    assert_eq!(
+        fixture.registry("publish", &receipt, &proof).unwrap()["status"],
+        "unchanged"
+    );
+    fixture.registry("cancel", &receipt, &proof).unwrap();
+    fixture.run("cancel").unwrap();
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 2);
+}
+
+#[test]
 fn b2_publish_keeps_condition_first_and_falls_back_only_with_live_git_binding() {
     let mut fixture = Fixture::new();
     fixture.store.b2 = true;

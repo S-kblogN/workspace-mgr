@@ -16,6 +16,7 @@ mod dvc;
 mod error;
 mod git;
 mod hex;
+mod historical_records;
 mod instructions;
 mod local_state;
 mod lock;
@@ -36,6 +37,7 @@ mod s3_purge;
 mod scaffold;
 mod storage;
 mod task_approval;
+mod task_dependencies;
 mod task_rename;
 mod task_upgrade;
 mod transaction;
@@ -266,6 +268,7 @@ fn run(cli: Cli) -> Result<()> {
                 paths: args.paths,
                 layout: args.layout,
                 dry_run: args.dry_run,
+                historical_records: args.historical_record,
             })?,
             cli.format,
         ),
