@@ -5,6 +5,37 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-06
+
+### Added
+
+- Explicit `task adopt` for reviewed legacy directories without manifests.
+- Previewable, idempotent `archive --cancel` with durable local metadata and Git
+  reference snapshots, preserving ignored/hydrated content and other task edits.
+
+### Fixed
+
+- Archive completion follows reviewed identity and content history across
+  schema/branch migrations and accepts branch tips behind a verified PR head.
+  Open reviews, unreviewed changes, divergent refs, and identity ambiguity fail.
+- B2 archive registries use full version-history conflict detection and a
+  checksum-compatible writer. Original B2 versions and delete markers remain
+  protected because this adapter uses append-only conflict detection in place
+  of atomic conditional registry publication.
+- Moving ignored nested Git worktrees repairs verifiable absolute/relative Git
+  control paths. Non-relocatable runtime references are refused before moving.
+- Legacy adoption review records remain in Git and are protected from
+  automatic S3 placement, explicit storage changes, and untracking.
+
+### Upgrading
+
+- Lossless `archive --cancel` requires an attempt journal created by this
+  release. Old receipts alone cannot reconstruct all original local metadata.
+- B2 archive publication retains original versions and delete markers as well
+  as their copies; account for this retained history in storage usage.
+- Upgrade every CLI that archives or purges this repository; older builds do
+  not apply the B2 source-history protection added by this release.
+
 ## [0.6.0] - 2026-10-06
 
 ### Changed

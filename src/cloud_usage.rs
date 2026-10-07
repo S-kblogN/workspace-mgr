@@ -1294,6 +1294,7 @@ fn is_control_file(path: &str) -> bool {
         || name == ".gitignore"
         || name == TASK_MANIFEST_NAME
         || name == crate::archive_migration::RECEIPT_NAME
+        || name == crate::archive_adoption::LEGACY_RECORD
         || path == CONFIG_NAME
 }
 

@@ -966,6 +966,13 @@ pub fn version_purge_adapter(
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let python = storage_python();
+    let script = format!(
+        "import sys, types\n_archive = types.ModuleType('dvc_archive_registry')\nexec({}, _archive.__dict__)\nsys.modules['dvc_archive_registry'] = _archive\nexec({}, globals())",
+        serde_json::to_string(ARCHIVE_REGISTRY_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?,
+        serde_json::to_string(VERSION_PURGE_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?
+    );
     let serialized = serde_json::to_string(payload).map_err(|error| {
         Error::message(format!(
             "failed to encode managed-storage purge request: {error}"
@@ -975,7 +982,7 @@ pub fn version_purge_adapter(
         &python,
         [
             "-c",
-            VERSION_PURGE_SCRIPT,
+            &script,
             &repo.root.to_string_lossy(),
             operation,
             &serialized,

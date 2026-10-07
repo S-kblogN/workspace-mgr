@@ -173,7 +173,7 @@ pub fn prepare(
                 // Keep task identity and earlier receipts, which the transport
                 // intentionally does not interpret.
                 let mut next = copied;
-                for key in ["task_id", "previous_receipt"] {
+                for key in ["task_id", "previous_receipt", "completion_reviews"] {
                     if let Some(value) = receipt.get(key) {
                         next.as_object_mut()
                             .ok_or_else(|| Error::message("archive copy did not return an object"))?
@@ -294,6 +294,7 @@ fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()>
     }
     let rendered =
         serde_yaml::to_string(&document).map_err(|error| Error::message(error.to_string()))?;
+    crate::archive_cancel::record_pointer_rewrite(repo, receipt, pointer, rendered.as_bytes())?;
     atomic_write(&absolute, rendered.as_bytes())
 }
 
@@ -335,6 +336,11 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| Error::message("archive metadata has no parent"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).at(parent)?;
     temp.write_all(bytes).at(path)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temp.as_file()
+            .set_permissions(metadata.permissions())
+            .at(path)?;
+    }
     temp.as_file().sync_all().at(path)?;
     temp.persist(path).map_err(|error| Error::Io {
         path: path.to_path_buf(),
@@ -373,6 +379,7 @@ mod tests {
         let repo = GitRepo {
             root: temp.path().canonicalize().unwrap(),
         };
+        repo.run(["init", "-b", "main"]).unwrap();
         (temp, repo)
     }
 

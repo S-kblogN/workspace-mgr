@@ -754,6 +754,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     s3_purge::queue(&repo, &purge_candidates)?;
     let local_ref = format!("refs/heads/{}", task.branch);
     let old_local_oid = repo.optional_oid(&local_ref)?;
+    crate::archive_cancel::record_publication(&repo, &task, &archive_receipts, &commit_oid, false)?;
     repo.run([
         "update-ref",
         "-m",
@@ -772,6 +773,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             "push verification failed: remote has {observed}, expected {commit_oid}"
         )));
     }
+    crate::archive_cancel::record_publication(&repo, &task, &archive_receipts, &commit_oid, true)?;
     repo.run([
         "update-ref",
         "-m",
@@ -1222,6 +1224,7 @@ fn is_housekeeping_name(name: &str) -> bool {
         || name == TASK_MANIFEST_NAME
         || name == ".gitignore"
         || name == crate::archive_migration::RECEIPT_NAME
+        || name == crate::archive_adoption::LEGACY_RECORD
 }
 
 fn is_markdown(path: &str) -> bool {
@@ -1838,7 +1841,9 @@ fn check_large_files(
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     for relative in repo.visible_paths(scopes)? {
-        if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)) {
+        if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
+            || relative.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD))
+        {
             continue;
         }
         if storage::is_local(repo, &relative)? {

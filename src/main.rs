@@ -1,6 +1,8 @@
 use clap::Parser;
 
 mod archive;
+mod archive_adoption;
+mod archive_cancel;
 mod archive_migration;
 mod branch_cleanup;
 mod cli;
@@ -21,6 +23,7 @@ mod path;
 mod policy;
 mod process;
 mod refresh;
+mod relocation;
 mod runtime;
 mod s3_purge;
 mod scaffold;
@@ -116,6 +119,18 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Task(args) => match args.command {
+            TaskCommand::Adopt(args) => emit(
+                &archive_adoption::adopt(&archive_adoption::ArchiveAdoptionOptions {
+                    start: args.repo,
+                    manifest: args.manifest,
+                    path: args.path,
+                    pull_request: args.pull_request,
+                    title: args.title,
+                    purpose: args.purpose,
+                    dry_run: args.dry_run,
+                })?,
+                cli.format,
+            ),
             TaskCommand::Create(args) => emit(
                 &create_task(&TaskCreateOptions {
                     repo: args.repo,
@@ -219,6 +234,15 @@ fn run(cli: Cli) -> Result<()> {
                 cli.format,
             )
         }
+        Command::Archive(args) if args.cancel => emit(
+            &archive_cancel::cancel(
+                &args.repo,
+                args.manifest.as_deref(),
+                &args.paths,
+                args.dry_run,
+            )?,
+            cli.format,
+        ),
         Command::Archive(args) => emit(
             &archive(&ArchiveOptions {
                 start: args.repo,

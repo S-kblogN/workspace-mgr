@@ -36,6 +36,7 @@ pub struct PurgeReport {
     pub protected: Vec<ObjectVersion>,
     pub pending: Vec<ObjectVersion>,
     pub retained_unmapped: Vec<ObjectVersion>,
+    pub retained_mapped: Vec<ObjectVersion>,
 }
 
 pub fn candidates_between(
@@ -112,6 +113,23 @@ pub fn queue(repo: &GitRepo, candidates: &[ObjectVersion]) -> Result<()> {
     write_state(repo, &state)
 }
 
+/// Cancel only newly queued retirement records belonging to an archive attempt.
+/// Older records and records for other tasks keep their original protection.
+pub fn cancel_archive(
+    repo: &GitRepo,
+    source: &str,
+    destination: &str,
+    previous: &[ObjectVersion],
+) -> Result<()> {
+    let mut state = read_state(repo)?;
+    state.pending.retain(|item| {
+        previous.contains(item)
+            || !(item.object.starts_with(&format!("{source}/"))
+                || item.object.starts_with(&format!("{destination}/")))
+    });
+    write_state(repo, &state)
+}
+
 pub fn preview(repo: &GitRepo) -> Result<PurgeReport> {
     let state = read_state(repo)?;
     Ok(PurgeReport {
@@ -140,15 +158,16 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
     }
     dvc::ensure_ready(repo, config)?;
     dvc::verify_object_versioning(repo, config)?;
-    let protected_objects = referenced_objects(repo, config, remote, &state.pending)?;
+    let mut protected_objects = referenced_objects(repo, config, remote, &state.pending)?;
     let protected_set = protected_objects.iter().cloned().collect::<BTreeSet<_>>();
-    let deleted = state
+    let mut deleted = state
         .pending
         .iter()
         .filter(|candidate| !protected_set.contains(*candidate))
         .cloned()
         .collect::<Vec<_>>();
     let mut retained_unmapped = Vec::new();
+    let mut retained_mapped: Vec<ObjectVersion> = Vec::new();
     if !deleted.is_empty() {
         let payload = serde_json::to_value(&deleted).map_err(|error| {
             Error::message(format!("failed to encode S3 purge candidates: {error}"))
@@ -158,6 +177,20 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
             retained_unmapped = serde_json::from_value(retained.clone()).map_err(|error| {
                 Error::message(format!("invalid unmapped archive version report: {error}"))
             })?;
+        }
+        if let Some(retained) = response.get("retained_mapped") {
+            retained_mapped = serde_json::from_value(retained.clone()).map_err(|error| {
+                Error::message(format!("invalid retained archive version report: {error}"))
+            })?;
+            if retained_mapped.iter().any(|item| !deleted.contains(item)) {
+                return Err(Error::message(
+                    "storage purge retained an unknown candidate",
+                ));
+            }
+            deleted.retain(|item| !retained_mapped.contains(item));
+            protected_objects.extend(retained_mapped.iter().cloned());
+            protected_objects.sort();
+            protected_objects.dedup();
         }
     }
     let next = PurgeState {
@@ -177,6 +210,7 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
         protected: protected_objects.clone(),
         pending: protected_objects,
         retained_unmapped,
+        retained_mapped,
     })
 }
 
@@ -266,7 +300,7 @@ fn referenced_objects(
                     ])?
                     .success()
                 {
-                    archive_protected.insert(pointer.clone());
+                    archive_protected.insert(format!("{source}/"));
                 }
                 continue;
             }
@@ -301,7 +335,10 @@ fn referenced_objects(
     Ok(candidates
         .iter()
         .filter(|candidate| {
-            referenced.contains(&candidate.object) || archive_protected.contains(&candidate.pointer)
+            referenced.contains(&candidate.object)
+                || archive_protected
+                    .iter()
+                    .any(|prefix| candidate.object.starts_with(prefix))
         })
         .cloned()
         .collect())
@@ -412,5 +449,88 @@ mod tests {
             version_id: "one".to_owned(),
         };
         assert_ne!(first, moved);
+    }
+
+    #[test]
+    fn live_archived_source_protects_stale_generic_candidates_across_the_complete_prefix() {
+        use std::process::Command;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let remote = fixture.path().join("remote.git");
+        let checkout = fixture.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let git = |directory: &std::path::Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(
+            fixture.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        git(&checkout, &["init", "-b", "main"]);
+        git(
+            &checkout,
+            &["config", "user.name", "Archive protection fixture"],
+        );
+        git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::create_dir(checkout.join("task")).unwrap();
+        fs::write(
+            checkout
+                .join("task")
+                .join(crate::policy::TASK_MANIFEST_NAME),
+            "historical manifest\n",
+        )
+        .unwrap();
+        git(&checkout, &["add", "."]);
+        git(
+            &checkout,
+            &[
+                "commit",
+                "-m",
+                "Keep source task, with retired pointer absent",
+            ],
+        );
+        git(
+            &checkout,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&checkout, &["push", "origin", "main"]);
+        let repo = GitRepo::discover(&checkout).unwrap();
+        let candidates = vec![
+            ObjectVersion {
+                pointer: "task/.workspace-mgr-archive.json".to_owned(),
+                object: "task/history.bin".to_owned(),
+                version_id: "mapped".to_owned(),
+            },
+            ObjectVersion {
+                pointer: "task/retired.bin.dvc".to_owned(),
+                object: "task/retired.bin".to_owned(),
+                version_id: "stale-generic".to_owned(),
+            },
+            ObjectVersion {
+                pointer: "task-neighbor/retired.bin.dvc".to_owned(),
+                object: "task-neighbor/retired.bin".to_owned(),
+                version_id: "neighbor".to_owned(),
+            },
+        ];
+        let protected =
+            referenced_objects(&repo, &Config::default(), "origin", &candidates).unwrap();
+        assert_eq!(protected, candidates[..2]);
+        let destructive = candidates
+            .iter()
+            .filter(|candidate| !protected.contains(candidate))
+            .collect::<Vec<_>>();
+        assert_eq!(destructive, [&candidates[2]]);
     }
 }

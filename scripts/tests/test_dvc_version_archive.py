@@ -199,6 +199,98 @@ class ArchiveHistoryTests(unittest.TestCase):
             if method in writes:
                 self.assertTrue(request["Key"].startswith(destination), method)
 
+    def test_cancel_preview_and_retry_preserve_every_version_and_marker(self):
+        self.remote.source("file", "old", body=b"old")
+        self.remote.source("file", "deleted", marker=True)
+        self.remote.source("file", "new", body=b"new")
+        self.remote.source("retired", "retired", marker=True)
+        self.run_archive()
+        snapshot = json.dumps(self.remote.versions, sort_keys=True, default=str)
+        preview = self.run_archive("cancel-preview")
+        self.assertEqual(len(preview["retained_versions"]), 4)
+        result = self.run_archive("cancel")
+        self.assertEqual(result["status"], "retained_history")
+        self.assertEqual(snapshot, json.dumps(self.remote.versions, sort_keys=True, default=str))
+        self.run_archive("cancel")
+        self.run_archive()
+        self.assertEqual(snapshot, json.dumps(self.remote.versions, sort_keys=True, default=str))
+        self.assert_no_source_writes()
+
+    def test_b2_spaces_same_key_versions_and_delete_markers_without_delaying_other_keys(self):
+        self.remote.endpoint_url = "https://s3.us-west-004.backblazeb2.com"
+        self.remote.source("file", "old", body=b"old")
+        self.remote.source("file", "deleted", marker=True)
+        self.remote.source("file", "new", body=b"new")
+        self.remote.source("other", "independent", body=b"other")
+        with mock.patch.object(adapter.time, "sleep") as sleep:
+            result = self.run_archive()
+        self.assertEqual(sleep.call_args_list, [mock.call(adapter.B2_VERSION_INTERVAL)] * 2)
+        self.assertEqual(len(result["versions"]), 4)
+        self.assertEqual(result["status"], "copied")
+
+    def test_cancel_partial_copy_keeps_owned_and_unrelated_versions(self):
+        self.remote.source("a", "source-a", body=b"a")
+        self.remote.source("b", "source-b", body=b"b")
+        self.remote.fail_before["copy_object"] = 2
+        with self.assertRaises(ConnectionError):
+            self.run_archive()
+        self.remote.add(adapter.key_for(CONTEXT, CONTEXT["destination"] + "/other"), "foreign", marker=True)
+        snapshot = json.dumps(self.remote.versions, sort_keys=True, default=str)
+        result = self.run_archive("cancel")
+        self.assertEqual(len(result["retained_versions"]), 2)
+        self.assertEqual(snapshot, json.dumps(self.remote.versions, sort_keys=True, default=str))
+
+    def test_cancel_aborts_only_its_durable_multipart_upload(self):
+        self.remote.source("large", "large-source", size=adapter.COPY_LIMIT + 1)
+        plan = self.run_archive("plan")
+        journal = {**plan, "status": "copying", "transaction_id": "test-owned"}
+        row = journal["versions"][0]
+        row["started"] = True
+        row["multipart_upload_id"] = "owned"
+        self.remote.uploads = {"owned": {}, "other-task": {}}
+        adapter.save_journal(self.journal, journal)
+        snapshot = self.source_snapshot()
+        self.run_archive("cancel-preview")
+        self.assertEqual(set(self.remote.uploads), {"owned", "other-task"})
+        self.run_archive("cancel")
+        self.assertEqual(set(self.remote.uploads), {"other-task"})
+        self.run_archive("cancel")
+        self.assertEqual(self.remote.counts["abort_multipart_upload"], 1)
+        self.assertEqual(snapshot, self.source_snapshot())
+
+    def test_cancel_recovers_a_lost_abort_response_translated_by_s3fs(self):
+        self.remote.source("large", "large-source", size=adapter.COPY_LIMIT + 1)
+        journal = {**self.run_archive("plan"), "status": "copying", "transaction_id": "owned"}
+        journal["versions"][0].update(started=True, multipart_upload_id="owned")
+        adapter.save_journal(self.journal, journal)
+        self.remote.uploads["owned"] = {}
+        self.remote.lose_after["abort_multipart_upload"] = 1
+        with self.assertRaises(ConnectionError):
+            self.run_archive("cancel")
+        original = self.remote.call_s3
+
+        def translated(method, **request):
+            try:
+                return original(method, **request)
+            except ProviderError as error:
+                raise FileNotFoundError("translated by s3fs") from error
+
+        with mock.patch.object(self.remote, "call_s3", side_effect=translated):
+            self.run_archive("cancel")
+        self.assertFalse(self.remote.uploads)
+        self.assertNotIn("multipart_upload_id", adapter.load_journal(self.journal)["versions"][0])
+
+    def test_retained_copy_cannot_be_reused_for_a_new_source_inventory(self):
+        self.remote.source("file", "v1")
+        self.run_archive()
+        self.run_archive("cancel")
+        self.remote.source("file", "v2")
+        # Local attempt cancellation retains remote data. A new attempt must
+        # not silently omit versions added since the retained complete copy.
+        planned = {**CONTEXT, "status": "planned", "versions": adapter.source_inventory(self.remote, CONTEXT)}
+        with self.assertRaisesRegex(RuntimeError, "this attempt's complete source history"):
+            self.run_archive(planned=planned)
+
     def test_complete_history_includes_retired_keys_delete_markers_and_null_version(self):
         first = self.remote.source("data/file.txt", "null", body=b"initial", metadata={"original": "retained"}, tags=[{"Key": "purpose", "Value": "test"}], ContentType="text/plain")
         self.remote.source("data/file.txt", "deleted-once", marker=True)

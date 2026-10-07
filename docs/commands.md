@@ -355,15 +355,25 @@ repository-infrastructure task.
 ```text
 workspace-mgr archive [<task-path> ...]
   [--layout <template>] [--repo <path>] [--manifest <path>] [--dry-run]
+workspace-mgr archive [<source-or-destination> ...]
+  --cancel --manifest <owning-infrastructure-manifest> [--dry-run]
 ```
 
 With no paths, inspect top-level deliverable directories and skip tasks without
 a verified merged pull request. An explicitly named active or unverified task
 is refused. Verification uses GitHub pull-request evidence for the task's
-branch, immutable identity, configured base branch, and reachable merge commit;
+current and historical branches, immutable identity, configured base branch,
+and reachable merge commits. Each published identity or tracked-content
+transition needs matching merged review evidence. Reviewed schema migrations
+and branch changes preserve continuity; retained branch tips may lag behind a
+reviewed head but must be its ancestors. Open reviews, new or divergent commits,
+identity gaps, and ambiguous evidence remain ineligible;
 `gh` must be installed and able to read the repository. Active task directories
 stay at the top level, and merge or turn-end synchronization never runs archive
 automatically.
+
+Verification requires complete Git history. A shallow checkout is refused;
+fetch its missing history with `git fetch --unshallow` before retrying.
 
 `--layout` uses `{year}` and `{month}` from each task directory's creation
 timestamp. The default is `{year}/{month}`; `{year}` and `{year}{month}` also
@@ -399,6 +409,51 @@ source history and retry journals. Historical Git checkouts use
 `workspace-mgr storage hydrate` to resolve the durable registry and verify their
 original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
 resolve the changed keys and version IDs.
+
+Backblaze B2 uses an append-only registry with exact reads of every retained
+registry version. Differing mappings or delete markers cause an explicit
+conflict, preserving both writers' evidence. B2's documented Put API does not
+promise the conditional publication used by the other S3 adapter, so this
+adapter conservatively retains the original source versions
+and markers permanently as well as the copies. The report lists these as
+`retained_mapped`; they remain protected in the retirement queue. Same-key copy
+generations are spaced by at least one second to preserve B2's current version
+ordering. The registry writer disables automatic SDK checksum headers and sends
+Content-MD5. Unknown endpoints keep conditional publication and fail safely if
+their provider rejects it.
+
+`--cancel --dry-run` previews a journaled local attempt. Apply restores its
+source directory, original manifest, receipt, storage pointer bytes and permissions,
+and verified nested Git control references. All local payloads, including
+ignored and hydrated content and files added after moving, travel with the
+directory. Cancellation changes neither the shared Git index nor another
+task's files. A failed publication's generated local tree and retirement queue
+are reversed only for the selected archive paths; other scoped work is retained.
+Independent metadata/ref edits and destination collisions refuse cancellation
+before movement. Repeating cancel is safe, including after interruption.
+
+Cancellation retains copied S3 versions and registry records and aborts only
+unfinished multipart uploads recorded by its journal. This preserves history
+and allows an unchanged copy to be reused on retry. A new source inventory that
+differs from a retained copy is refused rather than silently omitting versions.
+After verified Git push, use a reviewed revert. Receipts from an older CLI that
+did not save the local attempt journal cannot provide a verified lossless cancel.
+
+Legacy directories without a manifest appear in `skipped` with an adoption
+instruction. First adopt explicitly through an infrastructure task scoped to
+that directory, selecting its merged PR. Adoption checks the exact published
+legacy tree and all retained branch tips, then creates the manifest and
+`.workspace-mgr-legacy.json` review record. Publish and merge that adoption
+before running archive; neither inventory nor archive invents legacy ownership.
+
+```sh
+workspace-mgr task adopt <legacy-task-path> --pull-request <number> \
+  --title "Retained task" --purpose "Retain reviewed work" \
+  --manifest "$task_manifest" --dry-run
+# Repeat without --dry-run, publish, and merge the adoption review.
+workspace-mgr archive <task-path> --cancel --manifest "$task_manifest" --dry-run
+workspace-mgr archive <task-path> --cancel --manifest "$task_manifest"
+```
 
 ```sh
 workspace-mgr archive --dry-run

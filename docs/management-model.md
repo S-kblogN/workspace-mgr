@@ -95,6 +95,16 @@ agents do not perform those moves manually. After verified Git publication,
 cleanup retires only mapped source versions once live references release the
 original task. Concurrent source additions remain untouched.
 
+Archive and task rename inspect ignored local content before moving it. Nested
+Git worktree pointers, administrative backlinks, and `core.worktree` locations
+are repaired together; cancellation restores their exact original bytes and
+permissions. A Python virtual environment whose launchers or activation scripts
+embed the task's absolute location is refused before any move. Preserve its
+environment specification and rebuild it outside the task first. An absolute
+symlink into the moving task, or a relative symlink that leaves the task, is
+also refused because moving can invalidate its target. Relative symlinks whose
+targets stay inside the task remain valid.
+
 Reading and ownership are separate. Any chat may inspect any repository path
 when useful for context, including another chat's task directory. Reading a
 path does not transfer ownership or authorize mutation.

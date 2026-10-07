@@ -111,7 +111,7 @@ def list_versions(raw_fs, bucket, prefix):
     raise RuntimeError("S3 purge history exceeded the pagination limit")
 
 
-def delete_candidates(raw_fs, remote, bucket, payload):
+def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
     groups = {}
     archives = {}
     for candidate in payload:
@@ -143,29 +143,101 @@ def delete_candidates(raw_fs, remote, bucket, payload):
             raise RuntimeError(f"managed-storage purge escaped its configured bucket: {object_name!r}")
         return key
 
-    deleted, already_absent, retained_unmapped = [], [], []
+    deleted, already_absent, retained_unmapped, retained_mapped = [], [], [], []
+    if (archives or groups) and registry is None:
+        try:
+            from dvc_archive_registry import ArchiveRegistry, is_b2
+        except ModuleNotFoundError as error:
+            if error.name != "dvc_archive_registry" or "__file__" not in globals():
+                raise
+            # Direct asset tests use importlib; release adapters preload this
+            # module into the private storage interpreter.
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "dvc_archive_registry", Path(__file__).with_name("dvc_archive_registry.py"),
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            ArchiveRegistry = module.ArchiveRegistry
+            is_b2 = module.is_b2
+        if archives or is_b2(raw_fs):
+            object_bucket, prefix, selected_version = raw_fs.split_path(remote.path)
+            if object_bucket != bucket or selected_version:
+                raise RuntimeError("archive cleanup registry escaped its configured storage")
+            registry = ArchiveRegistry(raw_fs, bucket, prefix)
+
+    def verify_registry(source, objects):
+        # read() scans every B2 registry version and fails on conflicts/markers.
+        # Recheck immediately before each destructive request, including retries
+        # after partial cleanup, so no cached latest-writer receipt authorizes it.
+        receipt = registry.read(source)
+        if receipt is None:
+            raise RuntimeError("archive cleanup requires a published canonical registry")
+        mapped = {(row["source_object"], row["source_version_id"])
+                  for row in receipt["versions"]}
+        wanted = {(name, item["version_id"])
+                  for name, candidates in objects.items() for item in candidates}
+        if not wanted.issubset(mapped):
+            raise RuntimeError("archive cleanup candidate is not mapped by its published registry")
+
     # Archive candidates win over generic retirement of the same path: generic
     # candidates must not turn a mapped-version cleanup into an all-version
     # purge that could erase writes made after the archive source snapshot.
     for source, objects in archives.items():
+        verify_registry(source, objects)
         prefix = remote_key(source + "/", literal=True)
         initial = list_versions(raw_fs, bucket, prefix)
         wanted = {(remote_key(name, literal=True), item["version_id"])
                   for name, candidates in objects.items() for item in candidates}
         present = {(item["Key"], item["VersionId"]): item for item in initial}
+        suppressed_generic = []
+        for name in list(groups):
+            if name.startswith(source + "/"):
+                suppressed_generic.extend(groups.pop(name))
+        if getattr(registry, "_versioned_registry", False):
+            # An append-only B2 registry can become conflicted after this
+            # verification. Retain exact originals so old Git revisions can
+            # still hydrate directly even if later registry writes conflict.
+            # No read/check/delete sequence can replace a provider's atomic
+            # conditional primitive, so this retention is mandatory on B2.
+            for name, candidates in objects.items():
+                key = remote_key(name, literal=True)
+                for item in candidates:
+                    if (key, item["version_id"]) in present:
+                        retained_mapped.append({
+                            **item, "reason": "append_only_registry_no_atomic_cleanup",
+                        })
+                    else:
+                        already_absent.append(item)
+            for item in suppressed_generic:
+                key = remote_key(item["object"], literal=True)
+                if (key, item["version_id"]) in present:
+                    retained_mapped.append({
+                        **item, "reason": "append_only_registry_no_atomic_cleanup",
+                    })
+                else:
+                    already_absent.append(item)
+            for item in initial:
+                if (item["Key"], item["VersionId"]) not in wanted:
+                    retained_unmapped.append({
+                        "pointer": source + ARCHIVE_SUFFIX,
+                        "object": source + "/" + item["Key"][len(prefix):],
+                        "version_id": item["VersionId"],
+                    })
+            continue
         for name, candidates in objects.items():
             key = remote_key(name, literal=True)
             requested = {item["version_id"] for item in candidates}
             existing = sorted(version for version in requested if (key, version) in present)
             for version in existing:
+                verify_registry(source, objects)
                 raw_fs.call_s3("delete_object", Bucket=bucket, Key=key, VersionId=version)
             if existing:
                 deleted.append({**candidates[0], "deleted_version_ids": existing})
             else:
                 already_absent.append(candidates[0])
-        for name in list(groups):
-            if name.startswith(source + "/"):
-                groups.pop(name)
         # A complete rescan proves all mapped versions are absent, and reports
         # later writes (including brand-new keys) without deleting their bytes.
         remaining = list_versions(raw_fs, bucket, prefix)
@@ -177,6 +249,30 @@ def delete_candidates(raw_fs, remote, bucket, payload):
                 "object": source + "/" + item["Key"][len(prefix):],
                 "version_id": item["VersionId"],
             })
+
+    if getattr(registry, "_versioned_registry", False):
+        # A caller may omit archive candidates because Git references protected
+        # them, or because this checkout did not create the original archive.
+        # Discover only canonical registry keys for this object's ancestors;
+        # an ordinary retirement must not bypass B2's original-version safety.
+        for object_name, candidates in list(groups.items()):
+            parts = object_name.split("/")
+            for length in range(len(parts) - 1, 0, -1):
+                source = "/".join(parts[:length])
+                if registry.read(source) is None:
+                    continue
+                key = remote_key(object_name)
+                versions = [item for item in list_versions(raw_fs, bucket, key) if item["Key"] == key]
+                present = {item["VersionId"] for item in versions}
+                for candidate in candidates:
+                    if candidate["version_id"] in present:
+                        retained_mapped.append({
+                            **candidate, "reason": "append_only_registry_no_atomic_cleanup",
+                        })
+                    else:
+                        already_absent.append(candidate)
+                groups.pop(object_name)
+                break
 
     for object_name, candidates in groups.items():
         key = remote_key(object_name)
@@ -190,9 +286,10 @@ def delete_candidates(raw_fs, remote, bucket, payload):
             raise RuntimeError(f"managed-storage object versions still exist after permanent deletion: {object_name!r}")
         deleted.append({**candidates[0], "deleted_version_ids": sorted(item["VersionId"] for item in versions)})
     retained_unmapped.sort(key=lambda item: (item["pointer"], item["object"], item["version_id"]))
+    retained_mapped.sort(key=lambda item: (item["pointer"], item["object"], item["version_id"]))
     return {"mode": "permanent-version-deletion", "remote": remote.name,
             "deleted": deleted, "already_absent": already_absent,
-            "retained_unmapped": retained_unmapped}
+            "retained_unmapped": retained_unmapped, "retained_mapped": retained_mapped}
 
 
 def main(argv=None):

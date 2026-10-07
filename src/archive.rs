@@ -48,6 +48,7 @@ pub struct ArchiveTask {
     pub source: String,
     pub destination: String,
     pub pull_request: MergedPullRequest,
+    pub review_history: Vec<MergedPullRequest>,
     pub receipt: serde_json::Value,
 }
 
@@ -57,7 +58,7 @@ pub struct SkippedTask {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergedPullRequest {
     pub number: u64,
     pub url: String,
@@ -81,6 +82,43 @@ struct HostingPullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AssociatedPullRequest {
+    number: u64,
+    html_url: String,
+    state: String,
+    merged_at: Option<String>,
+    merge_commit_sha: Option<String>,
+    head: AssociatedRef,
+    base: AssociatedRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssociatedRef {
+    #[serde(rename = "ref")]
+    name: String,
+    sha: String,
+    repo: Option<AssociatedRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssociatedRepository {
+    full_name: String,
+}
+
+#[derive(Debug)]
+struct HistoricalManifest {
+    commit: String,
+    directory: String,
+    manifest: TaskManifest,
+    tree: String,
+}
+
+struct CompletionProof {
+    pull_request: MergedPullRequest,
+    reviews: Vec<MergedPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
 struct HostingCommit {
     oid: String,
 }
@@ -90,6 +128,7 @@ struct PreparedTask {
     original_manifest: String,
     next_manifest: String,
     original_receipt: Option<String>,
+    relocation: crate::relocation::RelocationPlan,
 }
 
 pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
@@ -130,6 +169,19 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             )));
         }
         let manifest_path = source_dir.join(TASK_MANIFEST_NAME);
+        if !manifest_path.exists() {
+            let reason = "legacy task has no manifest; explicitly adopt it with task adopt and a verified merged pull request before archiving";
+            if !options.paths.is_empty() {
+                return Err(Error::message(format!(
+                    "archive refuses {source}: {reason}"
+                )));
+            }
+            skipped.push(SkippedTask {
+                path: source.clone(),
+                reason: reason.to_owned(),
+            });
+            continue;
+        }
         reject_symlink_traversal(
             &repo.root,
             &format!("{source}/{TASK_MANIFEST_NAME}"),
@@ -148,7 +200,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             &task,
             &base_oid,
         )?;
-        let Some(pull_request) = eligible else {
+        let Some(completion) = eligible else {
             if !options.paths.is_empty() {
                 return Err(Error::message(format!(
                     "archive refuses active or unverified task {source}; its matching pull request must be merged into {:?}",
@@ -215,6 +267,8 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             }
         }
         validate_materialized(&repo, source)?;
+        let relocation =
+            crate::relocation::prepare(&source_dir, &resolved_under(&repo.root, &destination))?;
         let original_manifest = fs::read_to_string(&manifest_path).at(&manifest_path)?;
         let mut next: TaskManifest =
             toml::from_str(&original_manifest).map_err(|source| Error::Toml {
@@ -262,6 +316,14 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             .ok_or_else(|| Error::message("archive migration plan must be an object"))?;
         object.insert("task_id".to_owned(), task.task_id.clone().into());
         object.insert("status".to_owned(), "planned".into());
+        object.insert(
+            "completion_reviews".to_owned(),
+            serde_json::to_value(&completion.reviews).map_err(|error| {
+                Error::message(format!(
+                    "failed to render archive completion evidence: {error}"
+                ))
+            })?,
+        );
         if let Some(previous) = previous_receipt {
             object.insert("previous_receipt".to_owned(), previous);
         }
@@ -271,16 +333,18 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
                 branch: task.branch,
                 source: source.clone(),
                 destination,
-                pull_request,
+                pull_request: completion.pull_request,
+                review_history: completion.reviews,
                 receipt,
             },
             original_manifest,
             next_manifest,
             original_receipt,
+            relocation,
         });
     }
     if !options.dry_run {
-        apply(&repo, &config, &prepared)?;
+        apply(&repo, &config, &prepared, owner.as_ref())?;
     }
     Ok(ArchiveReport {
         status: if prepared.is_empty() {
@@ -301,7 +365,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
     })
 }
 
-fn infrastructure_task(
+pub(crate) fn infrastructure_task(
     repo: &GitRepo,
     config: &Config,
     options: &ArchiveOptions,
@@ -340,7 +404,14 @@ fn task_sources(repo: &GitRepo, selected: &[String]) -> Result<Vec<String>> {
     } else {
         for entry in fs::read_dir(&repo.root).at(&repo.root)? {
             let entry = entry.at(&repo.root)?;
-            if entry.path().join(TASK_MANIFEST_NAME).is_file() {
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| Error::message("archive task directory name is not UTF-8"))?;
+            if entry.path().join(TASK_MANIFEST_NAME).is_file()
+                || (entry.file_type().at(entry.path())?.is_dir()
+                    && parse_task_identity(TaskKind::Deliverable, name).is_ok())
+            {
                 let name = entry
                     .file_name()
                     .to_str()
@@ -384,7 +455,7 @@ fn hosting_command() -> String {
     "gh".to_owned()
 }
 
-fn hosting_repository(repo: &GitRepo, remote: &str) -> Result<String> {
+pub(crate) fn hosting_repository(repo: &GitRepo, remote: &str) -> Result<String> {
     #[cfg(feature = "test-storage")]
     if std::env::var_os("WORKSPACE_MGR_TEST_GH").is_some() {
         return Ok("example.invalid/owner/archive-fixture".to_owned());
@@ -433,7 +504,179 @@ fn merged_pull_request(
     host: &str,
     task: &ResolvedTask,
     base: &str,
-) -> Result<Option<MergedPullRequest>> {
+) -> Result<Option<CompletionProof>> {
+    if repo
+        .run(["rev-parse", "--is-shallow-repository"])?
+        .stdout
+        .trim()
+        == "true"
+    {
+        return Err(Error::message(
+            "archive requires complete Git history to verify historical identities and reviews; fetch the repository with --unshallow before archiving",
+        ));
+    }
+    let history = manifest_history(repo, base, task)?;
+    if history.is_empty() {
+        return Ok(None);
+    }
+    // The stable ID connects historical schema/path/branch migrations. A
+    // current branch name alone cannot identify the original review.
+    let mut branches = history
+        .iter()
+        .map(|item| item.manifest.branch.clone())
+        .collect::<BTreeSet<_>>();
+    branches.insert(task.branch.clone());
+    let oldest = history.last().expect("a nonempty identity history");
+    let legacy = crate::archive_adoption::verify_record(
+        repo,
+        &Config::load_compatible(repo)?,
+        host,
+        base,
+        task,
+        (&oldest.commit, &oldest.directory),
+    )?;
+    if let Some((branch, _)) = &legacy {
+        branches.insert(branch.clone());
+    }
+    let mut requests = Vec::new();
+    for branch in &branches {
+        let rows = branch_pull_requests(repo, host, branch)?;
+        if rows.iter().any(|pr| pr.state == "OPEN") {
+            return Ok(None);
+        }
+        requests.extend(rows);
+    }
+    let mut reviewed = Vec::new();
+    for (index, snapshot) in history.iter().enumerate() {
+        // Most task creation commits are the recorded PR merge itself. Other
+        // identity changes require the hosting provider's commit-to-PR
+        // association, so an unrelated later review cannot bless a direct edit.
+        let mut matching = requests
+            .iter()
+            .filter(|pr| {
+                pr.merge_commit
+                    .as_ref()
+                    .is_some_and(|merge| merge.oid == snapshot.commit)
+            })
+            .collect::<Vec<_>>();
+        let associated;
+        if matching.is_empty() {
+            associated = associated_pull_requests(repo, host, &snapshot.commit)?;
+            if associated.iter().any(|pr| pr.state == "OPEN") {
+                return Ok(None);
+            }
+            matching = associated.iter().collect();
+        }
+        let mut proofs = Vec::new();
+        for request in matching {
+            let Some(proof) = verified_review(repo, task, base, request)? else {
+                continue;
+            };
+            let merged = historical_manifest(repo, &proof.merge_commit, task)?;
+            if merged.as_ref().is_none_or(|merged| {
+                (index == 0 || proof.merge_commit == snapshot.commit)
+                    && merged.tree != snapshot.tree
+            }) {
+                continue;
+            }
+            // Squash commits are the merge itself. A commit associated with a
+            // regular/fast-forward PR must be part of its reviewed head.
+            if snapshot.commit != proof.merge_commit {
+                ensure_review_head(repo, remote, &proof)?;
+            }
+            if snapshot.commit != proof.merge_commit
+                && !ancestor(repo, &snapshot.commit, &proof.head_commit)?
+            {
+                continue;
+            }
+            branches.insert(request.head_ref_name.clone());
+            proofs.push(proof);
+        }
+        proofs.sort_by_key(|proof| proof.number);
+        proofs.dedup_by_key(|proof| proof.number);
+        if proofs.len() != 1 {
+            return Ok(None);
+        }
+        reviewed.push((snapshot.manifest.branch.clone(), proofs.remove(0)));
+    }
+    if let Some(legacy) = legacy {
+        reviewed.push(legacy);
+    }
+    for branch in &branches {
+        // A migration's own review branch is part of the verified lifecycle,
+        // even when the task's manifest retains a different canonical branch.
+        if !requests
+            .iter()
+            .any(|request| &request.head_ref_name == branch)
+        {
+            let rows = branch_pull_requests(repo, host, branch)?;
+            if rows.iter().any(|request| request.state == "OPEN") {
+                return Ok(None);
+            }
+            requests.extend(rows);
+        }
+    }
+    // Repeated reviews may change only task contents. They still establish
+    // that a newer retained branch head was merged even when no identity
+    // field changed. Every accepted review must contain a verified historical
+    // identity state on the synchronized base.
+    for request in &requests {
+        let Some(proof) = verified_review(repo, task, base, request)? else {
+            continue;
+        };
+        if historical_manifest(repo, &proof.merge_commit, task)?.is_some_and(|merged| {
+            history.iter().any(|snapshot| {
+                snapshot.directory == merged.directory && snapshot.tree == merged.tree
+            })
+        }) {
+            reviewed.push((request.head_ref_name.clone(), proof));
+        }
+    }
+    // A retained ref may lag behind its merged review; it must never contain
+    // commits that the review did not contain. Check both current and historic
+    // names against the reviewed head for that identity state.
+    for branch in branches {
+        let local = repo.optional_oid(&format!("refs/heads/{branch}"))?;
+        let remote_oid = repo.remote_branch_oid(remote, &branch)?;
+        if let Some(oid) = &remote_oid {
+            repo.fetch_branch_objects(remote, &branch, oid)?;
+        }
+        for oid in local.iter().chain(remote_oid.iter()) {
+            let mut contained = false;
+            for (_, proof) in &reviewed {
+                ensure_review_head(repo, remote, proof)?;
+                if ancestor(repo, oid, &proof.head_commit)? {
+                    contained = true;
+                    break;
+                }
+            }
+            if !contained {
+                return Ok(None);
+            }
+        }
+    }
+    let pull_request = reviewed
+        .first()
+        .expect("every history snapshot has a review")
+        .1
+        .clone();
+    let mut reviews = reviewed
+        .into_iter()
+        .map(|(_, proof)| proof)
+        .collect::<Vec<_>>();
+    reviews.sort_by_key(|review| review.number);
+    reviews.dedup_by_key(|review| review.number);
+    Ok(Some(CompletionProof {
+        pull_request,
+        reviews,
+    }))
+}
+
+fn branch_pull_requests(
+    repo: &GitRepo,
+    host: &str,
+    branch: &str,
+) -> Result<Vec<HostingPullRequest>> {
     let output = process::run(
         &hosting_command(),
         [
@@ -442,7 +685,7 @@ fn merged_pull_request(
             "--repo",
             host,
             "--head",
-            &task.branch,
+            branch,
             "--state",
             "all",
             "--limit",
@@ -463,99 +706,279 @@ fn merged_pull_request(
             "archive pull-request query reached its limit; resolve ambiguous task branch history first",
         ));
     }
-    let requests: Vec<_> = requests
+    Ok(requests
         .into_iter()
-        .filter(|pr| pr.head_ref_name == task.branch && !pr.is_cross_repository)
-        .collect();
-    if requests.iter().any(|pr| pr.state == "OPEN") {
+        .filter(|pr| pr.head_ref_name == branch && !pr.is_cross_repository)
+        .collect())
+}
+
+fn associated_pull_requests(
+    repo: &GitRepo,
+    host: &str,
+    commit: &str,
+) -> Result<Vec<HostingPullRequest>> {
+    let (hostname, repository) = host
+        .split_once('/')
+        .ok_or_else(|| Error::message("invalid archive hosting repository"))?;
+    let endpoint = format!("repos/{repository}/commits/{commit}/pulls?per_page=100");
+    let output = process::run(
+        &hosting_command(),
+        ["api", "--hostname", hostname, &endpoint],
+        &repo.root,
+    )?;
+    let rows: Vec<AssociatedPullRequest> =
+        serde_json::from_str(&output.stdout).map_err(|error| {
+            Error::message(format!(
+                "archive commit review verification returned invalid JSON: {error}"
+            ))
+        })?;
+    if rows.len() >= 100 {
+        return Err(Error::message(
+            "archive commit review query reached its limit; review history is ambiguous",
+        ));
+    }
+    Ok(rows
+        .into_iter()
+        .filter_map(|pr| {
+            let same_repository = pr
+                .head
+                .repo
+                .as_ref()
+                .zip(pr.base.repo.as_ref())
+                .is_some_and(|(head, base)| {
+                    head.full_name == repository && base.full_name == repository
+                });
+            same_repository.then(|| HostingPullRequest {
+                number: pr.number,
+                url: pr.html_url,
+                state: if pr.merged_at.is_some() {
+                    "MERGED".to_owned()
+                } else {
+                    pr.state.to_ascii_uppercase()
+                },
+                merged_at: pr.merged_at,
+                merge_commit: pr.merge_commit_sha.map(|oid| HostingCommit { oid }),
+                head_ref_name: pr.head.name,
+                head_ref_oid: pr.head.sha,
+                base_ref_name: pr.base.name,
+                is_cross_repository: false,
+            })
+        })
+        .collect())
+}
+
+fn verified_review(
+    repo: &GitRepo,
+    task: &ResolvedTask,
+    base: &str,
+    request: &HostingPullRequest,
+) -> Result<Option<MergedPullRequest>> {
+    if request.state != "MERGED"
+        || request.base_ref_name != task.base_branch
+        || request.is_cross_repository
+    {
         return Ok(None);
     }
-    let identity = parse_task_identity(task.kind, &task.task_id)?;
-    let expected = build_task_path(&identity, &task.slug);
-    let mut merged = Vec::new();
-    for request in requests {
-        if request.state != "MERGED" || request.base_ref_name != task.base_branch {
-            continue;
-        }
-        let (Some(merged_at), Some(commit)) = (request.merged_at, request.merge_commit) else {
-            return Err(Error::message(
-                "archive merged pull request lacks a merge timestamp or commit",
-            ));
-        };
-        if chrono::DateTime::parse_from_rfc3339(&merged_at).is_err()
-            || commit.oid.len() != 40
-            || !commit.oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || request.head_ref_oid.len() != 40
-            || !request
-                .head_ref_oid
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(Error::message(
-                "archive merged pull request contains invalid merge evidence",
-            ));
-        }
-        let ancestor = repo.run_unchecked(["merge-base", "--is-ancestor", &commit.oid, base])?;
-        match ancestor.code {
-            1 => continue,
-            0 => {}
-            _ => {
-                return Err(Error::message(
-                    "archive cannot verify the PR merge commit on the fetched shared branch",
-                ));
-            }
-        }
-        let suffix = format!("/{expected}/{TASK_MANIFEST_NAME}");
-        let root_manifest = format!("{expected}/{TASK_MANIFEST_NAME}");
-        let paths = repo
-            .run(["ls-tree", "-r", "-z", "--name-only", &commit.oid, "--"])?
-            .stdout;
-        let mut matching = 0;
-        for path in paths
-            .split('\0')
-            .filter(|path| *path == root_manifest || path.ends_with(&suffix))
-        {
-            let directory = path
-                .strip_suffix(&format!("/{TASK_MANIFEST_NAME}"))
-                .expect("manifest suffix");
-            if tree_manifest_matches(repo, &commit.oid, directory, task)? {
-                matching += 1;
-            }
-        }
-        if matching > 1 {
-            return Err(Error::message(
-                "archive PR merge tree contains multiple directories for this task identity",
-            ));
-        }
-        if matching == 1 {
-            merged.push(MergedPullRequest {
-                number: request.number,
-                url: request.url,
-                merged_at,
-                merge_commit: commit.oid,
-                head_commit: request.head_ref_oid,
-            });
-        }
+    let (Some(merged_at), Some(commit)) = (&request.merged_at, &request.merge_commit) else {
+        return Err(Error::message(
+            "archive merged pull request lacks a merge timestamp or commit",
+        ));
+    };
+    if chrono::DateTime::parse_from_rfc3339(merged_at).is_err()
+        || !commit_oid(&commit.oid)
+        || !commit_oid(&request.head_ref_oid)
+    {
+        return Err(Error::message(
+            "archive merged pull request contains invalid merge evidence",
+        ));
     }
-    match merged.len() {
-        0 => Ok(None),
-        1 => {
-            let accepted = merged.pop().expect("one merged pull request");
-            if repo
-                .remote_branch_oid(remote, &task.branch)?
-                .is_some_and(|oid| oid != accepted.head_commit)
-                || repo
-                    .optional_oid(&format!("refs/heads/{}", task.branch))?
-                    .is_some_and(|oid| oid != accepted.head_commit)
-            {
-                return Ok(None);
-            }
-            Ok(Some(accepted))
-        }
+    if !ancestor(repo, &commit.oid, base)? {
+        return Ok(None);
+    }
+    Ok(Some(MergedPullRequest {
+        number: request.number,
+        url: request.url.clone(),
+        merged_at: merged_at.clone(),
+        merge_commit: commit.oid.clone(),
+        head_commit: request.head_ref_oid.clone(),
+    }))
+}
+
+fn commit_oid(oid: &str) -> bool {
+    oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn ensure_review_head(
+    repo: &GitRepo,
+    remote: &str,
+    proof: &MergedPullRequest,
+) -> Result<()> {
+    if repo
+        .run_unchecked([
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", proof.head_commit),
+        ])?
+        .success()
+    {
+        return Ok(());
+    }
+    let reference = format!("refs/pull/{}/head", proof.number);
+    let observed = repo
+        .run(["ls-remote", "--refs", remote, &reference])?
+        .stdout;
+    let rows = observed
+        .lines()
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>();
+    if rows.len() != 1
+        || rows[0].split_once('\t') != Some((proof.head_commit.as_str(), reference.as_str()))
+    {
+        return Err(Error::message(
+            "archive cannot fetch the immutable reviewed PR head; its provider ref is absent or changed",
+        ));
+    }
+    repo.run([
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--refmap=",
+        remote,
+        &reference,
+    ])?;
+    if !repo
+        .run_unchecked([
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", proof.head_commit),
+        ])?
+        .success()
+    {
+        return Err(Error::message(
+            "archive immutable review head changed while it was fetched; retry verification",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ancestor(repo: &GitRepo, commit: &str, descendant: &str) -> Result<bool> {
+    let output = repo.run_unchecked(["merge-base", "--is-ancestor", commit, descendant])?;
+    match output.code {
+        0 => Ok(true),
+        1 => Ok(false),
         _ => Err(Error::message(
-            "archive found multiple merged pull requests for this task identity; resolve its review history first",
+            "archive cannot verify commit ancestry; fetch the immutable review history before archiving",
         )),
     }
+}
+
+fn manifest_history(
+    repo: &GitRepo,
+    base: &str,
+    task: &ResolvedTask,
+) -> Result<Vec<HistoricalManifest>> {
+    let pathspec = format!(":(glob)**/{TASK_MANIFEST_NAME}");
+    let manifest_commits = repo
+        .run([
+            "log",
+            "--first-parent",
+            "--format=%H",
+            base,
+            "--",
+            &pathspec,
+        ])?
+        .stdout;
+    let mut directories = BTreeSet::new();
+    for commit in manifest_commits.lines() {
+        if let Some(snapshot) = historical_manifest(repo, commit, task)? {
+            directories.insert(snapshot.directory);
+        }
+    }
+    if directories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["log", "--first-parent", "--format=%H", base, "--"];
+    args.extend(directories.iter().map(String::as_str));
+    let commits = repo.run(args)?.stdout;
+    let mut history: Vec<HistoricalManifest> = Vec::new();
+    let mut gap = false;
+    for commit in commits.lines() {
+        let Some(snapshot) = historical_manifest(repo, commit, task)? else {
+            if !history.is_empty() {
+                gap = true;
+            }
+            continue;
+        };
+        if gap {
+            return Err(Error::message(
+                "archive task identity disappeared and was reintroduced; historical ownership cannot be verified",
+            ));
+        }
+        if let Some(previous) = history.last_mut().filter(|previous| {
+            previous.directory == snapshot.directory && previous.tree == snapshot.tree
+        }) {
+            previous.commit = snapshot.commit;
+        } else {
+            history.push(snapshot);
+        }
+    }
+    Ok(history)
+}
+
+fn historical_manifest(
+    repo: &GitRepo,
+    commit: &str,
+    task: &ResolvedTask,
+) -> Result<Option<HistoricalManifest>> {
+    let paths = crate::manifest::published_task_paths(repo, commit, task)?;
+    if paths.len() > 1 {
+        return Err(Error::message(
+            "archive PR merge tree contains multiple directories for this task identity",
+        ));
+    }
+    let Some(directory) = paths.into_iter().next() else {
+        return Ok(None);
+    };
+    let raw = repo
+        .run([
+            "show",
+            &format!("{commit}:{directory}/{TASK_MANIFEST_NAME}"),
+        ])?
+        .stdout;
+    let manifest: TaskManifest = toml::from_str(&raw).map_err(|error| {
+        Error::message(format!("invalid historical archive task manifest: {error}"))
+    })?;
+    let identity = parse_task_identity(manifest.kind, &manifest.id)?;
+    let slug = match manifest.schema_version {
+        1 if manifest.slug.is_empty() => &identity.original_slug,
+        2 | 3 => {
+            crate::manifest::validate_task_slug(&manifest.slug)?;
+            &manifest.slug
+        }
+        _ => {
+            return Err(Error::message(
+                "archive historical task manifest has an unsupported schema or invalid slug",
+            ));
+        }
+    };
+    if directory.rsplit('/').next() != Some(build_task_path(&identity, slug).as_str())
+        || manifest.kind != TaskKind::Deliverable
+    {
+        return Err(Error::message(
+            "archive historical task manifest has an unverifiable directory identity",
+        ));
+    }
+    repo.validate_branch(&manifest.branch)?;
+    let tree = repo
+        .optional_oid(&format!("{commit}:{directory}"))?
+        .ok_or_else(|| Error::message("archive historical task tree is unavailable"))?;
+    Ok(Some(HistoricalManifest {
+        commit: commit.to_owned(),
+        directory,
+        manifest,
+        tree,
+    }))
 }
 
 fn tree_manifest_matches(
@@ -616,7 +1039,12 @@ fn validate_destination(repo: &GitRepo, base: &str, destination: &str) -> Result
     Ok(())
 }
 
-fn validate_clean_paths(repo: &GitRepo, base: &str, source: &str, destination: &str) -> Result<()> {
+pub(crate) fn validate_clean_paths(
+    repo: &GitRepo,
+    base: &str,
+    source: &str,
+    destination: &str,
+) -> Result<()> {
     validate_overlays(repo, source, destination)?;
     let difference = repo.run_unchecked(["diff", "--quiet", base, "HEAD", "--", source])?;
     if difference.code != 0 {
@@ -671,22 +1099,43 @@ fn validate_materialized(repo: &GitRepo, source: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply(repo: &GitRepo, config: &Config, tasks: &[PreparedTask]) -> Result<()> {
+fn apply(
+    repo: &GitRepo,
+    config: &Config,
+    tasks: &[PreparedTask],
+    owner: Option<&ResolvedTask>,
+) -> Result<()> {
     let mut moved = Vec::new();
     let mut created = Vec::new();
+    let mut recorded = Vec::new();
     let result = (|| {
         for (index, task) in tasks.iter().enumerate() {
             let old = resolved_under(&repo.root, &task.report.source);
             let new = resolved_under(&repo.root, &task.report.destination);
+            if let Some(owner) = owner {
+                crate::archive_cancel::record_attempt(
+                    repo,
+                    owner,
+                    &task.report.source,
+                    &task.report.destination,
+                    &task.relocation,
+                    &task.report.receipt,
+                )?;
+                recorded.push(index);
+            }
             create_parents(&repo.root, new.parent().expect("task parent"), &mut created)?;
             fs::rename(&old, &new).at(&old)?;
             moved.push(index);
+            task.relocation.apply()?;
             atomic_write(&new.join(TASK_MANIFEST_NAME), &task.next_manifest)?;
             let receipt = serde_json::to_string_pretty(&task.report.receipt).map_err(|error| {
                 Error::message(format!("failed to render archive receipt: {error}"))
             })? + "\n";
             atomic_write(&new.join(RECEIPT_NAME), &receipt)?;
             ResolvedTask::load(repo, config, &new.join(TASK_MANIFEST_NAME))?;
+            if owner.is_some() {
+                crate::archive_cancel::moved(repo, &task.report.source, &task.report.destination)?;
+            }
         }
         Ok(())
     })();
@@ -696,6 +1145,7 @@ fn apply(repo: &GitRepo, config: &Config, tasks: &[PreparedTask]) -> Result<()> 
             let task = &tasks[index];
             let new = resolved_under(&repo.root, &task.report.destination);
             let restored = (|| {
+                task.relocation.restore()?;
                 atomic_write(&new.join(TASK_MANIFEST_NAME), &task.original_manifest)?;
                 match &task.original_receipt {
                     Some(raw) => atomic_write(&new.join(RECEIPT_NAME), raw)?,
@@ -714,6 +1164,18 @@ fn apply(repo: &GitRepo, config: &Config, tasks: &[PreparedTask]) -> Result<()> 
             })();
             if let Err(failure) = restored {
                 failures.push(failure.to_string());
+            }
+        }
+        if failures.is_empty() {
+            for index in recorded {
+                let task = &tasks[index];
+                if let Err(error) = crate::archive_cancel::rolled_back(
+                    repo,
+                    &task.report.source,
+                    &task.report.destination,
+                ) {
+                    failures.push(error.to_string());
+                }
             }
         }
         for path in created.into_iter().rev() {
@@ -755,15 +1217,22 @@ fn create_parents(root: &Path, parent: &Path, created: &mut Vec<PathBuf>) -> Res
 }
 
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
-    let mut file =
-        tempfile::NamedTempFile::new_in(path.parent().expect("metadata parent")).at(path)?;
+    let parent = path.parent().expect("metadata parent");
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let mut file = tempfile::NamedTempFile::new_in(parent).at(path)?;
     file.write_all(text.as_bytes()).at(path)?;
     file.flush().at(path)?;
+    if let Some(permissions) = permissions {
+        file.as_file().set_permissions(permissions).at(path)?;
+    }
+    file.as_file().sync_all().at(path)?;
     file.persist(path).map_err(|error| Error::Io {
         path: path.to_path_buf(),
         source: error.error,
     })?;
-    Ok(())
+    fs::File::open(parent).at(parent)?.sync_all().at(parent)
 }
 
 #[cfg(test)]
@@ -801,7 +1270,7 @@ mod tests {
                     task_id: source.clone(),
                     branch: format!("codex/{name}"),
                     source,
-                    destination,
+                    destination: destination.clone(),
                     pull_request: MergedPullRequest {
                         number: index as u64 + 1,
                         url: "https://example.invalid/pull/1".to_owned(),
@@ -809,14 +1278,17 @@ mod tests {
                         merge_commit: "a".repeat(40),
                         head_commit: "b".repeat(40),
                     },
+                    review_history: Vec::new(),
                     receipt: serde_json::json!({"status": "planned"}),
                 },
                 original_manifest: original,
                 next_manifest,
                 original_receipt: None,
+                relocation: crate::relocation::prepare(&directory, &repo.root.join(&destination))
+                    .unwrap(),
             });
         }
-        let error = apply(&repo, &Config::default(), &prepared)
+        let error = apply(&repo, &Config::default(), &prepared, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("task directory must be"), "{error}");

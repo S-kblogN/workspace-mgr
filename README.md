@@ -93,6 +93,13 @@ and destination scopes, then apply `archive` in that infrastructure task.
 The command moves local directories; normal publication copies and verifies
 their complete retained S3 history, rewrites storage metadata, and records
 durable exact-version mappings before obsolete source objects are purged.
+Reviewed schema/branch migrations preserve completion evidence, and manifestless
+legacy tasks use explicit `task adopt` before archive. Preview or undo an
+unpublished local attempt with `archive --cancel --manifest <owner> --dry-run`;
+cancel preserves ignored and hydrated local content. B2 keeps original S3
+versions as well as copies because its append-only registry has no atomic
+conditional-write primitive. See the [archive command](docs/commands.md#workspace-mgr-archive)
+for review, conflict, and cancellation guarantees.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.
 

@@ -15,7 +15,8 @@ import os
 from pathlib import Path, PurePosixPath
 import sys
 import tempfile
-from urllib.parse import urlencode
+import time
+from urllib.parse import urlencode, urlsplit
 import uuid
 
 
@@ -25,6 +26,7 @@ MAX_LIST_PAGES = 100_000
 COPY_LIMIT = 5 * 2**30
 COPY_PART_SIZE = 512 * 2**20
 TRANSACTION_METADATA = "workspace-mgr-archive-copy"
+B2_VERSION_INTERVAL = 1.05
 SOURCE_FIELDS = (
     "source_object", "destination_object", "source_version_id",
     "source_last_modified", "source_is_latest", "source_list_order",
@@ -36,6 +38,15 @@ COPY_HEADERS = (
     "ServerSideEncryption", "SSEKMSKeyId", "BucketKeyEnabled", "ObjectLockMode",
     "ObjectLockRetainUntilDate", "ObjectLockLegalHoldStatus",
 )
+
+
+def b2_version_spacing(raw_fs):
+    client = getattr(raw_fs, "_s3", None)
+    endpoint = (getattr(raw_fs, "endpoint_url", None)
+                or getattr(raw_fs, "client_kwargs", {}).get("endpoint_url", "")
+                or getattr(getattr(client, "meta", None), "endpoint_url", ""))
+    host = urlsplit(endpoint or "").hostname or ""
+    return host == "backblazeb2.com" or host.endswith(".backblazeb2.com")
 
 
 def object_path(value):
@@ -302,8 +313,15 @@ def abort_upload(raw_fs, context, row):
             raw_fs.call_s3("abort_multipart_upload", Bucket=context["bucket"],
                            Key=key_for(context, row["destination_object"]), UploadId=upload_id)
         except Exception as error:
-            code = getattr(error, "response", {}).get("Error", {}).get("Code")
-            if code != "NoSuchUpload":
+            provider, seen = error, set()
+            code = None
+            while provider is not None and id(provider) not in seen:
+                seen.add(id(provider))
+                code = getattr(provider, "response", {}).get("Error", {}).get("Code")
+                if code:
+                    break
+                provider = getattr(provider, "__cause__", None) or getattr(provider, "__context__", None)
+            if code != "NoSuchUpload" and not (code is None and isinstance(error, FileNotFoundError)):
                 raise
         row.pop("multipart_upload_id", None)
 
@@ -394,7 +412,7 @@ def verify_history(raw_fs, context, journal):
 
 
 def archive(raw_fs, context, operation, payload):
-    if operation not in ("plan", "copy", "verify", "verify-source"):
+    if operation not in ("plan", "copy", "verify", "verify-source", "cancel", "cancel-preview"):
         raise RuntimeError(f"unknown archive storage operation: {operation!r}")
     if operation == "plan":
         rows = source_inventory(raw_fs, context)
@@ -404,6 +422,24 @@ def archive(raw_fs, context, operation, payload):
                 "source_cleanup": "after_verified_git_publication"}
     state_path = payload.get("state_path")
     journal = load_journal(state_path) if state_path else None
+    if operation in ("cancel", "cancel-preview"):
+        if journal is None:
+            return {"status": "no_remote_copy", "retained_versions": [], "uploads": []}
+        validate_receipt(journal, context)
+        # Copies and the canonical registry are immutable historical evidence.
+        # A cancelled local move must never delete them, source versions, or a
+        # concurrent writer's objects. Only this journal's unfinished uploads
+        # can be aborted. Keeping the copy journal also permits an exact retry.
+        actual = destination_inventory(raw_fs, context)
+        uploads = [{"object": row["destination_object"], "upload_id": row["multipart_upload_id"]}
+                   for row in journal["versions"] if row.get("multipart_upload_id")]
+        if operation == "cancel":
+            for row in journal["versions"]:
+                abort_upload(raw_fs, context, row)
+                save_journal(state_path, journal)
+        return {"status": "retained_history", "retained_versions": [
+            {"key": item["Key"], "version_id": item["VersionId"], "delete_marker": item["delete_marker"]}
+            for item in actual], "uploads": uploads}
     if operation in ("verify", "verify-source"):
         journal = journal or payload.get("receipt") or payload.get("planned")
         if journal is None and isinstance(payload.get("versions"), list):
@@ -423,6 +459,11 @@ def archive(raw_fs, context, operation, payload):
             # Source cleanup belongs to publication, which can run after this
             # receipt has been completed. A retry verifies the immutable
             # destination versions without requiring the retired source.
+            planned = payload.get("planned")
+            if planned is not None:
+                validate_receipt(planned, context)
+                if source_signature(planned["versions"]) != source_signature(journal["versions"]):
+                    raise RuntimeError("retained archive copy differs from this attempt's complete source history")
             verify_history(raw_fs, context, journal)
             return public_receipt(journal)
     current = source_inventory(raw_fs, context)
@@ -444,9 +485,17 @@ def archive(raw_fs, context, operation, payload):
     validate_destination(raw_fs, context, journal, recover=True)
     save_journal(state_path, journal)
     persist = lambda: save_journal(state_path, journal)
+    spaced = b2_version_spacing(raw_fs)
+    written_keys = {row["destination_object"] for row in journal["versions"]
+                    if row.get("destination_version_id")}
     for row in journal["versions"]:
         if row.get("destination_version_id"):
             continue
+        # B2 documents that writes/markers for one key within a second may be
+        # processed out of order. Space sequential generations, including a
+        # recovered prior version, to keep the snapshot's exact current state.
+        if spaced and row["destination_object"] in written_keys:
+            time.sleep(B2_VERSION_INTERVAL)
         abort_upload(raw_fs, context, row)
         row["started"] = True
         persist()
@@ -458,6 +507,7 @@ def archive(raw_fs, context, operation, payload):
             record_destination(row, response.get("VersionId"))
         else:
             copy_payload(raw_fs, context, journal, row, persist)
+        written_keys.add(row["destination_object"])
         persist()
     if source_signature(source_inventory(raw_fs, context)) != source_signature(journal["versions"]):
         raise RuntimeError("archive source history changed before completion")

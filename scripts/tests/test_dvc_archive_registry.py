@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 import sys
+import threading
+from types import SimpleNamespace
 import unittest
 
 
@@ -65,6 +67,80 @@ class FakeS3:
                 raise value
             return value
         raise AssertionError(f"unexpected operation {operation}")
+
+
+class FakeB2S3:
+    """Append-only versioned registry; every operation stays in memory."""
+
+    endpoint_url = "https://s3.fixture.backblazeb2.com"
+    storage_args = ()
+
+    def __init__(self, backend=None, config_kwargs=None, **options):
+        self.backend = backend if backend is not None else {
+            "history": [], "calls": [], "lock": threading.Lock(), "page_size": 1000,
+        }
+        self.config_kwargs = config_kwargs or {}
+        self.storage_options = {"backend": self.backend, "config_kwargs": self.config_kwargs}
+        self.client_kwargs = {}
+
+    @property
+    def calls(self):
+        return self.backend["calls"]
+
+    def append(self, key, body=None, marker=False):
+        with self.backend["lock"]:
+            version = "registry-" + str(len(self.backend["history"]) + 1)
+            self.backend["history"].append({"Key": key, "VersionId": version,
+                                             "body": body, "marker": marker})
+            return version
+
+    def call_s3(self, operation, **request):
+        self.calls.append((operation, request.copy()))
+        if operation == "put_object":
+            if "IfNoneMatch" in request:
+                error = ProviderError("NotImplemented")
+                error.response["Error"]["Header"] = "If-None-Match"
+                raise error
+            if self.config_kwargs.get("request_checksum_calculation") != "when_required":
+                raise AssertionError("B2 writes must suppress SDK optional checksums")
+            barrier = self.backend.get("before_put")
+            if barrier is not None:
+                barrier.wait(timeout=5)
+            version = self.append(request["Key"], request["Body"])
+            barrier = self.backend.get("after_put")
+            if barrier is not None:
+                barrier.wait(timeout=5)
+            if self.backend.pop("lose_put_response", False):
+                raise ConnectionError("response lost after append")
+            return {"VersionId": version}
+        if operation == "get_object":
+            if not request.get("VersionId"):
+                raise AssertionError("B2 registry must read exact versions")
+            item = next((item for item in self.backend["history"]
+                         if (item["Key"], item["VersionId"]) == (request["Key"], request["VersionId"])), None)
+            if item is None or item["marker"]:
+                raise ProviderError("NoSuchVersion")
+            return {"Body": io.BytesIO(item["body"]), "VersionId": item["VersionId"]}
+        if operation == "list_object_versions":
+            if self.backend.get("deny_listing"):
+                raise PermissionError("denied version history")
+            rows = sorted((item for item in self.backend["history"]
+                           if item["Key"].startswith(request["Prefix"])),
+                          key=lambda item: (item["Key"], item["VersionId"]))
+            start = 0
+            if request.get("KeyMarker"):
+                identities = [(item["Key"], item["VersionId"]) for item in rows]
+                start = identities.index((request["KeyMarker"], request["VersionIdMarker"])) + 1
+            size = min(request["MaxKeys"], self.backend["page_size"])
+            page = rows[start:start + size]
+            result = {"Versions": [], "DeleteMarkers": [], "IsTruncated": start + size < len(rows)}
+            for item in page:
+                result["DeleteMarkers" if item["marker"] else "Versions"].append(
+                    {"Key": item["Key"], "VersionId": item["VersionId"]})
+            if result["IsTruncated"]:
+                result.update(NextKeyMarker=page[-1]["Key"], NextVersionIdMarker=page[-1]["VersionId"])
+            return result
+        raise AssertionError(f"unexpected B2 operation {operation}")
 
 
 def receipt(source="task", destination="2026/07/task", old="old", new="new",
@@ -308,6 +384,25 @@ class RegistryTests(unittest.TestCase):
                 error.response = {"Error": {"Code": code}}
                 self.assertFalse(module.missing_object(error))
 
+    def test_translated_provider_header_is_reported_without_unsafe_retry(self):
+        cause = ProviderError("NotImplemented")
+        cause.response["Error"]["Header"] = "If-None-Match"
+        translated = OSError(78, "A header you provided implies functionality that is not implemented")
+        translated.__cause__ = cause
+        original = self.fs.call_s3
+
+        def call(operation, **request):
+            if operation == "put_object":
+                self.fs.calls.append((operation, request))
+                raise translated
+            return original(operation, **request)
+
+        self.fs.call_s3 = call
+        with self.assertRaisesRegex(RuntimeError, "rejected If-None-Match"):
+            self.publish()
+        self.assertEqual(sum(op == "put_object" for op, _ in self.fs.calls), 1)
+        self.assertFalse(self.fs.registry_objects)
+
     def test_source_integrity_mismatch_never_triggers_fallback(self):
         self.publish()
         self.fs.calls.clear()
@@ -325,6 +420,152 @@ class RegistryTests(unittest.TestCase):
         self.fs.versions[("remote/2026/07/task/data", "new")] = head(size=8)
         with self.assertRaisesRegex(RuntimeError, "mismatched size"):
             verifier.verify_entries(self.fs, "bucket", [entry()], registry=self.registry)
+
+
+class B2RegistryTests(unittest.TestCase):
+    def setUp(self):
+        self.fs = FakeB2S3()
+        self.registry = registry_module.ArchiveRegistry(self.fs, "bucket", "remote")
+        self.key = registry_module.registry_key("remote", "task")
+
+    def test_append_is_idempotent_and_preserves_all_existing_versions(self):
+        value = receipt()
+        self.assertEqual(self.registry.publish(value)["status"], "published")
+        self.assertEqual(self.registry.publish(value)["status"], "unchanged")
+        self.fs.append(self.key, json.dumps(value, indent=2).encode())
+        self.assertEqual(self.registry.read("task"), value)
+        self.assertEqual(len(self.fs.backend["history"]), 2)
+        self.assertEqual(sum(op == "put_object" for op, _ in self.fs.calls), 1)
+        self.assertEqual(self.fs.config_kwargs, {})
+
+    def test_lost_append_response_recovers_without_extra_versions(self):
+        self.fs.backend["lose_put_response"] = True
+        self.assertEqual(self.registry.publish(receipt())["status"], "unchanged")
+        self.assertEqual(len(self.fs.backend["history"]), 1)
+
+    def test_full_paginated_history_conflicts_cannot_be_hidden_by_latest(self):
+        self.fs.backend["page_size"] = 1
+        self.fs.append(self.key, registry_module.encoded_receipt(receipt(new="competing")))
+        self.fs.append(self.key, registry_module.encoded_receipt(receipt()))
+        with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
+            self.registry.publish(receipt())
+        self.assertEqual(len(self.fs.backend["history"]), 2)
+        self.assertFalse(any(op == "put_object" for op, _ in self.fs.calls))
+        self.assertTrue(any("KeyMarker" in args for op, args in self.fs.calls if op == "list_object_versions"))
+
+    def test_delete_markers_are_not_treated_as_missing_or_removed(self):
+        self.fs.append(self.key, registry_module.encoded_receipt(receipt()))
+        self.fs.append(self.key, marker=True)
+        with self.assertRaisesRegex(RuntimeError, "delete marker"):
+            self.registry.publish(receipt())
+        self.assertEqual(len(self.fs.backend["history"]), 2)
+        self.assertFalse(any(op in ("put_object", "delete_object") for op, _ in self.fs.calls))
+
+    def test_listing_permission_failure_never_uses_latest_or_writes(self):
+        self.fs.backend["deny_listing"] = True
+        with self.assertRaises(PermissionError):
+            self.registry.publish(receipt())
+        self.assertTrue(all(op == "list_object_versions" for op, _ in self.fs.calls))
+
+    def concurrent_publish(self, values):
+        self.fs.backend["before_put"] = threading.Barrier(2)
+        self.fs.backend["after_put"] = threading.Barrier(2)
+        outcomes = []
+
+        def publish(value):
+            try:
+                outcomes.append(self.registry.publish(value))
+            except Exception as error:
+                outcomes.append(error)
+
+        threads = [threading.Thread(target=publish, args=(value,)) for value in values]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        return outcomes
+
+    def test_simultaneous_conflicting_writers_fail_closed_and_retain_both(self):
+        outcomes = self.concurrent_publish([receipt(), receipt(new="competing")])
+        self.assertEqual(len(outcomes), 2)
+        self.assertTrue(all(isinstance(value, RuntimeError) for value in outcomes), outcomes)
+        self.assertTrue(all("conflicting archive registry history" in str(value) for value in outcomes))
+        self.assertEqual(len(self.fs.backend["history"]), 2)
+        with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
+            self.registry.read("task")
+
+    def test_simultaneous_identical_writers_are_safe_with_complete_history(self):
+        outcomes = self.concurrent_publish([receipt(), receipt()])
+        self.assertTrue(all(isinstance(value, dict) for value in outcomes), outcomes)
+        self.assertEqual(len(self.fs.backend["history"]), 2)
+        self.assertEqual(self.registry.read("task"), receipt())
+
+    def test_later_conflict_invalidates_a_previously_successful_publish(self):
+        self.assertEqual(self.registry.publish(receipt())["status"], "published")
+        self.fs.append(self.key, registry_module.encoded_receipt(receipt(new="later")))
+        with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
+            self.registry.read("task")
+        self.assertEqual(len(self.fs.backend["history"]), 2)
+
+    def test_unknown_alias_keeps_cas_and_resolved_b2_endpoint_is_recognized(self):
+        for endpoint in ("https://b2.example.invalid", "https://backblazeb2.com.example.invalid"):
+            fs = SimpleNamespace(endpoint_url=endpoint, client_kwargs={})
+            self.assertFalse(registry_module.is_b2(fs))
+        fs = SimpleNamespace(endpoint_url=None, client_kwargs={}, _s3=SimpleNamespace(
+            meta=SimpleNamespace(endpoint_url="https://s3.fixture.backblazeb2.com")))
+        self.assertTrue(registry_module.is_b2(fs))
+
+
+HAS_STORAGE_RUNTIME = importlib.util.find_spec("s3fs") is not None
+
+
+@unittest.skipUnless(HAS_STORAGE_RUNTIME, "requires the pinned s3fs storage runtime")
+class RegistryRequestTests(unittest.TestCase):
+    def test_real_sdk_headers_disable_b2_checksums_and_retain_other_provider_cas(self):
+        import s3fs
+
+        class Captured(Exception):
+            pass
+
+        def headers(fs, **condition):
+            client = fs.connect()
+            captured = {}
+
+            def capture(request, **kwargs):
+                captured.update({name.lower(): value for name, value in request.headers.items()})
+                raise Captured("request captured before transport")
+
+            client.meta.events.register("before-send.s3.PutObject", capture)
+            with self.assertRaises(Captured):
+                fs.call_s3("put_object", Bucket="fixture-bucket", Key="registry.json",
+                           Body=b"{}", ContentType="application/json",
+                           ContentMD5="mZFLkyvTelC5g8XnyQrpOw==", **condition)
+            return captured
+
+        raw = s3fs.S3FileSystem(endpoint_url="https://s3.fixture.backblazeb2.com",
+                                key="mock-key", secret="mock-secret", version_aware=True,
+                                client_kwargs={"region_name": "us-east-1"},
+                                config_kwargs={"retries": {"max_attempts": 0}},
+                                skip_instance_cache=True)
+        baseline = headers(raw, IfNoneMatch="*")
+        self.assertIn("x-amz-sdk-checksum-algorithm", baseline)
+        writer = registry_module.registry_write_fs(raw)
+        safe = headers(writer)
+        self.assertEqual(safe["content-md5"], b"mZFLkyvTelC5g8XnyQrpOw==")
+        self.assertEqual(safe["content-length"], "2")
+        self.assertNotIn("x-amz-sdk-checksum-algorithm", safe)
+        self.assertNotIn("x-amz-trailer", safe)
+        self.assertNotIn("transfer-encoding", safe)
+        self.assertNotIn("request_checksum_calculation", raw.config_kwargs)
+        ordinary = s3fs.S3FileSystem(endpoint_url="https://s3.fixture.example.invalid",
+                                     key="mock-key", secret="mock-secret", version_aware=True,
+                                     client_kwargs={"region_name": "us-east-1"},
+                                     config_kwargs={"retries": {"max_attempts": 0}},
+                                     skip_instance_cache=True)
+        self.assertIs(registry_module.registry_write_fs(ordinary), ordinary)
+        conditional = headers(ordinary, IfNoneMatch="*")
+        self.assertEqual(conditional["if-none-match"], b"*")
 
 
 if __name__ == "__main__":

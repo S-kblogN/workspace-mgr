@@ -7,19 +7,62 @@ callers pass full bucket-relative S3 keys.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import json
 from pathlib import PurePosixPath
 import sys
 import threading
+from urllib.parse import urlsplit
 
 REGISTRY_SCHEMA = 1
 MAX_ARCHIVE_HOPS = 32
+MAX_REGISTRY_PAGES = 100_000
+MAX_REGISTRY_READ_RETRIES = 3
+
+
+def provider_error(error):
+    """Keep provider details after s3fs translates ClientError to OSError."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        response = getattr(error, "response", None)
+        if isinstance(response, dict) and isinstance(response.get("Error"), dict):
+            return response["Error"]
+        error = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+    return {}
+
+
+def is_b2(raw_fs):
+    client = getattr(raw_fs, "_s3", None)
+    endpoint = (getattr(raw_fs, "endpoint_url", None)
+                or getattr(raw_fs, "client_kwargs", {}).get("endpoint_url", "")
+                or getattr(getattr(client, "meta", None), "endpoint_url", ""))
+    host = urlsplit(endpoint or "").hostname or ""
+    return host == "backblazeb2.com" or host.endswith(".backblazeb2.com")
+
+
+def registry_write_fs(raw_fs):
+    """Use a private B2 client without unsupported automatic checksum headers.
+
+    Recent botocore versions add flexible checksum headers/trailers by default.
+    B2's PutObject API can reject these.
+    Scope the compatibility setting to this writer, preserving the original DVC
+    client's configuration and credential/session selection.
+    """
+    if not is_b2(raw_fs):
+        return raw_fs
+    options = dict(raw_fs.storage_options)
+    config = dict(options.get("config_kwargs") or {})
+    config["request_checksum_calculation"] = "when_required"
+    options["config_kwargs"] = config
+    options["skip_instance_cache"] = True
+    return type(raw_fs)(*raw_fs.storage_args, **options)
 
 
 def missing_object(error):
-    code = (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
+    code = provider_error(error).get("Code")
     if code is not None:
         return code in ("NoSuchKey", "NoSuchVersion", "NotFound", "404")
     return isinstance(error, FileNotFoundError)
@@ -125,6 +168,7 @@ class ArchiveRegistry:
         self._lookup_receipts = {}
         self._lookup_locks = {}
         self._lookup_guard = threading.Lock()
+        self._versioned_registry = is_b2(raw_fs)
 
     def _lookup_receipt(self, source):
         # Cache only this read invocation's lookups, including absent parents.
@@ -143,12 +187,23 @@ class ArchiveRegistry:
 
     def read(self, source):
         key = registry_key(self.remote_prefix, source)
+        if self._versioned_registry:
+            return self._read_history(source, key)
+        return self._read_version(source, key)
+
+    def _read_version(self, source, key, version_id=None):
+        request = {"Bucket": self.bucket, "Key": key}
+        if version_id is not None:
+            request["VersionId"] = version_id
         try:
-            response = self.raw_fs.call_s3("get_object", Bucket=self.bucket, Key=key)
+            response = self.raw_fs.call_s3("get_object", **request)
         except Exception as error:
-            if missing_object(error):
+            if version_id is None and missing_object(error):
                 return None
             raise
+        if version_id is not None and response.get("VersionId") != version_id:
+            response["Body"].close()
+            raise RuntimeError("archive registry read did not return its exact requested version")
         try:
             receipt = json.loads(read_body(self.raw_fs, response["Body"]))
         except (ValueError, TypeError, KeyError) as error:
@@ -157,6 +212,54 @@ class ArchiveRegistry:
         if receipt["source"] != source:
             raise RuntimeError("archive registry source does not match its canonical key")
         return receipt
+
+    def _history_versions(self, key):
+        request = {"Bucket": self.bucket, "Prefix": key, "MaxKeys": 1000}
+        versions, seen, markers = [], set(), set()
+        for _ in range(MAX_REGISTRY_PAGES):
+            response = self.raw_fs.call_s3("list_object_versions", **request)
+            for section in ("Versions", "DeleteMarkers"):
+                for item in response.get(section, []):
+                    name, version = item.get("Key"), item.get("VersionId")
+                    if not isinstance(name, str) or not name.startswith(key) or not isinstance(version, str) or not version:
+                        raise RuntimeError("archive registry history has an invalid object identity")
+                    identity = (name, version)
+                    if identity in seen:
+                        raise RuntimeError("archive registry history repeated an object version")
+                    seen.add(identity)
+                    if name == key:
+                        if section == "DeleteMarkers":
+                            raise RuntimeError("archive registry history contains a delete marker; refusing a hidden mapping")
+                        if version == "null":
+                            raise RuntimeError("archive registry requires exact non-null object versions")
+                        versions.append(version)
+            if not response.get("IsTruncated"):
+                return frozenset(versions)
+            marker = (response.get("NextKeyMarker"), response.get("NextVersionIdMarker"))
+            if not marker[0] or not marker[1] or marker in markers:
+                raise RuntimeError("archive registry history has missing or repeated pagination markers")
+            markers.add(marker)
+            request["KeyMarker"], request["VersionIdMarker"] = marker
+        raise RuntimeError("archive registry history listing exceeded its pagination limit")
+
+    def _read_history(self, source, key):
+        # The B2 adapter does not rely on undocumented conditional PutObject.
+        # Every version participates in the
+        # mapping: competing writers append evidence and readers fail closed
+        # on a conflict instead of accepting the latest writer. A changed scan
+        # is retried, and a continuously changing history is never published.
+        for _ in range(MAX_REGISTRY_READ_RETRIES):
+            versions = self._history_versions(key)
+            selected, encoded = None, None
+            for version in sorted(versions):
+                receipt = self._read_version(source, key, version)
+                body = encoded_receipt(receipt)
+                if encoded is not None and body != encoded:
+                    raise RuntimeError(f"conflicting archive registry history at {key!r}")
+                selected, encoded = receipt, body
+            if self._history_versions(key) == versions:
+                return selected
+        raise RuntimeError("archive registry history changed while verifying its complete versions")
 
     def publish(self, receipt):
         validate_receipt(receipt, self.bucket, self.remote_prefix)
@@ -178,17 +281,35 @@ class ArchiveRegistry:
 
         if matches_existing():
             return result("unchanged")
+        body = encoded_receipt(receipt)
+        writer = registry_write_fs(self.raw_fs)
         try:
-            self.raw_fs.call_s3(
+            condition = {} if self._versioned_registry else {"IfNoneMatch": "*"}
+            writer.call_s3(
                 "put_object", Bucket=self.bucket, Key=key,
-                Body=encoded_receipt(receipt), ContentType="application/json",
-                IfNoneMatch="*",
+                Body=body, ContentType="application/json",
+                ContentMD5=base64.b64encode(hashlib.md5(body).digest()).decode("ascii"),
+                **condition,
             )
-        except Exception:
-            # A response may be lost after S3 accepted the conditional write.
-            # Exact rereading also handles a concurrent identical publisher.
+        except Exception as error:
+            # A response may be lost after S3 accepted the write. Rereading
+            # also handles a concurrent identical publisher; B2 validates every
+            # version and never accepts a conflicting latest writer.
             if matches_existing():
                 return result("unchanged")
+            details = provider_error(error)
+            if details.get("Code") in ("NotImplemented", "NotSupported"):
+                header = details.get("Header")
+                if header == "If-None-Match":
+                    raise RuntimeError(
+                        "archive registry provider rejected If-None-Match; "
+                        "atomic conditional publication is unavailable, refusing an unsafe unconditional write"
+                    ) from error
+                label = f" ({header})" if header in ("x-amz-sdk-checksum-algorithm", "x-amz-trailer", "x-amz-checksum-crc32") else ""
+                raise RuntimeError(
+                    f"archive registry provider rejected a request header{label}; "
+                    "no publication fallback was attempted"
+                ) from error
             raise
         if not matches_existing():
             raise RuntimeError("archive registry publication was not readable")

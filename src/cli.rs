@@ -137,6 +137,8 @@ pub struct TaskArgs {
 pub enum TaskCommand {
     /// Create a deliverable directory or a private infrastructure manifest on the shared branch.
     Create(TaskCreateArgs),
+    /// Adopt a reviewed legacy task that has no manifest; publish before archiving.
+    Adopt(TaskAdoptArgs),
     /// Change a task's current slug while preserving its identity and review branch.
     Rename(TaskRenameArgs),
     /// Inspect the resolved task scope and working changes.
@@ -177,6 +179,27 @@ pub struct ArchiveArgs {
     pub manifest: Option<PathBuf>,
 
     /// Inspect merged tasks and required scopes without moving content.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Restore an unpublished archive attempt, preserving every local payload.
+    #[arg(long, conflicts_with = "layout")]
+    pub cancel: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskAdoptArgs {
+    pub path: String,
+    #[arg(long)]
+    pub pull_request: u64,
+    #[arg(long)]
+    pub title: String,
+    #[arg(long)]
+    pub purpose: String,
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
     #[arg(long)]
     pub dry_run: bool,
 }

@@ -276,12 +276,42 @@ follows bounded mappings only after an exact original version is missing,
 preserving hash and size checks. Planned local pointers can read their original
 exact versions before publication.
 
+Completion verification follows published stable-ID manifest and full task-tree
+history. Every transition must have a reachable, matching merged review;
+commit-to-PR associations connect repository-wide migrations with historical
+task branches. The explicit `task adopt` transition adds review and tree evidence
+for a pre-manifest directory, and that transition itself needs merged review.
+
+Before a local archive move, `.workspace-mgr/local/archive-attempts/` saves
+original tool-mutated metadata, modes, verified Git relocation references, owner
+refs, and retirement records. It records generated publication commits before
+their ref update and verified pushes before cleanup. `archive --cancel` restores
+only an unpublished attempt, preserving whole local directories by rename.
+Cancel phases and generated undo commits are durable, so interruption can be
+resumed without losing other infrastructure work. Copied S3 history and canonical
+registry records remain intact; only owned unfinished uploads are aborted.
+
+Conditional registry Put remains the default. For B2's official endpoints, a
+separate writer suppresses SDK flexible checksum headers and writes Content-MD5.
+An append-only versioned registry avoids relying on undocumented conditional Put: fresh
+reads enumerate and compare every exact version, rejecting any conflict or
+delete marker. This provides conflict detection, not atomic single-winner CAS.
+B2 source versions remain permanently protected, eliminating a registry
+read/delete race and keeping historical exact-version reads available.
+
 Only after Git push verification are mapped source versions queued for cleanup.
 A live branch or tag containing the original task manifest protects the whole
 source prefix. Cleanup deletes only the exact copied versions; concurrent
 unmapped additions remain and are reported. Native DVC does not interpret the
 canonical archive mappings, so old revisions use workspace-mgr hydration after
 their original versions have been retired.
+
+The executable and repository transaction rules are Rust. Managed S3 storage
+currently adapts the pinned Python DVC/s3fs runtime through embedded assets;
+`setup` provisions that runtime. A fully Rust storage engine would require
+replacing DVC pointer/cache behavior, exact-version hydration, metadata and tags,
+multipart copy, and provider compatibility. The existing implementation is a
+Rust CLI with a Python storage adapter.
 
 `task rename` is a local identity-preserving transition. It moves an ordinary
 task directory as one filesystem unit and atomically rewrites manifest schema
