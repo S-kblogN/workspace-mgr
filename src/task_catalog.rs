@@ -91,8 +91,14 @@ pub(crate) fn list(args: &TaskListArgs, format: Format) -> Result<()> {
     if args.paths {
         let mut paths = Vec::new();
         for task in &catalog.tasks {
-            if let Some(path) = &task.path {
+            if task.kind == TaskKind::Deliverable {
                 require_valid(task)?;
+                let path = task.path.as_ref().ok_or_else(|| {
+                    Error::message(format!(
+                        "cannot verify the current path of task {}",
+                        task.name
+                    ))
+                })?;
                 paths.push(path);
             }
         }

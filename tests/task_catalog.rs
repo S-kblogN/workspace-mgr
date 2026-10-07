@@ -425,6 +425,31 @@ fn path_mismatches_in_current_metadata_are_invalid_instead_of_redirecting_lookup
     assert!(error.contains(FIRST), "{error}");
 }
 
+#[test]
+fn paths_output_refuses_invalid_deliverables_with_unrepresentable_relative_locations() {
+    let fixture = GitFixture::new();
+    let declared = format!("bad-group/{FIRST}");
+    let directory = write_task(&fixture.seed, &declared, FIRST, "analysis");
+    let unrepresentable_parent = fixture.seed.join(" bad-group");
+    std::fs::rename(directory.parent().unwrap(), &unrepresentable_parent).unwrap();
+
+    let catalog = json(&workspace(&fixture.seed, ["task", "list"]));
+    assert_eq!(tasks(&catalog).len(), 1);
+    let task = &tasks(&catalog)[0];
+    assert_eq!(task["metadata"], "invalid");
+    assert!(task["path"].is_null());
+    assert!(!task["diagnostic"].as_str().unwrap().is_empty());
+    for format in ["json", "human"] {
+        let output = common::workspace_env_unchecked(
+            &fixture.seed,
+            ["task", "list", "--paths"],
+            &[("WORKSPACE_MGR_FORMAT", format)],
+        );
+        let error = error_text(&output);
+        assert!(error.contains(FIRST), "{error}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_task_metadata_is_invalid_instead_of_becoming_a_legacy_candidate() {
