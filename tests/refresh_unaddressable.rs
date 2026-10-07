@@ -8,6 +8,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::*;
+use md5::Digest;
 
 const TIMESTAMP: &str = "20260920-090000";
 const TASK_ID: &str = "20260920-090000-refresh-unaddressable";
@@ -31,13 +32,51 @@ fn unaddressable_boundary() -> String {
     format!("{TASK_ID}/top\\level.bin")
 }
 
+/// Reproduce an old DVC3 file boundary without invoking an external engine.
+/// Its metadata and raw MD5 cache bytes live only in this fixture's checkout
+/// and filesystem remote, including when the historical path is unaddressable.
+fn fixture_storage_boundary(repo: &Path, remote: &Path, name: &str, payload: &[u8]) {
+    let task = repo.join(TASK_ID);
+    std::fs::write(task.join(name), payload).unwrap();
+    let digest = md5::Md5::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let document = serde_json::json!({
+        "outs": [{"path": name, "hash": "md5", "md5": digest, "size": payload.len()}]
+    });
+    std::fs::write(
+        task.join(format!("{name}.dvc")),
+        serde_yaml::to_string(&document).unwrap(),
+    )
+    .unwrap();
+    for root in [repo.join(".dvc/cache"), remote.to_owned()] {
+        let cache = root.join("files/md5").join(&digest[..2]).join(&digest[2..]);
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(cache, payload).unwrap();
+    }
+    let ignore = task.join(".gitignore");
+    let mut rules = std::fs::read_to_string(&ignore).unwrap_or_default();
+    let rule = format!("/{}", name.replace('\\', "\\\\"));
+    if !rules.lines().any(|line| line == rule) {
+        if !rules.is_empty() && !rules.ends_with('\n') {
+            rules.push('\n');
+        }
+        rules.push_str(&rule);
+        rules.push('\n');
+        std::fs::write(ignore, rules).unwrap();
+    }
+    // The historical payload is local/cache content, never ordinary Git data.
+    git(repo, ["check-ignore", &format!("{TASK_ID}/{name}")]);
+}
+
 /// A repository whose shared branch carries one incoming storage boundary the
 /// engine can address and one it cannot, plus an ordinary incoming Git file.
 ///
 /// No current command produces the unaddressable boundary: placement refuses
 /// it. A release before that refusal could, so the fixture reproduces that
-/// history with the engine and Git directly, in a crafting checkout, and leaves
-/// the shared checkout one fast-forward behind it.
+/// history with DVC-compatible metadata/cache and Git in a crafting checkout,
+/// and leaves the shared checkout one fast-forward behind it.
 fn shared_branch_carrying_unaddressable_metadata() -> SharedBranch {
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
@@ -94,21 +133,13 @@ fn shared_branch_carrying_unaddressable_metadata() -> SharedBranch {
     );
     configure_git(&publisher);
     let publisher_task = publisher.join(TASK_ID);
-    std::fs::write(publisher_task.join("second.bin"), SECOND_PAYLOAD).unwrap();
-    std::fs::write(publisher_task.join("top\\level.bin"), UNADDRESSABLE_PAYLOAD).unwrap();
-    command(
-        &publisher_task,
-        "dvc",
-        ["add", "--quiet", "--", "second.bin"],
+    fixture_storage_boundary(&publisher, &storage_remote, "second.bin", SECOND_PAYLOAD);
+    fixture_storage_boundary(
+        &publisher,
+        &storage_remote,
+        "top\\level.bin",
+        UNADDRESSABLE_PAYLOAD,
     );
-    command(
-        &publisher_task,
-        "dvc",
-        ["add", "--quiet", "--", "top\\level.bin"],
-    );
-    // Targeting either pointer would make the engine resolve it; the whole
-    // working set uploads both objects without naming a path.
-    command(&publisher, "dvc", ["push", "--quiet"]);
     std::fs::write(
         publisher_task.join("notes.md"),
         "Ordinary Git content arriving in the same revision.\n",
@@ -379,8 +410,8 @@ fn refresh_refuses_to_leave_a_payload_under_metadata_that_no_longer_describes_it
     let metadata = publisher.join(TASK_ID).join("top\\level.bin.dvc");
     let metadata_before = std::fs::read(&metadata).unwrap();
 
-    // Someone replaces that boundary's content upstream, which only the
-    // engine and Git used directly can still do.
+    // Someone replaces that boundary's content upstream, represented by
+    // historical pointer/cache bytes that current placement would refuse.
     let updater = branch.fixture.root.join("updater");
     command(
         &branch.fixture.root,
@@ -392,18 +423,12 @@ fn refresh_refuses_to_leave_a_payload_under_metadata_that_no_longer_describes_it
         ],
     );
     configure_git(&updater);
-    let updater_task = updater.join(TASK_ID);
-    std::fs::write(
-        updater_task.join("top\\level.bin"),
+    fixture_storage_boundary(
+        &updater,
+        &branch.fixture.root.join("storage-remote"),
+        "top\\level.bin",
         b"newer content for the payload nothing can address\n",
-    )
-    .unwrap();
-    command(
-        &updater_task,
-        "dvc",
-        ["add", "--quiet", "--", "top\\level.bin"],
     );
-    command(&updater, "dvc", ["push", "--quiet"]);
     git(&updater, ["add", "-A"]);
     git(
         &updater,

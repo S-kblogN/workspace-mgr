@@ -51,7 +51,7 @@ jobs:
         run: |
           git --version
           dvc version
-      - name: Test exact-version transport and request counts
+      - name: Test legacy storage compatibility oracles
         run: python -m unittest discover -s scripts/tests -p 'test_dvc_*.py'
       - name: Start versioned S3-compatible service
         run: |

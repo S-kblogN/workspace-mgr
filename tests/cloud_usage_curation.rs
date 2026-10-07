@@ -821,10 +821,34 @@ fn a_file_removed_from_a_boundary_in_s3_is_a_cleanup_an_undocumented_task_publis
         ["remove", format!("{outputs}/a.bin").as_str()],
         &OVER_300KB,
     );
-    command(
+    // A rejected Git push leaves the metadata prepared by the native storage
+    // engine for a retry. Exercise that state through the public CLI rather
+    // than requiring a separate storage-engine executable in the fixture.
+    let unavailable = fixture.root.join("unavailable-push-remote.git");
+    git(
         &fixture.shared,
-        "dvc",
-        ["commit", "-q", "--force", pointer.as_str()],
+        [
+            "config",
+            "remote.origin.pushurl",
+            unavailable.to_str().unwrap(),
+        ],
+    );
+    let prepared = workspace_env_unchecked(
+        &task,
+        ["publish", "-m", "Prepare the second cleanup for a retry"],
+        &OVER_300KB,
+    );
+    git(
+        &fixture.shared,
+        ["config", "--unset", "remote.origin.pushurl"],
+    );
+    assert_refused(&prepared, "unavailable-push-remote.git");
+    assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
+    assert!(
+        std::fs::read_to_string(task.join("outputs.dvc"))
+            .unwrap()
+            .contains("nfiles: 1"),
+        "the failed publication already rewrote the metadata for its retry"
     );
     let retried = json(&workspace_env(&task, ["plan"], &OVER_300KB));
     assert_eq!(retried["status"], "dry_run");
@@ -980,12 +1004,22 @@ fn text_added_to_published_s3_metadata_is_content() {
         "# Run 3 reached accuracy 0.93.\n",
     ] {
         std::fs::write(task.join("stored.bin.dvc"), format!("{published}{added}")).unwrap();
-        let engine = command(
-            &fixture.shared,
-            "dvc",
-            ["status", "--json", pointer.as_str()],
+        // The record lets a public plan reach native storage inspection. Its
+        // payload status remains clean despite the added metadata text; once
+        // the record is removed, the curation guard must still refuse it.
+        document_task(&task);
+        let engine = json(&workspace_env(&task, ["plan"], &ROOMY_10MB));
+        assert_eq!(
+            engine["storage"]["s3"]["dirty_files"],
+            serde_json::json!([])
         );
-        assert_eq!(String::from_utf8_lossy(&engine.stdout).trim(), "{}");
+        assert!(
+            engine["storage"]["s3"]["files"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(pointer.as_str()))
+        );
+        std::fs::remove_file(task.join("record.md")).unwrap();
         for args in [&["plan"][..], &["publish", "-m", "Annotate the result"][..]] {
             assert_refused(
                 &workspace_env_unchecked(&task, args, &ROOMY_10MB),
