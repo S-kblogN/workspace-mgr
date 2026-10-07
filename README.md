@@ -96,9 +96,12 @@ durable exact-version mappings before obsolete source objects are purged.
 Reviewed schema/branch migrations preserve completion evidence, and manifestless
 legacy tasks use explicit `task adopt` before archive. Preview or undo an
 unpublished local attempt with `archive --cancel --manifest <owner> --dry-run`;
-cancel preserves ignored and hydrated local content. B2 keeps original S3
-versions as well as copies because its append-only registry has no atomic
-conditional-write primitive. See the [archive command](docs/commands.md#workspace-mgr-archive)
+cancel preserves ignored and hydrated local content while removing this
+attempt's S3 copies and registry records. Archive completion requires the old
+S3 prefix to contain no data versions or delete markers; protected or unmapped
+history remains explicitly pending. A Git control tag binds each canonical
+receipt, allowing B2-compatible publication without permanently retaining
+duplicate source history. See the [archive command](docs/commands.md#workspace-mgr-archive)
 for review, conflict, and cancellation guarantees.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.

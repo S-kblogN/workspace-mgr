@@ -60,7 +60,7 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::message(format!("archive receipt is missing {key}")))
 }
 
-fn validate(path: &str, receipt: &Value) -> Result<()> {
+pub(crate) fn validate(path: &str, receipt: &Value) -> Result<()> {
     let source = repo_path(text(receipt, "source")?, "archive source")?;
     let destination = repo_path(text(receipt, "destination")?, "archive destination")?;
     if receipt["schema_version"] != 1
@@ -162,12 +162,13 @@ pub fn prepare(
                 let journal_dir = repo.local_state_dir()?.join("archive");
                 fs::create_dir_all(&journal_dir).at(&journal_dir)?;
                 let journal = journal_dir.join(format!("{digest}.json"));
+                let reservation = crate::archive_reservation::reserve(repo, &receipt)?;
                 let copied = dvc::version_archive_adapter(
                     repo,
                     "copy",
                     &json!({
                         "source":source,"destination":destination,"planned":receipt,
-                        "state_path":journal.to_string_lossy()
+                        "state_path":journal.to_string_lossy(),"reservation":reservation
                     }),
                 )?;
                 // Keep task identity and earlier receipts, which the transport
@@ -204,7 +205,7 @@ pub fn prepare(
     Ok(completed)
 }
 
-fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
+pub(crate) fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
     let source = text(receipt, "source")?;
     let destination = text(receipt, "destination")?;
     let digest = crate::hex::encode_lower(
@@ -232,7 +233,10 @@ fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
     ]
     .iter()
     .any(|key| journal[key] != receipt[key])
-        || journal["status"] != "copied"
+        || !matches!(
+            journal["status"].as_str(),
+            Some("copied" | "canceling" | "cancelled")
+        )
     {
         return Ok(false);
     }
@@ -243,6 +247,9 @@ fn trusted_copy_journal(repo: &GitRepo, receipt: &Value) -> Result<bool> {
         if let Some(object) = version.as_object_mut() {
             object.remove("started");
             object.remove("multipart_upload_id");
+            object.remove("cancel_started");
+            object.remove("cancel_deleted");
+            object.remove("cancel_owned_versions");
         }
     }
     Ok(journal["versions"] == receipt["versions"])

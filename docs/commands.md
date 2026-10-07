@@ -403,23 +403,47 @@ which the receipt maps to their originals. Copying history is charged to the
 infrastructure task's cloud-usage projection, so its full retained history must
 fit that task's approved limit before migration starts.
 
-Only after Git publication may source history be purged, and current remote
-branch or tag references defer that cleanup. A failed publication preserves
-source history and retry journals. Historical Git checkouts use
+Before the copied receipt merges into the configured shared branch, current
+remote branches or tags containing the source directory defer cleanup,
+including legacy trees without manifests. Once that receipt is merged, old
+branches and tags can read exact mapped versions through the registry; they
+remain intact and no longer require duplicate history at the original path.
+New referenced generations without mappings remain protected. Retirement is
+complete only after a full version-history scan finds neither data versions nor delete markers under
+the original prefix. `storage.purge.status: cleanup_pending` reports protected
+history or a prefix waiting for its copied receipt to reach the shared branch.
+Even an archive whose original version inventory is empty keeps a durable
+`pending_prefixes` intent until a complete version-and-marker scan confirms
+that the old prefix is empty.
+`blocked_unmapped` reports concurrent versions without a verified
+mapping. Both preserve retry records and report a warning. Git's `pushed` or
+`updated` status does not mean storage retirement is complete. Concurrent
+unmapped or foreign data is preserved and blocks completion; it is never
+silently erased or forgotten from the retry queue. A failed publication
+preserves source history and retry journals. Historical Git checkouts use
 `workspace-mgr storage hydrate` to resolve the durable registry and verify their
 original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
 resolve the changed keys and version IDs.
 
-Backblaze B2 uses an append-only registry with exact reads of every retained
-registry version. Differing mappings or delete markers cause an explicit
-conflict, preserving both writers' evidence. B2's documented Put API does not
-promise the conditional publication used by the other S3 adapter, so this
-adapter conservatively retains the original source versions
-and markers permanently as well as the copies. The report lists these as
-`retained_mapped`; they remain protected in the retirement queue. Same-key copy
+Before copying, an immutable source reservation under
+`refs/tags/workspace-mgr/archive-copy/` chooses one attempt by Git
+compare-and-create, so competing publishers cannot both copy into the same
+destination. The canonical registry is then bound to the complete copied
+receipt by a separate control tag under
+`refs/tags/workspace-mgr/archive-registry/` on the configured Git remote.
+The reservation binds a normalized planned receipt and its private journal's
+attempt nonce; the canonical binding records the complete copied receipt.
+Exact remote object ID checks guard mutations. Conflicting receipts or registry
+history refuse publication and cleanup.
+Neither ownership claim expires or permits takeover. The remote must permit
+creating and conditionally deleting both sets of control tags.
+For Backblaze B2, the registry writer disables automatic SDK checksum headers
+and sends Content-MD5. It first attempts conditional Put; a provider's explicit
+not-implemented/not-supported response permits an unconditional fallback only
+while the verified Git binding owns this exact receipt. Source history is
+retired under the same completion checks as other providers. Same-key copy
 generations are spaced by at least one second to preserve B2's current version
-ordering. The registry writer disables automatic SDK checksum headers and sends
-Content-MD5. Unknown endpoints keep conditional publication and fail safely if
+ordering. Unknown endpoints keep conditional publication and fail safely if
 their provider rejects it.
 
 `--cancel --dry-run` previews a journaled local attempt. Apply restores its
@@ -432,10 +456,21 @@ are reversed only for the selected archive paths; other scoped work is retained.
 Independent metadata/ref edits and destination collisions refuse cancellation
 before movement. Repeating cancel is safe, including after interruption.
 
-Cancellation retains copied S3 versions and registry records and aborts only
-unfinished multipart uploads recorded by its journal. This preserves history
-and allows an unchanged copy to be reused on retry. A new source inventory that
-differs from a retained copy is refused rather than silently omitting versions.
+Cancellation verifies that all original source versions and markers remain
+intact, withdraws only this attempt's exact registry versions, deletes its
+copied data versions and delete markers, and aborts its recorded multipart
+uploads. It records their verified absence durably, restores local directories,
+metadata, refs and retirement state, removes its empty generated parents, then
+releases its exact canonical binding and copy reservation before marking the
+attempt cancelled. Preview performs none of these writes. Foreign destination
+data, changed original source versions, or a conflicting registry blocks this
+initial remote cleanup and preserves a resumable attempt.
+Once remote cleanup is durably verified, an interrupted retry can finish local
+restoration while preserving any later foreign writes or a newer owner's
+claims. Completed cancellation does not require the source generations to
+remain after a newer archive retires them. Retries use exact version IDs without
+creating new delete markers. A subsequent archive starts a fresh copy transaction
+rather than reusing cancelled copies.
 After verified Git push, use a reviewed revert. Receipts from an older CLI that
 did not save the local attempt journal cannot provide a verified lossless cancel.
 

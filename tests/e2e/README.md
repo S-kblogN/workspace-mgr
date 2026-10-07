@@ -43,9 +43,11 @@ recorded in `evidence.jsonl`.
 It uses the same real Git/MinIO services and a feature-gated synthetic GitHub
 merge response. It checks a fresh unmaterialized clone, standalone and directory
 version bindings, superseded payloads, retired keys, delete markers, failed Git
-push and repaired metadata retry, prefix protection through merge, exact mapped
-source cleanup with concurrent additions retained and reported, and historical
-Git hydration through the durable registry. CI runs it after the production
+push and repaired metadata retry, prefix protection through merge, complete
+old-prefix retirement of data versions and delete markers, refusal to finish
+while unmapped concurrent history remains, lossless cancellation with copied
+versions and markers removed, and historical Git hydration through the durable
+registry without recreating the old prefix. CI runs it after the production
 lifecycle using a `test-storage` binary and its own bucket and evidence directory.
 
 GitHub Actions owns the MinIO process, verifies its pinned official binary's

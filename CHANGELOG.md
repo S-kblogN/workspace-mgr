@@ -18,23 +18,51 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Archive completion follows reviewed identity and content history across
   schema/branch migrations and accepts branch tips behind a verified PR head.
   Open reviews, unreviewed changes, divergent refs, and identity ambiguity fail.
-- B2 archive registries use full version-history conflict detection and a
-  checksum-compatible writer. Original B2 versions and delete markers remain
-  protected because this adapter uses append-only conflict detection in place
-  of atomic conditional registry publication.
+- Archive retirement completes only after a full S3 history scan finds no data
+  versions or delete markers under the original task prefix. Protected history
+  reports `cleanup_pending`; unmapped concurrent writes report
+  `blocked_unmapped` and remain durably queued instead of being forgotten.
+  Publication and refresh report these incomplete cleanup states separately
+  from successful Git push or synchronization. Empty original inventories also
+  retain typed prefix cleanup intents until a published-receipt scan verifies
+  no source versions or delete markers remain.
+- Archive cancellation removes the attempt's exact registry versions, copied
+  payloads, delete markers and unfinished uploads after verifying the original
+  source generations. It releases its exact canonical binding and copy
+  reservation after durable remote cleanup and local restoration,
+  preserving unrelated history and refusing terminal success on conflicts.
+  Retries after durable remote cleanup preserve later foreign writes and newer
+  claims while completing local undo; completed retries do not require source
+  versions that a subsequent archive may have retired.
+- Live legacy task trees on branches or tags protect their complete S3 prefix
+  before archive merge, even when the old Git snapshot has no task manifest.
+  After the copied receipt merges, historical tags hydrate mapped versions
+  through the registry without retaining duplicate source history.
 - Moving ignored nested Git worktrees repairs verifiable absolute/relative Git
   control paths. Non-relocatable runtime references are refused before moving.
 - Legacy adoption review records remain in Git and are protected from
   automatic S3 placement, explicit storage changes, and untracking.
 
+### Changed
+
+- Canonical archive registries use an immutable complete-receipt binding on a
+  reserved Git control tag for compare-and-create ownership. A separate source
+  copy reservation binds a normalized planned receipt and attempt nonce before
+  any copied history is written. Both ownership claims do not
+  expire or permit takeover. B2 registry writes suppress automatic checksum
+  headers and send Content-MD5 while retaining conditional Put as the first
+  attempt. An explicit unsupported-operation response permits a plain retry
+  only under the verified binding; completed archives retire their original
+  payload prefix instead of retaining duplicate source history permanently.
+
 ### Upgrading
 
 - Lossless `archive --cancel` requires an attempt journal created by this
-  release. Old receipts alone cannot reconstruct all original local metadata.
-- B2 archive publication retains original versions and delete markers as well
-  as their copies; account for this retained history in storage usage.
-- Upgrade every CLI that archives or purges this repository; older builds do
-  not apply the B2 source-history protection added by this release.
+  release, including its copy reservation nonce. Old receipts alone cannot
+  reconstruct ownership and all original local metadata.
+- Use this protocol on every CLI that archives, cancels or purges the same
+  repository. The configured Git remote must permit creating and conditionally
+  deleting the reserved `archive-copy` and `archive-registry` control tags.
 
 ## [0.6.0] - 2026-10-06
 

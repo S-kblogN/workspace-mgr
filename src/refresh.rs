@@ -189,10 +189,11 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let warnings = unaddressable_warnings(&unaddressable_boundaries);
     let working_before = working_changes(&repo)?;
     let purge_candidates = if old_oid == new_oid {
-        Vec::new()
+        s3_purge::archive_candidates_at(&repo, &new_oid, &[])?
     } else {
         s3_purge::candidates_between(&repo, &config, &old_oid, &new_oid, &[])?
     };
+    let archive_receipts = s3_purge::archive_receipts_at(&repo, &new_oid, &[])?;
     let mut report = RefreshReport {
         status: if old_oid == new_oid {
             "no_changes"
@@ -228,8 +229,20 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     if old_oid == new_oid {
         cleanup_branches(&repo, &config, &new_oid, options.dry_run, &mut report);
         if !options.dry_run {
+            s3_purge::queue(&repo, &purge_candidates)?;
+            s3_purge::queue_archive_prefixes(&repo, &archive_receipts)?;
             report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
-            if !report.storage.purge.deleted.is_empty() {
+            report.storage.purge.queued = purge_candidates;
+            if let Some((code, message)) = report.storage.purge.warning() {
+                report.warnings.push(RefreshWarning {
+                    code: code.to_owned(),
+                    message,
+                });
+            }
+            if !report.storage.purge.deleted.is_empty()
+                && report.storage.purge.pending.is_empty()
+                && report.storage.purge.pending_prefixes.is_empty()
+            {
                 report.status = "s3_purged".to_owned();
             }
         }
@@ -266,6 +279,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     }
 
     s3_purge::queue(&repo, &purge_candidates)?;
+    s3_purge::queue_archive_prefixes(&repo, &archive_receipts)?;
 
     let mut outputs_absent_before = Vec::new();
     if !incoming_dvc.is_empty() {
@@ -378,6 +392,12 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     cleanup_branches(&repo, &config, &new_oid, false, &mut report);
     report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
     report.storage.purge.queued = purge_candidates;
+    if let Some((code, message)) = report.storage.purge.warning() {
+        report.warnings.push(RefreshWarning {
+            code: code.to_owned(),
+            message,
+        });
+    }
     Ok(report)
 }
 

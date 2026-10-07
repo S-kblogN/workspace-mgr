@@ -111,9 +111,19 @@ def list_versions(raw_fs, bucket, prefix):
     raise RuntimeError("S3 purge history exceeded the pagination limit")
 
 
-def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
+def delete_candidates(raw_fs, remote, bucket, payload, registry=None, coordination=None, repo_path=None, prefixes=None):
+    coordination = coordination or {}
     groups = {}
     archives = {}
+    prefix_receipts = {}
+    for receipt in prefixes or []:
+        source = receipt.get("source")
+        if not isinstance(source, str) or not source or source in prefix_receipts:
+            raise RuntimeError("invalid or duplicate archive retirement prefix")
+        if receipt.get("status") != "copied" or not isinstance(receipt.get("versions"), list):
+            raise RuntimeError("archive retirement prefix requires a complete copied receipt")
+        prefix_receipts[source] = receipt
+        archives[source] = {}
     for candidate in payload:
         pointer, object_name, version = (candidate.get(field) for field in ("pointer", "object", "version_id"))
         if (not isinstance(pointer, str) or not isinstance(object_name, str)
@@ -144,6 +154,7 @@ def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
         return key
 
     deleted, already_absent, retained_unmapped, retained_mapped = [], [], [], []
+    cleaned_prefixes = []
     if (archives or groups) and registry is None:
         try:
             from dvc_archive_registry import ArchiveRegistry, is_b2
@@ -162,23 +173,37 @@ def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
             spec.loader.exec_module(module)
             ArchiveRegistry = module.ArchiveRegistry
             is_b2 = module.is_b2
-        if archives or is_b2(raw_fs):
+        if archives or groups:
             object_bucket, prefix, selected_version = raw_fs.split_path(remote.path)
             if object_bucket != bucket or selected_version:
                 raise RuntimeError("archive cleanup registry escaped its configured storage")
-            registry = ArchiveRegistry(raw_fs, bucket, prefix)
+            registry = ArchiveRegistry(raw_fs, bucket, prefix, repo_path=repo_path)
 
-    def verify_registry(source, objects):
+    def verify_registry(source, objects, present=None):
         # read() scans every B2 registry version and fails on conflicts/markers.
         # Recheck immediately before each destructive request, including retries
         # after partial cleanup, so no cached latest-writer receipt authorizes it.
         receipt = registry.read(source)
         if receipt is None:
             raise RuntimeError("archive cleanup requires a published canonical registry")
+        if source in prefix_receipts and receipt != prefix_receipts[source]:
+            raise RuntimeError("archive retirement prefix differs from its canonical registry")
         mapped = {(row["source_object"], row["source_version_id"])
                   for row in receipt["versions"]}
+        proof = coordination.get(source)
+        if proof is None and (repo_path is not None or getattr(registry, "_versioned_registry", False)):
+            raise RuntimeError("archive cleanup requires an atomic Git registry binding and published receipt")
+        if proof is not None:
+            if proof.get("receipt") != receipt:
+                raise RuntimeError("archive cleanup registry differs from its coordinated receipt")
+            registry.verify_coordination(receipt, proof.get("coordination"), allow_published=True)
+            # Every copied version (including markers) must still exist before
+            # any source version can be removed. A registry alone is no proof.
+            from dvc_version_archive import verify_history, receipt_context
+            verify_history(raw_fs, receipt_context(receipt), receipt)
         wanted = {(name, item["version_id"])
-                  for name, candidates in objects.items() for item in candidates}
+                  for name, candidates in objects.items() for item in candidates
+                  if present is None or (remote_key(name, literal=True), item["version_id"]) in present}
         if not wanted.issubset(mapped):
             raise RuntimeError("archive cleanup candidate is not mapped by its published registry")
 
@@ -186,53 +211,22 @@ def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
     # candidates must not turn a mapped-version cleanup into an all-version
     # purge that could erase writes made after the archive source snapshot.
     for source, objects in archives.items():
-        verify_registry(source, objects)
         prefix = remote_key(source + "/", literal=True)
         initial = list_versions(raw_fs, bucket, prefix)
         wanted = {(remote_key(name, literal=True), item["version_id"])
                   for name, candidates in objects.items() for item in candidates}
         present = {(item["Key"], item["VersionId"]): item for item in initial}
+        verify_registry(source, objects, present)
         suppressed_generic = []
         for name in list(groups):
             if name.startswith(source + "/"):
                 suppressed_generic.extend(groups.pop(name))
-        if getattr(registry, "_versioned_registry", False):
-            # An append-only B2 registry can become conflicted after this
-            # verification. Retain exact originals so old Git revisions can
-            # still hydrate directly even if later registry writes conflict.
-            # No read/check/delete sequence can replace a provider's atomic
-            # conditional primitive, so this retention is mandatory on B2.
-            for name, candidates in objects.items():
-                key = remote_key(name, literal=True)
-                for item in candidates:
-                    if (key, item["version_id"]) in present:
-                        retained_mapped.append({
-                            **item, "reason": "append_only_registry_no_atomic_cleanup",
-                        })
-                    else:
-                        already_absent.append(item)
-            for item in suppressed_generic:
-                key = remote_key(item["object"], literal=True)
-                if (key, item["version_id"]) in present:
-                    retained_mapped.append({
-                        **item, "reason": "append_only_registry_no_atomic_cleanup",
-                    })
-                else:
-                    already_absent.append(item)
-            for item in initial:
-                if (item["Key"], item["VersionId"]) not in wanted:
-                    retained_unmapped.append({
-                        "pointer": source + ARCHIVE_SUFFIX,
-                        "object": source + "/" + item["Key"][len(prefix):],
-                        "version_id": item["VersionId"],
-                    })
-            continue
         for name, candidates in objects.items():
             key = remote_key(name, literal=True)
             requested = {item["version_id"] for item in candidates}
             existing = sorted(version for version in requested if (key, version) in present)
             for version in existing:
-                verify_registry(source, objects)
+                verify_registry(source, objects, present)
                 raw_fs.call_s3("delete_object", Bucket=bucket, Key=key, VersionId=version)
             if existing:
                 deleted.append({**candidates[0], "deleted_version_ids": existing})
@@ -243,6 +237,8 @@ def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
         remaining = list_versions(raw_fs, bucket, prefix)
         if any((item["Key"], item["VersionId"]) in wanted for item in remaining):
             raise RuntimeError("mapped archive object versions still exist after permanent deletion")
+        if not remaining:
+            cleaned_prefixes.append(source)
         for item in remaining:
             retained_unmapped.append({
                 "pointer": source + ARCHIVE_SUFFIX,
@@ -250,27 +246,37 @@ def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
                 "version_id": item["VersionId"],
             })
 
-    if getattr(registry, "_versioned_registry", False):
-        # A caller may omit archive candidates because Git references protected
-        # them, or because this checkout did not create the original archive.
-        # Discover only canonical registry keys for this object's ancestors;
-        # an ordinary retirement must not bypass B2's original-version safety.
+    # Generic retirements beneath an archived prefix must never bypass the
+    # exact registry mapping, nor delete a newer independent source generation.
+    if registry is not None:
         for object_name, candidates in list(groups.items()):
             parts = object_name.split("/")
             for length in range(len(parts) - 1, 0, -1):
                 source = "/".join(parts[:length])
-                if registry.read(source) is None:
+                receipt = registry.read(source)
+                if receipt is None:
                     continue
+                mapped = {(row["source_object"], row["source_version_id"]) for row in receipt["versions"]}
                 key = remote_key(object_name)
                 versions = [item for item in list_versions(raw_fs, bucket, key) if item["Key"] == key]
                 present = {item["VersionId"] for item in versions}
-                for candidate in candidates:
-                    if candidate["version_id"] in present:
-                        retained_mapped.append({
-                            **candidate, "reason": "append_only_registry_no_atomic_cleanup",
-                        })
+                exact = [item for item in candidates if (object_name, item["version_id"]) in mapped]
+                if exact:
+                    verify_registry(source, {object_name: exact})
+                for item in versions:
+                    if (object_name, item["VersionId"]) in mapped:
+                        if not exact:
+                            raise RuntimeError("generic archive retirement has no coordinated exact mapping")
+                        verify_registry(source, {object_name: exact})
+                        raw_fs.call_s3("delete_object", Bucket=bucket, Key=key, VersionId=item["VersionId"])
                     else:
-                        already_absent.append(candidate)
+                        retained_unmapped.append({"pointer":source + ARCHIVE_SUFFIX,
+                                                  "object":object_name,"version_id":item["VersionId"]})
+                for item in candidates:
+                    if item["version_id"] not in present:
+                        already_absent.append(item)
+                    elif (object_name, item["version_id"]) in mapped:
+                        deleted.append(item)
                 groups.pop(object_name)
                 break
 
@@ -289,7 +295,8 @@ def delete_candidates(raw_fs, remote, bucket, payload, registry=None):
     retained_mapped.sort(key=lambda item: (item["pointer"], item["object"], item["version_id"]))
     return {"mode": "permanent-version-deletion", "remote": remote.name,
             "deleted": deleted, "already_absent": already_absent,
-            "retained_unmapped": retained_unmapped, "retained_mapped": retained_mapped}
+            "retained_unmapped": retained_unmapped, "retained_mapped": retained_mapped,
+            "cleaned_prefixes": sorted(cleaned_prefixes)}
 
 
 def main(argv=None):
@@ -312,7 +319,21 @@ def main(argv=None):
                 raise RuntimeError("configured S3 remote does not name a bucket")
             if not raw_fs.is_bucket_versioned(bucket):
                 raise RuntimeError(f"S3 bucket {bucket!r} does not have object versioning enabled")
-            result = delete_candidates(raw_fs, remote, bucket, payload)
+            coordination = {}
+            prefixes = []
+            if isinstance(payload, dict):
+                for proof in payload.get("coordination", []):
+                    source = proof.get("receipt", {}).get("source")
+                    if not source or source in coordination:
+                        raise RuntimeError("invalid or duplicate archive cleanup coordination")
+                    coordination[source] = proof
+                prefixes = payload.get("prefixes", [])
+                if not isinstance(prefixes, list):
+                    raise RuntimeError("archive retirement prefixes must be a list")
+                payload = payload.get("candidates")
+                if not isinstance(payload, list):
+                    raise RuntimeError("archive cleanup candidates must be a list")
+            result = delete_candidates(raw_fs, remote, bucket, payload, coordination=coordination, repo_path=repo_path, prefixes=prefixes)
     else:
         raise RuntimeError(f"unknown managed-storage purge operation: {operation!r}")
     print(json.dumps(result, sort_keys=True))

@@ -1313,7 +1313,9 @@ class Harness:
         self.check(local_branch.returncode == 128, "infrastructure discard deletes its local branch")
         self.check(
             all(item["key"] != infra_discarded_key for item in self.list_s3_versions())
-            and discarded["s3_purge"]["status"] == "deleted",
+            and discarded["s3_purge"]["status"] == "complete"
+            and discarded["s3_purge"]["pending"] == []
+            and discarded["s3_purge"].get("pending_prefixes", []) == [],
             "infrastructure discard permanently purges unreferenced versioned S3 content",
         )
         self.assert_shared_head()
@@ -2178,8 +2180,9 @@ class Harness:
             "published tree retains placement intent and removes payloads and S3 pointer",
         )
         self.check(
-            published["storage"]["purge"]["status"] == "protected"
+            published["storage"]["purge"]["status"] == "cleanup_pending"
             and published["storage"]["purge"]["pending"]
+            and any(warning["code"] == "s3-cleanup-pending" for warning in published.get("warnings", []))
             and self.list_s3_versions() == versions_before,
             "live main and tag references keep every retired S3 version pending",
         )
@@ -2190,7 +2193,9 @@ class Harness:
         repeated = self.wm(task, "publish", "-m", "Retry protected local-retention cleanup")
         self.check(
             repeated["status"] == "no_changes"
+            and repeated["storage"]["purge"]["status"] == "cleanup_pending"
             and repeated["storage"]["purge"]["pending"]
+            and any(warning["code"] == "s3-cleanup-pending" for warning in repeated.get("warnings", []))
             and self.list_s3_versions() == versions_before,
             "repeat publication neither uploads local content nor loses protected cleanup",
         )
@@ -2207,8 +2212,9 @@ class Harness:
             "merge and refresh preserve both clean Git bytes and edited S3 bytes locally",
         )
         self.check(
-            refreshed["storage"]["purge"]["status"] == "protected"
+            refreshed["storage"]["purge"]["status"] == "cleanup_pending"
             and refreshed["storage"]["purge"]["pending"]
+            and any(warning["code"] == "s3-cleanup-pending" for warning in refreshed.get("warnings", []))
             and self.list_s3_versions() == versions_before,
             "the remote tag independently protects retired S3 versions after main is merged",
         )
@@ -2216,7 +2222,7 @@ class Harness:
         cleaned = self.wm(self.shared, "refresh")
         self.check(
             cleaned["status"] == "s3_purged"
-            and cleaned["storage"]["purge"]["status"] == "deleted"
+            and cleaned["storage"]["purge"]["status"] == "complete"
             and cleaned["storage"]["purge"]["pending"] == [],
             "refresh retries and completes cleanup after the last remote reference disappears",
         )
@@ -2794,7 +2800,9 @@ class Harness:
         self.check(local_branch.returncode == 128, "deliverable discard deletes its local branch")
         self.check(
             all(item["key"] != discarded_key for item in self.list_s3_versions())
-            and discarded["s3_purge"]["status"] == "deleted",
+            and discarded["s3_purge"]["status"] == "complete"
+            and discarded["s3_purge"]["pending"] == []
+            and discarded["s3_purge"].get("pending_prefixes", []) == [],
             "deliverable discard permanently removes every S3 version owned only by its branch",
         )
         self.check(

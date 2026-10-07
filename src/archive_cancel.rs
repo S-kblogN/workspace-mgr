@@ -1,5 +1,6 @@
 //! A local archive is reversible until its Git tree is published. Payloads are
 //! renamed, never checked out or cleaned; only tool-mutated metadata is saved.
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,10 @@ struct Attempt {
     metadata: Vec<Metadata>,
     relocation: RelocationPlan,
     previous_purge: Vec<ObjectVersion>,
+    #[serde(default)]
+    previous_purge_prefixes: BTreeMap<String, Value>,
+    #[serde(default)]
+    remote_cleanup_complete: bool,
     #[serde(default)]
     publication_commits: Vec<String>,
     #[serde(default)]
@@ -141,6 +146,8 @@ pub fn record_attempt(
         metadata,
         relocation: relocation.clone(),
         previous_purge: s3_purge::preview(repo)?.pending,
+        previous_purge_prefixes: s3_purge::archive_prefixes(repo)?,
+        remote_cleanup_complete: false,
         publication_commits: Vec::new(),
         created_parents: missing_parents(repo, destination)?,
         expected_receipt: Some(planned_receipt.clone()),
@@ -441,13 +448,19 @@ pub fn cancel(
         }
         // Also catch a merged archive whose publication branch has been deleted.
         let base = repo.fetch_branch(&owner.remote, &owner.base_branch)?;
-        if repo
-            .run_unchecked([
-                "cat-file",
-                "-e",
-                &format!("{base}:{}/{}", attempt.destination, RECEIPT_NAME),
-            ])?
-            .success()
+        let journal = copy_journal(&repo, &attempt.source, &attempt.destination)?;
+        let remote_cancelled = attempt.remote_cleanup_complete
+            || (journal.exists() && read::<Value>(&journal)?["status"] == "cancelled");
+        // Once our remote cancellation completed, this path can belong to a
+        // later reviewed attempt. Local metadata/ref checks above still apply.
+        if !remote_cancelled
+            && repo
+                .run_unchecked([
+                    "cat-file",
+                    "-e",
+                    &format!("{base}:{}/{}", attempt.destination, RECEIPT_NAME),
+                ])?
+                .success()
         {
             return Err(Error::message(
                 "archive cancel refuses an archive already present on the shared branch",
@@ -466,19 +479,98 @@ pub fn cancel(
             continue;
         }
         let journal = copy_journal(&repo, &attempt.source, &attempt.destination)?;
+        let mut canonical_to_release = None;
+        let mut terminal_remote = attempt.remote_cleanup_complete;
         let remote = if config.s3_enabled() && journal.exists() {
             crate::dvc::ensure_ready(&repo, &config)?;
-            crate::dvc::version_archive_adapter(
-                &repo,
-                if dry_run { "cancel-preview" } else { "cancel" },
-                &json!({
-                    "source":attempt.source,"destination":attempt.destination,"state_path":journal.to_string_lossy()
-                }),
-            )?
+            let transport_request = json!({
+                "source":attempt.source,"destination":attempt.destination,"state_path":journal.to_string_lossy()
+            });
+            // Prove ownership/source preservation before withdrawing a mapping.
+            let preview =
+                crate::dvc::version_archive_adapter(&repo, "cancel-preview", &transport_request)?;
+            let mut receipt: Value = read(&journal)?;
+            terminal_remote |= receipt["status"] == "cancelled";
+            if attempt.remote_cleanup_complete && receipt["status"] != "cancelled" {
+                return Err(Error::message(
+                    "completed archive cancellation has an inconsistent copy journal",
+                ));
+            }
+            let complete = matches!(
+                receipt["status"].as_str(),
+                Some("copied" | "canceling" | "cancelled")
+            ) && receipt["versions"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .all(|row| row["destination_version_id"].is_string())
+            });
+            if complete {
+                receipt["status"] = "copied".into();
+                receipt["source_cleanup"] = "after_verified_git_publication".into();
+                for row in receipt["versions"].as_array_mut().into_iter().flatten() {
+                    if let Some(object) = row.as_object_mut() {
+                        for key in [
+                            "started",
+                            "multipart_upload_id",
+                            "cancel_started",
+                            "cancel_deleted",
+                            "cancel_owned_versions",
+                        ] {
+                            object.remove(key);
+                        }
+                    }
+                }
+                if let Some(expected) = &attempt.expected_receipt {
+                    for key in ["task_id", "previous_receipt", "completion_reviews"] {
+                        if let Some(value) = expected.get(key) {
+                            receipt[key] = value.clone();
+                        }
+                    }
+                }
+            }
+            let coordinated = !terminal_remote
+                && complete
+                && (crate::archive_registry::has_binding(&repo, &receipt)? || !dry_run);
+            let proof = if coordinated {
+                crate::archive_registry::coordinate(&repo, &receipt, !dry_run)?
+            } else {
+                Value::Null
+            };
+            let registry = if terminal_remote {
+                json!({"status":"already_cancelled"})
+            } else {
+                crate::dvc::archive_registry_adapter(
+                    &repo,
+                    if dry_run { "cancel-preview" } else { "cancel" },
+                    &json!({"receipt":receipt,"coordination":proof}),
+                )?
+            };
+            let mut result = if dry_run {
+                preview
+            } else {
+                let result =
+                    crate::dvc::version_archive_adapter(&repo, "cancel", &transport_request)?;
+                if !matches!(
+                    result["status"].as_str(),
+                    Some("cancelled" | "already_cancelled" | "no_remote_copy")
+                ) {
+                    return Err(Error::message(
+                        "archive cancellation is incomplete: unrelated destination versions or uploads remain; their bytes were preserved",
+                    ));
+                }
+                if coordinated || (terminal_remote && complete) {
+                    canonical_to_release = Some(receipt.clone());
+                }
+                result
+            };
+            result["registry"] = registry;
+            result
         } else {
             json!({"status":"no_remote_copy","retained_versions":[]})
         };
         if !dry_run {
+            // Remote cleanup is durable before touching local bytes. Keep both
+            // Git claims until local undo completes, including parent cleanup.
+            attempt.remote_cleanup_complete = true;
             attempt.status = "canceling".to_owned();
             save(&path, &attempt)?;
             let source = resolved_under(&repo.root, &attempt.source);
@@ -510,10 +602,11 @@ pub fn cancel(
                 &attempt.source,
                 &attempt.destination,
                 &attempt.previous_purge,
+                &attempt.previous_purge_prefixes,
             )?;
             // Keep the durable attempt resumable until the batch's recorded
             // parent cleanup has also completed.
-            completed_journals.push(path);
+            completed_journals.push((path, canonical_to_release, terminal_remote));
         }
         reports.push(
             json!({"source":attempt.source,"destination":attempt.destination,
@@ -535,9 +628,21 @@ pub fn cancel(
                 Err(source) => return Err(Error::Io { path, source }),
             }
         }
-        for path in completed_journals {
+        for (path, receipt, terminal_remote) in completed_journals {
             // Other tasks in this batch may have extended the undo allowlist.
             let mut attempt: Attempt = read(&path)?;
+            if config.s3_enabled() {
+                if let Some(receipt) = receipt {
+                    if terminal_remote {
+                        crate::archive_registry::release_if_owned(&repo, &receipt)?;
+                    } else {
+                        crate::archive_registry::release(&repo, &receipt)?;
+                    }
+                }
+                if let Some(planned) = &attempt.expected_receipt {
+                    crate::archive_reservation::release(&repo, planned)?;
+                }
+            }
             attempt.status = "cancelled".to_owned();
             save(&path, &attempt)?;
         }
@@ -650,9 +755,13 @@ fn validate_current_receipt(repo: &GitRepo, attempt: &Attempt, receipt: &Value) 
         return Err(receipt_edit_error());
     }
     let mut generated: Value = read(&journal_path)?;
-    if generated["status"] != "copied" {
+    if !matches!(
+        generated["status"].as_str(),
+        Some("copied" | "canceling" | "cancelled")
+    ) {
         return Err(receipt_edit_error());
     }
+    generated["status"] = "copied".into();
     let versions = generated["versions"]
         .as_array_mut()
         .ok_or_else(receipt_edit_error)?;
@@ -660,6 +769,9 @@ fn validate_current_receipt(repo: &GitRepo, attempt: &Attempt, receipt: &Value) 
         let object = version.as_object_mut().ok_or_else(receipt_edit_error)?;
         object.remove("started");
         object.remove("multipart_upload_id");
+        object.remove("cancel_started");
+        object.remove("cancel_deleted");
+        object.remove("cancel_owned_versions");
     }
     generated["source_cleanup"] = "after_verified_git_publication".into();
     for key in ["task_id", "previous_receipt", "completion_reviews"] {
@@ -920,6 +1032,8 @@ mod tests {
             )
             .unwrap(),
             previous_purge: Vec::new(),
+            previous_purge_prefixes: BTreeMap::new(),
+            remote_cleanup_complete: false,
             publication_commits: Vec::new(),
             created_parents: Vec::new(),
             expected_receipt: Some(expected),
@@ -933,6 +1047,31 @@ mod tests {
         validate_current_receipt(&repo, &attempt, attempt.expected_receipt.as_ref().unwrap())
             .unwrap();
         validate_current_receipt(&repo, &attempt, &copied).unwrap();
+    }
+
+    #[test]
+    fn cancellation_audit_does_not_change_the_frozen_public_receipt() {
+        let (_temporary, repo, attempt, copied, mut journal) = copied_receipt_fixture();
+        journal["status"] = "canceling".into();
+        journal["versions"][0]["cancel_started"] = true.into();
+        journal["versions"][0]["cancel_owned_versions"] = json!([
+            {"version_id":"sdk-retry-copy","delete_marker":false,
+             "etag":"same-payload","started":true,"deleted":true}
+        ]);
+        fs::write(
+            copy_journal(&repo, &attempt.source, &attempt.destination).unwrap(),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        validate_current_receipt(&repo, &attempt, &copied).unwrap();
+        assert!(crate::archive_migration::trusted_copy_journal(&repo, &copied).unwrap());
+        let mut legacy = serde_json::to_value(&attempt).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("remote_cleanup_complete");
+        object.remove("previous_purge_prefixes");
+        let restored: Attempt = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.remote_cleanup_complete);
+        assert!(restored.previous_purge_prefixes.is_empty());
     }
 
     #[test]

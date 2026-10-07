@@ -11,7 +11,9 @@ import base64
 import hashlib
 import inspect
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
 import sys
 import threading
 from urllib.parse import urlsplit
@@ -44,10 +46,10 @@ def is_b2(raw_fs):
 
 
 def registry_write_fs(raw_fs):
-    """Use a private B2 client without unsupported automatic checksum headers.
+    """Suppress optional SDK checksum headers on the private B2 writer.
 
     Recent botocore versions add flexible checksum headers/trailers by default.
-    B2's PutObject API can reject these.
+    The original provider error does not identify which header it rejected.
     Scope the compatibility setting to this writer, preserving the original DVC
     client's configuration and credential/session selection.
     """
@@ -145,6 +147,28 @@ def encoded_receipt(receipt):
     return json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def coordination_ref(receipt):
+    identity = json.dumps([receipt["bucket"], receipt["remote_prefix"], receipt["source"]],
+                          separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "refs/tags/workspace-mgr/archive-registry/" + hashlib.sha256(identity).hexdigest()
+
+
+def archive_helper():
+    # The embedded Rust adapter supplies this module without a filesystem
+    # dependency. File-backed tests can load the adjacent asset normally.
+    module = sys.modules.get("dvc_version_archive")
+    if module is None and "__file__" in globals():
+        import importlib.util
+        path = Path(__file__).with_name("dvc_version_archive.py")
+        spec = importlib.util.spec_from_file_location("dvc_version_archive", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    if module is None:
+        raise RuntimeError("archive registry requires the embedded copy-journal verifier")
+    return module
+
+
 def read_body(raw_fs, body):
     try:
         result = body.read()
@@ -161,7 +185,7 @@ def read_body(raw_fs, body):
 
 
 class ArchiveRegistry:
-    def __init__(self, raw_fs, bucket, remote_prefix):
+    def __init__(self, raw_fs, bucket, remote_prefix, *, repo_path=None, coordination_check=None):
         self.raw_fs = raw_fs
         self.bucket = bucket
         self.remote_prefix = remote_prefix.rstrip("/")
@@ -169,6 +193,89 @@ class ArchiveRegistry:
         self._lookup_locks = {}
         self._lookup_guard = threading.Lock()
         self._versioned_registry = is_b2(raw_fs)
+        self.repo_path = Path(repo_path) if repo_path is not None else None
+        self._coordination_check = coordination_check
+
+    def verify_coordination(self, receipt, coordination, *, allow_published=False):
+        """Verify the Git CAS binding and the authority to mutate its mapping.
+
+        Git's compare-and-create ref arbitrates between cooperative writers.
+        It stays held through source retirement, or through cancellation of
+        both registry and copies. It is never stolen based on an expiry time.
+        """
+        validate_receipt(receipt, self.bucket, self.remote_prefix)
+        if not isinstance(coordination, dict) or coordination.get("mode") != "git-cas":
+            raise RuntimeError("archive registry mutation requires a verified Git CAS binding")
+        body = encoded_receipt(receipt)
+        if coordination.get("receipt_sha256") != hashlib.sha256(body).hexdigest():
+            raise RuntimeError("archive registry Git binding selects another receipt")
+        if coordination.get("ref") != coordination_ref(receipt):
+            raise RuntimeError("archive registry Git binding selects another storage identity")
+        oid, remote = coordination.get("oid"), coordination.get("remote")
+        if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+            raise RuntimeError("archive registry Git binding has no exact object identity")
+        if not isinstance(remote, str) or not remote or remote.startswith("-"):
+            raise RuntimeError("archive registry Git binding has no valid configured remote")
+        if coordination.get("publication_oid"):
+            if not allow_published:
+                raise RuntimeError("published archive evidence cannot withdraw a mapping")
+            revision, path = coordination["publication_oid"], coordination.get("receipt_path")
+            if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+                raise RuntimeError("archive registry has no exact Git publication identity")
+            relative_path(path, "published receipt path")
+        else:
+            helper = archive_helper()
+            state_path = coordination.get("state_path")
+            if not isinstance(state_path, str) or not state_path:
+                raise RuntimeError("archive registry mutation requires its private copy journal")
+            journal = helper.load_journal(state_path)
+            transaction = coordination.get("transaction_id")
+            if (not journal or not isinstance(transaction, str) or not transaction
+                    or journal.get("transaction_id") != transaction
+                    or receipt.get("transaction_id") != transaction):
+                raise RuntimeError("archive registry mutation is not owned by this private copy transaction")
+            public = helper.public_receipt(journal)
+            # Cancellation bookkeeping does not change the immutable mapping
+            # that was claimed while the copy was complete.
+            public["status"] = receipt.get("status")
+            for row in public["versions"]:
+                row.pop("cancel_started", None)
+                row.pop("cancel_deleted", None)
+                row.pop("cancel_owned_versions", None)
+            # These review fields are frozen and validated by the Rust
+            # orchestrator; the storage journal deliberately stores only its
+            # copy transaction. They remain part of the exact Git CAS blob.
+            journal_mapping = {key: value for key, value in public.items()
+                               if key not in ("task_id", "previous_receipt", "completion_reviews")}
+            receipt_mapping = {key: value for key, value in receipt.items()
+                               if key not in ("task_id", "previous_receipt", "completion_reviews")}
+            if encoded_receipt(journal_mapping) != encoded_receipt(receipt_mapping):
+                raise RuntimeError("archive registry receipt differs from its private copy journal")
+        if self._coordination_check is not None:
+            self._coordination_check(receipt, coordination)
+            return
+        if self.repo_path is None:
+            raise RuntimeError("archive registry Git binding requires its repository")
+
+        def git(*args):
+            result = subprocess.run(["git", *args], cwd=self.repo_path, capture_output=True, check=False)
+            if result.returncode:
+                raise RuntimeError("archive registry could not verify its Git coordination binding")
+            return result.stdout
+
+        reference = coordination["ref"]
+        expected = f"{oid}\t{reference}\n".encode()
+        if git("ls-remote", "--refs", "--", remote, reference) != expected:
+            raise RuntimeError("archive registry Git CAS binding was removed or replaced")
+        if git("cat-file", "blob", oid) != body:
+            raise RuntimeError("archive registry Git CAS blob differs from its receipt")
+        if coordination.get("publication_oid"):
+            try:
+                published = json.loads(git("show", f"{revision}:{path}"))
+            except (ValueError, TypeError) as error:
+                raise RuntimeError("archive registry Git publication receipt is invalid") from error
+            if encoded_receipt(published) != body:
+                raise RuntimeError("archive registry Git publication selects another receipt")
 
     def _lookup_receipt(self, source):
         # Cache only this read invocation's lookups, including absent parents.
@@ -243,11 +350,9 @@ class ArchiveRegistry:
         raise RuntimeError("archive registry history listing exceeded its pagination limit")
 
     def _read_history(self, source, key):
-        # The B2 adapter does not rely on undocumented conditional PutObject.
-        # Every version participates in the
-        # mapping: competing writers append evidence and readers fail closed
-        # on a conflict instead of accepting the latest writer. A changed scan
-        # is retried, and a continuously changing history is never published.
+        # Every retained version participates in the mapping. Even with the
+        # cooperative Git CAS protocol, an older client or external mutation
+        # must fail closed rather than silently choose the latest version.
         for _ in range(MAX_REGISTRY_READ_RETRIES):
             versions = self._history_versions(key)
             selected, encoded = None, None
@@ -261,12 +366,26 @@ class ArchiveRegistry:
                 return selected
         raise RuntimeError("archive registry history changed while verifying its complete versions")
 
-    def publish(self, receipt):
+    def publish(self, receipt, coordination=None):
         validate_receipt(receipt, self.bucket, self.remote_prefix)
+
+        def authorize():
+            self.verify_coordination(receipt, coordination, allow_published=True)
+            if not coordination.get("publication_oid"):
+                journal = archive_helper().load_journal(coordination["state_path"])
+                if (journal.get("status") != "copied"
+                        or any(row.get("cancel_started") or row.get("cancel_deleted") or row.get("cancel_owned_versions")
+                               for row in journal["versions"])):
+                    raise RuntimeError("archive registry publication requires a complete uncancelled copy journal")
+
+        if self._versioned_registry or coordination is not None:
+            authorize()
         source = receipt["source"]
         key = registry_key(self.remote_prefix, source)
 
         def result(status):
+            if self._versioned_registry or coordination is not None:
+                authorize()
             with self._lookup_guard:
                 self._lookup_receipts.pop(source, None)
             return {"status": status, "registry_key": key}
@@ -283,14 +402,19 @@ class ArchiveRegistry:
             return result("unchanged")
         body = encoded_receipt(receipt)
         writer = registry_write_fs(self.raw_fs)
+        request = {"Bucket": self.bucket, "Key": key, "Body": body,
+                   "ContentType": "application/json",
+                   "ContentMD5": base64.b64encode(hashlib.md5(body).digest()).decode("ascii")}
+
+        def write(*, conditional):
+            if self._versioned_registry or coordination is not None:
+                authorize()
+            writer.call_s3("put_object", **request, **({"IfNoneMatch": "*"} if conditional else {}))
+
         try:
-            condition = {} if self._versioned_registry else {"IfNoneMatch": "*"}
-            writer.call_s3(
-                "put_object", Bucket=self.bucket, Key=key,
-                Body=body, ContentType="application/json",
-                ContentMD5=base64.b64encode(hashlib.md5(body).digest()).decode("ascii"),
-                **condition,
-            )
+            # First preserve conditional publication with checksum overhead
+            # suppressed. Errno 78 alone does not diagnose If-None-Match.
+            write(conditional=True)
         except Exception as error:
             # A response may be lost after S3 accepted the write. Rereading
             # also handles a concurrent identical publisher; B2 validates every
@@ -300,6 +424,22 @@ class ArchiveRegistry:
             details = provider_error(error)
             if details.get("Code") in ("NotImplemented", "NotSupported"):
                 header = details.get("Header")
+                if self._versioned_registry and coordination is not None:
+                    # This is not an unchecked retry: the exact immutable
+                    # receipt is owned by a verified compare-and-create Git
+                    # ref. Generic endpoints never take this path.
+                    if header and header.lower() != "if-none-match":
+                        raise RuntimeError(f"archive registry provider rejected request header {header!r}") from error
+                    try:
+                        write(conditional=False)
+                    except Exception:
+                        if matches_existing():
+                            return result("unchanged")
+                        raise
+                    if not matches_existing():
+                        raise RuntimeError("archive registry publication was not readable")
+                    authorize()
+                    return result("published")
                 if header == "If-None-Match":
                     raise RuntimeError(
                         "archive registry provider rejected If-None-Match; "
@@ -313,7 +453,61 @@ class ArchiveRegistry:
             raise
         if not matches_existing():
             raise RuntimeError("archive registry publication was not readable")
+        if self._versioned_registry or coordination is not None:
+            authorize()
         return result("published")
+
+    def cancel(self, receipt, coordination, *, preview=False):
+        """Withdraw only this private transaction's exact registry versions.
+
+        The Git binding remains held until the caller has also cancelled the
+        copied history. No unversioned DELETE is sent, so withdrawal never
+        creates a delete marker or hides another receipt.
+        """
+        if coordination is None:
+            source = relative_path(receipt.get("source"), "source")
+            key = registry_key(self.remote_prefix, source)
+            if self._read_history(source, key) is not None:
+                raise RuntimeError("archive registry cancellation requires the owning complete copy transaction")
+            return {"status": "no_registry", "registry_key": key,
+                    "delete_registry_versions": [], "deleted_registry_versions": []}
+        self.verify_coordination(receipt, coordination)
+        helper = archive_helper()
+        helper.verify_cancel_source(self.raw_fs, helper.receipt_context(receipt), receipt)
+        source, key = receipt["source"], registry_key(self.remote_prefix, receipt["source"])
+        versions = self._history_versions(key)
+        body = encoded_receipt(receipt)
+        for version in versions:
+            if encoded_receipt(self._read_version(source, key, version)) != body:
+                raise RuntimeError("archive registry cancellation found another transaction's receipt")
+        if self._history_versions(key) != versions:
+            raise RuntimeError("archive registry changed during cancellation preview")
+        if preview:
+            return {"status": "would_cancel", "registry_key": key,
+                    "delete_registry_versions": sorted(versions)}
+        deleted, absent = [], []
+        for version in sorted(versions):
+            self.verify_coordination(receipt, coordination)
+            # Revalidate the entire history before each irreversible request.
+            # New conflicting writers or markers stop cleanup immediately.
+            current = self._read_history(source, key)
+            if current is not None and encoded_receipt(current) != body:
+                raise RuntimeError("archive registry changed during cancellation")
+            try:
+                self.raw_fs.call_s3("delete_object", Bucket=self.bucket, Key=key, VersionId=version)
+            except Exception:
+                if version in self._history_versions(key):
+                    raise
+                absent.append(version)
+            else:
+                deleted.append(version)
+        self.verify_coordination(receipt, coordination)
+        if self._history_versions(key):
+            raise RuntimeError("archive registry cancellation left object versions behind")
+        with self._lookup_guard:
+            self._lookup_receipts.pop(source, None)
+        return {"status": "cancelled", "registry_key": key,
+                "deleted_registry_versions": deleted, "already_absent": absent}
 
     def lookup(self, key, version_id):
         prefix = self.remote_prefix + "/" if self.remote_prefix else ""
@@ -358,9 +552,15 @@ def main(argv=None):
         bucket, remote_prefix, _ = raw_fs.split_path(remote.path)
         if not bucket or not raw_fs.is_bucket_versioned(bucket):
             raise RuntimeError("archive registry requires an enabled versioned bucket")
-        registry = ArchiveRegistry(raw_fs, bucket, remote_prefix)
+        registry = ArchiveRegistry(raw_fs, bucket, remote_prefix, repo_path=repo_path)
         if operation == "publish":
-            result = registry.publish(payload)
+            result = registry.publish(payload.get("receipt", payload), payload.get("coordination"))
+        elif operation in ("cancel", "cancel-preview"):
+            result = registry.cancel(payload["receipt"], payload.get("coordination"), preview=operation == "cancel-preview")
+        elif operation == "inspect":
+            source = relative_path(payload["source"], "source")
+            value = registry._read_history(source, registry_key(registry.remote_prefix, source))
+            result = {"status": "mapped" if value is not None else "missing", "receipt": value}
         elif operation == "read":
             mapping = registry.lookup(payload["object"], payload["version_id"])
             result = {"status": "mapped" if mapping else "missing", "mapping": mapping}

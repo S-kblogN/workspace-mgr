@@ -967,13 +967,54 @@ pub fn version_purge_adapter(
 ) -> Result<serde_json::Value> {
     let python = storage_python();
     let script = format!(
-        "import sys, types\n_archive = types.ModuleType('dvc_archive_registry')\nexec({}, _archive.__dict__)\nsys.modules['dvc_archive_registry'] = _archive\nexec({}, globals())",
+        "import sys, types\n_history = types.ModuleType('dvc_version_archive')\nexec({}, _history.__dict__)\nsys.modules['dvc_version_archive'] = _history\n_archive = types.ModuleType('dvc_archive_registry')\nexec({}, _archive.__dict__)\nsys.modules['dvc_archive_registry'] = _archive\nexec({}, globals())",
+        serde_json::to_string(VERSION_ARCHIVE_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?,
         serde_json::to_string(ARCHIVE_REGISTRY_SCRIPT)
             .map_err(|error| Error::message(error.to_string()))?,
         serde_json::to_string(VERSION_PURGE_SCRIPT)
             .map_err(|error| Error::message(error.to_string()))?
     );
-    let serialized = serde_json::to_string(payload).map_err(|error| {
+    let mut coordination = Vec::new();
+    if operation == "delete" {
+        let mut sources = BTreeSet::new();
+        let candidates = payload.get("candidates").unwrap_or(payload);
+        for candidate in candidates.as_array().into_iter().flatten() {
+            if let Some(source) = candidate["pointer"]
+                .as_str()
+                .and_then(|pointer| pointer.strip_suffix("/.workspace-mgr-archive.json"))
+            {
+                sources.insert(source.to_owned());
+            } else if let Some(object) = candidate["object"].as_str() {
+                let parts = object.split('/').collect::<Vec<_>>();
+                for length in 1..parts.len() {
+                    sources.insert(parts[..length].join("/"));
+                }
+            }
+        }
+        for receipt in payload["prefixes"].as_array().into_iter().flatten() {
+            if let Some(source) = receipt["source"].as_str() {
+                sources.insert(source.to_owned());
+            }
+        }
+        for source in sources {
+            let inspected =
+                archive_registry_adapter(repo, "inspect", &serde_json::json!({"source":source}))?;
+            let Some(receipt) = inspected.get("receipt").filter(|value| value.is_object()) else {
+                continue;
+            };
+            coordination.push(serde_json::json!({"receipt":receipt,"coordination":crate::archive_registry::coordinate_published(repo, receipt)?}));
+        }
+    }
+    let mut request = if payload.is_object() || coordination.is_empty() {
+        payload.clone()
+    } else {
+        serde_json::json!({"candidates":payload})
+    };
+    if !coordination.is_empty() {
+        request["coordination"] = coordination.into();
+    }
+    let serialized = serde_json::to_string(&request).map_err(|error| {
         Error::message(format!(
             "failed to encode managed-storage purge request: {error}"
         ))
@@ -1037,13 +1078,25 @@ pub(crate) fn archive_registry_adapter(
     operation: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    let coordinated = if operation == "publish" {
+        serde_json::json!({"receipt":payload,"coordination":crate::archive_registry::coordinate(repo, payload, true)?})
+    } else {
+        payload.clone()
+    };
     let serialized =
-        serde_json::to_string(payload).map_err(|error| Error::message(error.to_string()))?;
+        serde_json::to_string(&coordinated).map_err(|error| Error::message(error.to_string()))?;
+    let script = format!(
+        "import sys, types\n_history = types.ModuleType('dvc_version_archive')\nexec({}, _history.__dict__)\nsys.modules['dvc_version_archive'] = _history\nexec({}, globals())",
+        serde_json::to_string(VERSION_ARCHIVE_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?,
+        serde_json::to_string(ARCHIVE_REGISTRY_SCRIPT)
+            .map_err(|error| Error::message(error.to_string()))?
+    );
     let output = run_process_unchecked(
         &storage_python(),
         [
             "-c",
-            ARCHIVE_REGISTRY_SCRIPT,
+            &script,
             &repo.root.to_string_lossy(),
             operation,
             &serialized,

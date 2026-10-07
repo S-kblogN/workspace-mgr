@@ -92,8 +92,23 @@ the scoped infrastructure task, and the normal plan/publish flow. The CLI moves
 the directories and migrates complete
 S3 version histories with new storage bindings and durable historical mappings;
 agents do not perform those moves manually. After verified Git publication,
-cleanup retires only mapped source versions once live references release the
-original task. Concurrent source additions remain untouched.
+cleanup retires verified source versions after the complete receipt merges
+into the shared branch. Historical branches and tags remain readable through
+the mapping; newer referenced generations without mappings stay protected.
+Completion requires the old S3 prefix to contain no data
+versions or delete markers. Protected history remains explicitly pending;
+unmapped concurrent additions remain intact, block completion, and stay queued
+for reconciliation and retry.
+
+An unpublished archive attempt can be previewed and cancelled with
+`archive --cancel`. Cancellation preserves all local contents and restores the
+original metadata, removes only the attempt's copied S3 versions, markers,
+registry records and unfinished uploads, and verifies remote cleanup before
+restoring the directory. It releases its exact copy reservation and canonical
+Git binding after local restoration and records terminal completion last.
+Conflicting or foreign history blocks initial remote cleanup without deleting
+unrelated data. After that cleanup is durably verified, retries can finish local
+undo while preserving later foreign writes and newer owners' claims.
 
 Archive and task rename inspect ignored local content before moving it. Nested
 Git worktree pointers, administrative backlinks, and `core.worktree` locations

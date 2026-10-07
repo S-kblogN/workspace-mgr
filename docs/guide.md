@@ -799,8 +799,19 @@ the complete retained S3 history, including old versions, delete markers, and
 retired paths, verifies it, and rewrites storage metadata automatically. Its
 receipt records original and destination keys, version IDs, and timestamps;
 the S3 registry makes those mappings available to older Git snapshots. Source
-history is purged only after Git publication and while no live remote branch
-or tag protects it. The copied history counts toward the infrastructure task's
+history is purged only after the copied receipt merges into the shared branch.
+Historical tags remain and hydrate mapped versions through the registry; new
+referenced generations without mappings stay protected. Storage retirement is complete only when a full scan finds
+no old-prefix data versions or delete markers. `storage.purge` distinguishes
+`complete`, `cleanup_pending` and `blocked_unmapped`; the latter two preserve
+retry state and report a warning even when Git push or refresh succeeded.
+An empty original inventory also keeps a `pending_prefixes` cleanup intent
+until its published receipt's full source scan confirms an empty prefix.
+Concurrent unmapped history is preserved and blocks completion. Preview and
+cancel an unpublished attempt with `archive --cancel --manifest <path> --dry-run`;
+apply restores local contents and metadata after verifying removal of its
+remote copies, markers, registry records and unfinished uploads.
+The copied history counts toward the infrastructure task's
 cloud-usage limit. Materialized local-only content must be preserved or
 returned to tracked storage before organization.
 

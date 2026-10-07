@@ -692,7 +692,16 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
             report.status = "no_changes".to_owned();
         } else {
             let purge = s3_purge::purge_pending(&repo, &config, &task.remote)?;
-            report.status = if purge.deleted.is_empty() {
+            if let Some((code, message)) = purge.warning() {
+                report.warnings.push(TransactionWarning {
+                    code: code.to_owned(),
+                    message,
+                });
+            }
+            report.status = if purge.deleted.is_empty()
+                || !purge.pending.is_empty()
+                || !purge.pending_prefixes.is_empty()
+            {
                 "no_changes"
             } else {
                 "s3_purged"
@@ -752,6 +761,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     purge_candidates.sort();
     purge_candidates.dedup();
     s3_purge::queue(&repo, &purge_candidates)?;
+    s3_purge::queue_archive_prefixes(&repo, &archive_receipts)?;
     let local_ref = format!("refs/heads/{}", task.branch);
     let old_local_oid = repo.optional_oid(&local_ref)?;
     crate::archive_cancel::record_publication(&repo, &task, &archive_receipts, &commit_oid, false)?;
@@ -783,6 +793,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     ])?;
     let mut purge = s3_purge::purge_pending(&repo, &config, &task.remote)?;
     purge.queued = purge_candidates;
+    if let Some((code, message)) = purge.warning() {
+        report.warnings.push(TransactionWarning {
+            code: code.to_owned(),
+            message,
+        });
+    }
     report.storage["purge"] = serde_json::to_value(purge)
         .map_err(|error| Error::message(format!("failed to encode S3 purge report: {error}")))?;
     report.status = "pushed".to_owned();

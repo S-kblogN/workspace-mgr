@@ -4,6 +4,8 @@ mod archive;
 mod archive_adoption;
 mod archive_cancel;
 mod archive_migration;
+mod archive_registry;
+mod archive_reservation;
 mod branch_cleanup;
 mod cli;
 mod cloud_usage;

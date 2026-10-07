@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timedelta, timezone
+import copy
 import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -84,6 +88,16 @@ class B2VersionTransport(VersionTransport):
     endpoint_url = "https://s3.fixture.backblazeb2.com"
     client_kwargs = {}
 
+    def add(self, name, version, marker=False, *, copied=False):
+        task = "2026/07/" + SOURCE if copied else SOURCE
+        key = f"storage/{task}/{name}"
+        for row in self.versions:
+            if row["Key"] == key:
+                row["IsLatest"] = False
+        self.versions.append({"Key": key, "VersionId": version, "marker": marker,
+                              "Size": 7, "ETag": '"etag"', "IsLatest": True,
+                              "LastModified": datetime(2026, 7, 12, tzinfo=timezone.utc) + timedelta(seconds=len(self.versions))})
+
     def call_s3(self, method, **request):
         if method == "get_object":
             self.calls.append((method, request.copy()))
@@ -94,6 +108,27 @@ class B2VersionTransport(VersionTransport):
             row = next(row for row in self.versions
                        if (row["Key"], row["VersionId"]) == (request["Key"], version))
             return {"Body": io.BytesIO(row["body"]), "VersionId": version}
+        if method == "head_object":
+            self.calls.append((method, request.copy()))
+            self.counts[method] += 1
+            row = next((row for row in self.versions
+                        if (row["Key"], row["VersionId"]) == (request["Key"], request.get("VersionId"))), None)
+            if row is None or row["marker"]:
+                raise FileNotFoundError("exact fixture payload is missing")
+            return {"VersionId": row["VersionId"], "ContentLength": row["Size"],
+                    "ETag": row["ETag"], "Metadata": {}}
+        if method == "list_object_versions":
+            # Let the base mock exercise complete two-marker pagination, then
+            # supply the immutable S3 metadata needed to verify copied history.
+            response = super().call_s3(method, **request)
+            for section in ("Versions", "DeleteMarkers"):
+                for item in response[section]:
+                    original = next(row for row in self.versions
+                                    if (row["Key"], row["VersionId"]) == (item["Key"], item["VersionId"]))
+                    for field in ("Size", "ETag", "IsLatest", "LastModified"):
+                        if field in original:
+                            item[field] = original[field]
+            return response
         return super().call_s3(method, **request)
 
 
@@ -110,6 +145,8 @@ class ArchivePurgeTests(unittest.TestCase):
             self.registry_calls.append(source)
             if self.registry_failure is not None:
                 raise self.registry_failure
+            if source != SOURCE or not self.mapped:
+                return None
             return {"versions": [{"source_object": row["object"], "source_version_id": row["version_id"]}
                                  for row in self.mapped]}
 
@@ -274,6 +311,17 @@ class ArchivePurgeTests(unittest.TestCase):
                                          [candidate("data", "mapped")], registry)
         self.assertEqual(self.transport.counts["delete_object"], 0)
 
+    def test_late_generic_registry_on_any_provider_cannot_retire_unpublished_originals(self):
+        self.transport.add("data", "mapped")
+        self.mapped = [candidate("data", "mapped")]
+        with self.assertRaisesRegex(RuntimeError, "published receipt"):
+            purger.delete_candidates(
+                self.transport, self.remote, BUCKET,
+                [candidate("data", "mapped", pointer=SOURCE + "/data.dvc")],
+                self.registry, repo_path="/isolated-fixture")
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+        self.assertEqual([row["VersionId"] for row in self.transport.versions], ["mapped"])
+
     def test_nonadvancing_pagination_cannot_trigger_deletion_after_partial_inventory(self):
         response = {"IsTruncated": True, "NextKeyMarker": "fixed", "NextVersionIdMarker": "fixed"}
         with mock.patch.object(self.transport, "call_s3", return_value=response) as request:
@@ -292,68 +340,162 @@ class B2ArchivePurgeTests(unittest.TestCase):
             "purge_registry_fixture", SCRIPT.with_name("dvc_archive_registry.py"))
         self.registry_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.registry_module)
+        helper = self.registry_module.archive_helper()
+        sys.modules["dvc_version_archive"] = helper
+        self.registry = self.registry_module.ArchiveRegistry(
+            self.transport, BUCKET, "storage", coordination_check=self.check_binding)
         self.key = self.registry_module.registry_key("storage", SOURCE)
         self.transport.add("data", "mapped")
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.claim = None
+        self.binding_checks = 0
+        self.receipt = None
+        self.proof = None
 
-    def append_registry(self, version, *, destination="copy", marker=False):
-        value = {"schema_version": 1, "source": SOURCE, "destination": "2026/07/" + SOURCE,
-                 "bucket": BUCKET, "remote_prefix": "storage", "remote": "workspace-mgr",
-                 "versions": [{"source_object": SOURCE + "/data",
-                               "destination_object": "2026/07/" + SOURCE + "/data",
-                               "source_version_id": "mapped", "destination_version_id": destination,
-                               "delete_marker": False, "size": 7, "destination_etag": "etag"}]}
+    def check_binding(self, receipt, coordination):
+        self.binding_checks += 1
+        if self.claim != coordination["receipt_sha256"]:
+            raise RuntimeError("Git CAS binding was removed or replaced")
+
+    def complete_copy(self):
+        original = [row.copy() for row in self.transport.versions
+                    if row["Key"].startswith(f"storage/{SOURCE}/")]
+        rows = []
+        for index, source in enumerate(original):
+            name = source["Key"][len(f"storage/{SOURCE}/"):]
+            copied = "copy-" + source["VersionId"]
+            self.transport.add(name, copied, marker=source["marker"], copied=True)
+            rows.append({
+                "source_object": SOURCE + "/" + name,
+                "destination_object": "2026/07/" + SOURCE + "/" + name,
+                "source_version_id": source["VersionId"], "destination_version_id": copied,
+                "source_last_modified": source["LastModified"].isoformat(),
+                "source_is_latest": source["IsLatest"], "source_list_order": index,
+                "delete_marker": source["marker"],
+                "size": None if source["marker"] else source["Size"],
+                "source_etag": None if source["marker"] else "etag",
+                "destination_etag": None if source["marker"] else "etag",
+                "destination_last_modified": self.transport.versions[-1]["LastModified"].isoformat(),
+            })
+        self.receipt = {"schema_version": 1, "status": "copied", "source": SOURCE,
+                        "destination": "2026/07/" + SOURCE, "bucket": BUCKET,
+                        "remote_prefix": "storage", "remote": "workspace-mgr",
+                        "transaction_id": "isolated-purge-transaction", "versions": rows,
+                        "source_cleanup": "after_verified_git_publication"}
+        body = self.registry_module.encoded_receipt(self.receipt)
+        digest = self.registry_module.hashlib.sha256(body).hexdigest()
+        self.claim = digest
+        journal = Path(self.directory.name) / "private-copy.json"
+        journal.write_text(json.dumps(self.receipt))
+        self.proof = {"receipt": self.receipt, "coordination": {
+            "mode": "git-cas", "receipt_sha256": digest,
+            "transaction_id": self.receipt["transaction_id"], "state_path": str(journal),
+            "remote": "origin", "ref": self.registry_module.coordination_ref(self.receipt), "oid": "a" * 40,
+        }}
+
+    def append_registry(self, version, *, destination=None, marker=False):
+        if self.receipt is None:
+            self.complete_copy()
+        value = copy.deepcopy(self.receipt)
+        if destination is not None:
+            value["versions"][0]["destination_version_id"] = destination
         self.transport.versions.append({"Key": self.key, "VersionId": version, "marker": marker,
                                         "body": json.dumps(value).encode()})
 
-    def delete(self):
-        return purger.delete_candidates(self.transport, self.remote, BUCKET, [candidate("data", "mapped")])
+    def delete(self, candidates=None, *, authorized=True):
+        candidates = candidates if candidates is not None else [candidate("data", "mapped")]
+        coordination = {SOURCE: self.proof} if authorized and self.proof is not None else {}
+        return purger.delete_candidates(self.transport, self.remote, BUCKET, candidates,
+                                       self.registry, coordination=coordination)
 
-    def test_complete_b2_registry_history_retains_exact_originals_for_historical_reads(self):
+    def source_versions(self):
+        return [row for row in self.transport.versions if row["Key"].startswith(f"storage/{SOURCE}/")]
+
+    def test_verified_b2_binding_retires_full_payload_and_delete_marker_history(self):
+        self.transport.versions.clear()
+        self.transport.add("data", "null")
+        self.transport.add("data", "old-marker", marker=True)
+        self.transport.add("data", "mapped")
+        self.transport.add("retired", "retired-data")
+        self.transport.add("retired", "retired-marker", marker=True)
         self.append_registry("registry-first")
         self.append_registry("registry-identical")
-        result = self.delete()
-        self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual(len(self.transport.versions), 3)
-        self.assertEqual(result["retained_mapped"], [{**candidate("data", "mapped"),
-                                                    "reason": "append_only_registry_no_atomic_cleanup"}])
-        self.assertEqual(result["deleted"], [])
+        copies = [row.copy() for row in self.transport.versions
+                  if row["Key"].startswith(f"storage/2026/07/{SOURCE}/")]
+        candidates = [candidate(row["source_object"][len(SOURCE) + 1:], row["source_version_id"])
+                      for row in self.receipt["versions"]]
+        result = self.delete(candidates)
+        self.assertFalse(self.source_versions())
+        self.assertEqual(result["retained_mapped"], [])
+        self.assertEqual(result["retained_unmapped"], [])
+        self.assertEqual(self.transport.counts["delete_object"], 5)
+        self.assertEqual(copies, [row for row in self.transport.versions
+                                 if row["Key"].startswith(f"storage/2026/07/{SOURCE}/")])
+        self.assertEqual(self.binding_checks, 6)
         gets = [request for op, request in self.transport.calls if op == "get_object"]
         self.assertEqual({request["VersionId"] for request in gets}, {"registry-first", "registry-identical"})
+        deletes = [request for op, request in self.transport.calls if op == "delete_object"]
+        self.assertTrue(all(request["Key"].startswith(f"storage/{SOURCE}/") and request["VersionId"] for request in deletes))
 
-    def test_mixed_generic_and_archive_candidates_are_reported_protected_exactly(self):
+    def test_unavailable_binding_blocks_b2_source_deletion(self):
+        self.append_registry("registry-first")
+        with self.assertRaisesRegex(RuntimeError, "atomic Git registry binding"):
+            self.delete(authorized=False)
+        self.claim = "another-writer"
+        with self.assertRaisesRegex(RuntimeError, "removed or replaced"):
+            self.delete()
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+        self.assertEqual([row["VersionId"] for row in self.source_versions()], ["mapped"])
+
+    def test_missing_or_corrupted_destination_history_blocks_every_original_delete(self):
+        self.append_registry("registry-first")
+        copied = next(row for row in self.transport.versions if row["VersionId"] == "copy-mapped")
+        self.transport.versions.remove(copied)
+        with self.assertRaisesRegex(RuntimeError, "lost a previously copied"):
+            self.delete()
+        self.transport.versions.append(copied)
+        copied["ETag"] = '"corrupt-copy"'
+        with self.assertRaisesRegex(RuntimeError, "missing or mismatched"):
+            self.delete()
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+
+    def test_mixed_generic_candidates_cannot_delete_later_generations(self):
         self.append_registry("registry-first")
         self.transport.add("data", "generic-later")
-        generic_same_version = candidate("data", "mapped", pointer=SOURCE + "/data.dvc")
+        generic_same = candidate("data", "mapped", pointer=SOURCE + "/data.dvc")
         generic_later = candidate("data", "generic-later", pointer=SOURCE + "/data.dvc")
-        generic_absent = candidate("data", "already-gone", pointer=SOURCE + "/data.dvc")
-        result = purger.delete_candidates(self.transport, self.remote, BUCKET, [
-            candidate("data", "mapped"), generic_same_version, generic_later, generic_absent,
-        ])
-        protected = [{key: row[key] for key in ("pointer", "object", "version_id")}
-                     for row in result["retained_mapped"]]
-        self.assertCountEqual(protected, [candidate("data", "mapped"), generic_same_version, generic_later])
-        self.assertEqual(result["already_absent"], [generic_absent])
-        self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual({row["VersionId"] for row in self.transport.versions
-                          if row["Key"].startswith(f"storage/{SOURCE}/")}, {"mapped", "generic-later"})
+        result = self.delete([candidate("data", "mapped"), generic_same, generic_later])
+        self.assertEqual(result["retained_unmapped"], [candidate("data", "generic-later")])
+        self.assertEqual(result["retained_mapped"], [])
+        self.assertEqual(self.transport.counts["delete_object"], 1)
+        self.assertEqual([row["VersionId"] for row in self.source_versions()], ["generic-later"])
 
-    def test_generic_only_retirement_discovers_b2_registry_without_archive_candidate(self):
+    def test_generic_only_retirement_discovers_registry_and_requires_exact_coordinated_mapping(self):
         self.append_registry("registry-first")
         self.transport.add("data", "later-marker", marker=True)
-        generic = candidate("data", "later-marker", pointer=SOURCE + "/retired.dvc")
-        result = purger.delete_candidates(self.transport, self.remote, BUCKET, [generic])
-        self.assertEqual(result["retained_mapped"], [{**generic,
-                                                    "reason": "append_only_registry_no_atomic_cleanup"}])
+        later = candidate("data", "later-marker", pointer=SOURCE + "/retired.dvc")
+        with self.assertRaisesRegex(RuntimeError, "no coordinated exact mapping"):
+            self.delete([later])
         self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual({row["VersionId"] for row in self.transport.versions
-                          if row["Key"].startswith(f"storage/{SOURCE}/")}, {"mapped", "later-marker"})
+        mapped = candidate("data", "mapped", pointer=SOURCE + "/retired.dvc")
+        result = self.delete([mapped, later])
+        self.assertEqual(result["retained_unmapped"], [candidate("data", "later-marker")])
+        self.assertEqual([row["VersionId"] for row in self.source_versions()], ["later-marker"])
 
-    def test_generic_only_nested_retirement_checks_only_ancestor_registry_keys(self):
+    def test_generic_only_mapped_version_cannot_bypass_unavailable_binding(self):
         self.append_registry("registry-first")
-        self.transport.add("nested/retired", "generic")
-        generic = candidate("nested/retired", "generic", pointer=SOURCE + "/nested/retired.dvc")
-        result = purger.delete_candidates(self.transport, self.remote, BUCKET, [generic])
-        self.assertEqual(result["retained_mapped"][0]["version_id"], "generic")
+        mapped = candidate("data", "mapped", pointer=SOURCE + "/retired.dvc")
+        with self.assertRaisesRegex(RuntimeError, "atomic Git registry binding"):
+            self.delete([mapped], authorized=False)
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+
+    def test_generic_nested_unmapped_keys_are_reported_without_any_cleanup(self):
+        self.append_registry("registry-first")
+        self.transport.add("nested/retired", "independent")
+        generic = candidate("nested/retired", "independent", pointer=SOURCE + "/nested/retired.dvc")
+        result = self.delete([generic])
+        self.assertEqual(result["retained_unmapped"], [candidate("nested/retired", "independent")])
         prefixes = {request["Prefix"] for method, request in self.transport.calls if method == "list_object_versions"}
         self.assertEqual(prefixes, {
             self.registry_module.registry_key("storage", SOURCE + "/nested"), self.key,
@@ -361,67 +503,127 @@ class B2ArchivePurgeTests(unittest.TestCase):
         })
         self.assertEqual(self.transport.counts["delete_object"], 0)
 
-    def test_conflicting_registry_blocks_generic_only_b2_retirement(self):
-        self.append_registry("registry-first", destination="different")
-        self.append_registry("registry-second")
-        generic = candidate("data", "mapped", pointer=SOURCE + "/retired.dvc")
-        with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
-            purger.delete_candidates(self.transport, self.remote, BUCKET, [generic])
-        self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual(len(self.transport.versions), 3)
-
-    def test_b2_generic_retirement_without_any_archive_mapping_remains_supported(self):
-        generic = candidate("data", "mapped", pointer=SOURCE + "/data.dvc")
-        result = purger.delete_candidates(self.transport, self.remote, BUCKET, [generic])
-        self.assertEqual(result["retained_mapped"], [])
+    def test_unplanned_payloads_and_markers_after_copy_remain_visible_and_not_completed(self):
+        self.append_registry("registry-first")
+        self.transport.add("new", "late-payload")
+        self.transport.add("new", "late-marker", marker=True)
+        result = self.delete()
+        self.assertEqual(result["retained_unmapped"], [candidate("new", "late-marker"), candidate("new", "late-payload")])
         self.assertEqual(self.transport.counts["delete_object"], 1)
-        self.assertEqual(self.transport.versions, [])
+        self.assertEqual({row["VersionId"] for row in self.source_versions()}, {"late-payload", "late-marker"})
+
+    def test_externally_removed_unmapped_pending_versions_allow_complete_retry(self):
+        self.append_registry("registry-first")
+        self.transport.add("new", "late-payload")
+        self.transport.add("new", "late-marker", marker=True)
+        first = self.delete()
+        self.assertEqual(first["retained_unmapped"], [candidate("new", "late-marker"), candidate("new", "late-payload")])
+        pending = [candidate("data", "mapped"), *first["retained_unmapped"]]
+        with self.assertRaisesRegex(RuntimeError, "candidate is not mapped"):
+            self.delete(pending)
+        self.assertEqual(self.transport.counts["delete_object"], 1)
+        # An independent owner resolves its added generations. A queued ID
+        # that is now absent need not be invented into the immutable receipt.
+        source_prefix = f"storage/{SOURCE}/"
+        self.transport.versions = [row for row in self.transport.versions if not row["Key"].startswith(source_prefix)]
+        retried = self.delete(pending)
+        self.assertEqual(retried["deleted"], [])
+        self.assertEqual(retried["retained_unmapped"], [])
+        self.assertEqual(retried["retained_mapped"], [])
+        self.assertTrue(retried["already_absent"])
+        self.assertFalse(self.source_versions())
+        self.assertEqual(self.transport.counts["delete_object"], 1)
+
+    def test_claim_or_copy_loss_between_deletions_blocks_remaining_originals(self):
+        self.transport.add("data", "second")
+        self.append_registry("registry-first")
+        def remove_claim(method, request, count):
+            if method == "delete_object" and count == 1:
+                self.claim = None
+        self.transport.hook = remove_claim
+        with self.assertRaisesRegex(RuntimeError, "removed or replaced"):
+            self.delete([candidate("data", "mapped"), candidate("data", "second")])
+        self.assertEqual(self.transport.counts["delete_object"], 1)
+        self.assertEqual([row["VersionId"] for row in self.source_versions()], ["second"])
+
+    def test_copy_loss_between_deletions_blocks_remaining_originals(self):
+        self.transport.add("data", "second")
+        self.append_registry("registry-first")
+        def remove_copy(method, request, count):
+            if method == "delete_object" and count == 1:
+                self.transport.versions = [row for row in self.transport.versions if row["VersionId"] != "copy-second"]
+        self.transport.hook = remove_copy
+        with self.assertRaisesRegex(RuntimeError, "lost a previously copied"):
+            self.delete([candidate("data", "mapped"), candidate("data", "second")])
+        self.assertEqual(self.transport.counts["delete_object"], 1)
+        self.assertEqual([row["VersionId"] for row in self.source_versions()], ["second"])
 
     def test_conflicting_append_after_verification_cannot_erase_originals_or_markers(self):
-        self.append_registry("registry-first")
-        value = json.loads(self.transport.versions[-1]["body"])
-        value["versions"].append({**value["versions"][0], "source_version_id": "source-marker",
-                                  "destination_version_id": "copy-marker", "delete_marker": True,
-                                  "size": None, "destination_etag": None})
-        self.transport.versions[-1]["body"] = json.dumps(value).encode()
         self.transport.add("data", "source-marker", marker=True)
-        self.transport.add("other", "unmapped")
-
-        def append_after_registry_check(method, request, count):
+        self.append_registry("registry-first")
+        def append_conflict(method, request, count):
             if method == "list_object_versions" and request["Prefix"] == f"storage/{SOURCE}/":
                 self.transport.hook = None
-                self.append_registry("registry-concurrent-conflict", destination="different")
-
-        self.transport.hook = append_after_registry_check
-        result = purger.delete_candidates(self.transport, self.remote, BUCKET, [
-            candidate("data", "mapped"), candidate("data", "source-marker"),
-            candidate("other", "unmapped", pointer=SOURCE + "/other.dvc"),
-        ])
-        self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual({row["version_id"] for row in result["retained_mapped"]}, {"mapped", "source-marker", "unmapped"})
-        self.assertEqual(result["retained_unmapped"], [candidate("other", "unmapped")])
-        self.assertEqual({row["VersionId"] for row in self.transport.versions
-                          if row["Key"].startswith(f"storage/{SOURCE}/")},
-                         {"mapped", "source-marker", "unmapped"})
-        registry = self.registry_module.ArchiveRegistry(self.transport, BUCKET, "storage")
+                self.append_registry("registry-conflict", destination="other-copy")
+        self.transport.hook = append_conflict
         with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
-            registry.read(SOURCE)
+            self.delete([candidate("data", "mapped"), candidate("data", "source-marker")])
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+        self.assertEqual({row["VersionId"] for row in self.source_versions()}, {"mapped", "source-marker"})
 
-    def test_paginated_conflicting_b2_registry_history_blocks_source_cleanup(self):
+    def test_paginated_conflicting_registry_blocks_archive_and_generic_cleanup(self):
         self.append_registry("registry-first", destination="conflicting")
         self.append_registry("registry-newest")
-        with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
-            self.delete()
+        for candidates in ([candidate("data", "mapped")],
+                           [candidate("data", "mapped", pointer=SOURCE + "/retired.dvc")]):
+            with self.assertRaisesRegex(RuntimeError, "conflicting archive registry history"):
+                self.delete(candidates)
         self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual(len(self.transport.versions), 3)
 
-    def test_b2_registry_delete_marker_blocks_source_cleanup_without_hiding_history(self):
+    def test_registry_delete_marker_blocks_source_cleanup_without_hiding_history(self):
         self.append_registry("registry-first")
         self.append_registry("registry-hidden", marker=True)
         with self.assertRaisesRegex(RuntimeError, "delete marker"):
             self.delete()
         self.assertEqual(self.transport.counts["delete_object"], 0)
-        self.assertEqual(len(self.transport.versions), 3)
+
+    def test_b2_generic_retirement_without_any_archive_mapping_remains_supported(self):
+        generic = candidate("data", "mapped", pointer=SOURCE + "/data.dvc")
+        result = self.delete([generic])
+        self.assertEqual(result["retained_mapped"], [])
+        self.assertEqual(self.transport.counts["delete_object"], 1)
+        self.assertEqual(self.transport.versions, [])
+
+    def test_empty_snapshot_prefix_finds_late_payload_and_marker_and_finishes_only_when_empty(self):
+        self.transport.versions = []
+        self.append_registry("empty-registry")
+        self.assertEqual(self.receipt["versions"], [])
+        self.transport.add("late", "independent-payload")
+        self.transport.add("late", "independent-marker", marker=True)
+        result = purger.delete_candidates(
+            self.transport, self.remote, BUCKET, [], self.registry,
+            coordination={SOURCE: self.proof}, prefixes=[self.receipt])
+        self.assertEqual(result["cleaned_prefixes"], [])
+        self.assertEqual(result["retained_unmapped"], [
+            candidate("late", "independent-marker"), candidate("late", "independent-payload")])
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+        self.transport.versions = [row for row in self.transport.versions
+                                   if not row["Key"].startswith(f"storage/{SOURCE}/")]
+        retry = purger.delete_candidates(
+            self.transport, self.remote, BUCKET, [], self.registry,
+            coordination={SOURCE: self.proof}, prefixes=[self.receipt])
+        self.assertEqual(retry["cleaned_prefixes"], [SOURCE])
+        self.assertEqual(retry["retained_unmapped"], [])
+        self.assertEqual(self.transport.counts["delete_object"], 0)
+
+    def test_empty_prefix_receipt_cannot_replace_canonical_inventory(self):
+        self.append_registry("registry")
+        forged = copy.deepcopy(self.receipt)
+        forged["versions"] = []
+        with self.assertRaisesRegex(RuntimeError, "differs from its canonical"):
+            purger.delete_candidates(self.transport, self.remote, BUCKET, [], self.registry,
+                                    coordination={SOURCE: self.proof}, prefixes=[forged])
+        self.assertEqual(self.transport.counts["delete_object"], 0)
 
 
 if __name__ == "__main__":

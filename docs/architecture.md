@@ -288,21 +288,51 @@ refs, and retirement records. It records generated publication commits before
 their ref update and verified pushes before cleanup. `archive --cancel` restores
 only an unpublished attempt, preserving whole local directories by rename.
 Cancel phases and generated undo commits are durable, so interruption can be
-resumed without losing other infrastructure work. Copied S3 history and canonical
-registry records remain intact; only owned unfinished uploads are aborted.
+resumed without losing other infrastructure work. Before local restoration,
+cancel verifies the original source history, withdraws only the attempt's exact
+registry versions, deletes owned copies and markers by exact version ID, and
+aborts owned unfinished uploads. A full scan must prove remote cleanup and
+record it durably before local restoration. Cancel restores local directories,
+metadata, refs and retirement state and removes empty generated parents, then
+releases both exact ownership claims before marking the attempt cancelled.
+Foreign history blocks initial remote cleanup and stays intact. A retry after
+durable remote cleanup finishes local undo without touching later foreign writes
+or another owner's claims; completed retries do not recheck original source
+generations that a newer archive may have retired.
+
+The configured Git remote first reserves source copying with a control tag under
+`refs/tags/workspace-mgr/archive-copy/`. Its immutable descriptor binds the
+normalized planned receipt and the private copy journal's attempt nonce before
+any destination history is written. It coordinates canonical publication with
+a separate tag under `refs/tags/workspace-mgr/archive-registry/`. Its immutable blob
+binds the complete copied receipt and transaction. Compare-and-create chooses
+the owner; exact remote object ID checks fence mutations. Bindings have no
+expiration or takeover. Cancellation releases only its exact copy reservation
+and canonical binding after remote cleanup and local restoration. Canonical mappings for completed
+archives remain available to historical readers.
 
 Conditional registry Put remains the default. For B2's official endpoints, a
 separate writer suppresses SDK flexible checksum headers and writes Content-MD5.
-An append-only versioned registry avoids relying on undocumented conditional Put: fresh
-reads enumerate and compare every exact version, rejecting any conflict or
-delete marker. This provides conflict detection, not atomic single-winner CAS.
-B2 source versions remain permanently protected, eliminating a registry
-read/delete race and keeping historical exact-version reads available.
+An explicit provider not-implemented/not-supported response permits an
+unconditional retry only with the verified Git binding for that exact receipt.
+Fresh reads enumerate and compare every registry version, rejecting conflicts
+or delete markers. This retains concurrency protection without retaining a
+second payload history at the original task path.
 
-Only after Git push verification are mapped source versions queued for cleanup.
-A live branch or tag containing the original task manifest protects the whole
-source prefix. Cleanup deletes only the exact copied versions; concurrent
-unmapped additions remain and are reported. Native DVC does not interpret the
+Source deletion requires the exact copied receipt on the configured shared
+branch. Before that merge, a live branch or tag containing the original task
+tree protects the whole source prefix, including trees from before manifest
+adoption. After merge, old mapped generations hydrate through the registry, so
+historical tags remain while their source bytes can retire. Actual newer
+referenced generations without mappings remain protected. Cleanup deletes
+only verified mapped versions and completes only when a full scan finds the
+original prefix empty of both payload versions and delete markers. Protected
+history reports `cleanup_pending`; unmapped concurrent additions report
+`blocked_unmapped` and remain in the durable retry queue. Neither is terminal
+completion, even when Git publication or synchronization succeeded. A typed
+copied-receipt prefix intent persists even when its original inventory is
+empty; only a published-receipt scan confirming no versions or markers clears
+that intent. Native DVC does not interpret the
 canonical archive mappings, so old revisions use workspace-mgr hydration after
 their original versions have been retired.
 

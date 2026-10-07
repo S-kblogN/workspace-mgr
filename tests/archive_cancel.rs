@@ -426,6 +426,105 @@ fn attempt_journal(fixture: &GitFixture) -> PathBuf {
 }
 
 #[test]
+fn interrupted_terminal_cancel_preserves_a_later_owners_merged_archive_and_claims() {
+    let (f, gh, manifest) = fixture();
+    let original_manifest = std::fs::read(f.shared.join(SOURCE).join(MANIFEST)).unwrap();
+    std::fs::write(
+        f.shared.join("README.md"),
+        "another task's retained local edit\n",
+    )
+    .unwrap();
+    git(&f.shared, ["add", "README.md"]);
+    let index_before = git(&f.shared, ["ls-files", "--stage"]).stdout;
+    invoke(&f.shared, &gh, &manifest, false, false);
+    invoke(&f.shared, &gh, &manifest, true, false);
+    let journal = attempt_journal(&f);
+    let mut attempt: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    // The process lost its final state write after durable cleanup, local undo
+    // and claim release. A different checkout can now publish a new attempt.
+    attempt["status"] = "canceling".into();
+    attempt["remote_cleanup_complete"] = true.into();
+    std::fs::write(&journal, serde_json::to_vec(&attempt).unwrap()).unwrap();
+
+    std::fs::create_dir_all(f.seed.join("2026/07")).unwrap();
+    git(&f.seed, ["mv", SOURCE, DEST]);
+    let later_receipt = json!({
+        "schema_version":1,"task_id":SOURCE,"source":SOURCE,"destination":DEST,
+        "status":"copied","bucket":"isolated-fixture","remote_prefix":"dvc",
+        "transaction_id":"later-owner","versions":[]
+    });
+    std::fs::write(
+        f.seed.join(DEST).join(RECEIPT),
+        serde_json::to_vec_pretty(&later_receipt).unwrap(),
+    )
+    .unwrap();
+    let later_manifest = std::fs::read_to_string(f.seed.join(DEST).join(MANIFEST))
+        .unwrap()
+        .replace(
+            &format!("path = \"{SOURCE}\""),
+            &format!("path = \"{DEST}\""),
+        );
+    std::fs::write(f.seed.join(DEST).join(MANIFEST), later_manifest).unwrap();
+    f.commit_seed("Merge a later owner's archive after old claims were released");
+    let receipt_blob =
+        String::from_utf8(git(&f.seed, ["rev-parse", &format!("HEAD:{DEST}/{RECEIPT}")]).stdout)
+            .unwrap();
+    for namespace in ["archive-copy", "archive-registry"] {
+        git(
+            &f.remote,
+            [
+                "update-ref",
+                &format!("refs/tags/workspace-mgr/{namespace}/later-owner"),
+                receipt_blob.trim(),
+            ],
+        );
+    }
+    let refs_before = git(
+        &f.remote,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )
+    .stdout;
+    let later_tree_before = git(&f.remote, ["rev-parse", "refs/heads/main^{tree}"]).stdout;
+
+    assert_eq!(
+        invoke(&f.shared, &gh, &manifest, true, true)["status"],
+        "dry_run"
+    );
+    assert_eq!(
+        invoke(&f.shared, &gh, &manifest, true, false)["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        invoke(&f.shared, &gh, &manifest, true, false)["status"],
+        "no_changes"
+    );
+    assert_eq!(
+        git(
+            &f.remote,
+            ["for-each-ref", "--format=%(refname) %(objectname)"]
+        )
+        .stdout,
+        refs_before
+    );
+    assert_eq!(
+        git(&f.remote, ["rev-parse", "refs/heads/main^{tree}"]).stdout,
+        later_tree_before
+    );
+    assert_eq!(
+        std::fs::read(f.shared.join(SOURCE).join(MANIFEST)).unwrap(),
+        original_manifest
+    );
+    assert!(!f.shared.join(DEST).exists());
+    assert_eq!(git(&f.shared, ["ls-files", "--stage"]).stdout, index_before);
+    assert_eq!(
+        std::fs::read_to_string(f.shared.join("README.md")).unwrap(),
+        "another task's retained local edit\n"
+    );
+    let finished: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+    assert_eq!(finished["status"], "cancelled");
+}
+
+#[test]
 fn resumed_cancel_still_refuses_independently_edited_metadata() {
     let (f, gh, manifest) = fixture();
     invoke(&f.shared, &gh, &manifest, false, false);
