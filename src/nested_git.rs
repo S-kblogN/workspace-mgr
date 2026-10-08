@@ -15,15 +15,39 @@ use crate::git::GitRepo;
 /// repository ignore rule. User/global rules alone cannot establish this
 /// boundary for another checkout.
 pub(crate) fn validate(repo: &GitRepo, source: &str) -> Result<()> {
-    for root in roots(repo, source)? {
-        let tracked =
-            repo.run_bytes(["ls-files", "-z", "--", &format!(":(literal){root}")], None)?;
-        if !tracked.stdout.is_empty() {
+    validate_roots(repo, &roots(repo, source)?)
+}
+
+fn validate_roots(repo: &GitRepo, roots: &[String]) -> Result<()> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let literals = roots
+        .iter()
+        .map(|root| format!(":(literal){root}"))
+        .collect::<Vec<_>>();
+    let mut tracked = BTreeSet::new();
+    for batch in crate::git::pathspec_batches(&literals) {
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend(batch.iter().map(String::as_str));
+        let output = repo.run_bytes(args, None)?;
+        tracked.extend(
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(<[u8]>::to_vec),
+        );
+    }
+    let rules = shared_ignore_rules(repo, roots, None)?;
+    for root in roots {
+        if contains_tracked_path(&tracked, root.as_bytes()) {
             return Err(Error::message(format!(
                 "nested Git repository {root:?} is tracked by the outer repository (including gitlinks); remove it from the outer Git index and ignore the entire directory in a shared .gitignore"
             )));
         }
-        validate_shared_ignore(repo, &root, None)?;
+        let (source, pattern) = &rules[root];
+        validate_shared_ignore_rule(root, source, pattern)?;
     }
     Ok(())
 }
@@ -32,10 +56,10 @@ pub(crate) fn validate(repo: &GitRepo, source: &str) -> Result<()> {
 /// its destination. A task-local relative ignore travels with the task; a
 /// root ignore tied to only its old absolute repository path does not.
 pub(crate) fn validate_move(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
-    validate(repo, source)?;
     let source = crate::path::repo_path(source, "archive source")?;
     let destination = crate::path::repo_path(destination, "archive destination")?;
     let roots = roots(repo, &source)?;
+    validate_roots(repo, &roots)?;
     if roots.is_empty() {
         return Ok(());
     }
@@ -45,8 +69,10 @@ pub(crate) fn validate_move(repo: &GitRepo, source: &str, destination: &str) -> 
     })?;
     let git_dir = repo.git_dir()?;
     let git_dir = git_dir.canonicalize().at(&git_dir)?;
-    for root in roots {
-        let nested = Path::new(&root)
+    let mut future_roots = Vec::new();
+    let mut copied_rules = BTreeSet::new();
+    for root in &roots {
+        let nested = Path::new(root)
             .strip_prefix(&source)
             .map_err(|_| Error::message("nested Git root is outside archive source"))?;
         let future_root = Path::new(&destination).join(nested);
@@ -62,7 +88,9 @@ pub(crate) fn validate_move(repo: &GitRepo, source: &str, destination: &str) -> 
                 directory.to_path_buf()
             };
             let ignore = repo.root.join(current).join(".gitignore");
-            if metadata(&ignore)?.is_some_and(|value| value.is_file()) {
+            if copied_rules.insert(directory.to_path_buf())
+                && metadata(&ignore)?.is_some_and(|value| value.is_file())
+            {
                 let copied = shadow.path().join(directory).join(".gitignore");
                 if let Some(parent) = copied.parent() {
                     fs::create_dir_all(parent).at(parent)?;
@@ -71,11 +99,15 @@ pub(crate) fn validate_move(repo: &GitRepo, source: &str, destination: &str) -> 
             }
             parent = directory.parent();
         }
-        let shadow_repo = GitRepo {
-            root: shadow.path().to_path_buf(),
-        };
-        let future_root = crate::path::to_slash(&future_root);
-        validate_shared_ignore(&shadow_repo, &future_root, Some(&git_dir)).map_err(|error| {
+        future_roots.push(crate::path::to_slash(&future_root));
+    }
+    let shadow_repo = GitRepo {
+        root: shadow.path().to_path_buf(),
+    };
+    let rules = shared_ignore_rules(&shadow_repo, &future_roots, Some(&git_dir))?;
+    for (root, future_root) in roots.iter().zip(&future_roots) {
+        let (source, pattern) = &rules[future_root];
+        validate_shared_ignore_rule(future_root, source, pattern).map_err(|error| {
             Error::message(format!(
                 "archive would leave nested Git repository {root:?} unignored at {future_root:?}: {error}; use a task-local relative .gitignore rule or a shared rule that also covers the destination"
             ))
@@ -159,7 +191,8 @@ fn opaque_ignored_directories(repo: &GitRepo, source: &str) -> Result<BTreeSet<V
         .stdout
         .split(|byte| *byte == b'\0')
         .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
+        .map(<[u8]>::to_vec)
+        .collect::<BTreeSet<_>>();
     let ignored = repo.run_bytes(
         [
             "ls-files",
@@ -178,10 +211,7 @@ fn opaque_ignored_directories(repo: &GitRepo, source: &str) -> Result<BTreeSet<V
         let Some(directory) = path.strip_suffix(b"/") else {
             continue;
         };
-        if !tracked.iter().any(|path| {
-            *path == directory
-                || (path.starts_with(directory) && path.get(directory.len()) == Some(&b'/'))
-        }) {
+        if !contains_tracked_path(&tracked, directory) {
             candidates.insert(directory.to_vec());
         }
     }
@@ -226,6 +256,16 @@ fn opaque_ignored_directories(repo: &GitRepo, source: &str) -> Result<BTreeSet<V
         }
     }
     Ok(opaque)
+}
+
+fn contains_tracked_path(tracked: &BTreeSet<Vec<u8>>, root: &[u8]) -> bool {
+    let mut prefix = root.to_vec();
+    prefix.push(b'/');
+    tracked.contains(root)
+        || tracked
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|path| path.starts_with(&prefix))
 }
 
 fn shared_ignore_source(raw: &[u8]) -> bool {
@@ -300,8 +340,16 @@ fn repository_marker(directory: &Path) -> Result<bool> {
     )
 }
 
-fn validate_shared_ignore(repo: &GitRepo, root: &str, git_dir: Option<&Path>) -> Result<()> {
-    let input = format!("{root}\0");
+fn shared_ignore_rules(
+    repo: &GitRepo,
+    roots: &[String],
+    git_dir: Option<&Path>,
+) -> Result<BTreeMap<String, (String, String)>> {
+    let mut input = Vec::new();
+    for root in roots {
+        input.extend_from_slice(root.as_bytes());
+        input.push(0);
+    }
     let mut args = vec!["-C".to_owned(), repo.root.to_string_lossy().into_owned()];
     if let Some(git_dir) = git_dir {
         args.extend([
@@ -311,37 +359,64 @@ fn validate_shared_ignore(repo: &GitRepo, root: &str, git_dir: Option<&Path>) ->
             repo.root.to_string_lossy().into_owned(),
         ]);
     }
-    args.extend(["check-ignore", "-v", "-z", "--no-index", "--stdin"].map(str::to_owned));
+    args.extend(
+        [
+            "check-ignore",
+            "-v",
+            "-z",
+            "--non-matching",
+            "--no-index",
+            "--stdin",
+        ]
+        .map(str::to_owned),
+    );
     let result = crate::process::run_bytes(
         "git",
         args,
         &repo.root,
         &BTreeMap::new(),
-        Some(input.as_bytes()),
+        Some(&input),
         false,
     )?;
     if result.code != 0 && result.code != 1 {
         return Err(Error::message(format!(
-            "cannot verify the Git ignore boundary for nested repository {root:?}: {}",
+            "cannot verify the Git ignore boundaries for nested repositories {roots:?}: {}",
             result.stderr.trim()
         )));
     }
     let raw = std::str::from_utf8(&result.stdout)
         .map_err(|_| Error::message("nested Git ignore rules must be UTF-8"))?;
-    let fields = raw.split('\0').collect::<Vec<_>>();
-    if fields.len() < 4 || fields[0].is_empty() || fields[2].starts_with('!') {
+    let fields = raw.split_terminator('\0').collect::<Vec<_>>();
+    if fields.len() != roots.len() * 4 {
+        return Err(Error::message(
+            "Git returned an incomplete nested ignore inventory",
+        ));
+    }
+    let mut rules = BTreeMap::new();
+    for (root, fields) in roots.iter().zip(fields.as_chunks::<4>().0) {
+        if fields[3] != root {
+            return Err(Error::message(
+                "Git returned a mismatched nested ignore path",
+            ));
+        }
+        rules.insert(root.clone(), (fields[0].to_owned(), fields[2].to_owned()));
+    }
+    Ok(rules)
+}
+
+fn validate_shared_ignore_rule(root: &str, source: &str, pattern: &str) -> Result<()> {
+    if source.is_empty() || pattern.starts_with('!') {
         return Err(Error::message(format!(
             "nested Git repository {root:?} must be ignored as an entire directory by a shared .gitignore before archiving"
         )));
     }
-    let source = Path::new(fields[0]);
-    if !shared_ignore_source(fields[0].as_bytes()) {
-        return Err(local_ignore_error(root, source));
+    if !shared_ignore_source(source.as_bytes()) {
+        return Err(local_ignore_error(root, Path::new(source)));
     }
     // Repository and task-local ignore rules are shareable by publication,
     // including a rule introduced by the archive's current task changes.
     // Git ignores symlinked .gitignore files, so no target is opened here.
-    crate::path::repo_path(fields[0], "nested Git ignore source")?;
+    crate::path::repo_path(source, "nested Git ignore source")?;
     Ok(())
 }
 
@@ -412,6 +487,42 @@ mod tests {
         fn marker(&self, directory: &str) {
             fs::create_dir_all(self.repo.root.join(directory).join(".git")).unwrap();
         }
+    }
+
+    #[test]
+    fn batched_nested_boundaries_keep_literal_paths_and_per_root_rule_failures() {
+        let fixture = Fixture::new();
+        for root in ["task/[literal]", "task/back\\slash", "task/with space"] {
+            fixture.marker(root);
+        }
+        fixture.write(
+            "task/.gitignore",
+            "/[[]literal]/\n/back\\\\slash/\n/with space/\n",
+        );
+        validate(&fixture.repo, "task").unwrap();
+        validate_move(&fixture.repo, "task", "archive/task").unwrap();
+        fixture.write("task/.gitignore", "/[[]literal]/\n/back\\\\slash/\n");
+        let error = validate(&fixture.repo, "task").unwrap_err().to_string();
+        assert!(error.contains("task/with space"), "{error}");
+        assert!(
+            error.contains("must be ignored as an entire directory"),
+            "{error}"
+        );
+        fixture.write(
+            "task/.gitignore",
+            "/[[]literal]/\n/back\\\\slash/\n/with space/\n",
+        );
+        fixture.write("task/with space/forced", "tracked\n");
+        git(
+            &fixture.repo.root,
+            &["add", "-f", "--", ":(literal)task/with space/forced"],
+        );
+        let error = validate(&fixture.repo, "task").unwrap_err().to_string();
+        assert!(error.contains("task/with space"), "{error}");
+        assert!(
+            error.contains("is tracked by the outer repository"),
+            "{error}"
+        );
     }
 
     #[test]

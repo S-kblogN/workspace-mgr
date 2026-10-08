@@ -78,9 +78,13 @@ routing. The CLI never prints credential values in management reports.
 ## Storage manifests and repository migration
 
 Each managed file or directory has one adjacent `.wm-storage.json` sidecar.
-Native schema 1 records `path`, `kind`, `checksum` (algorithm and digest), physical
+Native storage records `path`, `kind`, `checksum` (algorithm and digest), physical
 `size`, and optional exact `version` (id and etag). Directory boundaries also
 record complete relative `entries`, each with its own checksum, size and version.
+Schema 2 adds a required verification record to every bound version, associating
+its raw SHA256 with endpoint, bucket, full key, exact VersionId and size. Schema 1
+remains readable through the legacy verification path; `manage` establishes
+these proofs once before upgrading existing controls.
 Unknown fields, unsupported schema versions, unsafe paths and inconsistent
 content identities are rejected. See [Native repository storage](storage.md) for
 examples and the engine contract.
@@ -140,7 +144,10 @@ when its version is at least the declared one by semantic-version precedence.
 A pre-release also meets a declaration of its own release, so 0.4.0-rc.1 meets
 `"0.4.0"`, while it does not meet `"0.4.1"`.
 
-Management raises the declaration to at least 0.8.1 when adopting native storage. Publication maintains the declaration for subsequent task and storage changes. Task manifest schema 3, which records a
+Management raises the declaration to at least 0.8.1 when adopting native storage,
+or 0.8.7 when storage schema 2 controls are present. Publication maintains the
+declaration for subsequent task and storage changes, requiring 0.8.1 for storage
+schema 1 and 0.8.7 for storage schema 2. Task manifest schema 3, which records a
 cloud-usage approval, needs `workspace-mgr` 0.4.0. Schema 4, which retains
 archive completion evidence, needs 0.7.0. Top-level manifests with
 schemas 1 and 2 need no declaration. A nested archive task manifest needs
@@ -170,6 +177,9 @@ left the base branch:
   the base branch already carries, even when a hosting provider replays the
   branch's commits onto the base branch in a rebase merge.
 
+Storage schema requirements participate in the same reconciliation as task
+manifest requirements.
+
 When the task is authorized to change `.workspace-mgr.toml`, or an earlier
 publication of the branch changed anything else in the file, even only comments
 or formatting, the file's content belongs to the user: publication keeps the
@@ -183,12 +193,12 @@ that needed it are gone; nothing lowers a merged declaration. A branch that was
 raised before the base branch was raised further conflicts with it until the
 branch is published again; resolving such a conflict by hand must keep the
 higher value. `manage` preserves an existing declaration or raises it to at
-least 0.8.1 when adopting native storage; it never lowers one. `manage`, and
-publication whenever it rewrites the declaration, write this file in its
+least 0.8.1 when adopting native storage, or 0.8.7 for schema 2; it never lowers
+one. `manage`, and publication whenever it rewrites the declaration, write this file in its
 canonical form, so comments in it are not preserved then.
 
 A build never publishes a declaration that it does not meet itself: when a
-task manifest needs a newer release than the installed one, `plan` and
+task or storage manifest needs a newer release than the installed one, `plan` and
 `publish`, including `publish --dry-run`, refuse before anything is placed or
 uploaded. The refusal offers recording the default limit only when removing
 the task's own approval clears its schema requirement. An archived-path

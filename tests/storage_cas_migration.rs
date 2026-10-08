@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use base64::Engine;
 use common::*;
 use md5::{Digest, Md5};
 use serde_json::Value;
+use sha2::Sha256;
 
 const BUCKET: &str = "migration-test";
 const PREFIX: &str = "repository";
@@ -319,6 +321,17 @@ fn respond(state: &mut State, request: Request, body: Vec<u8>) -> Option<Vec<u8>
         return Some(response(200, xml.as_bytes(), &[], false));
     }
     if request.method == "PUT" && !request.key.is_empty() {
+        assert_eq!(
+            request.headers.get("x-amz-content-sha256"),
+            Some(&sha256(&body)),
+            "every stored upload must sign the transmitted raw SHA256"
+        );
+        assert_eq!(
+            request.headers.get("content-md5"),
+            Some(&base64::engine::general_purpose::STANDARD.encode(Md5::digest(&body))),
+            "every stored upload must validate the transmitted raw MD5"
+        );
+        assert!(request.headers["authorization"].contains("content-md5"));
         match state
             .objects
             .get(&request.key)
@@ -498,6 +511,13 @@ fn native(root: &Path, path: &str) -> Value {
         .unwrap()
 }
 
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn assert_binding(remote: &S3Fixture, object: &str, checksum: &str, bytes: &[u8], binding: &Value) {
     let key = format!("{PREFIX}/{object}");
     let versions = remote.versions(&key);
@@ -524,16 +544,30 @@ fn assert_latest_binding(
     assert_eq!(binding["size"], bytes.len());
     assert_eq!(binding["version"]["id"], version.id);
     assert_eq!(binding["version"]["etag"], version.etag);
+    if binding.get("schema_version").is_some() {
+        assert_eq!(binding["schema_version"], 2);
+    }
+    let proof = &binding["version"]["verification"];
+    assert_eq!(proof["endpoint"], remote.endpoint);
+    assert_eq!(proof["bucket"], BUCKET);
+    assert_eq!(proof["key"], key);
+    assert_eq!(proof["version_id"], binding["version"]["id"]);
+    assert_eq!(proof["size"], bytes.len());
+    assert_eq!(proof["checksum"]["algorithm"], "sha256");
+    assert_eq!(proof["checksum"]["digest"], sha256(bytes));
+    assert_eq!(proof["method"], "verified-upload");
     let requests = remote.requests();
     assert!(
-        requests.iter().any(|request| request.method == "GET"
+        requests.iter().any(|request| request.method == "HEAD"
             && request.key == key
-            && request.query.get("versionId") == Some(&version.id)
-            && request
-                .headers
-                .get("if-match")
-                .is_some_and(|etag| etag.trim_matches('"') == version.etag)),
-        "exact uploaded version must be read and verified before binding"
+            && request.query.get("versionId") == Some(&version.id)),
+        "exact uploaded version must be checked before binding"
+    );
+    assert!(
+        requests.iter().any(|request| request.method == "PUT"
+            && request.key == key
+            && request.headers.get("x-amz-content-sha256") == Some(&sha256(bytes))),
+        "content proof must correspond to a signed payload upload"
     );
 }
 
@@ -604,6 +638,17 @@ fn remote_only_directory_preview_is_read_only_and_migration_binds_verified_versi
         &second_digest,
         second,
         &entries[1],
+    );
+    assert!(
+        remote
+            .requests()
+            .iter()
+            .all(|request| request.method != "GET"
+                || !matches!(
+                    request.key.as_str(),
+                    "repository/data/a.bin" | "repository/data/nested/b.bin"
+                )),
+        "new schema 2 imports must not download their uploaded payloads for verification"
     );
     assert!(
         !fixture.shared.join("data").exists(),

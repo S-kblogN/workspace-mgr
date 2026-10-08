@@ -75,6 +75,7 @@ pub(crate) fn parse_document(raw: &str, origin: &str) -> Result<PointerDocument>
                                 size: file.size,
                                 version_id,
                                 etag,
+                                verification: None,
                             }
                         })
                         .collect()
@@ -93,6 +94,7 @@ pub(crate) fn parse_document(raw: &str, origin: &str) -> Result<PointerDocument>
                     size,
                     version_id,
                     etag,
+                    verification: None,
                     files,
                 }
             })
@@ -374,6 +376,7 @@ pub(crate) fn parse_directory_manifest(
                 size: row["size"].as_u64(),
                 version_id: None,
                 etag: None,
+                verification: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -668,7 +671,13 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
         digest: digest.trim_end_matches(".dir").to_owned(),
     };
     checksum.validate()?;
-    let binding = |id: Option<String>, etag| id.map(|id| Version { id, etag });
+    let binding = |id: Option<String>, etag| {
+        id.map(|id| Version {
+            id,
+            etag,
+            verification: None,
+        })
+    };
     let mut manifest = Manifest {
         schema_version: 1,
         path,
@@ -726,6 +735,7 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
                             size: row["size"].as_u64(),
                             version_id: None,
                             etag: None,
+                            verification: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?
@@ -752,6 +762,7 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
                 size: Some(entry.size),
                 version_id: None,
                 etag: None,
+                verification: None,
             })
             .collect::<Vec<_>>();
         if directory_digest(&logical)? != digest {

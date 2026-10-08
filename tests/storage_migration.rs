@@ -1,15 +1,155 @@
 mod common;
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::ops::Deref;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use common::*;
 
-fn legacy_repository() -> GitFixture {
+struct LegacyFixture {
+    git: GitFixture,
+    s3: ExactVersionFixture,
+}
+
+impl Deref for LegacyFixture {
+    type Target = GitFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.git
+    }
+}
+
+/// Read-only, immutable versions with deliberately absent SHA256 headers. The
+/// fixture makes legacy migration establish its proof through an actual exact
+/// GET rather than trusting a made-up checksum or a developer's S3 account.
+struct ExactVersionFixture {
+    endpoint: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ExactVersionFixture {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let serving_requests = requests.clone();
+        let serving_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            while !serving_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        let mut raw = Vec::new();
+                        let mut byte = [0];
+                        while !raw.ends_with(b"\r\n\r\n") {
+                            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                                break;
+                            }
+                            raw.push(byte[0]);
+                            assert!(raw.len() < 64 * 1024);
+                        }
+                        let raw = String::from_utf8(raw).unwrap();
+                        let line = raw.lines().next().unwrap_or_default();
+                        serving_requests.lock().unwrap().push(line.to_owned());
+                        let mut fields = line.split_whitespace();
+                        let method = fields.next().unwrap_or_default();
+                        let target = fields.next().unwrap_or_default();
+                        let url = url::Url::parse(&format!("http://local{target}")).unwrap();
+                        let wanted = match url.path() {
+                            "/offline.invalid/repository/data.bin"
+                            | "/offline.invalid/repository/2025/archive/task/cold.bin" => {
+                                Some(("exact-version", "exact-etag"))
+                            }
+                            "/offline.invalid/repository/absent-directory/nested/sample.bin" => {
+                                Some(("exact-directory-file-version", "exact-directory-file-etag"))
+                            }
+                            _ => None,
+                        };
+                        let version = url
+                            .query_pairs()
+                            .find(|(key, _)| key == "versionId")
+                            .map(|(_, value)| value.into_owned());
+                        if method == "GET" && url.query_pairs().any(|(key, _)| key == "versioning")
+                        {
+                            let body = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+                            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+                            stream.write_all(body).unwrap();
+                        } else if let Some((id, etag)) = wanted
+                            && version.as_deref() == Some(id)
+                            && matches!(method, "HEAD" | "GET")
+                        {
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"{etag}\"\r\nx-amz-version-id: {id}\r\nConnection: close\r\n\r\n"
+                            );
+                            stream.write_all(header.as_bytes()).unwrap();
+                            if method == "GET" {
+                                stream.write_all(b"abc").unwrap();
+                            }
+                        } else {
+                            let body = b"<Error><Code>NoSuchVersion</Code></Error>";
+                            stream.write_all(format!("HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+                            if method != "HEAD" {
+                                stream.write_all(body).unwrap();
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("legacy S3 fixture failed: {error}"),
+                }
+            }
+        });
+        Self {
+            endpoint,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn payload_gets(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("GET ") && line.contains("versionId="))
+            .count()
+    }
+}
+
+impl Drop for ExactVersionFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+        if thread::panicking() {
+            eprintln!("legacy S3 requests: {:?}", self.requests.lock().unwrap());
+        }
+    }
+}
+
+fn legacy_repository() -> LegacyFixture {
     let fixture = GitFixture::new();
+    let s3 = ExactVersionFixture::new();
     fixture.clone_shared();
     fs::create_dir_all(fixture.shared.join(".dvc/cache/files/md5/90")).unwrap();
-    fs::write(fixture.shared.join(".dvc/config"), "[core]\nremote = workspace-mgr\n['remote \"workspace-mgr\"']\nurl = s3://offline.invalid/repository\nversion_aware = true\n").unwrap();
+    fs::write(fixture.shared.join(".dvc/config"), format!("[core]\nremote = workspace-mgr\n['remote \"workspace-mgr\"']\nurl = s3://offline.invalid/repository\nendpointurl = {}\nversion_aware = true\n", s3.endpoint)).unwrap();
+    fs::write(fixture.shared.join(".dvc/config.local"), "['remote \"workspace-mgr\"']\naccess_key_id = isolated-access\nsecret_access_key = isolated-secret\nregion = us-east-1\n").unwrap();
     fs::write(
         fixture.shared.join(".dvc/.gitignore"),
         "/config.local\n/cache\n/tmp\n",
@@ -35,7 +175,7 @@ fn legacy_repository() -> GitFixture {
     )
     .unwrap();
     pointer(&fixture.shared, "data.bin.dvc", "data.bin");
-    fixture
+    LegacyFixture { git: fixture, s3 }
 }
 
 fn pointer(root: &Path, path: &str, payload: &str) {
@@ -82,13 +222,38 @@ fn manage_converts_entire_checkout_without_payload_or_history_changes() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.shared.join("data.bin.wm-storage.json")).unwrap())
             .unwrap();
-    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["schema_version"], 2);
     assert_eq!(
         manifest["checksum"]["digest"],
         "900150983cd24fb0d6963f7d28e17f72"
     );
     assert_eq!(manifest["version"]["id"], "exact-version");
     assert_eq!(manifest["version"]["etag"], "exact-etag");
+    assert_eq!(
+        manifest["version"]["verification"]["version_id"],
+        "exact-version"
+    );
+    assert_eq!(
+        manifest["version"]["verification"]["endpoint"],
+        fixture.s3.endpoint
+    );
+    assert_eq!(
+        manifest["version"]["verification"]["bucket"],
+        "offline.invalid"
+    );
+    assert_eq!(
+        manifest["version"]["verification"]["key"],
+        "repository/data.bin"
+    );
+    assert_eq!(
+        manifest["version"]["verification"]["checksum"]["algorithm"],
+        "sha256"
+    );
+    assert_eq!(
+        manifest["version"]["verification"]["checksum"]["digest"],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(fixture.s3.payload_gets(), 2);
     assert_eq!(
         fs::read(
             fixture
@@ -111,7 +276,7 @@ fn manage_converts_entire_checkout_without_payload_or_history_changes() {
     assert!(
         fs::read_to_string(fixture.shared.join(".workspace-mgr.toml"))
             .unwrap()
-            .contains("minimum_cli_version = \"0.8.1\"")
+            .contains("minimum_cli_version = \"0.8.7\"")
     );
     assert_eq!(git(&fixture.shared, ["rev-parse", "HEAD"]).stdout, head);
     assert_eq!(git(&fixture.shared, ["ls-files", "-s"]).stdout, index);
@@ -135,6 +300,11 @@ fn manage_converts_entire_checkout_without_payload_or_history_changes() {
         json(&workspace(&fixture.shared, ["manage"]))["status"],
         "no_changes"
     );
+    assert_eq!(
+        fixture.s3.payload_gets(),
+        2,
+        "schema 2 reconciliation reread payloads"
+    );
 }
 
 #[test]
@@ -144,6 +314,7 @@ fn dry_run_and_failed_preflight_leave_all_files_intact() {
     let private_exclude = fixture.shared.join(".git/info/exclude");
     let exclude_before = fs::read(&private_exclude).unwrap();
     let report = json(&workspace(&fixture.shared, ["manage", "--dry-run"]));
+    assert_eq!(fixture.s3.payload_gets(), 0, "dry run downloaded a payload");
     assert_eq!(report["status"], "dry_run");
     assert_eq!(
         report["migration"]["converted"][0]["destination"],
@@ -169,6 +340,54 @@ fn dry_run_and_failed_preflight_leave_all_files_intact() {
     );
     assert!(!fixture.shared.join("data.bin.wm-storage.json").exists());
     assert!(!fixture.shared.join("AGENTS.md").exists());
+}
+
+#[test]
+fn native_schema1_upgrade_is_previewed_without_payload_reads_and_verified_once() {
+    let fixture = legacy_repository();
+    workspace(&fixture.shared, ["manage"]);
+    let path = fixture.shared.join("data.bin.wm-storage.json");
+    let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    legacy["schema_version"] = 1.into();
+    legacy["version"]
+        .as_object_mut()
+        .unwrap()
+        .remove("verification");
+    let before = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&path, &before).unwrap();
+    fs::remove_file(fixture.shared.join("data.bin")).unwrap();
+    let reads_before = fixture.s3.payload_gets();
+
+    let preview = json(&workspace(&fixture.shared, ["manage", "--dry-run"]));
+    assert_eq!(preview["status"], "dry_run");
+    assert_eq!(
+        preview["migration"]["upgraded"],
+        serde_json::json!(["data.bin.wm-storage.json"])
+    );
+    assert_eq!(fixture.s3.payload_gets(), reads_before);
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let upgraded = json(&workspace(&fixture.shared, ["manage"]));
+    assert_eq!(
+        upgraded["migration"]["upgraded"],
+        serde_json::json!(["data.bin.wm-storage.json"])
+    );
+    let native: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(native["schema_version"], 2);
+    assert_eq!(native["checksum"], legacy["checksum"]);
+    assert_eq!(native["version"]["id"], legacy["version"]["id"]);
+    assert_eq!(
+        native["version"]["verification"]["version_id"],
+        native["version"]["id"]
+    );
+    assert_eq!(native["version"]["verification"]["method"], "verified-read");
+    assert_eq!(fixture.s3.payload_gets(), reads_before + 1);
+    assert!(!fixture.shared.join("data.bin").exists());
+    assert_eq!(
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
+        "no_changes"
+    );
+    assert_eq!(fixture.s3.payload_gets(), reads_before + 1);
 }
 
 #[test]
@@ -211,7 +430,7 @@ fn scaffold_failure_is_preflighted_before_pointer_conversion() {
 #[test]
 fn named_version_aware_remote_imports_exact_bindings() {
     let fixture = legacy_repository();
-    for path in [".dvc/config", "data.bin.dvc"] {
+    for path in [".dvc/config", ".dvc/config.local", "data.bin.dvc"] {
         let original = fs::read_to_string(fixture.shared.join(path)).unwrap();
         fs::write(
             fixture.shared.join(path),
@@ -274,7 +493,7 @@ fn unfinished_upload_refuses_pointer_rename() {
 }
 
 #[test]
-fn directory_manifest_migrates_without_fetching_payloads() {
+fn directory_manifest_migration_verifies_remote_bytes_without_materializing_payloads() {
     use md5::{Digest, Md5};
     let fixture = legacy_repository();
     let rows =
@@ -296,6 +515,12 @@ fn directory_manifest_migrates_without_fetching_payloads() {
         "exact-directory-file-version"
     );
     assert!(!fixture.shared.join("absent-directory").exists());
+    assert_eq!(native["schema_version"], 2);
+    assert_eq!(
+        native["entries"][0]["version"]["verification"]["method"],
+        "verified-read"
+    );
+    assert_eq!(fixture.s3.payload_gets(), 2);
 }
 
 #[test]

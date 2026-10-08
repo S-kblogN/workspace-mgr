@@ -36,7 +36,9 @@ pub(crate) const CONTROL_FILE_ALLOWANCE_BYTES: u64 = 1_048_576;
 /// Suggested limits are whole multiples of 256 MiB.
 const SUGGESTION_STEP_BYTES: u64 = 268_435_456;
 const CONTRIBUTOR_LIMIT: usize = 10;
-// Single-threaded packing with fixed settings keeps packed sizes reproducible.
+// Single-threaded packing with fixed settings keeps quota estimates reproducible.
+// Parallel delta searches can change the packed bytes and therefore approval
+// decisions for the same immutable input; independent hashing can run in parallel.
 const PACK_SETTINGS: [&str; 10] = [
     "-c",
     "pack.threads=1",
@@ -1096,61 +1098,9 @@ fn object_info<'a>(
 pub(crate) fn read_blobs(
     repo: &GitRepo,
     oids: &[String],
-    mut visit: impl FnMut(&str, &[u8]) -> Result<()>,
+    visit: impl FnMut(&str, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    if oids.is_empty() {
-        return Ok(());
-    }
-    let input = oids
-        .iter()
-        .map(|oid| format!("{oid}\n"))
-        .collect::<String>();
-    let mut buffer = Vec::new();
-    repo.stream(["cat-file", "--batch"], Some(input.as_bytes()), |chunk| {
-        buffer.extend_from_slice(chunk);
-        let mut start = 0;
-        while let Some(offset) = buffer[start..].iter().position(|byte| *byte == b'\n') {
-            let header_end = start + offset;
-            let header = String::from_utf8_lossy(&buffer[start..header_end]).into_owned();
-            let fields = header.split(' ').collect::<Vec<_>>();
-            let (oid, size) = match fields.as_slice() {
-                [oid, _, size] => (
-                    *oid,
-                    size.parse::<usize>().map_err(|_| {
-                        Error::message(format!("unexpected Git object header {header:?}"))
-                    })?,
-                ),
-                [oid, "missing"] => {
-                    return Err(Error::message(format!(
-                        "Git object {oid} is missing locally; cloud usage cannot be measured"
-                    )));
-                }
-                _ => {
-                    return Err(Error::message(format!(
-                        "unexpected Git object header {header:?}"
-                    )));
-                }
-            };
-            let content_start = header_end + 1;
-            let Some(record_end) = content_start
-                .checked_add(size)
-                .and_then(|end| end.checked_add(1))
-            else {
-                return Err(Error::message("Git object is too large to inspect"));
-            };
-            if buffer.len() < record_end {
-                break;
-            }
-            visit(oid, &buffer[content_start..record_end - 1])?;
-            start = record_end;
-        }
-        buffer.drain(..start);
-        Ok(())
-    })?;
-    if !buffer.is_empty() {
-        return Err(Error::message("Git object stream ended mid-record"));
-    }
-    Ok(())
+    repo.visit_blobs(oids, visit)
 }
 
 fn lfs_objects(repo: &GitRepo, candidates: &[String]) -> Result<BTreeMap<String, LfsObject>> {
@@ -1641,6 +1591,7 @@ impl DirectoryListings {
                     size: Some(file.size),
                     version_id: None,
                     etag: None,
+                    verification: None,
                     aggregate: false,
                 })),
                 None => expanded.push(entry),
@@ -1854,15 +1805,17 @@ fn archive_history_usage(
     published: bool,
 ) -> Result<BTreeMap<String, Tally>> {
     let names = repo.run(["ls-tree", "-r", "-z", "--name-only", tree, "--"])?;
-    let mut totals = BTreeMap::<String, Tally>::new();
-    let mut seen = BTreeSet::new();
-    for path in names
+    let paths = names
         .stdout
         .split('\0')
         .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
-    {
-        let raw = repo.run(["show", &format!("{tree}:{path}")])?;
-        let receipt: serde_json::Value = serde_json::from_str(&raw.stdout).map_err(|error| {
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let receipts = repo.show_files(tree, &paths)?;
+    let mut totals = BTreeMap::<String, Tally>::new();
+    let mut seen = BTreeSet::new();
+    for (path, raw) in receipts {
+        let receipt: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
             Error::message(format!("invalid archive usage receipt {path}: {error}"))
         })?;
         let destination = receipt["destination"]
@@ -1871,7 +1824,7 @@ fn archive_history_usage(
         if published && receipt["status"] != "copied" {
             continue;
         }
-        if !selected.contains(path)
+        if !selected.contains(&path)
             && !current
                 .iter()
                 .any(|entry| entry.key.starts_with(&format!("{destination}/")))
@@ -1942,35 +1895,7 @@ pub(crate) fn blobs_at(
     revision: &str,
     paths: &[String],
 ) -> Result<BTreeMap<String, Option<String>>> {
-    if paths.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let input = paths
-        .iter()
-        .map(|path| format!("{revision}:{path}\n"))
-        .collect::<String>();
-    let output = repo.run_bytes(
-        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
-        Some(input.as_bytes()),
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let lines = text.lines().collect::<Vec<_>>();
-    if lines.len() != paths.len() {
-        return Err(Error::message(
-            "unexpected Git object lookup output while reading storage metadata",
-        ));
-    }
-    Ok(paths
-        .iter()
-        .zip(lines)
-        .map(|(path, line)| {
-            let blob = match line.split_once(' ') {
-                Some((oid, "blob")) if is_object_id(oid) => Some(oid.to_owned()),
-                _ => None,
-            };
-            (path.clone(), blob)
-        })
-        .collect())
+    repo.blob_ids(revision, paths)
 }
 
 /// Sizes the uploads implied by uncommitted output changes. Returns changed
@@ -2416,6 +2341,7 @@ mod tests {
             size: Some(size),
             version_id: version.map(ToOwned::to_owned),
             etag: None,
+            verification: None,
             aggregate: false,
         }
     }
@@ -2427,6 +2353,7 @@ mod tests {
             size: Some(size),
             version_id: None,
             etag: None,
+            verification: None,
             aggregate: false,
         }
     }
@@ -3090,6 +3017,7 @@ mod tests {
             version: Some(Version {
                 id: "original-v1".into(),
                 etag: Some("original-etag".into()),
+                verification: None,
             }),
         };
         let manifest = |entries: Vec<Entry>| Manifest {
@@ -3808,6 +3736,45 @@ mod tests {
             }),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn archive_usage_batches_literal_receipts_and_validates_unselected_documents() {
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"base\n");
+        fixture.commit("base");
+        let paths = [
+            "archive/[literal]\nspace/.workspace-mgr-archive.json",
+            "archive/second\\folder/.workspace-mgr-archive.json",
+            "archive/planned\tcopy/.workspace-mgr-archive.json",
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let receipt = serde_json::json!({
+                "destination":"archive/destination", "status":if index == 2 {"planned"} else {"copied"},
+                "versions":[{"destination_object":if index == 2 {"archive/destination/pending"} else {"archive/destination/data"},
+                    "source_version_id":"original", "size":11, "delete_marker":false}]
+            });
+            fixture.write(path, &serde_json::to_vec(&receipt).unwrap());
+        }
+        let selected = paths.into_iter().map(str::to_owned).collect();
+        let tree = fixture.tree();
+        let projected = archive_history_usage(&fixture.repo, &tree, &[], &selected, false).unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected["archive/destination/data"].bytes, 11);
+        assert_eq!(projected["archive/destination/data"].versions, 1);
+        assert!(projected["archive/destination/pending"].pending);
+        let published = archive_history_usage(&fixture.repo, &tree, &[], &selected, true).unwrap();
+        assert_eq!(published.len(), 1);
+        fixture.write(
+            "archive/unselected/.workspace-mgr-archive.json",
+            b"invalid json",
+        );
+        assert!(
+            archive_history_usage(&fixture.repo, &fixture.tree(), &[], &selected, false)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid archive usage receipt archive/unselected/")
+        );
     }
 
     #[test]

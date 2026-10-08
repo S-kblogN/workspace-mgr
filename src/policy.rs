@@ -29,6 +29,7 @@ pub const ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION: semver::Version =
 pub const ARCHIVE_COPY_JOURNAL_SCHEMA_VERSION: u32 = 2;
 /// First release that reads native storage manifests.
 pub const NATIVE_STORAGE_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 8, 1);
+pub const VERIFIED_STORAGE_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 8, 7);
 
 pub const REVIEW_PULL_REQUEST: &str = "required";
 pub const REVIEW_INITIAL_STATE: &str = "draft";

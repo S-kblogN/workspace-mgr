@@ -286,10 +286,14 @@ pub fn inspect(path: &Path, selector: Option<&str>) -> Result<DoctorReport> {
                             }
                             .into(),
                             detail: format!(
-                                "{} expected objects, {} remote versions, {} differences",
+                                "{} expected objects, {} remote versions, {} differences; {} verified versions, {} remote checksums, {} streamed objects ({} bytes)",
                                 report.expected_objects,
                                 report.remote_versions,
                                 report.issues.len(),
+                                report.verified_version_objects,
+                                report.remote_checksum_objects,
+                                report.streamed_objects,
+                                report.streamed_bytes,
                             ),
                         });
                         for issue in &report.issues {
@@ -426,6 +430,7 @@ fn retired_scopes(repo: &GitRepo, tasks: &[DoctorTask], all: bool) -> Result<Vec
     )?;
     let mut records = output.stdout.split(|byte| *byte == 0);
     let mut seen = BTreeSet::new();
+    let mut historical = Vec::new();
     while let Some(header) = records.next() {
         let header = String::from_utf8_lossy(header);
         let fields = header.split_whitespace().collect::<Vec<_>>();
@@ -448,13 +453,22 @@ fn retired_scopes(repo: &GitRepo, tasks: &[DoctorTask], all: bool) -> Result<Vec
         {
             continue;
         }
-        let raw = repo.run(["cat-file", "blob", blob])?.stdout;
+        historical.push((blob.to_owned(), path.to_owned()));
+    }
+    let contents = repo.read_blobs(
+        &historical
+            .iter()
+            .map(|(blob, _)| blob.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    for (blob, path) in historical {
+        let raw = String::from_utf8_lossy(&contents[&blob]);
         if let Ok(document) = toml::from_str::<toml::Value>(&raw)
             && document
                 .get("id")
                 .and_then(toml::Value::as_str)
                 .is_some_and(|id| ids.contains(id))
-            && let Some(parent) = Path::new(path).parent().and_then(Path::to_str)
+            && let Some(parent) = Path::new(&path).parent().and_then(Path::to_str)
         {
             retired.insert(crate::path::repo_path(parent, "historical task path")?);
         }

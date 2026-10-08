@@ -905,6 +905,7 @@ fn check_storage_import_projection(repo: &GitRepo, index: &Path, base_oid: &str)
     {
         return Ok(());
     }
+    let mut retained = Vec::new();
     for entry in index_entries(repo, index, ":(glob)**/*.dvc")? {
         if !entry.is_regular_file() {
             continue;
@@ -921,7 +922,16 @@ fn check_storage_import_projection(repo: &GitRepo, index: &Path, base_oid: &str)
         if nested {
             continue;
         }
-        let raw = blob_text(repo, &entry.oid)?;
+        retained.push(entry);
+    }
+    let contents = repo.read_blobs(
+        &retained
+            .iter()
+            .map(|entry| entry.oid.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    for entry in retained {
+        let raw = String::from_utf8_lossy(&contents[&entry.oid]);
         let document: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|_| {
             Error::message(format!("invalid legacy storage metadata: {}", entry.path))
         })?;
@@ -945,6 +955,22 @@ fn check_storage_import_projection(repo: &GitRepo, index: &Path, base_oid: &str)
 }
 
 fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
+    let literal = scopes
+        .iter()
+        .map(|scope| format!(":(literal){scope}"))
+        .collect::<Vec<_>>();
+    let mut tracked = BTreeSet::new();
+    for batch in pathspec_batches(&literal) {
+        let mut args = vec!["ls-files".to_owned(), "-z".to_owned(), "--".to_owned()];
+        args.extend(batch.iter().cloned());
+        tracked.extend(
+            repo.run_with_index(index, args, None, true)?
+                .stdout
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
     let mut present = Vec::new();
     for scope in scopes {
         if storage::is_local(repo, scope)? {
@@ -967,23 +993,28 @@ fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
                 });
             }
         };
-        let tracked = !repo
-            .run_with_index(index, ["ls-files", "-z", "--", scope], None, true)?
-            .stdout
-            .is_empty();
-        if exists || tracked {
-            present.push(scope.clone());
+        if exists
+            || tracked
+                .iter()
+                .any(|path| path == scope || inside(scope, path))
+        {
+            present.push(format!(":(literal){scope}"));
         }
     }
     if present.is_empty() {
         return Ok(());
     }
-    let mut add = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
-    add.extend(present);
     // An upgraded repository may still have its older root ignore file.
     // Scope-wide staging must exclude product state independently of it.
-    add.extend(crate::local_state::LOCAL_STATE_EXCLUDE_PATHSPECS.map(str::to_owned));
-    repo.run_with_index(index, add, None, true)?;
+    present.extend(crate::local_state::LOCAL_STATE_EXCLUDE_PATHSPECS.map(str::to_owned));
+    let mut input = present.join("\0");
+    input.push('\0');
+    repo.run_with_index(
+        index,
+        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        Some(&input),
+        true,
+    )?;
     Ok(())
 }
 
@@ -1000,10 +1031,15 @@ fn remove_output_paths_from_index<'a>(
     index: &Path,
     outputs: impl IntoIterator<Item = &'a String>,
 ) -> Result<()> {
+    let literal = outputs
+        .into_iter()
+        .map(|output| format!(":(literal){output}"))
+        .collect::<Vec<_>>();
     let mut tracked = BTreeSet::new();
-    for output in outputs {
-        let literal = format!(":(literal){output}");
-        let listed = repo.run_with_index(index, ["ls-files", "-z", "--", &literal], None, true)?;
+    for batch in pathspec_batches(&literal) {
+        let mut args = vec!["ls-files".to_owned(), "-z".to_owned(), "--".to_owned()];
+        args.extend(batch.iter().cloned());
+        let listed = repo.run_with_index(index, args, None, true)?;
         tracked.extend(
             listed
                 .stdout
@@ -1012,11 +1048,13 @@ fn remove_output_paths_from_index<'a>(
                 .map(ToOwned::to_owned),
         );
     }
-    for path in tracked {
+    if !tracked.is_empty() {
+        let mut input = tracked.into_iter().collect::<Vec<_>>().join("\0");
+        input.push('\0');
         repo.run_with_index(
             index,
-            ["update-index", "--force-remove", "--", &path],
-            None,
+            ["update-index", "--force-remove", "-z", "--stdin"],
+            Some(&input),
             true,
         )?;
     }
@@ -1212,6 +1250,7 @@ fn check_staged_entry_modes(
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     let destination = retained_content_destination(policy.task);
+    let mut links = Vec::new();
     for batch in pathspec_batches(paths) {
         let mut args = vec![
             "ls-files".to_owned(),
@@ -1219,7 +1258,7 @@ fn check_staged_entry_modes(
             "-z".to_owned(),
             "--".to_owned(),
         ];
-        args.extend(batch.iter().cloned());
+        args.extend(batch.iter().map(|path| format!(":(literal){path}")));
         let output = repo.run_with_index(index, args, None, true)?;
         for entry in output.stdout.split('\0').filter(|entry| !entry.is_empty()) {
             let Some((attributes, path)) = entry.split_once('\t') else {
@@ -1238,15 +1277,17 @@ fn check_staged_entry_modes(
             let Some(oid) = fields.next() else {
                 continue;
             };
-            let target = repo
-                .run_with_index(index, ["cat-file", "blob", oid], None, true)?
-                .stdout;
-            let target = target.trim();
-            if escapes_repository(path, target) {
-                return Err(Error::message(format!(
-                    "{path:?} is a symbolic link to {target:?}, which is outside the repository; keep the work inside {destination} and copy retained content into it instead of linking to it"
-                )));
-            }
+            links.push((path.to_owned(), oid.to_owned()));
+        }
+    }
+    let targets = repo.read_blobs(&links.iter().map(|(_, oid)| oid.clone()).collect::<Vec<_>>())?;
+    for (path, oid) in links {
+        let target = String::from_utf8_lossy(&targets[&oid]);
+        let target = target.trim();
+        if escapes_repository(&path, target) {
+            return Err(Error::message(format!(
+                "{path:?} is a symbolic link to {target:?}, which is outside the repository; keep the work inside {destination} and copy retained content into it instead of linking to it"
+            )));
         }
     }
     Ok(())
@@ -1935,6 +1976,7 @@ fn check_large_files(
     base_oid: &str,
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
+    let mut candidates = Vec::new();
     for relative in repo.visible_paths(scopes)? {
         if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
             || relative.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD))
@@ -1963,8 +2005,17 @@ fn check_large_files(
             policy.task.task_path.as_deref(),
             policy.published_task_path,
         );
-        let object = format!("{base_oid}:{history_path}");
-        if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
+        candidates.push((relative, history_path));
+    }
+    let history = repo.existing_paths(
+        base_oid,
+        &candidates
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    for (relative, path) in candidates {
+        if history.contains(&path) {
             continue;
         }
         return Err(Error::message(format!(
@@ -2593,11 +2644,12 @@ fn require_publishable(
     needs: &ManifestNeeds,
     declaration: &Version,
 ) -> Result<()> {
-    if let Some(path) = &needs.native_storage {
-        let required = crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION;
-        if !cli_version_satisfies(installed, &required) {
+    if let Some(storage) = &needs.native_storage {
+        let required = &storage.version;
+        if !cli_version_satisfies(installed, required) {
             return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish native storage manifest {path}; workspace-mgr {required} or newer is required"
+                "this build (workspace-mgr {installed}) cannot publish native storage manifest {} (schema {}); workspace-mgr {required} or newer is required",
+                storage.path, storage.schema
             )));
         }
     }
@@ -2652,9 +2704,10 @@ fn require_publishable(
 
 fn missing_configuration(required: &Version, schema: Option<u32>, needs: &ManifestNeeds) -> Error {
     let Some(schema) = schema else {
-        if let Some(path) = &needs.native_storage {
+        if let Some(storage) = &needs.native_storage {
             return Error::message(format!(
-                "native storage manifest {path} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; run `workspace-mgr manage` first"
+                "native storage manifest {} (schema {}) requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; run `workspace-mgr manage` first",
+                storage.path, storage.schema
             ));
         }
         return Error::message(format!(
@@ -2685,6 +2738,13 @@ struct ManifestNeed {
     archived: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageManifestNeed {
+    version: Version,
+    schema: u32,
+    path: String,
+}
+
 /// What the task manifests in a private index need, split by whether the
 /// manifest is this task's own, since only this task's approval can be
 /// withdrawn by this task.
@@ -2697,7 +2757,7 @@ struct ManifestNeeds {
     /// Archive receipts use a storage protocol newer than their task manifest
     /// and public data schemas. This floor must not depend on schema 4.
     archive_protocol: Option<String>,
-    native_storage: Option<String>,
+    native_storage: Option<StorageManifestNeed>,
 }
 
 impl ManifestNeeds {
@@ -2705,14 +2765,15 @@ impl ManifestNeeds {
     /// instance's schema.
     fn highest(&self) -> Option<(Version, Option<u32>)> {
         let manifest = self.highest_need();
-        if self.native_storage.is_some()
-            && manifest.is_none_or(|need| {
-                crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION
-                    .cmp_precedence(&need.version)
-                    .is_ge()
-            })
+        if let Some(storage) = &self.native_storage
+            && manifest.is_none_or(|need| storage.version.cmp_precedence(&need.version).is_ge())
+            && (self.archive_protocol.is_none()
+                || storage
+                    .version
+                    .cmp_precedence(&ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION)
+                    .is_ge())
         {
-            return Some((crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION, None));
+            return Some((storage.version.clone(), None));
         }
         if self.archive_protocol.is_some()
             && manifest.is_none_or(|need| {
@@ -2741,9 +2802,24 @@ fn manifest_requirement(
     index: &Path,
     own_manifest: Option<&str>,
 ) -> Result<ManifestNeeds> {
-    let manifests = index_entries(repo, index, &format!(":(glob)**/{TASK_MANIFEST_NAME}"))?
-        .into_iter()
-        .filter(IndexEntry::is_regular_file)
+    let entries = index_entries_for(
+        repo,
+        index,
+        &[
+            format!(":(glob)**/{TASK_MANIFEST_NAME}"),
+            ":(glob)**/*.wm-storage.json".to_owned(),
+            format!(":(glob)**/{}", archive_migration::RECEIPT_NAME),
+        ],
+    )?;
+    let manifests = entries
+        .iter()
+        .filter(|entry| {
+            Path::new(&entry.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(TASK_MANIFEST_NAME)
+        })
+        .filter(|entry| entry.is_regular_file())
         .filter(|entry| {
             let Some(directory) = entry.path.strip_suffix(&format!("/{TASK_MANIFEST_NAME}")) else {
                 return false;
@@ -2753,35 +2829,70 @@ fn manifest_requirement(
                 Some((_, name)) => parse_task_identity(TaskKind::Deliverable, name).is_ok(),
             }
         })
+        .cloned()
         .collect::<Vec<_>>();
+    let storage_origins = entries
+        .iter()
+        .filter(|entry| {
+            entry.is_regular_file() && entry.path.ends_with(crate::storage_format::SUFFIX)
+        })
+        .map(|entry| (entry.oid.clone(), entry.path.clone()))
+        .collect::<BTreeMap<_, _>>();
     let oids = manifests
         .iter()
         .map(|entry| entry.oid.clone())
+        .chain(storage_origins.keys().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let mut schemas = std::collections::BTreeMap::new();
+    let mut storage_schemas = BTreeMap::new();
     crate::cloud_usage::read_blobs(repo, &oids, |oid, content| {
         if let Some(schema) = manifest_schema(content) {
             schemas.insert(oid.to_owned(), schema);
         }
+        if let Some(origin) = storage_origins.get(oid) {
+            let raw = std::str::from_utf8(content).map_err(|_| {
+                Error::message(format!("native storage metadata is not UTF-8: {origin}"))
+            })?;
+            let manifest = crate::storage_format::Manifest::parse(raw, origin)?;
+            storage_schemas.insert(oid.to_owned(), manifest.schema_version);
+        }
         Ok(())
     })?;
     let mut needs = ManifestNeeds {
-        native_storage: index_entries(repo, index, ":(glob)**/*.wm-storage.json")?
-            .into_iter()
-            .find(IndexEntry::is_regular_file)
-            .map(|entry| entry.path),
-        archive_protocol: index_entries(
-            repo,
-            index,
-            &format!(":(glob)**/{}", archive_migration::RECEIPT_NAME),
-        )?
-        .into_iter()
-        .find(IndexEntry::is_regular_file)
-        .map(|entry| entry.path),
+        archive_protocol: entries
+            .iter()
+            .filter(|entry| {
+                Path::new(&entry.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(archive_migration::RECEIPT_NAME)
+            })
+            .find(|entry| entry.is_regular_file())
+            .map(|entry| entry.path.clone()),
         ..ManifestNeeds::default()
     };
+    for entry in entries.iter().filter(|entry| {
+        entry.is_regular_file() && entry.path.ends_with(crate::storage_format::SUFFIX)
+    }) {
+        let schema = storage_schemas[&entry.oid];
+        let version = match schema {
+            1 => crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION,
+            _ => crate::policy::VERIFIED_STORAGE_MINIMUM_CLI_VERSION,
+        };
+        if needs
+            .native_storage
+            .as_ref()
+            .is_none_or(|need| version.cmp_precedence(&need.version).is_gt())
+        {
+            needs.native_storage = Some(StorageManifestNeed {
+                version,
+                schema,
+                path: entry.path.clone(),
+            });
+        }
+    }
     for entry in manifests {
         let Some(schema) = schemas.get(&entry.oid).copied() else {
             continue;
@@ -2960,12 +3071,22 @@ impl IndexEntry {
 }
 
 fn index_entries(repo: &GitRepo, index: &Path, pathspec: &str) -> Result<Vec<IndexEntry>> {
-    let listed = repo.run_with_index(
-        index,
-        ["ls-files", "--stage", "-z", "--", pathspec],
-        None,
-        true,
-    )?;
+    index_entries_for(repo, index, &[pathspec.to_owned()])
+}
+
+fn index_entries_for(
+    repo: &GitRepo,
+    index: &Path,
+    pathspecs: &[String],
+) -> Result<Vec<IndexEntry>> {
+    let mut args = vec![
+        "ls-files".to_owned(),
+        "--stage".to_owned(),
+        "-z".to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(pathspecs.iter().cloned());
+    let listed = repo.run_with_index(index, args, None, true)?;
     listed
         .stdout
         .split('\0')
@@ -3322,6 +3443,79 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.oid)
         }
+    }
+
+    #[test]
+    fn batched_index_removal_keeps_literal_boundaries_and_neighbor_files() {
+        let fixture = Fixture::new(None);
+        let directory = "data[?]*";
+        let direct = "direct\nline\tfile";
+        for path in [
+            format!("{directory}/first\nfile"),
+            format!("{directory}/second\\file"),
+            format!("{directory}-neighbor/keep"),
+            direct.to_owned(),
+            "dataXneighbor/keep".to_owned(),
+        ] {
+            fixture.write(&path, "payload");
+        }
+        let base = fixture.commit();
+        fixture.stage(&base, &["."]);
+        let boundaries = [directory.to_owned(), direct.to_owned(), "absent".to_owned()];
+        remove_output_paths_from_index(&fixture.repo, &fixture.index, &boundaries).unwrap();
+        let tracked = fixture
+            .repo
+            .run_with_index(&fixture.index, ["ls-files", "-z"], None, true)
+            .unwrap()
+            .stdout;
+        let paths = tracked
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .collect::<BTreeSet<_>>();
+        assert!(!paths.contains(direct));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(&format!("{directory}/")))
+        );
+        assert!(paths.contains(format!("{directory}-neighbor/keep").as_str()));
+        assert!(paths.contains("dataXneighbor/keep"));
+        assert!(
+            fixture.repo.root.join(direct).is_file(),
+            "index removal preserves worktree bytes"
+        );
+    }
+
+    #[test]
+    fn batched_scope_staging_preserves_deletions_and_literal_names() {
+        let fixture = Fixture::new(None);
+        fixture.write("deleted[?]*", "before");
+        fixture.write("deletedXneighbor", "neighbor");
+        let base = fixture.commit();
+        fixture
+            .repo
+            .run_with_index(&fixture.index, ["read-tree", &base], None, true)
+            .unwrap();
+        fs::remove_file(fixture.repo.root.join("deleted[?]*")).unwrap();
+        fixture.write("new\nname", "new payload");
+        stage_scopes(
+            &fixture.repo,
+            &fixture.index,
+            &[
+                "deleted[?]*".to_owned(),
+                "new\nname".to_owned(),
+                "absent".to_owned(),
+            ],
+        )
+        .unwrap();
+        let changed = changed_paths(&fixture.repo, &fixture.index, &base).unwrap();
+        assert_eq!(changed, ["deleted[?]*", "new\nname"]);
+        let tracked = fixture
+            .repo
+            .run_with_index(&fixture.index, ["ls-files", "-z"], None, true)
+            .unwrap()
+            .stdout;
+        assert!(tracked.split('\0').any(|path| path == "deletedXneighbor"));
     }
 
     #[test]

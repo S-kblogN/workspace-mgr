@@ -33,6 +33,8 @@ pub(crate) struct RemoteObject {
     pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::storage_format::Verification>,
 }
 
 impl RemoteObject {
@@ -44,6 +46,7 @@ impl RemoteObject {
             size: Some(self.size),
             version_id: None,
             etag: None,
+            verification: None,
             hash_name: self.algorithm.clone(),
         }
     }
@@ -65,6 +68,7 @@ impl RemoteObject {
         let mut value = self.clone();
         value.version_id = None;
         value.etag = None;
+        value.verification = None;
         value
     }
 }
@@ -425,6 +429,7 @@ fn remote_object(
     source: Located,
 ) -> RemoteObject {
     RemoteObject {
+        verification: None,
         destination_key: client.key_for(&object),
         object,
         algorithm: algorithm.to_owned(),
@@ -660,6 +665,7 @@ pub(crate) fn execute(
         }
         plan.objects[index].version_id = Some(version.id);
         plan.objects[index].etag = version.etag;
+        plan.objects[index].verification = version.verification;
         journal.objects[index] = plan.objects[index].clone();
         save_journal(repo, &journal)?;
     }
@@ -683,6 +689,7 @@ pub(crate) fn bind_manifests(
                     Version {
                         id,
                         etag: row.etag.clone(),
+                        verification: row.verification.clone(),
                     },
                 ))
             })
@@ -717,6 +724,7 @@ pub(crate) fn bind_manifests(
                 }
             }
         }
+        manifest.schema_version = crate::storage_format::SCHEMA_VERSION;
         let serialized = manifest.serialize()?;
         Manifest::parse(&serialized, path)?;
         writes.insert(path.clone(), serialized.into_bytes());
@@ -875,6 +883,7 @@ mod tests {
             bucket: "isolated".to_owned(),
             prefix: "root".to_owned(),
             objects: vec![RemoteObject {
+                verification: None,
                 source_key: "root/files/md5/90/0150983cd24fb0d6963f7d28e17f72".to_owned(),
                 destination_key: "root/data".to_owned(),
                 object: "data".to_owned(),

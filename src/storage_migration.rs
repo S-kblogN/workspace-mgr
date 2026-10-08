@@ -14,7 +14,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::path::{reject_symlink_traversal, repo_path, to_slash};
-use crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION;
+use crate::policy::VERIFIED_STORAGE_MINIMUM_CLI_VERSION;
 use crate::scaffold::{ManageOptions, ManageReport};
 
 const JOURNAL_NAME: &str = "storage-migration.json";
@@ -34,10 +34,75 @@ pub(crate) struct MigrationReport {
     /// owning task's next publication uploads their verified local payload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_upload: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upgraded: Vec<String>,
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn upgrade_storage_proofs(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
+    let mut client = None;
+    for pointer in &plan.native_upgrades {
+        let raw = plan
+            .writes
+            .get(pointer)
+            .ok_or_else(|| Error::message("planned storage upgrade disappeared"))?;
+        let mut manifest = crate::storage_format::Manifest::parse(
+            std::str::from_utf8(raw).map_err(|_| Error::message("storage control is not UTF-8"))?,
+            pointer,
+        )?;
+        if manifest.schema_version == crate::storage_format::SCHEMA_VERSION {
+            continue;
+        }
+        let bound = manifest.version.is_some()
+            || manifest
+                .entries
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry.version.is_some());
+        if bound {
+            if client.is_none() {
+                let raw = plan
+                    .writes
+                    .get(CONFIG_NAME)
+                    .or_else(|| {
+                        plan.expected_before
+                            .get(CONFIG_NAME)
+                            .and_then(Option::as_ref)
+                    })
+                    .ok_or_else(|| {
+                        Error::message("storage upgrade has no repository configuration")
+                    })?;
+                let config = Config::parse(
+                    std::str::from_utf8(raw)
+                        .map_err(|_| Error::message("configuration is not UTF-8"))?,
+                    &repo.root.join(CONFIG_NAME),
+                )?;
+                let location = config.s3.ok_or_else(|| {
+                    Error::message("bound storage upgrade requires S3 configuration")
+                })?;
+                client = Some(crate::storage_import::client(
+                    &location.url,
+                    location.endpoint_url.as_deref(),
+                    &plan.credentials,
+                )?);
+            }
+            crate::native_engine::upgrade_manifest_verification(
+                repo,
+                client.as_ref().unwrap(),
+                pointer,
+                &mut manifest,
+            )?;
+        } else {
+            manifest.schema_version = crate::storage_format::SCHEMA_VERSION;
+        }
+        plan.writes
+            .insert(pointer.clone(), manifest.serialize()?.into_bytes());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +140,8 @@ struct Plan {
     legacy_directory: bool,
     credentials: crate::native_s3::CredentialsConfig,
     import: Option<crate::storage_import::Plan>,
+    native_upgrades: BTreeSet<String>,
+    has_native_storage: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -229,6 +296,10 @@ fn manage_inner(options: &ManageOptions) -> Result<Report> {
                 .map(|row| row.destination.clone())
                 .collect::<Vec<_>>();
             crate::storage_import::bind_manifests(import, &mut plan.writes, &destinations)?;
+            plan.report.remote_objects = import.objects.clone();
+        }
+        upgrade_storage_proofs(&repo, &mut plan)?;
+        if plan.import.is_some() {
             crate::storage_import::prepare_commit(
                 &repo,
                 &plan.writes,
@@ -239,7 +310,6 @@ fn manage_inner(options: &ManageOptions) -> Result<Report> {
                     .map(|row| (row.source.clone(), row.destination.clone()))
                     .collect::<Vec<_>>(),
             )?;
-            plan.report.remote_objects = import.objects.clone();
         }
         execute(&repo, &journal_path, &plan)?;
         if plan.import.is_some() {
@@ -347,7 +417,11 @@ fn merge_scaffold(repo: &GitRepo, plan: &mut Plan, scaffold: &ManageReport) -> R
             }
         }
     }
-    if !plan.report.converted.is_empty() || plan.legacy_directory {
+    if plan.has_native_storage
+        || !plan.report.converted.is_empty()
+        || !plan.native_upgrades.is_empty()
+        || plan.legacy_directory
+    {
         let path = repo.root.join(CONFIG_NAME);
         let raw = match plan.writes.get(CONFIG_NAME) {
             Some(bytes) => bytes.clone(),
@@ -360,15 +434,17 @@ fn merge_scaffold(repo: &GitRepo, plan: &mut Plan, scaffold: &ManageReport) -> R
             .minimum_cli_version
             .as_deref()
             .and_then(|v| semver::Version::parse(v).ok())
-            .is_none_or(|v| v < NATIVE_STORAGE_MINIMUM_CLI_VERSION)
+            .is_none_or(|v| v < VERIFIED_STORAGE_MINIMUM_CLI_VERSION)
         {
-            config.minimum_cli_version = Some(NATIVE_STORAGE_MINIMUM_CLI_VERSION.to_string());
+            config.minimum_cli_version = Some(VERIFIED_STORAGE_MINIMUM_CLI_VERSION.to_string());
             plan.writes
                 .insert(CONFIG_NAME.to_owned(), config.render()?.into_bytes());
         }
     }
-    plan.writes
-        .retain(|path, bytes| fs::read(repo.root.join(path)).ok().as_ref() != Some(bytes));
+    plan.writes.retain(|path, bytes| {
+        plan.native_upgrades.contains(path)
+            || fs::read(repo.root.join(path)).ok().as_ref() != Some(bytes)
+    });
     Ok(())
 }
 
@@ -501,10 +577,16 @@ fn preflight(repo: &GitRepo) -> Result<Plan> {
         }
     }
     let mut boundaries = BTreeSet::new();
+    plan.has_native_storage = !native_pointers.is_empty();
     for pointer in native_pointers {
         let raw = fs::read_to_string(repo.root.join(&pointer)).at(repo.root.join(&pointer))?;
         record_expected(&mut plan, &pointer, Some(raw.as_bytes().to_vec()))?;
         let manifest = crate::storage_format::Manifest::parse(&raw, &pointer)?;
+        if manifest.schema_version < crate::storage_format::SCHEMA_VERSION {
+            plan.native_upgrades.insert(pointer.clone());
+            plan.report.upgraded.push(pointer.clone());
+            plan.writes.insert(pointer.clone(), raw.as_bytes().to_vec());
+        }
         let parent = Path::new(&pointer).parent().unwrap_or(Path::new(""));
         let boundary = repo_path(
             &to_slash(&parent.join(&manifest.path)),
@@ -598,6 +680,7 @@ fn preflight(repo: &GitRepo) -> Result<Plan> {
             &destination,
         )?;
         plan.writes.insert(destination.clone(), bytes);
+        plan.native_upgrades.insert(destination.clone());
         plan.removes.insert(source.clone());
         plan.report.converted.push(Conversion {
             source,
@@ -605,6 +688,10 @@ fn preflight(repo: &GitRepo) -> Result<Plan> {
         });
     }
     if !plan.report.converted.is_empty() {
+        reject_pending_transactions(repo)?;
+    }
+    if !plan.native_upgrades.is_empty() {
+        require_primary_checkout(repo)?;
         reject_pending_transactions(repo)?;
     }
     if !plan.report.converted.is_empty() {
