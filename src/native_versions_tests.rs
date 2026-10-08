@@ -404,6 +404,238 @@ fn generic_purge_deletes_complete_exact_object_history_including_markers() {
     );
 }
 
+#[derive(Default)]
+struct ConcurrentPurgeState {
+    deleted: BTreeSet<(String, String)>,
+    active: BTreeSet<String>,
+    maximum: usize,
+    post_lists: usize,
+    published: bool,
+    failed: bool,
+}
+type ConcurrentPurgeFixture = (
+    S3Client,
+    std::thread::JoinHandle<Vec<crate::native_s3::tests::WireRequest>>,
+    std::sync::Arc<(std::sync::Mutex<ConcurrentPurgeState>, std::sync::Condvar)>,
+);
+
+fn concurrent_purge_fixture(
+    requests: usize,
+    objects: Vec<String>,
+    marker: bool,
+    fail_first_delete: bool,
+    publish_after_first_wave: bool,
+) -> ConcurrentPurgeFixture {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    let state = Arc::new((Mutex::new(ConcurrentPurgeState::default()), Condvar::new()));
+    let observed = state.clone();
+    let registry = format!(
+        "root/.workspace-mgr/archive/{}.json",
+        crate::hex::encode_lower(Sha256::digest(b"task/deep/shared"))
+    );
+    let mut receipt = copied_receipt();
+    receipt["source"] = "task/deep/shared".into();
+    receipt["destination"] = "archive/task/deep/shared".into();
+    receipt["versions"][0]["source_object"] = "task/deep/shared/item04".into();
+    receipt["versions"][0]["destination_object"] = "archive/task/deep/shared/item04".into();
+    let (client, worker) = fixture_handler(requests, move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+        let (lock, changed) = &*observed;
+        if request.method == "DELETE" {
+            let object = url.path().strip_prefix("/fixture-bucket/").unwrap();
+            assert!(objects.iter().any(|expected| expected == object));
+            let version = query.get("versionId").unwrap().as_ref();
+            assert!(version == "v1" || (marker && version == "d1"));
+            let mut state = lock.lock().unwrap();
+            if fail_first_delete && object == objects[0] && !state.failed {
+                state.failed = true;
+                return missing("InternalError", 500);
+            }
+            assert!(state.deleted.insert((object.into(), version.into())));
+            return deleted();
+        }
+        assert_eq!(request.method, "GET");
+        if !query.contains_key("versions") {
+            assert_eq!(url.path(), format!("/fixture-bucket/{registry}"));
+            return registry_body(&receipt);
+        }
+        let prefix = query.get("prefix").unwrap().as_ref();
+        if prefix.starts_with("root/.workspace-mgr/archive/") {
+            if prefix == registry && lock.lock().unwrap().published {
+                return history(&version_row(&registry, "registry-version"));
+            }
+            return history("");
+        }
+        assert!(objects.iter().any(|expected| expected == prefix));
+        let mut state = lock.lock().unwrap();
+        let remaining = !state.deleted.contains(&(prefix.into(), "v1".into()));
+        if remaining {
+            state.active.insert(prefix.into());
+            state.maximum = state.maximum.max(state.active.len());
+            changed.notify_all();
+            // Make the first wave overlap deterministically, with a finite wait
+            // so a regression to a sequential implementation cannot hang CI.
+            let (updated, _) = changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                    state.maximum < PURGE_WORKERS
+                })
+                .unwrap();
+            state = updated;
+        } else if state.active.remove(prefix) {
+            state.post_lists += 1;
+            if publish_after_first_wave {
+                if state.post_lists == PURGE_WORKERS {
+                    state.published = true;
+                }
+                changed.notify_all();
+                let (updated, _) = changed
+                    .wait_timeout_while(state, Duration::from_secs(5), |state| !state.published)
+                    .unwrap();
+                state = updated;
+            }
+        }
+        let mut rows = String::new();
+        if remaining {
+            rows.push_str(&version_row(prefix, "v1"));
+        }
+        if marker && !state.deleted.contains(&(prefix.into(), "d1".into())) {
+            rows.push_str(&marker_row(prefix, "d1"));
+        }
+        // ListObjectVersions uses prefix matching; a neighboring logical key
+        // must never become a deletion candidate for this object.
+        rows.push_str(&version_row(&format!("{prefix}-neighbor"), "neighbor"));
+        history(&rows)
+    });
+    (client, worker, state)
+}
+
+fn concurrent_purge_payload(count: usize) -> Value {
+    (0..count)
+        .rev()
+        .map(|index| {
+            let object = format!("task/deep/shared/item{index:02}");
+            json!({"pointer":format!("{object}.dvc"),"object":object,"version_id":"v1"})
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn concurrent_purge_objects(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("root/task/deep/shared/item{index:02}"))
+        .collect()
+}
+
+#[test]
+fn generic_purge_pipelines_distinct_objects_with_four_workers_and_fresh_shared_ancestors() {
+    let (_directory, repo) = repo();
+    let count = 12;
+    let mut payload = concurrent_purge_payload(count);
+    // Duplicate candidates must still share a single object pipeline.
+    let duplicate = payload[0].clone();
+    payload.as_array_mut().unwrap().push(duplicate);
+    // Three ancestor registries, each read twice, plus initial history,
+    // two exact DELETEs (including a marker), and a post-delete history.
+    let (client, worker, state) = concurrent_purge_fixture(
+        count * 10,
+        concurrent_purge_objects(count),
+        true,
+        false,
+        false,
+    );
+    let result = delete_candidates(&client, &repo, &payload).unwrap();
+    let requests = worker.join().unwrap();
+    let state = state.0.lock().unwrap();
+    assert_eq!(state.maximum, PURGE_WORKERS);
+    assert!(state.active.is_empty());
+    assert_eq!(state.deleted.len(), count * 2);
+    assert_eq!(state.post_lists, count);
+    assert_eq!(result["deleted"].as_array().unwrap().len(), count);
+    for (index, value) in result["deleted"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(value["object"], format!("task/deep/shared/item{index:02}"));
+        assert_eq!(value["deleted_version_ids"], json!(["d1", "v1"]));
+    }
+    for source in ["task", "task/deep", "task/deep/shared"] {
+        let registry = format!(
+            "root/.workspace-mgr/archive/{}.json",
+            crate::hex::encode_lower(Sha256::digest(source.as_bytes()))
+        );
+        let reads = requests
+            .iter()
+            .filter(|request| {
+                let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+                url.query_pairs()
+                    .any(|(name, value)| name == "prefix" && value == registry)
+            })
+            .count();
+        assert_eq!(reads, count * 2, "fresh registry checks for {source}");
+    }
+}
+
+#[test]
+fn generic_purge_queued_object_observes_new_registry_and_refuses_uncoordinated_delete() {
+    let (_directory, repo) = repo();
+    let payload = concurrent_purge_payload(5);
+    // Four complete unarchived pipelines (9 requests each). The queued fifth
+    // reads the newly published registry twice (3 requests each), lists its
+    // object once, then rejects the missing coordination proof before DELETE.
+    let (client, worker, state) =
+        concurrent_purge_fixture(43, concurrent_purge_objects(5), false, false, true);
+    let error = delete_candidates(&client, &repo, &payload).unwrap_err();
+    assert!(error.to_string().contains("atomic Git registry binding"));
+    let requests = worker.join().unwrap();
+    let state = state.0.lock().unwrap();
+    assert!(state.published);
+    assert_eq!(state.maximum, PURGE_WORKERS);
+    assert_eq!(state.deleted.len(), PURGE_WORKERS);
+    assert!(
+        !state
+            .deleted
+            .contains(&("root/task/deep/shared/item04".into(), "v1".into()))
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .all(|request| {
+                !request.target.contains("item04") && !request.target.contains("neighbor")
+            })
+    );
+}
+
+#[test]
+fn generic_purge_joins_inflight_objects_after_failure_and_can_retry_the_same_candidates() {
+    let (_directory, repo) = repo();
+    let payload = concurrent_purge_payload(PURGE_WORKERS);
+    let unchanged = payload.clone();
+    // First attempt: one failed DELETE (8 calls), three successful objects
+    // (9 each). Retry: three absent objects (7 each), one success (9).
+    let (client, worker, state) =
+        concurrent_purge_fixture(65, concurrent_purge_objects(4), false, true, false);
+    assert!(delete_candidates(&client, &repo, &payload).is_err());
+    assert_eq!(payload, unchanged);
+    assert_eq!(state.0.lock().unwrap().deleted.len(), 3);
+    let result = delete_candidates(&client, &repo, &payload).unwrap();
+    let requests = worker.join().unwrap();
+    let state = state.0.lock().unwrap();
+    assert_eq!(state.maximum, PURGE_WORKERS);
+    assert!(state.active.is_empty());
+    assert_eq!(state.deleted.len(), PURGE_WORKERS);
+    assert_eq!(result["deleted"].as_array().unwrap().len(), 1);
+    assert_eq!(result["deleted"][0]["object"], "task/deep/shared/item00");
+    assert_eq!(result["already_absent"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .count(),
+        5
+    );
+}
+
 fn oversized_purge_candidates() -> Value {
     // Real candidate fields carry the size: every distinct, exact version ID
     // is 480 ASCII bytes, rather than padding an ignored metadata field.
