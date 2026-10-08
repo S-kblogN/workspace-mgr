@@ -145,7 +145,7 @@ fn refresh_adopts_first_s3_configuration_and_restores_controls_after_hydration_f
         &std::fs::read_to_string(fixture.shared.join(".workspace-mgr.toml")).unwrap(),
     )
     .unwrap();
-    assert_eq!(adopted["minimum_cli_version"].as_str(), Some("0.8.1"));
+    assert_eq!(adopted["minimum_cli_version"].as_str(), Some("0.8.7"));
     assert_eq!(adopted["s3"]["url"].as_str(), storage_remote.to_str());
     assert!(
         git(&fixture.shared, ["diff", "--cached", "--name-only"])

@@ -24,6 +24,8 @@ from typing import Any, Iterable
 import botocore.session
 from botocore.config import Config as BotocoreConfig
 
+VERIFIED_STORAGE_MINIMUM_CLI_VERSION = "0.8.7"
+
 
 class E2EFailure(RuntimeError):
     pass
@@ -1097,12 +1099,18 @@ class Harness:
             "infrastructure storage status resolves its private task identity",
         )
         plan = self.wm(worktree, "plan", "--manifest", manifest)
+        requirement = plan.get("repository_requirement")
+        self.check(requirement is not None
+                   and requirement["path"] == ".workspace-mgr.toml"
+                   and requirement["change"] == "raise"
+                   and requirement["minimum_cli_version"] == VERIFIED_STORAGE_MINIMUM_CLI_VERSION,
+                   "infrastructure schema 2 publication plans its required compatibility gate")
         self.check(
             all(
-                path == "e2e-shared-policy.md" or path.startswith("e2e-infra-assets/")
+                path in {"e2e-shared-policy.md", requirement["path"]} or path.startswith("e2e-infra-assets/")
                 for path in plan["changed_paths"]
             ),
-            "infrastructure plan contains only declared shared paths",
+            "infrastructure plan contains only declared shared paths and its required compatibility gate",
         )
         self.check(
             "e2e-infra-assets/data.bin.wm-storage.json" in plan["changed_paths"],
@@ -1115,6 +1123,9 @@ class Harness:
             self.remote_path_exists(oid, "e2e-shared-policy.md"),
             "infrastructure path exists in the published tree",
         )
+        self.check(f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"'
+                   in self.remote_file(oid, ".workspace-mgr.toml"),
+                   "infrastructure publication gates clients unable to read schema 2")
         self.check(
             self.remote_path_exists(oid, "e2e-infra-assets/data.bin.wm-storage.json")
             and not self.remote_path_exists(oid, "e2e-infra-assets/data.bin"),
@@ -1353,6 +1364,11 @@ class Harness:
                    and (self.shared / ".workspace-mgr.toml").read_bytes() == changed_config,
                    "editing root config cannot relocate existing boundaries during reconciliation")
         (self.shared / ".workspace-mgr.toml").write_bytes(config_before_relocation)
+        restored_config = self.wm(self.shared, "manage")
+        self.check(restored_config["status"] == "managed"
+                   and [action["path"] for action in restored_config["actions"]] == [".workspace-mgr.toml"]
+                   and f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"' in (self.shared / ".workspace-mgr.toml").read_text(),
+                   "restoring native config raises only the schema 2 compatibility requirement")
         self.check(self.wm(self.shared, "manage")["status"] == "no_changes", "restoring native config reconciles without derived files")
         bodies_v1 = self.s3_bodies()
         for payload in (v1, bundle_v1_a, bundle_v1_b, bundle_bulk):
@@ -1631,6 +1647,10 @@ class Harness:
         selected = inspect(task_id, "--repo", str(self.shared), cwd=self.root)
         self.check(selected["storage"]["issues"] == [] and selected["storage"]["expected_objects"] == 5,
                    "selected doctor verifies every standalone and directory object")
+        self.check(selected["storage"]["verified_version_objects"] == 5
+                   and selected["storage"]["streamed_objects"] == 0
+                   and selected["storage"]["streamed_bytes"] == 0,
+                   "schema 2 doctor verifies exact-version bindings without downloading payloads")
         self.check(inspect()["storage"]["issues"] == [], "doctor without a selector audits all tasks")
 
         try:
@@ -1654,6 +1674,7 @@ class Harness:
         try:
             metadata = json.loads(original_pointer)
             metadata["size"] += 1
+            metadata["version"]["verification"]["size"] = metadata["size"]
             pointer.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
             mismatch = inspect(task_id, expected=2)
             self.check(any(issue["code"] == "remote-size-mismatch" for issue in mismatch["storage"]["issues"]),
@@ -1665,11 +1686,20 @@ class Harness:
             self.check(any(issue["code"] == "remote-etag-mismatch" for issue in mismatch["storage"]["issues"]),
                        "doctor compares metadata ETag with the exact remote version")
             metadata = json.loads(original_pointer)
+            metadata["version"]["verification"]["checksum"]["digest"] = "0" * 64
+            pointer.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            mismatch = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "local-remote-bytes-mismatch" for issue in mismatch["storage"]["issues"])
+                       and mismatch["storage"]["streamed_objects"] == 0,
+                       "schema 2 doctor rejects a conflicting SHA256 binding without payload downloads")
+            metadata = json.loads(original_pointer)
+            metadata["schema_version"] = 1
+            del metadata["version"]["verification"]
             metadata["checksum"]["digest"] = "0" * 32
             pointer.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
             mismatch = inspect(task_id, expected=2)
             self.check(any(issue["code"] == "remote-content-mismatch" for issue in mismatch["storage"]["issues"]),
-                       "doctor hashes remote GET bytes even when version, ETag, and size match metadata")
+                       "schema 1 doctor retains remote-byte verification when version, ETag, and size match metadata")
         finally:
             pointer.write_bytes(original_pointer)
 
@@ -1692,7 +1722,7 @@ class Harness:
             self.check(any(issue["code"] == "local-content-mismatch" for issue in local["storage"]["issues"]),
                        "doctor compares materialized local bytes with metadata")
             self.check(any(issue["code"] == "local-remote-bytes-mismatch" for issue in local["storage"]["issues"]),
-                       "doctor also compares materialized local bytes directly with the exact remote payload")
+                       "doctor also compares materialized raw bytes with their verified exact-version checksum")
             data.write_bytes(original_data)
             extra = task / "bundle" / "unlisted.bin"
             extra.write_bytes(b"unlisted local directory entry\n")
@@ -2618,7 +2648,7 @@ class Harness:
         )
         published_config = self.remote_file(commit, config_name)
         self.check(
-            published_config == shared_config and 'minimum_cli_version = "0.8.1"' in published_config,
+            published_config == shared_config and f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"' in published_config,
             "the published tree retains the repository native compatibility requirement",
             config=published_config,
         )
@@ -2630,7 +2660,7 @@ class Harness:
             (self.shared / config_name).read_text(encoding="utf-8") == shared_config
             and self.git(self.shared, "status", "--porcelain", "--", config_name).stdout == ""
             and self.remote_ref("main") == main_before
-            and 'minimum_cli_version = "0.8.1"' in self.remote_file(main_before, config_name),
+            and f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"' in self.remote_file(main_before, config_name),
             "publication leaves shared main and its native compatibility requirement unchanged",
         )
         self.check(
@@ -3094,9 +3124,10 @@ class Harness:
         # Advance main by a fast-forward whose configuration requires a
         # release that does not exist yet.
         config = self.remote_file(local_main, config_name)
-        self.check('minimum_cli_version = "0.8.1"' in config, "shared main declares the native compatibility requirement")
+        requirement = f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"'
+        self.check(requirement in config, "shared main declares the verified-storage compatibility requirement")
         raised = self.root / "raised-workspace-config.toml"
-        raised.write_text(config.replace('minimum_cli_version = "0.8.1"', 'minimum_cli_version = "99.0.0"'), encoding="utf-8")
+        raised.write_text(config.replace(requirement, 'minimum_cli_version = "99.0.0"'), encoding="utf-8")
         blob = self.git(self.shared, "hash-object", "-w", str(raised)).stdout.strip()
         index = {"GIT_INDEX_FILE": str(self.root / "raised-workspace-index")}
         self.run(["git", "-C", self.shared, "read-tree", local_main], cwd=self.shared, env=index)

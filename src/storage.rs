@@ -676,8 +676,7 @@ pub fn apply_automatic(
         ) {
             continue;
         }
-        let object = format!("{base_oid}:{}", history.object_path(&path));
-        if repo.run_unchecked(["cat-file", "-e", &object])?.success() {
+        if history.contains(&history.object_path(&path)) {
             continue;
         }
         let size = metadata.len();
@@ -770,6 +769,7 @@ pub fn local_boundaries(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<St
 
 pub fn local_boundaries_at(repo: &GitRepo, oid: &str) -> Result<BTreeSet<String>> {
     let mut result = BTreeSet::new();
+    let mut entries = Vec::new();
     for entry in repo
         .run(["ls-tree", "-r", "-z", oid])?
         .stdout
@@ -790,10 +790,18 @@ pub fn local_boundaries_at(repo: &GitRepo, oid: &str) -> Result<BTreeSet<String>
                 "storage placement metadata is not a regular file: {path}"
             )));
         }
-        let object = fields[2];
-        let raw = repo.run(["cat-file", "blob", object])?.stdout;
+        entries.push((path.to_owned(), boundary.to_owned(), fields[2].to_owned()));
+    }
+    let contents = repo.read_blobs(
+        &entries
+            .iter()
+            .map(|(_, _, object)| object.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    for (path, boundary, object) in entries {
+        let raw = String::from_utf8_lossy(&contents[&object]);
         let placement: PlacementFile = toml::from_str(&raw).map_err(|source| Error::Toml {
-            path: repo.root.join(path),
+            path: repo.root.join(&path),
             source,
         })?;
         if placement.schema_version != PLACEMENT_SCHEMA {
@@ -802,7 +810,7 @@ pub fn local_boundaries_at(repo: &GitRepo, oid: &str) -> Result<BTreeSet<String>
             )));
         }
         if placement.target == StorageTarget::Local {
-            result.insert(repo_path(boundary, "local-only boundary")?);
+            result.insert(repo_path(&boundary, "local-only boundary")?);
         }
     }
     Ok(result)
@@ -867,19 +875,11 @@ fn automatic_target_after_reset(
             format!("{history_path}.dvc"),
         ]
         .iter()
-        .map(|pointer| {
-            repo.run_unchecked(["cat-file", "-e", &format!("{}:{pointer}", history.oid)])
-        })
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .any(|output| output.success())
+        .any(|pointer| history.contains(pointer))
         {
             return Ok((StorageTarget::S3, PlacementBasis::PublishedHistory));
         }
-        if repo
-            .run_unchecked(["cat-file", "-e", &format!("{}:{history_path}", history.oid)])?
-            .success()
-        {
+        if history.contains(&history_path) {
             return Ok((StorageTarget::Git, PlacementBasis::PublishedHistory));
         }
     }
@@ -912,12 +912,7 @@ fn placement_status(
             format!("{history_path}.dvc"),
         ]
         .iter()
-        .map(|pointer| {
-            repo.run_unchecked(["cat-file", "-e", &format!("{}:{pointer}", history.oid)])
-        })
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .any(|output| output.success())
+        .any(|pointer| history.contains(pointer))
         {
             return placement_report(
                 repo,
@@ -949,23 +944,11 @@ fn placement_status(
             boundary.reason,
         );
     }
-    let published_in_git = if let Some(history) = history {
-        repo.run_unchecked([
-            "cat-file",
-            "-e",
-            &format!("{}:{}", history.oid, history.object_path(path)),
-        ])?
-        .success()
-    } else {
-        false
-    };
+    let published_in_git =
+        history.is_some_and(|history| history.contains(&history.object_path(path)));
     if published_in_git {
-        let published_as_directory = history
-            .map(|history| {
-                published_object_is_directory(repo, &history.oid, &history.object_path(path))
-            })
-            .transpose()?
-            .unwrap_or(false);
+        let published_as_directory =
+            history.is_some_and(|history| history.is_directory(&history.object_path(path)));
         if resolved_under(&repo.root, path).is_dir() || published_as_directory {
             return Err(unbounded_directory_status_error(path));
         }
@@ -989,11 +972,6 @@ fn placement_status(
         PlacementBasis::AutomaticSizeFallback,
         None,
     )
-}
-
-fn published_object_is_directory(repo: &GitRepo, oid: &str, path: &str) -> Result<bool> {
-    let object = format!("{oid}:{path}");
-    Ok(repo.run(["cat-file", "-t", &object])?.stdout.trim() == "tree")
 }
 
 fn unbounded_directory_status_error(path: &str) -> Error {
@@ -1137,13 +1115,22 @@ fn warning_relevant_boundaries(
 
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryContext {
-    oid: String,
     current_task_path: Option<String>,
     published_task_path: Option<String>,
     archive_paths: BTreeMap<String, String>,
+    /// Freshly resolved and existence-checked paths from one immutable commit.
+    objects: BTreeMap<String, String>,
 }
 
 impl HistoryContext {
+    pub(crate) fn contains(&self, path: &str) -> bool {
+        self.objects.contains_key(path)
+    }
+
+    pub(crate) fn is_directory(&self, path: &str) -> bool {
+        self.objects.get(path).is_some_and(|kind| kind == "tree")
+    }
+
     pub(crate) fn object_path(&self, current: &str) -> String {
         // A single infrastructure publication can relocate many independent
         // tasks, including legacy tasks which had no published manifest. Each
@@ -1179,19 +1166,13 @@ impl HistoryContext {
             // Once this destination is in the selected publication, its own
             // tree is authoritative. Retained receipts must not send future
             // plans back to an older source that may no longer exist.
-            if repo
-                .run_unchecked(["cat-file", "-e", &format!("{}:{destination}", self.oid)])?
-                .success()
-            {
+            if self.contains(destination) {
                 self.archive_paths
                     .insert(destination.to_owned(), destination.to_owned());
                 continue;
             }
             crate::archive_cancel::validate_migration(repo, &receipt)?;
-            if repo
-                .run_unchecked(["cat-file", "-e", &format!("{}:{source}", self.oid)])?
-                .success()
-            {
+            if self.contains(source) {
                 self.archive_paths
                     .insert(destination.to_owned(), source.to_owned());
             }
@@ -1249,10 +1230,10 @@ pub(crate) fn history_for_oid(
             Ok(path) => ResolvedTask::load(repo, config, &path)?,
             Err(_) => {
                 return HistoryContext {
-                    oid: oid.to_owned(),
                     current_task_path: None,
                     published_task_path: None,
                     archive_paths: BTreeMap::new(),
+                    objects: history_objects(repo, oid)?,
                 }
                 .with_archives(repo, config, scopes);
             }
@@ -1348,7 +1329,7 @@ pub(crate) fn archived_lfs_entries(
     ];
     args.extend(history.archive_paths.values().cloned());
     let listed = repo.run(args)?;
-    let mut result = Vec::new();
+    let mut candidates = Vec::new();
     for entry in listed.stdout.split('\0').filter(|entry| !entry.is_empty()) {
         let Some((header, old_path)) = entry.split_once('\t') else {
             continue;
@@ -1383,8 +1364,19 @@ pub(crate) fn archived_lfs_entries(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        let raw = repo.run_bytes(["cat-file", "blob", blob], None)?.stdout;
-        let Some(old_pointer) = archived_lfs_pointer(&raw) else {
+        candidates.push((old_mode.to_string(), blob.to_string(), path, metadata));
+    }
+    let blobs = repo.read_blobs(
+        &candidates
+            .iter()
+            .map(|(_, blob, _, _)| blob.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut result = Vec::new();
+    for (old_mode, blob, path, metadata) in candidates {
+        let absolute = repo.root.join(&path);
+        let raw = &blobs[&blob];
+        let Some(old_pointer) = archived_lfs_pointer(raw) else {
             continue;
         };
         let current_raw = (metadata.len() <= 1024)
@@ -1423,7 +1415,7 @@ pub(crate) fn archived_lfs_entries(
             }
             (unchanged, pointer)
         };
-        let mut mode = old_mode.to_string();
+        let mut mode = old_mode;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1445,7 +1437,7 @@ pub(crate) fn archived_lfs_entries(
             path,
             unchanged,
             mode,
-            blob: blob.to_string(),
+            blob,
             pointer,
         });
     }
@@ -1513,11 +1505,51 @@ fn history_context(repo: &GitRepo, task: &ResolvedTask, oid: &str) -> Result<His
         )));
     }
     Ok(HistoryContext {
-        oid: oid.to_owned(),
         current_task_path: task.task_path.clone(),
         published_task_path: paths.into_iter().next(),
         archive_paths: BTreeMap::new(),
+        objects: history_objects(repo, oid)?,
     })
+}
+
+fn history_objects(repo: &GitRepo, oid: &str) -> Result<BTreeMap<String, String>> {
+    let output = repo.run_bytes(["ls-tree", "-r", "-t", "-z", oid], None)?;
+    let mut entries = Vec::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(Error::message(
+                "invalid Git tree while reading storage history",
+            ));
+        };
+        let header = std::str::from_utf8(&record[..separator])
+            .map_err(|_| Error::message("invalid Git storage history attributes"))?;
+        // An unrelated non-UTF-8 filename cannot be selected through the UTF-8
+        // storage interface and must not block checks of other paths.
+        let Ok(path) = std::str::from_utf8(&record[separator + 1..]) else {
+            continue;
+        };
+        let fields = header.split(' ').collect::<Vec<_>>();
+        let [_, kind, object] = fields.as_slice() else {
+            return Err(Error::message("invalid Git storage history entry"));
+        };
+        entries.push((path.to_owned(), (*kind).to_owned(), (*object).to_owned()));
+    }
+    let kinds = repo.object_types(
+        &entries
+            .iter()
+            .map(|(_, _, object)| object.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|(path, kind, object)| {
+            (kinds.get(&object).and_then(Option::as_ref) == Some(&kind)).then_some((path, kind))
+        })
+        .collect())
 }
 
 fn validate_targets(
@@ -2378,11 +2410,24 @@ mod tests {
             .unwrap();
             fs::write(
                 repo.root.join(root).join("stored.bin.wm-storage.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "schema_version":1,"path":"stored.bin",
-                    "kind":"file","checksum":{"algorithm":"md5","digest":"0".repeat(32)},
-                    "size":42,"version":{"id":"existing-version"}
-                }))
+                serde_json::to_vec(&if root.ends_with("completed") {
+                    serde_json::json!({
+                        "schema_version":2,"path":"stored.bin",
+                        "kind":"file","checksum":{"algorithm":"md5","digest":"0".repeat(32)},
+                        "size":42,"version":{"id":"existing-version","verification":{
+                            "endpoint":"https://s3.example.invalid","bucket":"fixture",
+                            "key":format!("{root}/stored.bin"),"version_id":"existing-version",
+                            "checksum":{"algorithm":"sha256","digest":"1".repeat(64)},
+                            "size":42,"method":"verified-upload"
+                        }}
+                    })
+                } else {
+                    serde_json::json!({
+                        "schema_version":1,"path":"stored.bin",
+                        "kind":"file","checksum":{"algorithm":"md5","digest":"0".repeat(32)},
+                        "size":42,"version":{"id":"existing-version"}
+                    })
+                })
                 .unwrap(),
             )
             .unwrap();
@@ -2405,18 +2450,6 @@ mod tests {
             let destination = format!("2026/07/{root}");
             fs::create_dir_all(repo.root.join("2026/07")).unwrap();
             fs::rename(repo.root.join(root), repo.root.join(&destination)).unwrap();
-            fs::write(
-                repo.root
-                    .join(&destination)
-                    .join("stored.bin.wm-storage.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "schema_version":1,"path":"stored.bin",
-                    "kind":"file","checksum":{"algorithm":"md5","digest":"0".repeat(32)},
-                    "size":42,"version":{"id":"existing-version"}
-                }))
-                .unwrap(),
-            )
-            .unwrap();
             fs::write(
                 repo.root.join(&destination).join(TASK_MANIFEST_NAME),
                 format!(
@@ -2442,6 +2475,13 @@ mod tests {
                 .unwrap();
             scopes.extend([destination, root.to_owned()]);
         }
+        let native_before = roots.map(|root| {
+            fs::read(
+                repo.root
+                    .join(format!("2026/07/{root}/stored.bin.wm-storage.json")),
+            )
+            .unwrap()
+        });
         for _ in 0..2 {
             let history = history_for_oid(&repo, &config, &scopes, &base).unwrap();
             for root in roots {
@@ -2473,6 +2513,16 @@ mod tests {
                     .automatic_s3()
                     .is_empty()
             );
+            for (root, original) in roots.iter().zip(&native_before) {
+                assert_eq!(
+                    fs::read(
+                        repo.root
+                            .join(format!("2026/07/{root}/stored.bin.wm-storage.json"))
+                    )
+                    .unwrap(),
+                    *original
+                );
+            }
             // A later retry must use the current published destination rather
             // than blindly mapping it back to the older receipt source.
             repo.run(["add", "-A", "--", "."]).unwrap();
@@ -2505,6 +2555,93 @@ mod tests {
             archived_lfs_entries(&repo, &config, &scopes, &base)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn storage_history_batches_keep_literal_paths_types_and_missing_objects() {
+        let (_temporary, repo) = private_state_fixture();
+        repo.run(["config", "user.name", "Storage batch fixture"])
+            .unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let root = "literal[?]*\nroot";
+        fs::create_dir(repo.root.join(root)).unwrap();
+        let file = format!("{root}/file\tname");
+        fs::write(repo.root.join(&file), "unique history fixture blob").unwrap();
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "fixture"]).unwrap();
+        let first = repo.optional_oid("HEAD").unwrap().unwrap();
+        let history = history_for_oid(&repo, &Config::default(), &[], &first).unwrap();
+        assert!(history.contains(&file));
+        assert!(history.is_directory(root));
+        assert!(!history.contains(&format!("{root}-neighbor")));
+        fs::write(repo.root.join(&file), "next generation").unwrap();
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "next"]).unwrap();
+        assert!(
+            history.contains(&file),
+            "an immutable commit context survives worktree changes"
+        );
+        let current = repo.optional_oid("HEAD").unwrap().unwrap();
+        let id = repo
+            .blob_ids(&current, std::slice::from_ref(&file))
+            .unwrap()[&file]
+            .clone()
+            .unwrap();
+        fs::remove_file(
+            repo.git_dir()
+                .unwrap()
+                .join("objects")
+                .join(&id[..2])
+                .join(&id[2..]),
+        )
+        .unwrap();
+        let checked = history_for_oid(&repo, &Config::default(), &[], &current).unwrap();
+        assert!(
+            !checked.contains(&file),
+            "a tree entry alone does not prove its blob exists"
+        );
+        assert!(checked.is_directory(root));
+    }
+
+    #[test]
+    fn published_local_boundaries_batch_validates_every_sidecar() {
+        let (_temporary, repo) = private_state_fixture();
+        repo.run(["config", "user.name", "Storage batch fixture"])
+            .unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        for boundary in ["literal[?]*", "back\\slash", "name space"] {
+            fs::write(
+                repo.root.join(format!("{boundary}{PLACEMENT_SUFFIX}")),
+                "schema_version = 1\ntarget = 'local'\nreason = 'fixture'\n",
+            )
+            .unwrap();
+        }
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "fixture"]).unwrap();
+        let first = repo.optional_oid("HEAD").unwrap().unwrap();
+        assert_eq!(
+            local_boundaries_at(&repo, &first).unwrap(),
+            BTreeSet::from([
+                "literal[?]*".to_owned(),
+                "back\\slash".to_owned(),
+                "name space".to_owned()
+            ])
+        );
+        fs::write(
+            repo.root.join(format!("last{PLACEMENT_SUFFIX}")),
+            "schema_version = 999\ntarget = 'local'\nreason = 'fixture'\n",
+        )
+        .unwrap();
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "invalid last sidecar"]).unwrap();
+        assert!(
+            local_boundaries_at(&repo, "HEAD")
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported placement metadata schema")
         );
     }
 

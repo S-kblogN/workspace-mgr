@@ -1129,11 +1129,11 @@ mod test_storage {
     // schema 3, so these tests stand in for one explicitly.
     pub const LIMIT_10MB: [(&str, &str); 2] = [
         (CLOUD_USAGE_THRESHOLD_ENV, "10000000"),
-        (CLI_VERSION_ENV, "0.8.1"),
+        (CLI_VERSION_ENV, "0.8.7"),
     ];
     pub const LIMIT_300KB: [(&str, &str); 2] = [
         (CLOUD_USAGE_THRESHOLD_ENV, "300000"),
-        (CLI_VERSION_ENV, "0.8.1"),
+        (CLI_VERSION_ENV, "0.8.7"),
     ];
     pub const LARGE: usize = 10_485_761;
 
@@ -1767,7 +1767,7 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
     let plan = json(&workspace_env(&task, ["plan"], env));
     let usage = &plan["cloud_usage"];
     // Removing the approval changes only the task manifest. Native storage
-    // keeps the repository compatibility floor at 0.8.1.
+    // keeps the repository compatibility floor at 0.8.7.
     assert_eq!(plan["status"], "dry_run");
     assert_eq!(
         plan["changed_paths"],
@@ -2455,12 +2455,12 @@ fn content_addressed_directories_are_charged_per_file_at_every_check() {
     std::fs::write(data.join("notes.txt"), "notes\n").unwrap();
     let settled = publish_and_settle("Add notes", 6_000_006);
     let contributors = settled["cloud_usage"]["contributors"].as_array().unwrap();
-    for (name, bytes) in [("a.bin", 2_000_000), ("notes.txt", 6)] {
-        assert!(
-            contributors.contains(&json!({"path": path(name), "store": "s3", "bytes": bytes, "versions": 1, "state": "published"})),
-            "{contributors:?}"
-        );
-    }
+    // The six-byte addition is covered by the exact totals above. Schema 2's
+    // compatibility declaration can push it below the ten largest contributors.
+    assert!(
+        contributors.contains(&json!({"path": path("a.bin"), "store": "s3", "bytes": 2_000_000, "versions": 1, "state": "published"})),
+        "{contributors:?}"
+    );
     assert_eq!(
         json(&workspace_env(&task, ["task", "status"], env))["cloud_usage"]["pending"],
         Value::Null

@@ -26,6 +26,7 @@ use crate::process;
 const MAX_PAGES: usize = 100_000;
 const COPY_LIMIT: u64 = 5 * (1 << 30);
 const COPY_PART_SIZE: u64 = 512 * (1 << 20);
+const READ_WORKERS: usize = 16;
 const SOURCE_FIELDS: [&str; 9] = [
     "source_object",
     "destination_object",
@@ -71,11 +72,23 @@ trait Storage {
     fn bucket(&self) -> &str;
     fn prefix(&self) -> &str;
     fn b2(&self) -> bool;
+    fn read_heads(&self, requests: &[Value]) -> Result<Vec<Value>> {
+        requests
+            .iter()
+            .map(|args| Ok(self.call("head_object", args, None)?.value))
+            .collect()
+    }
     fn read_registry(&self, args: &Value) -> Result<Value> {
         let response = self.call("get_object", args, None)?;
         validate_registry_get(&response.value, args, response.body.len() as u64)?;
         serde_json::from_slice(&response.body)
             .map_err(|error| message(format!("invalid archive registry JSON: {error}")))
+    }
+    fn read_registries(&self, requests: &[Value], _limit: usize) -> Result<Vec<Value>> {
+        requests
+            .iter()
+            .map(|args| self.read_registry(args))
+            .collect()
     }
 }
 
@@ -97,6 +110,9 @@ impl Storage for S3Client {
     fn b2(&self) -> bool {
         self.b2
     }
+    fn read_heads(&self, requests: &[Value]) -> Result<Vec<Value>> {
+        parallel_heads(self, requests)
+    }
     fn read_registry(&self, args: &Value) -> Result<Value> {
         let scratch = tempfile::tempdir().at(std::env::temp_dir())?;
         let path = scratch.path().join("receipt.json");
@@ -106,6 +122,41 @@ impl Storage for S3Client {
         serde_json::from_reader(BufReader::new(input))
             .map_err(|error| message(format!("invalid archive registry JSON: {error}")))
     }
+    fn read_registries(&self, requests: &[Value], limit: usize) -> Result<Vec<Value>> {
+        parallel_registries(self, requests, limit)
+    }
+}
+
+fn parallel_heads(store: &(impl Storage + Sync), requests: &[Value]) -> Result<Vec<Value>> {
+    crate::native_versions::bounded_map_with_workers(
+        requests,
+        READ_WORKERS,
+        false,
+        |args: &Value| Ok(store.call("head_object", args, None)?.value),
+    )
+}
+
+fn parallel_registries(
+    store: &(impl Storage + Sync),
+    requests: &[Value],
+    limit: usize,
+) -> Result<Vec<Value>> {
+    crate::native_versions::bounded_map_with_workers(
+        requests,
+        limit.clamp(1, READ_WORKERS),
+        false,
+        |args: &Value| store.read_registry(args),
+    )
+}
+
+fn checked_heads(store: &impl Storage, requests: &[Value]) -> Result<Vec<Value>> {
+    let responses = store.read_heads(requests)?;
+    if responses.len() != requests.len() {
+        return Err(message(
+            "archive HEAD batch returned an incomplete inventory",
+        ));
+    }
+    Ok(responses)
 }
 
 fn validate_registry_get(info: &Value, request: &Value, count: u64) -> Result<()> {
@@ -549,6 +600,16 @@ fn head_payload(
             None,
         )?
         .value;
+    validate_payload_head(&info, object, version, size, expected_etag)?;
+    Ok(info)
+}
+fn validate_payload_head(
+    info: &Value,
+    object: &str,
+    version: &str,
+    size: &Value,
+    expected_etag: &Value,
+) -> Result<()> {
     if info["VersionId"] != version
         || info["DeleteMarker"] == true
         || info["ContentLength"] != *size
@@ -558,7 +619,33 @@ fn head_payload(
             "archive payload version is missing or mismatched: {object:?}"
         )));
     }
-    Ok(info)
+    Ok(())
+}
+fn cached_version_head<'a>(
+    store: &impl Storage,
+    object: &str,
+    version: &str,
+    heads: &'a mut BTreeMap<(String, String), Value>,
+) -> Result<&'a Value> {
+    use std::collections::btree_map::Entry;
+    let id = (object.to_owned(), version.to_owned());
+    // A legacy null generation can be overwritten. It is not an immutable
+    // version and must retain a fresh HEAD on each ownership comparison.
+    if version == "null" {
+        heads.remove(&id);
+    }
+    Ok(match heads.entry(id) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(
+            store
+                .call(
+                    "head_object",
+                    &json!({"Bucket":store.bucket(),"Key":object,"VersionId":version}),
+                    None,
+                )?
+                .value,
+        ),
+    })
 }
 fn record_destination(
     row: &mut Value,
@@ -830,31 +917,42 @@ fn validate_destination(
             "archive destination lost a previously copied object version",
         ));
     }
-    for item in &actual {
-        let identity = (
-            text(item, "Key")?.to_owned(),
-            text(item, "VersionId")?.to_owned(),
-        );
-        let index = *wanted
-            .get(&identity)
-            .ok_or_else(|| message("archive destination contains an unknown version"))?;
-        let row = &journal["versions"][index];
-        if item["delete_marker"] != row["delete_marker"] {
-            return Err(message(
-                "archive destination has a mismatched delete marker",
-            ));
+    for chunk in actual.chunks(READ_WORKERS) {
+        let mut indices = Vec::new();
+        let mut payloads = Vec::new();
+        let mut requests = Vec::new();
+        for item in chunk {
+            let index = *wanted
+                .get(&identity(item)?)
+                .ok_or_else(|| message("archive destination contains an unknown version"))?;
+            let row = &journal["versions"][index];
+            if item["delete_marker"] != row["delete_marker"] {
+                return Err(message(
+                    "archive destination has a mismatched delete marker",
+                ));
+            }
+            indices.push(index);
+            if row["delete_marker"] != true {
+                payloads.push(index);
+                requests.push(json!({"Bucket":store.bucket(),
+                    "Key":key(store,text(row,"destination_object")?),
+                    "VersionId":text(row,"destination_version_id")?}));
+            }
         }
-        if row["delete_marker"] != true {
-            head_payload(
-                store,
+        for (index, info) in payloads.into_iter().zip(checked_heads(store, &requests)?) {
+            let row = &journal["versions"][index];
+            validate_payload_head(
+                &info,
                 text(row, "destination_object")?,
                 text(row, "destination_version_id")?,
                 &row["size"],
                 &row["destination_etag"],
             )?;
         }
-        journal["versions"][index]["destination_last_modified"] =
-            timestamp(&item["LastModified"])?.into();
+        for (index, item) in indices.into_iter().zip(chunk) {
+            journal["versions"][index]["destination_last_modified"] =
+                timestamp(&item["LastModified"])?.into();
+        }
     }
     Ok(actual)
 }
@@ -900,28 +998,49 @@ pub(crate) fn verify_history(client: &S3Client, receipt: &Value) -> Result<()> {
 fn verify_cancel_source_with(store: &impl Storage, context: &Value, receipt: &Value) -> Result<()> {
     validate_receipt(receipt, context)?;
     let current = source_inventory(store, context)?;
-    for row in rows(receipt)? {
-        let original = current.iter().find(|item| {
-            item["source_object"] == row["source_object"]
-                && item["source_version_id"] == row["source_version_id"]
-        });
-        if original.is_none_or(|item| {
-            [
-                "source_last_modified",
-                "delete_marker",
-                "size",
-                "source_etag",
-            ]
-            .iter()
-            .any(|name| item[*name] != row[*name])
-        }) {
-            return Err(message(
-                "archive cancellation requires every unchanged original source version and delete marker",
-            ));
+    let originals = current
+        .iter()
+        .map(|item| {
+            Ok((
+                (
+                    text(item, "source_object")?,
+                    text(item, "source_version_id")?,
+                ),
+                item,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for chunk in rows(receipt)?.chunks(READ_WORKERS) {
+        let mut payloads = Vec::new();
+        let mut requests = Vec::new();
+        for row in chunk {
+            let original =
+                originals.get(&(text(row, "source_object")?, text(row, "source_version_id")?));
+            if original.is_none_or(|item| {
+                [
+                    "source_last_modified",
+                    "delete_marker",
+                    "size",
+                    "source_etag",
+                ]
+                .iter()
+                .any(|name| item[*name] != row[*name])
+            }) {
+                return Err(message(
+                    "archive cancellation requires every unchanged original source version and delete marker",
+                ));
+            }
+            if row["delete_marker"] != true {
+                payloads.push(row);
+                requests.push(
+                    json!({"Bucket":store.bucket(),"Key":key(store,text(row,"source_object")?),
+                "VersionId":text(row,"source_version_id")?}),
+                );
+            }
         }
-        if row["delete_marker"] != true {
-            head_payload(
-                store,
+        for (row, info) in payloads.into_iter().zip(checked_heads(store, &requests)?) {
+            validate_payload_head(
+                &info,
                 text(row, "source_object")?,
                 text(row, "source_version_id")?,
                 &row["size"],
@@ -1085,6 +1204,39 @@ fn cancel_inventory(
     text(journal, "transaction_id")?;
     let metadata = metadata_key(journal)?;
     let actual = destination_inventory(store, context)?;
+    let mut actual_by_id = BTreeMap::new();
+    let mut actual_by_key = BTreeMap::<String, Vec<usize>>::new();
+    for (index, item) in actual.iter().enumerate() {
+        let id = identity(item)?;
+        actual_by_key.entry(id.0.clone()).or_default().push(index);
+        actual_by_id.insert(id, index);
+    }
+    // Exact-version payload metadata is immutable. Reuse responses only in
+    // this read-only inventory pass, checking each row's ownership and payload
+    // expectations again. Every resume or post-delete inventory starts fresh.
+    let mut heads = BTreeMap::new();
+    let payload_keys = rows(journal)?
+        .iter()
+        .filter(|row| row["delete_marker"] != true)
+        .map(|row| Ok(key(store, text(row, "destination_object")?)))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let requests = actual
+        .iter()
+        .filter(|item| item["delete_marker"] != true && item["VersionId"] != "null")
+        .filter(|item| {
+            item["Key"]
+                .as_str()
+                .is_some_and(|key| payload_keys.contains(key))
+        })
+        .map(
+            |item| json!({"Bucket":store.bucket(),"Key":item["Key"],"VersionId":item["VersionId"]}),
+        )
+        .collect::<Vec<_>>();
+    for chunk in requests.chunks(READ_WORKERS) {
+        for (request, response) in chunk.iter().zip(checked_heads(store, chunk)?) {
+            heads.insert(identity(request)?, response);
+        }
+    }
     let mut tracked = BTreeSet::new();
     let mut owned = Vec::new();
     let mut owned_ids = BTreeSet::new();
@@ -1135,9 +1287,7 @@ fn cancel_inventory(
                     "archive cancellation repeated a private copied version",
                 ));
             }
-            let item = actual
-                .iter()
-                .find(|item| item["Key"] == object && item["VersionId"] == recorded);
+            let item = actual_by_id.get(&id).map(|index| &actual[*index]);
             let Some(item) = item else {
                 if record["started"] != true {
                     return Err(message(
@@ -1152,8 +1302,9 @@ fn cancel_inventory(
                 ));
             }
             if !marker {
-                let info = head_payload(
-                    store,
+                let info = cached_version_head(store, &object, recorded, &mut heads)?;
+                validate_payload_head(
+                    info,
                     text(row, "destination_object")?,
                     recorded,
                     &row["size"],
@@ -1184,9 +1335,10 @@ fn cancel_inventory(
         let row = journal["versions"][index].clone();
         let object = key(store, text(&row, "destination_object")?);
         let row_token = token(journal, &row)?;
-        for item in &actual {
+        for item_index in actual_by_key.get(&object).into_iter().flatten() {
+            let item = &actual[*item_index];
             let id = identity(item)?;
-            if item["Key"] != object || owned_ids.contains(&id) {
+            if owned_ids.contains(&id) {
                 continue;
             }
             if row["delete_marker"] == true {
@@ -1203,7 +1355,7 @@ fn cancel_inventory(
             if item["delete_marker"] == true {
                 continue;
             }
-            let info = store.call("head_object",&json!({"Bucket":store.bucket(),"Key":item["Key"],"VersionId":item["VersionId"]}),None)?.value;
+            let info = cached_version_head(store, &id.0, &id.1, &mut heads)?;
             if info["Metadata"][&metadata] != row_token {
                 continue;
             }
@@ -1844,30 +1996,61 @@ fn registry_read_version(
 ) -> Result<Value> {
     let receipt =
         store.read_registry(&json!({"Bucket":store.bucket(),"Key":object,"VersionId":version}))?;
-    validate_registry_receipt(store, &receipt)?;
+    validate_registry_source(store, source, &receipt)?;
+    Ok(receipt)
+}
+fn validate_registry_source(store: &impl Storage, source: &str, receipt: &Value) -> Result<()> {
+    validate_registry_receipt(store, receipt)?;
     if receipt["source"] != source {
         return Err(message(
             "archive registry source does not match its canonical key",
         ));
     }
-    Ok(receipt)
+    Ok(())
 }
 fn registry_read_with(store: &impl Storage, source: &str) -> Result<Option<Value>> {
+    registry_read_bounded(store, source, READ_WORKERS)
+}
+fn registry_read_bounded(
+    store: &impl Storage,
+    source: &str,
+    limit: usize,
+) -> Result<Option<Value>> {
+    let limit = limit.clamp(1, READ_WORKERS);
     let object = registry_key(store, source)?;
     for _ in 0..3 {
         let versions = registry_versions(store, &object)?;
         let mut selected = None;
         let mut encoded = None;
-        for version in &versions {
-            let receipt = registry_read_version(store, source, &object, version)?;
-            let body = canonical(&receipt)?;
-            if encoded.as_ref().is_some_and(|previous| previous != &body) {
-                return Err(message(format!(
-                    "conflicting archive registry history at {object:?}"
-                )));
+        let version_ids = versions.iter().collect::<Vec<_>>();
+        // Bound both concurrent downloads and decoded receipt memory. Keep the
+        // complete before/after version sets so parallel reads cannot hide a
+        // registry generation added or removed during this validation pass.
+        for chunk in version_ids.chunks(limit) {
+            let requests = chunk
+                .iter()
+                .map(|version| {
+                    json!({"Bucket":store.bucket(),
+                "Key":object,"VersionId":version})
+                })
+                .collect::<Vec<_>>();
+            let receipts = store.read_registries(&requests, limit)?;
+            if receipts.len() != requests.len() {
+                return Err(message(
+                    "archive registry batch returned an incomplete inventory",
+                ));
             }
-            selected = Some(receipt);
-            encoded = Some(body);
+            for receipt in receipts {
+                validate_registry_source(store, source, &receipt)?;
+                let body = canonical(&receipt)?;
+                if encoded.as_ref().is_some_and(|previous| previous != &body) {
+                    return Err(message(format!(
+                        "conflicting archive registry history at {object:?}"
+                    )));
+                }
+                selected = Some(receipt);
+                encoded = Some(body);
+            }
         }
         if registry_versions(store, &object)? == versions {
             return Ok(selected);
@@ -1879,10 +2062,18 @@ fn registry_read_with(store: &impl Storage, source: &str) -> Result<Option<Value
 }
 pub(crate) fn registry_read(
     client: &S3Client,
-    _repo: &GitRepo,
+    repo: &GitRepo,
     source: &str,
 ) -> Result<Option<Value>> {
-    registry_read_with(client, source)
+    registry_read_with_parallelism(client, repo, source, READ_WORKERS)
+}
+pub(crate) fn registry_read_with_parallelism(
+    client: &S3Client,
+    _repo: &GitRepo,
+    source: &str,
+    limit: usize,
+) -> Result<Option<Value>> {
+    registry_read_bounded(client, source, limit)
 }
 fn registry_lookup_with(
     store: &impl Storage,

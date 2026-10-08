@@ -36,7 +36,9 @@ pub(crate) const CONTROL_FILE_ALLOWANCE_BYTES: u64 = 1_048_576;
 /// Suggested limits are whole multiples of 256 MiB.
 const SUGGESTION_STEP_BYTES: u64 = 268_435_456;
 const CONTRIBUTOR_LIMIT: usize = 10;
-// Single-threaded packing with fixed settings keeps packed sizes reproducible.
+// Single-threaded packing with fixed settings keeps quota estimates reproducible.
+// Parallel delta searches can change the packed bytes and therefore approval
+// decisions for the same immutable input; independent hashing can run in parallel.
 const PACK_SETTINGS: [&str; 10] = [
     "-c",
     "pack.threads=1",
@@ -1096,61 +1098,9 @@ fn object_info<'a>(
 pub(crate) fn read_blobs(
     repo: &GitRepo,
     oids: &[String],
-    mut visit: impl FnMut(&str, &[u8]) -> Result<()>,
+    visit: impl FnMut(&str, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    if oids.is_empty() {
-        return Ok(());
-    }
-    let input = oids
-        .iter()
-        .map(|oid| format!("{oid}\n"))
-        .collect::<String>();
-    let mut buffer = Vec::new();
-    repo.stream(["cat-file", "--batch"], Some(input.as_bytes()), |chunk| {
-        buffer.extend_from_slice(chunk);
-        let mut start = 0;
-        while let Some(offset) = buffer[start..].iter().position(|byte| *byte == b'\n') {
-            let header_end = start + offset;
-            let header = String::from_utf8_lossy(&buffer[start..header_end]).into_owned();
-            let fields = header.split(' ').collect::<Vec<_>>();
-            let (oid, size) = match fields.as_slice() {
-                [oid, _, size] => (
-                    *oid,
-                    size.parse::<usize>().map_err(|_| {
-                        Error::message(format!("unexpected Git object header {header:?}"))
-                    })?,
-                ),
-                [oid, "missing"] => {
-                    return Err(Error::message(format!(
-                        "Git object {oid} is missing locally; cloud usage cannot be measured"
-                    )));
-                }
-                _ => {
-                    return Err(Error::message(format!(
-                        "unexpected Git object header {header:?}"
-                    )));
-                }
-            };
-            let content_start = header_end + 1;
-            let Some(record_end) = content_start
-                .checked_add(size)
-                .and_then(|end| end.checked_add(1))
-            else {
-                return Err(Error::message("Git object is too large to inspect"));
-            };
-            if buffer.len() < record_end {
-                break;
-            }
-            visit(oid, &buffer[content_start..record_end - 1])?;
-            start = record_end;
-        }
-        buffer.drain(..start);
-        Ok(())
-    })?;
-    if !buffer.is_empty() {
-        return Err(Error::message("Git object stream ended mid-record"));
-    }
-    Ok(())
+    repo.visit_blobs(oids, visit)
 }
 
 fn lfs_objects(repo: &GitRepo, candidates: &[String]) -> Result<BTreeMap<String, LfsObject>> {
@@ -1641,6 +1591,7 @@ impl DirectoryListings {
                     size: Some(file.size),
                     version_id: None,
                     etag: None,
+                    verification: None,
                     aggregate: false,
                 })),
                 None => expanded.push(entry),
@@ -1867,7 +1818,7 @@ fn measure_storage(
 /// copied byte count is a temporary storage peak, not new retained payload.
 #[derive(Debug, Default)]
 struct ArchiveTransfers {
-    shared_tree: String,
+    shared_receipts: BTreeMap<String, serde_json::Value>,
     receipts: BTreeSet<String>,
     task_receipts: BTreeSet<String>,
     aliases: BTreeMap<(String, String), ((String, String), u64)>,
@@ -1883,37 +1834,14 @@ impl ArchiveTransfers {
         selected: &BTreeSet<String>,
     ) -> Result<Self> {
         let mut transfers = Self {
-            shared_tree: inputs.remote_base_oid.to_owned(),
+            shared_receipts: archive_receipt_documents(repo, inputs.remote_base_oid)?,
             ..Self::default()
         };
-        let names = repo.run([
-            "ls-tree",
-            "-r",
-            "-z",
-            "--name-only",
-            inputs.projected_tree_oid,
-            "--",
-        ])?;
-        for path in names
-            .stdout
-            .split('\0')
-            .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
-        {
-            let raw = repo.run(["show", &format!("{}:{path}", inputs.projected_tree_oid)])?;
-            let receipt: serde_json::Value =
-                serde_json::from_str(&raw.stdout).map_err(|error| {
-                    Error::message(format!("invalid archive usage receipt {path}: {error}"))
-                })?;
+        for (path, receipt) in archive_receipt_documents(repo, inputs.projected_tree_oid)? {
             let Some(destination) = receipt["destination"].as_str() else {
                 return Err(Error::message("archive usage destination missing"));
             };
-            let remote =
-                repo.run_unchecked(["show", &format!("{}:{path}", inputs.remote_base_oid)])?;
-            let recorded = remote.success()
-                && serde_json::from_str::<serde_json::Value>(&remote.stdout)
-                    .ok()
-                    .as_ref()
-                    == Some(&receipt);
+            let recorded = transfers.shared_receipts.get(&path) == Some(&receipt);
             if !recorded {
                 // A task still owns its receipt when its last current pointer
                 // disappears. Complete retained history remains chargeable on
@@ -1921,7 +1849,7 @@ impl ArchiveTransfers {
                 transfers.task_receipts.insert(path.to_owned());
             }
             if recorded
-                && !selected.contains(path)
+                && !selected.contains(&path)
                 && !current.iter().any(|entry| beneath(&entry.key, destination))
             {
                 continue;
@@ -1935,7 +1863,7 @@ impl ArchiveTransfers {
             if !recorded && !crate::archive_cancel::has_trusted_migration(repo, &receipt)? {
                 continue;
             }
-            crate::archive_migration::validate(path, &receipt)?;
+            crate::archive_migration::validate(&path, &receipt)?;
             let source = receipt["source"].as_str().expect("validated source");
             let location = format!(
                 "s3://{}/{}",
@@ -2049,6 +1977,28 @@ impl ArchiveTransfers {
     }
 }
 
+fn archive_receipt_documents(
+    repo: &GitRepo,
+    tree: &str,
+) -> Result<BTreeMap<String, serde_json::Value>> {
+    let names = repo.run(["ls-tree", "-r", "-z", "--name-only", tree, "--"])?;
+    let paths = names
+        .stdout
+        .split('\0')
+        .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    repo.show_files(tree, &paths)?
+        .into_iter()
+        .map(|(path, raw)| {
+            let receipt = serde_json::from_str(&raw).map_err(|error| {
+                Error::message(format!("invalid archive usage receipt {path}: {error}"))
+            })?;
+            Ok((path, receipt))
+        })
+        .collect()
+}
+
 fn archive_history_usage(
     repo: &GitRepo,
     tree: &str,
@@ -2063,39 +2013,24 @@ fn archive_history_usage(
     } else {
         &accounting.projected
     };
-    let names = repo.run(["ls-tree", "-r", "-z", "--name-only", tree, "--"])?;
     let mut totals = BTreeMap::<String, Tally>::new();
     let mut seen = BTreeSet::new();
-    for path in names
-        .stdout
-        .split('\0')
-        .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
-    {
-        let raw = repo.run(["show", &format!("{tree}:{path}")])?;
-        let receipt: serde_json::Value = serde_json::from_str(&raw.stdout).map_err(|error| {
-            Error::message(format!("invalid archive usage receipt {path}: {error}"))
-        })?;
+    for (path, receipt) in archive_receipt_documents(repo, tree)? {
         let destination = receipt["destination"]
             .as_str()
             .ok_or_else(|| Error::message("archive usage destination missing"))?;
         // Shared-branch receipts are inherited state, just like shared pointer
         // versions. Reorganizing an already archived task does not reassign its
         // existing registry or complete historical payload to the new task.
-        let shared = repo.run_unchecked(["show", &format!("{}:{path}", transfers.shared_tree)])?;
-        if shared.success()
-            && serde_json::from_str::<serde_json::Value>(&shared.stdout)
-                .ok()
-                .as_ref()
-                == Some(&receipt)
-        {
+        if transfers.shared_receipts.get(&path) == Some(&receipt) {
             continue;
         }
         if published && receipt["status"] != "copied" {
             continue;
         }
-        if !selected.contains(path)
-            && !transfers.task_receipts.contains(path)
-            && !transfers.receipts.contains(path)
+        if !selected.contains(&path)
+            && !transfers.task_receipts.contains(&path)
+            && !transfers.receipts.contains(&path)
             && !current
                 .iter()
                 .any(|entry| entry.key.starts_with(&format!("{destination}/")))
@@ -2137,7 +2072,7 @@ fn archive_history_usage(
                 .ok_or_else(|| Error::message("archive usage version missing"))?;
             let copied = version["destination_version_id"].as_str();
             let mut key = key.to_owned();
-            if transfers.receipts.contains(path) {
+            if transfers.receipts.contains(&path) {
                 let source = version["source_object"]
                     .as_str()
                     .ok_or_else(|| Error::message("archive usage source object missing"))?;
@@ -2180,35 +2115,7 @@ pub(crate) fn blobs_at(
     revision: &str,
     paths: &[String],
 ) -> Result<BTreeMap<String, Option<String>>> {
-    if paths.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let input = paths
-        .iter()
-        .map(|path| format!("{revision}:{path}\n"))
-        .collect::<String>();
-    let output = repo.run_bytes(
-        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
-        Some(input.as_bytes()),
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let lines = text.lines().collect::<Vec<_>>();
-    if lines.len() != paths.len() {
-        return Err(Error::message(
-            "unexpected Git object lookup output while reading storage metadata",
-        ));
-    }
-    Ok(paths
-        .iter()
-        .zip(lines)
-        .map(|(path, line)| {
-            let blob = match line.split_once(' ') {
-                Some((oid, "blob")) if is_object_id(oid) => Some(oid.to_owned()),
-                _ => None,
-            };
-            (path.clone(), blob)
-        })
-        .collect())
+    repo.blob_ids(revision, paths)
 }
 
 /// Sizes the uploads implied by uncommitted output changes. Returns changed
@@ -2701,6 +2608,7 @@ mod tests {
             size: Some(size),
             version_id: version.map(ToOwned::to_owned),
             etag: None,
+            verification: None,
             aggregate: false,
         }
     }
@@ -2712,6 +2620,7 @@ mod tests {
             size: Some(size),
             version_id: None,
             etag: None,
+            verification: None,
             aggregate: false,
         }
     }
@@ -3375,6 +3284,7 @@ mod tests {
             version: Some(Version {
                 id: "original-v1".into(),
                 etag: Some("original-etag".into()),
+                verification: None,
             }),
         };
         let manifest = |entries: Vec<Entry>| Manifest {
@@ -4093,6 +4003,74 @@ mod tests {
             }),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn archive_usage_batches_literal_receipts_and_validates_unselected_documents() {
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"base\n");
+        fixture.commit("base");
+        let paths = [
+            "archive/[literal]\nspace/.workspace-mgr-archive.json",
+            "archive/second\\folder/.workspace-mgr-archive.json",
+            "archive/planned\tcopy/.workspace-mgr-archive.json",
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let receipt = serde_json::json!({
+                "destination":"archive/destination", "status":if index == 2 {"planned"} else {"copied"},
+                "versions":[{"destination_object":if index == 2 {"archive/destination/pending"} else {"archive/destination/data"},
+                    "source_version_id":"original", "size":11, "delete_marker":false}]
+            });
+            fixture.write(path, &serde_json::to_vec(&receipt).unwrap());
+        }
+        let selected = paths.into_iter().map(str::to_owned).collect();
+        let tree = fixture.tree();
+        let transfers = ArchiveTransfers::default();
+        let accounting =
+            account_versioned_storage(&[], &[], &PendingSources::default(), &transfers);
+        let projected = archive_history_usage(
+            &fixture.repo,
+            &tree,
+            &[],
+            &selected,
+            false,
+            &transfers,
+            &accounting,
+        )
+        .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected["archive/destination/data"].bytes, 11);
+        assert_eq!(projected["archive/destination/data"].versions, 1);
+        assert!(projected["archive/destination/pending"].pending);
+        let published = archive_history_usage(
+            &fixture.repo,
+            &tree,
+            &[],
+            &selected,
+            true,
+            &transfers,
+            &accounting,
+        )
+        .unwrap();
+        assert_eq!(published.len(), 1);
+        fixture.write(
+            "archive/unselected/.workspace-mgr-archive.json",
+            b"invalid json",
+        );
+        assert!(
+            archive_history_usage(
+                &fixture.repo,
+                &fixture.tree(),
+                &[],
+                &selected,
+                false,
+                &transfers,
+                &accounting
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid archive usage receipt archive/unselected/")
+        );
     }
 
     #[test]

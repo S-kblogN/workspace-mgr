@@ -1,6 +1,8 @@
 //! Small, synchronous S3 REST transport. No implicit retry is performed for a
 //! mutation: archive callers recover lost responses using their durable token
 //! and exact version journal before deciding whether another write is safe.
+//! The explicit exact-version delete helper alone can replay an idempotent
+//! request; it cannot create a delete marker or target a replacement version.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -185,6 +187,30 @@ impl S3Error {
                 "SlowDown" | "RequestTimeout" | "InternalError" | "ServiceUnavailable"
             )
     }
+
+    fn checksum_mode_unsupported(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        matches!(self.status, Some(400 | 501))
+            && matches!(
+                self.code.as_str(),
+                "NotImplemented"
+                    | "Unsupported"
+                    | "NotSupported"
+                    | "UnsupportedOperation"
+                    | "InvalidRequest"
+            )
+            && (self.code != "InvalidRequest"
+                || message.contains("unsupported")
+                || message.contains("not supported")
+                || message.contains("not implemented"))
+            && (message.contains("checksum")
+                || self.header.as_ref().is_some_and(|header| {
+                    matches!(
+                        header.to_ascii_lowercase().as_str(),
+                        "x-amz-checksum-mode" | "checksummode"
+                    )
+                }))
+    }
 }
 
 impl fmt::Display for S3Error {
@@ -241,6 +267,10 @@ struct RequestPlan {
 type S3Result<T> = std::result::Result<T, S3Error>;
 
 impl S3Client {
+    /// Stable physical service identity, including a configured path prefix.
+    pub(crate) fn endpoint_identity(&self) -> String {
+        format!("{}{}", self.endpoint, self.endpoint_path)
+    }
     pub(crate) fn cache_route(repo: &GitRepo) -> Result<Option<(String, Option<String>)>> {
         match fs::symlink_metadata(Config::path(repo)) {
             Ok(_) => Ok(Config::load_compatible(repo)?
@@ -465,6 +495,126 @@ impl S3Client {
         self.read_response(operation, response)
     }
 
+    /// Request provider checksums, retrying ordinary metadata only when the
+    /// endpoint explicitly rejects checksum mode. Other failures stay errors.
+    pub(crate) fn head_with_checksums(&self, args: &Value) -> S3Result<S3Response> {
+        let mut request = args.clone();
+        request["ChecksumMode"] = "ENABLED".into();
+        self.call_s3("head_object", &request, None)
+            .or_else(|error| {
+                if error.checksum_mode_unsupported() {
+                    self.call_s3("head_object", args, None)
+                } else {
+                    Err(error)
+                }
+            })
+    }
+
+    /// Visits the exact GET body in bounded chunks without a scratch file.
+    /// The caller can hash and compare local bytes in the same pass, then verify
+    /// the returned version, ETag and size before accepting the result. A failed
+    /// read is never restarted after bytes have reached the consumer.
+    pub(crate) fn get_stream(
+        &self,
+        args: &Value,
+        mut consume: impl FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> S3Result<S3Response> {
+        let plan = self.plan("get_object", args, None)?;
+        let mut response = self.run_buffered_request(&plan, &[])?;
+        if !response.status().is_success() {
+            return self.read_response("get_object", response);
+        }
+        let value = response_metadata(response.headers())?;
+        let expected = value["ContentLength"]
+            .as_u64()
+            .ok_or_else(|| S3Error::local("S3 GET returned no object Content-Length"))?;
+        let mut reader =
+            ReadResumingReader::new(response.body_mut().with_config().limit(u64::MAX).reader());
+        let mut buffer = [0u8; 64 * 1024];
+        let mut count = 0u64;
+        loop {
+            let length = reader
+                .read(&mut buffer)
+                .map_err(|error| S3Error::transport(format!("incomplete S3 download: {error}")))?;
+            if length == 0 {
+                break;
+            }
+            count = count
+                .checked_add(length as u64)
+                .filter(|count| *count <= expected)
+                .ok_or_else(|| {
+                    S3Error::transport("incomplete S3 download: Content-Length mismatch")
+                })?;
+            consume(&buffer[..length])
+                .map_err(|error| S3Error::local(format!("verify streamed S3 bytes: {error}")))?;
+        }
+        if count != expected {
+            return Err(S3Error::transport(
+                "incomplete S3 download: Content-Length mismatch",
+            ));
+        }
+        Ok(S3Response {
+            value,
+            body: Vec::new(),
+        })
+    }
+
+    /// Permanently deletes explicitly named immutable versions in batches of
+    /// at most 1000, prevalidating the entire inventory before the first write.
+    /// A verbose batch must acknowledge every exact pair once; HTTP 200 item
+    /// errors remain errors. Replaying the same version IDs is idempotent.
+    pub(crate) fn delete_versions(&self, versions: &[(String, String)]) -> S3Result<()> {
+        validate_exact_versions(versions)?;
+        for batch in versions.chunks(1000) {
+            self.delete_version_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn delete_version_batch(&self, versions: &[(String, String)]) -> S3Result<()> {
+        exact_delete_xml(versions)?;
+        let (operation, args) = if let [(key, version)] = versions {
+            (
+                "delete_object",
+                json!({"Bucket":self.bucket,"Key":key,"VersionId":version}),
+            )
+        } else {
+            (
+                "delete_objects",
+                json!({"Bucket":self.bucket,"Delete":{"Objects":versions.iter().map(|(key, version)|json!({"Key":key,"VersionId":version})).collect::<Vec<_>>()}}),
+            )
+        };
+        let plan = self.plan(operation, &args, None)?;
+        for attempt in 0..=INTERRUPTED_READ_RETRIES {
+            let result = self
+                .run_buffered_request(&plan, &plan.body)
+                .and_then(|response| self.read_response(operation, response))
+                .and_then(|response| {
+                    if versions.len() == 1 {
+                        if response.value["VersionId"]
+                            .as_str()
+                            .is_some_and(|version| version != versions[0].1)
+                        {
+                            return Err(S3Error::local(
+                                "S3 exact deletion acknowledged a different version",
+                            ));
+                        }
+                        Ok(())
+                    } else {
+                        validate_delete_result(&response.value, versions)
+                    }
+                });
+            match result {
+                Err(error)
+                    if attempt < INTERRUPTED_READ_RETRIES
+                        && error.status != Some(200)
+                        && error.is_retryable() => {}
+                result => return result,
+            }
+        }
+        unreachable!("bounded delete retries return on the last attempt")
+    }
+
     /// Streams into a caller-owned scratch file. The caller verifies metadata,
     /// count and digest before atomically installing the cache object.
     pub fn get_to_file(&self, args: &Value, destination: &Path) -> S3Result<S3Response> {
@@ -503,10 +653,18 @@ impl S3Client {
     pub fn put_file(&self, args: &Value, source: &Path) -> S3Result<S3Response> {
         let mut file = File::open(source)
             .map_err(|error| S3Error::local(format!("open upload cache file: {error}")))?;
-        let (sha256, content_md5, length) = file_hashes(&mut file)?;
+        let hashes = file_hashes(&mut file)?;
+        if args["ExpectedSHA256"]
+            .as_str()
+            .is_some_and(|expected| expected != hashes.sha256)
+        {
+            return Err(S3Error::local(
+                "upload cache file raw SHA256 differs from its verified metadata",
+            ));
+        }
         if args["ExpectedSize"]
             .as_u64()
-            .is_some_and(|expected| expected != length)
+            .is_some_and(|expected| expected != hashes.length)
         {
             return Err(S3Error::local(
                 "upload cache file size differs from its verified metadata",
@@ -514,7 +672,7 @@ impl S3Client {
         }
         if args["ExpectedMD5"].as_str().is_some_and(|expected| {
             STANDARD
-                .decode(&content_md5)
+                .decode(&hashes.content_md5)
                 .is_ok_and(|bytes| encode_lower(bytes) != expected)
         }) {
             return Err(S3Error::local(
@@ -523,24 +681,44 @@ impl S3Client {
         }
         if args["ContentMD5"]
             .as_str()
-            .is_some_and(|expected| expected != content_md5)
+            .is_some_and(|expected| expected != hashes.content_md5)
         {
             return Err(S3Error::local(
                 "upload cache file differs from its expected Content-MD5",
             ));
         }
-        let mut plan = self.plan("put_object", args, None)?;
-        plan.headers.insert("content-md5".to_owned(), content_md5);
+        let plan = self.file_upload_plan(args, &hashes)?;
         let request = self.request(
             &plan,
             ureq::SendBody::from_owned_reader(ReadResumingReader::new(file)),
-            Some((&sha256, length)),
+            Some((&hashes.sha256, hashes.length)),
         )?;
         let response = self
             .agent
             .run(request)
             .map_err(|error| S3Error::transport(error.to_string()))?;
         self.read_response("put_object", response)
+    }
+
+    fn file_upload_plan(&self, args: &Value, hashes: &UploadFileHashes) -> S3Result<RequestPlan> {
+        let mut plan = self.plan("put_object", args, None)?;
+        plan.headers
+            .insert("content-md5".to_owned(), hashes.content_md5.clone());
+        // AWS documents that PutObject validates and stores this full-object
+        // checksum. Other compatible endpoints retain their current headers
+        // until their support is established; a failed PUT cannot be replayed.
+        if self.endpoint_path.is_empty()
+            && (self.endpoint == "https://s3.amazonaws.com"
+                || self.endpoint == format!("https://s3.{}.amazonaws.com", self.region)
+                || (self.region.starts_with("cn-")
+                    && self.endpoint == format!("https://s3.{}.amazonaws.com.cn", self.region)))
+        {
+            plan.headers.insert(
+                "x-amz-checksum-sha256".to_owned(),
+                hashes.sha256_base64.clone(),
+            );
+        }
+        Ok(plan)
     }
 
     pub fn upload_part_file(
@@ -583,6 +761,14 @@ impl S3Client {
         plan.headers
             .insert("content-md5".to_owned(), STANDARD.encode(md5.finalize()));
         let hash = encode_lower(sha.finalize());
+        if args["ExpectedSHA256"]
+            .as_str()
+            .is_some_and(|expected| expected != hash)
+        {
+            return Err(S3Error::local(
+                "upload part differs from its verified raw SHA256",
+            ));
+        }
         let mut limited = ReadResumingReader::new(file.take(length));
         let request = self.request(
             &plan,
@@ -668,6 +854,7 @@ impl S3Client {
                 | "list_object_versions"
                 | "list_multipart_uploads"
                 | "list_objects_v2"
+                | "delete_objects"
         );
         if object_operation {
             let key = args
@@ -725,6 +912,38 @@ impl S3Client {
             "head_object" => plan.method = "HEAD",
             "get_object" => {}
             "delete_object" => plan.method = "DELETE",
+            "delete_objects" => {
+                plan.method = "POST";
+                plan.query.push(("delete".to_owned(), String::new()));
+                let delete = args.get("Delete").ok_or_else(|| {
+                    S3Error::local("S3 batch deletion has no Delete specification")
+                })?;
+                if delete.get("Quiet").is_some_and(|quiet| quiet != false) {
+                    return Err(S3Error::local(
+                        "S3 exact batch deletion requires verbose results",
+                    ));
+                }
+                let versions = delete["Objects"]
+                    .as_array()
+                    .ok_or_else(|| S3Error::local("S3 batch deletion Objects must be a list"))?
+                    .iter()
+                    .map(|object| {
+                        Ok((
+                            object["Key"]
+                                .as_str()
+                                .ok_or_else(|| S3Error::local("S3 batch deletion has no key"))?
+                                .to_owned(),
+                            object["VersionId"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    S3Error::local("S3 batch deletion has no exact version")
+                                })?
+                                .to_owned(),
+                        ))
+                    })
+                    .collect::<S3Result<Vec<_>>>()?;
+                plan.body = exact_delete_xml(&versions)?;
+            }
             "put_object" | "copy_object" => plan.method = "PUT",
             "get_object_tagging" => plan.query.push(("tagging".to_owned(), String::new())),
             "put_object_tagging" => {
@@ -781,6 +1000,17 @@ impl S3Client {
             }
         }
         query_args(&mut plan, args, &[("VersionId", "versionId")])?;
+        if let Some(mode) = args.get("ChecksumMode") {
+            if !matches!(operation, "head_object" | "get_object")
+                || mode.as_str() != Some("ENABLED")
+            {
+                return Err(S3Error::local(
+                    "S3 ChecksumMode must be ENABLED on an object HEAD or GET",
+                ));
+            }
+            plan.headers
+                .insert("x-amz-checksum-mode".to_owned(), "ENABLED".to_owned());
+        }
         for (field, header) in HEADER_FIELDS {
             if let Some(value) = args.get(*field) {
                 plan.headers
@@ -839,7 +1069,7 @@ impl S3Client {
         }
         if matches!(
             operation,
-            "put_object" | "upload_part" | "put_object_tagging"
+            "put_object" | "upload_part" | "put_object_tagging" | "delete_objects"
         ) && !plan.headers.contains_key("content-md5")
         {
             plan.headers.insert(
@@ -849,7 +1079,7 @@ impl S3Client {
         }
         if matches!(
             operation,
-            "complete_multipart_upload" | "put_object_tagging"
+            "complete_multipart_upload" | "put_object_tagging" | "delete_objects"
         ) {
             plan.headers
                 .entry("content-type".to_owned())
@@ -1063,6 +1293,22 @@ const HEADER_FIELDS: &[(&str, &str)] = &[
     ("CopySourceIfNoneMatch", "x-amz-copy-source-if-none-match"),
 ];
 
+/// Provider checksum responses are separate from user-defined Metadata and
+/// request headers. COMPOSITE checksums must never be treated as raw file hashes.
+const CHECKSUM_RESPONSE_FIELDS: &[(&str, &str)] = &[
+    ("ChecksumType", "x-amz-checksum-type"),
+    ("ChecksumMD5", "x-amz-checksum-md5"),
+    ("ChecksumSHA1", "x-amz-checksum-sha1"),
+    ("ChecksumSHA256", "x-amz-checksum-sha256"),
+    ("ChecksumSHA512", "x-amz-checksum-sha512"),
+    ("ChecksumCRC32", "x-amz-checksum-crc32"),
+    ("ChecksumCRC32C", "x-amz-checksum-crc32c"),
+    ("ChecksumCRC64NVME", "x-amz-checksum-crc64nvme"),
+    ("ChecksumXXHASH64", "x-amz-checksum-xxhash64"),
+    ("ChecksumXXHASH3", "x-amz-checksum-xxhash3"),
+    ("ChecksumXXHASH128", "x-amz-checksum-xxhash128"),
+];
+
 fn header_value(field: &str, value: &Value) -> S3Result<String> {
     if let Some(value) = value.as_str() {
         return Ok(value.to_owned());
@@ -1183,7 +1429,14 @@ fn sign(
     headers.insert("authorization".to_owned(),format!("AWS4-HMAC-SHA256 Credential={}/{scope},SignedHeaders={signed_headers},Signature={signature}",credentials.access));
 }
 
-fn file_hashes(file: &mut File) -> S3Result<(String, String, u64)> {
+struct UploadFileHashes {
+    sha256: String,
+    sha256_base64: String,
+    content_md5: String,
+    length: u64,
+}
+
+fn file_hashes(file: &mut File) -> S3Result<UploadFileHashes> {
     let mut sha = Sha256::new();
     let mut md5 = Md5::new();
     let mut buffer = [0u8; 1024 * 1024];
@@ -1201,11 +1454,13 @@ fn file_hashes(file: &mut File) -> S3Result<(String, String, u64)> {
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| S3Error::local(format!("rewind upload cache file: {error}")))?;
-    Ok((
-        encode_lower(sha.finalize()),
-        STANDARD.encode(md5.finalize()),
-        count,
-    ))
+    let sha256 = sha.finalize();
+    Ok(UploadFileHashes {
+        sha256: encode_lower(sha256),
+        sha256_base64: STANDARD.encode(sha256),
+        content_md5: STANDARD.encode(md5.finalize()),
+        length: count,
+    })
 }
 
 fn response_metadata(headers: &ureq::http::HeaderMap) -> S3Result<Value> {
@@ -1229,6 +1484,7 @@ fn response_metadata(headers: &ureq::http::HeaderMap) -> S3Result<Value> {
             "x-amz-bucket-region" => Some("BucketRegion"),
             _ => HEADER_FIELDS
                 .iter()
+                .chain(CHECKSUM_RESPONSE_FIELDS)
                 .find_map(|(field, header)| (*header == name).then_some(*field)),
         };
         if let Some(field) = field {
@@ -1373,6 +1629,7 @@ fn operation_result(operation: &str, node: &XmlNode) -> S3Result<Value> {
         "complete_multipart_upload" => "CompleteMultipartUploadResult",
         "get_object_tagging" => "Tagging",
         "list_parts" => "ListPartsResult",
+        "delete_objects" => "DeleteResult",
         _ => return Ok(node.object()),
     };
     if node.name != expected {
@@ -1380,6 +1637,37 @@ fn operation_result(operation: &str, node: &XmlNode) -> S3Result<Value> {
             "S3 {operation} returned unexpected XML root {:?}",
             node.name
         )));
+    }
+    if operation == "delete_objects" {
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+        if !node.text.trim().is_empty() {
+            return Err(S3Error::local(
+                "S3 batch deletion returned unexpected root text",
+            ));
+        }
+        for item in &node.children {
+            if !matches!(item.name.as_str(), "Deleted" | "Error") || !item.text.trim().is_empty() {
+                return Err(S3Error::local(
+                    "S3 batch deletion returned an unexpected result element",
+                ));
+            }
+            let mut fields = BTreeSet::new();
+            for field in &item.children {
+                if !field.children.is_empty() || !fields.insert(&field.name) {
+                    return Err(S3Error::local(
+                        "S3 batch deletion returned duplicate or nested result fields",
+                    ));
+                }
+            }
+            let value = typed_object(item)?;
+            if item.name == "Deleted" {
+                deleted.push(value);
+            } else {
+                errors.push(value);
+            }
+        }
+        return Ok(json!({"Deleted":deleted,"Errors":errors}));
     }
     if matches!(operation, "copy_object" | "upload_part_copy") {
         return Ok(json!({expected:typed_object(node)?}));
@@ -1480,6 +1768,119 @@ pub(crate) fn normalize_timestamp(value: &str) -> S3Result<String> {
 
 fn xml_escape(value: &str) -> String {
     quick_xml::escape::escape(value).into_owned()
+}
+
+fn exact_delete_xml(versions: &[(String, String)]) -> S3Result<Vec<u8>> {
+    if !(1..=1000).contains(&versions.len()) {
+        return Err(S3Error::local(
+            "S3 exact deletion requires 1..=1000 versions",
+        ));
+    }
+    validate_exact_versions(versions)?;
+    let mut xml = String::from("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for (key, version) in versions {
+        // XML normalizes literal CR characters to LF; preserve exact key and
+        // version bytes using the entity AWS documents for DeleteObjects.
+        xml.push_str(&format!(
+            "<Object><Key>{}</Key><VersionId>{}</VersionId></Object>",
+            xml_escape(key).replace('\r', "&#13;"),
+            xml_escape(version).replace('\r', "&#13;")
+        ));
+    }
+    xml.push_str("<Quiet>false</Quiet></Delete>");
+    Ok(xml.into_bytes())
+}
+
+fn validate_exact_versions(versions: &[(String, String)]) -> S3Result<()> {
+    if versions.is_empty() {
+        return Err(S3Error::local(
+            "S3 exact deletion requires at least one version",
+        ));
+    }
+    let valid_xml = |value: &str| {
+        value.chars().all(|character| matches!(character,
+        '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'))
+    };
+    let mut seen = BTreeSet::new();
+    for (key, version) in versions {
+        if key.is_empty()
+            || version.trim().is_empty()
+            || version.trim() == "null"
+            || !valid_xml(key)
+            || !valid_xml(version)
+            || !seen.insert((key, version))
+        {
+            return Err(S3Error::local(
+                "S3 exact deletion has an invalid or duplicate key/version pair",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_delete_result(value: &Value, versions: &[(String, String)]) -> S3Result<()> {
+    let mut remaining = versions
+        .iter()
+        .map(|(key, version)| (key.as_str(), version.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut failures = Vec::new();
+    for section in ["Deleted", "Errors"] {
+        let records = value[section]
+            .as_array()
+            .ok_or_else(|| S3Error::local("S3 batch deletion has no verbose result"))?;
+        for record in records {
+            let key = record["Key"]
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| S3Error::local("S3 batch deletion result has no key"))?;
+            let version = record["VersionId"]
+                .as_str()
+                .filter(|version| !version.is_empty())
+                .ok_or_else(|| S3Error::local("S3 batch deletion result has no exact version"))?;
+            if !remaining.remove(&(key, version)) {
+                return Err(S3Error::local(
+                    "S3 batch deletion returned an extra or duplicate exact version",
+                ));
+            }
+            if section == "Errors" {
+                record["Code"]
+                    .as_str()
+                    .filter(|code| !code.is_empty())
+                    .ok_or_else(|| S3Error::local("S3 batch deletion item error has no code"))?;
+                failures.push(record.clone());
+            } else if record["DeleteMarkerVersionId"]
+                .as_str()
+                .is_some_and(|marker| marker != version)
+            {
+                return Err(S3Error::local(
+                    "S3 exact deletion acknowledged another delete marker",
+                ));
+            }
+        }
+    }
+    if !remaining.is_empty() {
+        return Err(S3Error::local(
+            "S3 batch deletion omitted requested exact versions",
+        ));
+    }
+    if let Some(first) = failures.first() {
+        return Err(S3Error {
+            status: Some(200),
+            code: first["Code"].as_str().expect("validated code").into(),
+            message: format!(
+                "{} exact version deletion(s) failed; first key {:?}, version {:?}: {}",
+                failures.len(),
+                first["Key"],
+                first["VersionId"],
+                first["Message"]
+                    .as_str()
+                    .unwrap_or("S3 object deletion was rejected")
+            ),
+            header: None,
+            details: json!({"Errors":failures,"Deleted":value["Deleted"]}),
+        });
+    }
+    Ok(())
 }
 
 fn complete_xml(value: &Value) -> S3Result<Vec<u8>> {
@@ -2842,6 +3243,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn file_upload_stores_sha256_only_on_confirmed_aws_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raw");
+        fs::write(&path, b"a\r\nb\n").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let hashes = file_hashes(&mut file).unwrap();
+        let expected_sha256 = STANDARD.encode(Sha256::digest(b"a\r\nb\n"));
+        for (endpoint, region, checksum) in [
+            ("https://s3.amazonaws.com", "us-east-1", true),
+            ("https://s3.eu-west-1.amazonaws.com", "eu-west-1", true),
+            ("https://s3.cn-north-1.amazonaws.com.cn", "cn-north-1", true),
+            (
+                "https://s3.us-west-004.backblazeb2.com",
+                "us-west-004",
+                false,
+            ),
+            ("https://storage.example.com", "us-east-1", false),
+            (
+                "https://s3.us-east-1.amazonaws.com.example.com",
+                "us-east-1",
+                false,
+            ),
+            ("https://s3.amazonaws.com:8443", "us-east-1", false),
+            ("https://s3.amazonaws.com/proxy", "us-east-1", false),
+        ] {
+            let client = S3Client::new(
+                "fixture-bucket",
+                "root",
+                endpoint,
+                region,
+                Credentials {
+                    access: "key".into(),
+                    secret: "secret".into(),
+                    token: None,
+                },
+            )
+            .unwrap();
+            let plan = client
+                .file_upload_plan(&json!({"Key":"root/raw","IfNoneMatch":"*"}), &hashes)
+                .unwrap();
+            assert_eq!(
+                plan.headers["content-md5"],
+                STANDARD.encode(Md5::digest(b"a\r\nb\n"))
+            );
+            assert_eq!(
+                plan.headers.get("x-amz-checksum-sha256"),
+                checksum.then_some(&expected_sha256)
+            );
+            let request = client
+                .request(
+                    &plan,
+                    ureq::SendBody::from_owned_reader(std::io::Cursor::new(b"a\r\nb\n")),
+                    Some((&hashes.sha256, hashes.length)),
+                )
+                .unwrap();
+            assert_eq!(request.headers()["content-length"], "5");
+            assert_eq!(request.headers()["x-amz-content-sha256"], hashes.sha256);
+            assert_eq!(
+                request.headers()["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains("x-amz-checksum-sha256"),
+                checksum
+            );
+            assert!(!request.headers().contains_key("x-amz-trailer"));
+            assert!(!request.headers().contains_key("transfer-encoding"));
+        }
+    }
+
+    #[test]
     fn exact_get_metadata_binary_body_and_duplicate_slashes() {
         let bytes = vec![0, 255, 4, 13, 10];
         let (client, worker) = single_reply_fixture(Reply {
@@ -3012,6 +3483,379 @@ pub(crate) mod tests {
                 assert!(request.headers["authorization"].contains("if-match"));
             }
         }
+    }
+
+    #[test]
+    fn streamed_get_preserves_exact_bytes_checksum_headers_and_signed_conditions() {
+        let bytes = (0..300_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected = bytes.clone();
+        let md5 = STANDARD.encode(Md5::digest(&bytes));
+        let sha256 = STANDARD.encode(Sha256::digest(&bytes));
+        let response_md5 = md5.clone();
+        let response_sha256 = sha256.clone();
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.headers["x-amz-checksum-mode"], "ENABLED");
+            assert_eq!(request.headers["if-match"], "\"bound\"");
+            assert!(request.headers["authorization"].contains("x-amz-checksum-mode"));
+            Reply {
+                status: 200,
+                headers: vec![
+                    ("x-amz-version-id", "v/+1".into()),
+                    ("ETag", "\"bound\"".into()),
+                    ("x-amz-checksum-type", "FULL_OBJECT".into()),
+                    ("x-amz-checksum-md5", response_md5.clone()),
+                    ("x-amz-checksum-sha256", response_sha256.clone()),
+                    ("x-amz-meta-checksum-sha1", "uploader-controlled".into()),
+                ],
+                body: bytes.clone(),
+            }
+        });
+        let mut received = Vec::new();
+        let mut chunks = 0;
+        let response = client
+            .get_stream(
+                &json!({"Key":"root/raw","VersionId":"v/+1","IfMatch":"\"bound\"","ChecksumMode":"ENABLED"}),
+                |bytes| {
+                    assert!(bytes.len() <= 64 * 1024);
+                    chunks += 1;
+                    received.extend_from_slice(bytes);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(received, expected);
+        assert!(chunks > 1);
+        assert!(response.body.is_empty());
+        assert_eq!(response.value["ContentLength"], expected.len());
+        assert_eq!(response.value["VersionId"], "v/+1");
+        assert_eq!(response.value["ETag"], "\"bound\"");
+        assert_eq!(response.value["ChecksumType"], "FULL_OBJECT");
+        assert_eq!(response.value["ChecksumMD5"], md5);
+        assert_eq!(response.value["ChecksumSHA256"], sha256);
+        assert!(response.value["ChecksumSHA1"].is_null());
+        assert_eq!(
+            response.value["Metadata"]["checksum-sha1"],
+            "uploader-controlled"
+        );
+        assert_eq!(worker.finish_requests().len(), 1);
+    }
+
+    #[test]
+    fn streamed_get_failure_never_replays_delivered_bytes() {
+        for consumer_failure in [false, true] {
+            let (client, worker) = routed_fixture(move |_| Reply {
+                status: 200,
+                headers: vec![(
+                    "Content-Length",
+                    if consumer_failure { "3" } else { "5" }.into(),
+                )],
+                body: b"abc".to_vec(),
+            });
+            let mut received = Vec::new();
+            let result = client.get_stream(&json!({"Key":"root/raw","VersionId":"v1"}), |bytes| {
+                received.extend_from_slice(bytes);
+                if consumer_failure {
+                    Err(std::io::Error::other("local compare failed"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err());
+            assert_eq!(received, b"abc");
+            assert_eq!(worker.finish_requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn checksum_head_keeps_composite_and_full_object_types_distinct() {
+        for checksum_type in ["FULL_OBJECT", "COMPOSITE"] {
+            let (client, worker) = routed_fixture(move |request| {
+                assert_eq!(request.method, "HEAD");
+                assert_eq!(request.headers["x-amz-checksum-mode"], "ENABLED");
+                Reply {
+                    status: 200,
+                    headers: vec![
+                        ("Content-Length", "3".into()),
+                        ("x-amz-checksum-type", checksum_type.into()),
+                        ("x-amz-checksum-sha1", "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=".into()),
+                        ("x-amz-checksum-crc32", "NSRBwg==".into()),
+                        ("x-amz-checksum-crc32c", "Nks/tw==".into()),
+                        ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA=".into()),
+                        ("x-amz-checksum-sha512", "sha512-response".into()),
+                        ("x-amz-checksum-xxhash64", "xxhash64-response".into()),
+                        ("x-amz-checksum-xxhash3", "xxhash3-response".into()),
+                        ("x-amz-checksum-xxhash128", "xxhash128-response".into()),
+                    ],
+                    body: Vec::new(),
+                }
+            });
+            let response = client
+                .call_s3(
+                    "head_object",
+                    &json!({"Key":"root/a","VersionId":"v1","ChecksumMode":"ENABLED"}),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(response.value["ChecksumType"], checksum_type);
+            for field in [
+                "ChecksumSHA1",
+                "ChecksumCRC32",
+                "ChecksumCRC32C",
+                "ChecksumCRC64NVME",
+                "ChecksumSHA512",
+                "ChecksumXXHASH64",
+                "ChecksumXXHASH3",
+                "ChecksumXXHASH128",
+            ] {
+                assert!(response.value[field].is_string(), "missing {field}");
+            }
+            assert_eq!(worker.finish_requests().len(), 1);
+        }
+        let client = client("http://127.0.0.1:1");
+        for (operation, mode) in [("head_object", "DISABLED"), ("put_object", "ENABLED")] {
+            assert!(
+                client
+                    .plan(
+                        operation,
+                        &json!({"Key":"root/a","ChecksumMode":mode}),
+                        None
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    fn delete_reply(versions: &[(String, String)]) -> String {
+        let mut xml = String::from("<DeleteResult>");
+        for (key, version) in versions.iter().rev() {
+            xml.push_str(&format!(
+                "<Deleted><Key>{}</Key><VersionId>{}</VersionId></Deleted>",
+                xml_escape(key).replace('\r', "&#13;"),
+                xml_escape(version).replace('\r', "&#13;")
+            ));
+        }
+        xml.push_str("</DeleteResult>");
+        xml
+    }
+
+    #[test]
+    fn exact_batch_deletion_signs_md5_and_preserves_xml_key_version_bytes() {
+        let versions = vec![
+            ("root/a<&>\r\n汉字".into(), "v/+&\r".into()),
+            ("root/a<&>\r\n汉字".into(), "other-version".into()),
+        ];
+        let expected = versions.clone();
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/fixture-bucket?delete=");
+            assert_eq!(
+                request.headers["content-md5"],
+                STANDARD.encode(Md5::digest(&request.body))
+            );
+            assert_eq!(
+                request.headers["x-amz-content-sha256"],
+                encode_lower(Sha256::digest(&request.body))
+            );
+            assert!(request.headers["authorization"].contains("content-md5"));
+            assert_eq!(request.headers["content-type"], "application/xml");
+            assert!(!request.body.contains(&b'\r'));
+            assert!(String::from_utf8_lossy(&request.body).contains("&#13;"));
+            let xml = parse_xml(&request.body).unwrap();
+            assert_eq!(xml.name, "Delete");
+            assert_eq!(xml.child("Quiet").unwrap().text, "false");
+            let objects = xml
+                .children
+                .iter()
+                .filter(|node| node.name == "Object")
+                .map(|node| {
+                    (
+                        node.child("Key").unwrap().text.clone(),
+                        node.child("VersionId").unwrap().text.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(objects, expected);
+            Reply::xml(&delete_reply(&expected))
+        });
+        client.delete_versions(&versions).unwrap();
+        assert_eq!(worker.finish_requests().len(), 1);
+    }
+
+    #[test]
+    fn exact_delete_inventory_is_fully_validated_before_any_request() {
+        let (client, worker) = empty_fixture();
+        let mut crossing_duplicate = (0..1001)
+            .map(|index| ("root/a".into(), format!("v{index}")))
+            .collect::<Vec<_>>();
+        crossing_duplicate.push(crossing_duplicate[0].clone());
+        for versions in [
+            vec![],
+            vec![("".into(), "v1".into())],
+            vec![("root/a".into(), "".into())],
+            vec![("root/a".into(), "null".into())],
+            vec![("root/a".into(), " null ".into())],
+            vec![("root/a\0".into(), "v1".into())],
+            vec![("root/a".into(), "v\u{b}".into())],
+            crossing_duplicate,
+        ] {
+            assert!(client.delete_versions(&versions).is_err());
+        }
+        let too_many = (0..1001)
+            .map(|index| ("root/a".into(), format!("v{index}")))
+            .collect::<Vec<_>>();
+        assert!(exact_delete_xml(&too_many).is_err());
+        assert!(
+            client
+                .plan(
+                    "delete_objects",
+                    &json!({"Delete":{"Objects":[{"Key":"root/a","VersionId":"v1"}],"Quiet":true}}),
+                    None
+                )
+                .is_err()
+        );
+        assert!(worker.finish_requests().is_empty());
+    }
+
+    #[test]
+    fn exact_batch_delete_rejects_missing_extra_duplicate_and_malformed_acknowledgements() {
+        let first = "<Deleted><Key>root/a</Key><VersionId>v1</VersionId></Deleted>";
+        let second = "<Deleted><Key>root/a</Key><VersionId>v2</VersionId></Deleted>";
+        for response in [
+            "<Other/>".to_owned(),
+            "<DeleteResult/>".to_owned(),
+            format!("<DeleteResult>{first}</DeleteResult>"),
+            format!("<DeleteResult>{first}{second}{first}</DeleteResult>"),
+            format!(
+                "<DeleteResult>{first}<Deleted><Key>root/b</Key><VersionId>v2</VersionId></Deleted></DeleteResult>"
+            ),
+            format!("<DeleteResult>{first}<Deleted><Key>root/a</Key></Deleted></DeleteResult>"),
+            format!(
+                "<DeleteResult>{first}<Deleted><Key>root/a</Key><VersionId>v2</VersionId><VersionId>v2</VersionId></Deleted></DeleteResult>"
+            ),
+            format!(
+                "<DeleteResult>{first}<Deleted><Key><Nested>root/a</Nested></Key><VersionId>v2</VersionId></Deleted></DeleteResult>"
+            ),
+            format!(
+                "<DeleteResult>{first}{second}<Error><Key>root/a</Key><VersionId>v1</VersionId><Code>AccessDenied</Code></Error></DeleteResult>"
+            ),
+            format!("<DeleteResult>{first}{second}<Unexpected/></DeleteResult>"),
+            format!(
+                "<DeleteResult>{first}<Deleted><Key>root/a</Key><VersionId>v2</VersionId><DeleteMarkerVersionId>other-version</DeleteMarkerVersionId></Deleted></DeleteResult>"
+            ),
+        ] {
+            let (client, worker) = single_reply_fixture(Reply::xml(&response));
+            assert!(
+                client
+                    .delete_versions(&[
+                        ("root/a".into(), "v1".into()),
+                        ("root/a".into(), "v2".into())
+                    ])
+                    .is_err(),
+                "{response}"
+            );
+            assert_eq!(worker.finish_requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn exact_batch_delete_propagates_http_200_item_errors_without_replaying() {
+        for code in ["AccessDenied", "SlowDown"] {
+            let (client, worker) = single_reply_fixture(Reply::xml(&format!(
+                "<DeleteResult><Deleted><Key>root/a</Key><VersionId>v1</VersionId></Deleted><Error><Key>root/a</Key><VersionId>v2</VersionId><Code>{code}</Code><Message>provider rejected this version</Message></Error></DeleteResult>"
+            )));
+            let error = client
+                .delete_versions(&[
+                    ("root/a".into(), "v1".into()),
+                    ("root/a".into(), "v2".into()),
+                ])
+                .unwrap_err();
+            assert_eq!(error.status, Some(200));
+            assert_eq!(error.code, code);
+            assert_eq!(error.details["Errors"][0]["VersionId"], "v2");
+            assert_eq!(worker.finish_requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn exact_delete_splits_large_inventory_and_retains_singleton_delete() {
+        let versions = (0..1001)
+            .map(|index| ("root/a".into(), format!("v{index}")))
+            .collect::<Vec<_>>();
+        let expected = versions.clone();
+        let (client, worker) = routed_fixture(move |request| {
+            if request.method == "POST" {
+                let xml = parse_xml(&request.body).unwrap();
+                assert_eq!(
+                    xml.children
+                        .iter()
+                        .filter(|node| node.name == "Object")
+                        .count(),
+                    1000
+                );
+                Reply::xml(&delete_reply(&expected[..1000]))
+            } else {
+                assert_eq!(request.method, "DELETE");
+                assert_eq!(request.target, "/fixture-bucket/root/a?versionId=v1000");
+                Reply {
+                    status: 204,
+                    headers: vec![("x-amz-version-id", "v1000".into())],
+                    body: Vec::new(),
+                }
+            }
+        });
+        client.delete_versions(&versions).unwrap();
+        assert_eq!(worker.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn only_explicit_exact_deletions_retry_transient_requests_with_a_bound() {
+        for versions in [
+            vec![("root/a".into(), "v1".into())],
+            vec![
+                ("root/a".into(), "v1".into()),
+                ("root/a".into(), "v2".into()),
+            ],
+        ] {
+            let (client, worker) = empty_fixture();
+            let (client, attempts) = inject_connector_failure(
+                client,
+                usize::MAX,
+                InjectedFailure::Io(std::io::ErrorKind::Interrupted),
+            );
+            assert_eq!(
+                client.delete_versions(&versions).unwrap_err().code,
+                "TransportError"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            assert!(worker.finish_requests().is_empty());
+        }
+        let versions = vec![
+            ("root/a".into(), "v1".into()),
+            ("root/a".into(), "v2".into()),
+        ];
+        let expected = versions.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = count.clone();
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "POST");
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reply {
+                    status: 503,
+                    headers: Vec::new(),
+                    body: b"<Error><Code>ServiceUnavailable</Code></Error>".to_vec(),
+                }
+            } else {
+                Reply::xml(&delete_reply(&expected))
+            }
+        });
+        client.delete_versions(&versions).unwrap();
+        let requests = worker.finish_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+        assert_eq!(requests[0].target, requests[1].target);
     }
 
     #[test]

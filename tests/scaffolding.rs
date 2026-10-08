@@ -855,9 +855,19 @@ fn native_storage_location_is_authoritative_and_cannot_move_with_boundaries() {
     );
 
     std::fs::write(&config_path, &public_config).unwrap();
+    let upgraded = json(&workspace(&fixture.shared, ["manage"]));
+    assert_eq!(upgraded["status"], "managed");
+    assert_eq!(
+        upgraded["migration"]["upgraded"],
+        serde_json::json!(["retained.bin.wm-storage.json"])
+    );
     assert_eq!(
         json(&workspace(&fixture.shared, ["manage"]))["status"],
         "no_changes"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&pointer).unwrap()).unwrap()["schema_version"],
+        2
     );
     let mut config: toml::Value = toml::from_str(&public_config).unwrap();
     config.as_table_mut().unwrap().remove("s3");

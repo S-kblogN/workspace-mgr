@@ -1926,3 +1926,83 @@ fn archived_lfs_preserves_a_higher_shared_requirement() {
     );
     assert_eq!(read(&worktree.join(CONFIG)), declaring("0.9.0", &original));
 }
+
+#[cfg(feature = "test-storage")]
+#[test]
+fn schema_two_storage_requires_0_8_7_without_raising_the_schema_one_floor() {
+    let fixture = GitFixture::new();
+    let remote = fixture.root.join("verified-native-storage");
+    workspace(
+        &fixture.seed,
+        ["manage", "--s3-url", remote.to_str().unwrap()],
+    );
+    let config_path = fixture.seed.join(CONFIG);
+    std::fs::write(&config_path, declaring("0.7.2", &read(&config_path))).unwrap();
+    fixture.commit_seed("Manage storage with an older declaration");
+    fixture.clone_shared();
+    let (task_id, task) = create_task(&fixture, "verified-format", "20261008-190000");
+    document_task(&task);
+    std::fs::write(task.join("artifact.bin"), b"abc").unwrap();
+    let mut manifest: Value = serde_json::from_str(&storage_file_manifest(
+        "artifact.bin",
+        "900150983cd24fb0d6963f7d28e17f72",
+        3,
+        None,
+    ))
+    .unwrap();
+    manifest["schema_version"] = json!(2);
+    std::fs::write(
+        task.join("artifact.bin.wm-storage.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let index = git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout;
+    let head = rev(&fixture.shared, "HEAD").unwrap();
+    for older in ["0.8.1", "0.8.6"] {
+        for args in [
+            &["plan"][..],
+            &["publish", "--dry-run", "-m", "Verified metadata"][..],
+            &["publish", "-m", "Verified metadata"][..],
+        ] {
+            let rejected = workspace_env_unchecked(&task, args, &[(CLI_VERSION_ENV, older)]);
+            assert_eq!(rejected.status.code(), Some(2));
+            assert!(
+                stderr(&rejected).contains("native storage manifest"),
+                "{}",
+                stderr(&rejected)
+            );
+            assert!(
+                stderr(&rejected).contains("schema 2"),
+                "{}",
+                stderr(&rejected)
+            );
+            assert!(stderr(&rejected).contains("0.8.7"), "{}", stderr(&rejected));
+            assert_eq!(
+                git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
+                index
+            );
+            assert_eq!(rev(&fixture.shared, "HEAD").unwrap(), head);
+            assert!(rev(&fixture.remote, "refs/heads/codex/verified-format").is_none());
+        }
+    }
+    let plan = json(&workspace(&task, ["plan"]));
+    assert_eq!(
+        plan["repository_requirement"]["minimum_cli_version"],
+        "0.8.7"
+    );
+    let published = json(&workspace(
+        &task,
+        ["publish", "-m", "Retain verified metadata"],
+    ));
+    let tip = published["remote_oid"].as_str().unwrap();
+    assert!(
+        show(&fixture.remote, &format!("{tip}:{CONFIG}"))
+            .starts_with("minimum_cli_version = \"0.8.7\"")
+    );
+    let stored: Value = serde_json::from_str(&show(
+        &fixture.remote,
+        &format!("{tip}:{task_id}/artifact.bin.wm-storage.json"),
+    ))
+    .unwrap();
+    assert_eq!(stored["schema_version"], 2);
+}

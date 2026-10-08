@@ -26,8 +26,10 @@ public location when needed. `manage --dry-run` inventories changes first.
 Management combines storage-format migration and scaffold updates in one
 recoverable repository transaction. It reports converted manifests and removed
 legacy control files. It leaves changes available for normal Git review; it
-does not rewrite Git history. Exact-version imports change metadata only;
-ordinary CAS imports upload and verify new native S3 versions.
+does not rewrite Git history. Existing exact-version bindings are upgraded only
+after their content is verified; ordinary CAS imports upload and verify new
+native S3 versions. A dry run inventories pending upgrades without downloading
+file payloads.
 
 `.workspace-mgr.toml` is the sole public source of remote facts. Native clients
 read it directly. Authentication uses AWS environment/profile mechanisms or the
@@ -41,13 +43,25 @@ Each manifest describes exactly one file or directory boundary and carries a
 strict `schema_version`. File manifests record an explicit checksum algorithm,
 physical size, and optional exact remote version binding.
 
-New native recordings use MD5 over physical bytes. An imported normalized-text
-binding is retained only when its exact-version cache proves the raw bytes are
-unchanged; otherwise recording uses a raw checksum and requires a new binding.
+New native recordings use schema 2. MD5 remains the logical content identity
+for compatibility, and unbound or legacy cache entries retain their existing
+routing. Bound schema 2 files use `objects/sha256/` cache identities so MD5
+collisions cannot cause unrelated payloads to share a verified cache object.
+Every bound file also carries a verification record
+that associates its raw-byte SHA256 with the exact endpoint, bucket, full object
+key and non-null VersionId. The record is written only after a verified transfer,
+a reliable provider checksum, or verified exact-version read. It is shared in
+Git rather than held in a machine-local checksum cache. Unbound local recordings
+do not claim that remote content has been verified.
+
+An imported normalized-text binding is retained only when its exact-version
+cache proves the raw bytes are unchanged; otherwise recording uses a raw
+checksum and requires a new binding. Normalized MD5 alone cannot establish raw
+byte equality.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "path": "model.bin",
   "kind": "file",
   "checksum": {
@@ -57,26 +71,65 @@ unchanged; otherwise recording uses a raw checksum and requires a new binding.
   "size": 1,
   "version": {
     "id": "exact-object-version",
-    "etag": "remote-etag"
+    "etag": "remote-etag",
+    "verification": {
+      "endpoint": "https://s3.us-west-2.amazonaws.com",
+      "bucket": "repository-data",
+      "key": "workspace/task/model.bin",
+      "version_id": "exact-object-version",
+      "checksum": {
+        "algorithm": "sha256",
+        "digest": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+      },
+      "size": 1,
+      "method": "verified-upload"
+    }
   }
 }
 ```
 
 A directory manifest contains a complete `entries` list. Each entry records its
-relative path, checksum, size and optional version. The aggregate identity
+relative path, checksum, size and optional verified version. The aggregate identity
 covers sorted content descriptions, including sizes; it excludes remote
 version bindings, so an archive copy does not change content identity.
 Directories cannot contain overlapping file paths. Unknown fields, unknown
 versions, ambiguous paths, duplicate entries and inconsistent aggregates fail.
 
-MD5 is retained for existing content identities and cache reuse. Imported
+MD5 is retained for existing logical content identities and legacy cache reuse. Imported
 legacy text hashes explicitly declare `md5-dos2unix`; physical byte sizes are
 still verified. Changing the implementation language does not change imported
 file bytes or checksum semantics.
 
-Repositories using the native format declare `minimum_cli_version = "0.8.1"`
+Repositories upgraded to schema 2 declare `minimum_cli_version = "0.8.7"`
 or a higher existing requirement. Older releases must refuse them before
 interpreting or publishing unfamiliar control metadata.
+
+## Verification and schema upgrades
+
+For schema 2, local bytes must match both their logical checksum and the
+verification record's raw SHA256. Remote checks confirm that the recorded exact
+version still exists at its recorded location with the expected size and ETag;
+layout, version history and transaction checks also remain in place. These
+checks do not download remote file payloads. They do not use timestamps or a
+"last verified" date: a non-null version is the immutable identity, and deleting
+that version is still detected by its metadata check.
+
+`manage` upgrades existing schema 1 manifests once. It does not treat a legacy
+MD5 and VersionId as a raw-byte proof. A suitable provider checksum can establish
+the association without downloading payload bytes. Otherwise the existing
+exact-version verification method streams the old object, checks its legacy
+checksum and physical size, compares materialized local bytes, and computes raw
+SHA256 before recording schema 2. Old-schema verification, actual file use and
+recovery of an unproven upload can require a payload read; subsequent schema 2
+audits use the shared record. Historical schema 1 manifests retain their
+previous verification path.
+
+Changing the endpoint, bucket, key, version or bytes requires a new proof.
+Ordinary moves clear remote bindings. An authorized archive copy can derive a
+`verified-copy` record from a matching source proof because the copy pins the
+exact source version; its destination version, scope, size and ownership are
+checked before the rewritten manifest is saved. A copy receipt without an
+existing content proof cannot create one.
 
 ## Migrating legacy DVC repositories
 
@@ -89,8 +142,9 @@ Unrelated `.gitattributes` rules and repository ignore rules are retained.
 Legacy adoption runs in the primary shared checkout, including configuration or
 cache-only adoption. Native scaffold reconciliation also supports linked worktrees.
 
-Path-based, version-aware S3 metadata imports without transferring objects when
-every file already has an exact VersionId. DVC 3 records such a directory by its
+Path-based, version-aware S3 imports preserve existing exact VersionIds and
+establish their raw-byte verification records before completing migration.
+DVC 3 records such a directory by its
 complete `files` list alone; the importer rebuilds the omitted aggregate checksum
 and size from that list, as DVC does when it loads the pointer. Ordinary DVC S3 remotes instead store
 objects by content identity. `manage` supports the DVC 3 `files/md5/<digest>`
@@ -120,8 +174,10 @@ verification succeed. The private `storage-import.json` journal and owned upload
 journals let the next `manage` resume an interrupted transfer, including a lost
 upload response, without creating a second owned version. A changed source or
 later edit to a planned control file blocks recovery for explicit resolution.
-CAS upload receipts also retain a raw SHA-256 identity, verified by reading the
-exact uploaded version. Imported normalized-text bindings use a cache isolated
+CAS upload receipts also retain a raw SHA-256 identity. New signed uploads verify
+the transmitted bytes and the exact resulting version without downloading it;
+recovery of older receipts retains the previous read verification. Imported
+normalized-text bindings use a cache isolated
 by exact object version, so matching normalized checksums cannot swap raw bytes.
 Finish or cancel any pending archive, upload or purge operation before migration.
 

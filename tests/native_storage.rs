@@ -98,7 +98,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     let native: serde_json::Value =
         serde_json::from_slice(&std::fs::read(task.join("large.bin.wm-storage.json")).unwrap())
             .unwrap();
-    assert_eq!(native["schema_version"], 1);
+    assert_eq!(native["schema_version"], 2);
     assert_eq!(native["kind"], "file");
     assert_eq!(native["checksum"]["algorithm"], "md5");
     assert!(native.get("outs").is_none());
@@ -929,4 +929,113 @@ fn bulk_publication_counts_an_automatic_boundary_the_same_at_plan_and_publish() 
         "plan and publish must measure the same content"
     );
     assert_eq!(published["status"], "pushed");
+}
+
+#[cfg(unix)]
+#[test]
+fn planning_large_storage_directories_keeps_cache_discovery_constant() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = GitFixture::new();
+    let storage_remote = fixture.root.join("storage-remote");
+    workspace(
+        &fixture.seed,
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
+    );
+    fixture.commit_seed("Initialize storage performance fixture");
+    fixture.clone_shared();
+    workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "storage-scale",
+            "--title",
+            "Storage scale",
+            "--purpose",
+            "Verify every file without per-file Git subprocesses.",
+            "--timestamp",
+            "20261008-120000",
+        ],
+    );
+    let task_id = "20261008-120000-storage-scale";
+    let task = fixture.shared.join(task_id);
+    document_task(&task);
+    let data = task.join("data");
+    std::fs::create_dir(&data).unwrap();
+    let boundary = format!("{task_id}/data");
+    let pointer = format!("{boundary}.wm-storage.json");
+    let wrappers = fixture.root.join("wrappers");
+    std::fs::create_dir(&wrappers).unwrap();
+    let log = fixture.root.join("cache-discovery.log");
+    let real_git = which::which("git").unwrap();
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let wrapper = wrappers.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$3\" = worktree ] && [ \"$4\" = list ]; then printf '.\\n' >> {}; fi\nexec {} \"$@\"\n",
+            quote(&log), quote(&real_git),
+        ),
+    ).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", wrappers.display(), std::env::var("PATH").unwrap());
+    let mut discoveries = Vec::new();
+    for (from, to) in [(0, 32), (32, 160)] {
+        for index in from..to {
+            std::fs::write(
+                data.join(format!("file-{index:04}")),
+                format!("payload {index}\n"),
+            )
+            .unwrap();
+        }
+        workspace(
+            &task,
+            [
+                "storage",
+                "set",
+                &boundary,
+                "--to",
+                "s3",
+                "--reason",
+                "Scale fixture.",
+            ],
+        );
+        std::fs::write(
+            task.join("record.md"),
+            format!("# Record\n\nRecorded {to} fixture files.\n"),
+        )
+        .unwrap();
+        workspace(&task, ["publish", "-m", "Prepare checked scale fixture"]);
+        std::fs::write(&log, "").unwrap();
+        let plan = workspace_env(&task, ["plan"], &[("PATH", &path)]);
+        assert!(matches!(
+            json(&plan)["status"].as_str(),
+            Some("dry_run" | "no_changes")
+        ));
+        assert!(
+            json(&plan)["storage"]["s3"]["dirty_files"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        discoveries.push(std::fs::read_to_string(&log).unwrap().lines().count());
+    }
+    assert!(
+        discoveries[1] <= discoveries[0] + 2,
+        "cache discovery grew with files: {discoveries:?}"
+    );
+    assert!(
+        discoveries[1] < 32,
+        "too many shared cache discoveries: {discoveries:?}"
+    );
+
+    // The last file is still checked despite its position in a large manifest.
+    std::fs::write(data.join("file-0159"), "changed 159\n").unwrap();
+    let plan = workspace_env(&task, ["plan"], &[("PATH", &path)]);
+    assert_eq!(
+        json(&plan)["storage"]["s3"]["dirty_files"],
+        serde_json::json!([pointer])
+    );
 }

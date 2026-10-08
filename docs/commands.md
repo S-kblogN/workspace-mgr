@@ -109,6 +109,15 @@ file is product-owned, so a hand edit there is drift that `manage` repairs.
 Managed local-retention blocks stay in the root file separately. Migration drops
 only the recognized obsolete DVC control rules and normalizes trailing newlines.
 
+The command also upgrades native storage schema 1 to schema 2 in the primary
+checkout. Each bound file gains a shared proof of its raw SHA256 and exact
+endpoint, bucket, key, VersionId and size. A suitable provider checksum avoids
+payload reads; otherwise the existing legacy verification streams the exact
+version once before upgrading. Existing VersionIds remain unchanged, and no
+remote write is needed. Unbound recordings claim no remote proof. `--dry-run`
+inventories these upgrades without downloading file payloads. Later schema 2
+verification uses the shared proof and remote metadata without payload GETs.
+
 The command scans the whole checkout, including archived tasks, for legacy
 `.dvc` manifests. It converts supported metadata to `.wm-storage.json`, carries
 reusable caches and private credentials into `.workspace-mgr/local/`, and removes
@@ -194,7 +203,8 @@ reported action names the marker it dropped. `doctor` reports a hand-edited
 root file through its `repository-scaffold` check. `manage` refuses to change the S3
 location while retained S3 boundaries exist. It preserves higher existing
 `minimum_cli_version` declarations and raises the requirement to at least
-0.8.1 when adopting native storage. It does not push Git refs. Ordinary CAS
+0.8.1 when adopting native storage, or 0.8.7 when schema 2 storage controls are
+present. It does not push Git refs. Ordinary CAS
 adoption reads S3 sources and creates verified native object versions;
 `--dry-run` reads only the remote metadata and listings needed for its inventory.
 The generated `AGENTS.md` includes an approval-gated command that
@@ -267,10 +277,44 @@ separately from payload paths; arbitrary control-looking keys are not exempt.
 
 The audit checks materialized local bytes and directory membership against the
 manifest too. Unmaterialized outputs use the manifest as the logical local tree
-and are counted separately; doctor does not hydrate them. Exact remote checksum
-verification downloads each current object into temporary scratch space, without
-installing a cache or changing repository files. Large tasks can take time and
-incur S3 read/transfer costs.
+and are counted separately; doctor does not hydrate them. Local hashes run in
+parallel across available CPU cores. Independent S3 checks use at most sixteen
+workers, preserving exact version, ETag, size and inventory checks.
+
+For storage schema 2, doctor checks the shared verification record against the
+configured endpoint, bucket, full object key and exact VersionId, and verifies
+materialized local bytes against both the logical checksum and raw SHA256. It
+checks the remote version's size, ETag, existence and latest-version status
+without payload GETs. Missing, CRC-only or composite provider checksums do not
+require a download; a conflicting full-object SHA256 or invalid proof fails the
+audit. Both remote inventories and local file generations are compared before
+and after the audit.
+
+For legacy schema 1, doctor requests S3 `HeadObject` with
+`ChecksumMode=ENABLED`. A provider's
+`FULL_OBJECT` MD5 can validate an unmaterialized raw-MD5 manifest without
+downloading the object. When checked local bytes are present, skipping GET
+requires a matching full-object SHA256; MD5 alone retains the literal local-byte
+comparison, including for distinct files with the same MD5. The local manifest
+checksum is still checked, including the legacy `md5-dos2unix` normalization rule.
+This uses the provider's content checksum, never a generic ETag or
+uploader-controlled user metadata.
+Checksum equality is a digest-based integrity proof; it is not a mathematical
+collision-free proof of literal byte equality.
+
+For schema 1, missing, malformed, composite, CRC-only or incompatible checksums
+retain the full read check, as does a materialized payload with MD5 alone. An unmaterialized
+normalized manifest also requires this fallback. Doctor streams each exact
+remote version directly through checksum verification and literal local-byte
+comparison in the same pass, without a
+scratch file, cache installation or filesystem sync. Large
+tasks can still incur S3 read/transfer costs when the provider lacks a suitable
+full-object checksum.
+
+Interactive terminals show stages and object progress. JSON storage reports
+include `verified_version_objects`, `remote_checksum_objects`, `streamed_objects`
+and `streamed_bytes` so callers can see which verification path ran. Configuration remains `[s3]`:
+all remote checks use the S3 API, including on Backblaze endpoints.
 
 A selected task also checks its former prefixes recorded in locally available
 Git history and archive receipts. Doctor never fetches refs or follows archive
@@ -1240,9 +1284,10 @@ archived task manifest of any supported schema requires at least 0.5.0, a branch
 whose manifests no longer need its earlier raise withdraws it but never below
 the fetched base branch's declaration, and a branch whose configuration
 carries a user-authorized change keeps it and only raises its declaration,
-also to follow the base branch. When a task manifest needs a newer release
-than the installed CLI, plan and publish refuse with status 2 because this
-build cannot publish that task state. The refusal offers recording the default
+also to follow the base branch. Native storage controls in the proposed tree
+require 0.8.1 for schema 1 and 0.8.7 for schema 2. When a task or storage manifest
+needs a newer release than the installed CLI, plan and publish refuse with
+status 2 because this build cannot publish that state. The refusal offers recording the default
 limit only when removing the task's own approval clears its schema requirement;
 an archived-path requirement needs an update. For another task's manifest in
 the publication, such as one merged on the base branch, it names the manifest

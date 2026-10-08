@@ -452,14 +452,13 @@ pub(crate) fn published_task_paths(
     let listed = repo.run(["ls-tree", "-r", "-z", "--name-only", oid, "--"])?;
     let suffix = format!("/{TASK_MANIFEST_NAME}");
     let mut matches = Vec::new();
-    for manifest_path in listed
+    let paths = listed
         .stdout
         .split('\0')
         .filter(|path| path.ends_with(&suffix))
-    {
-        let raw = repo
-            .run(["show", &format!("{oid}:{manifest_path}")])?
-            .stdout;
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (manifest_path, raw) in repo.show_files(oid, &paths)? {
         let manifest: PublishedTaskIdentity = toml::from_str(&raw).map_err(|error| {
             Error::message(format!(
                 "failed to inspect published task manifest {manifest_path:?}: {error}"

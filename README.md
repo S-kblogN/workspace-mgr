@@ -56,10 +56,11 @@ Both task kinds publish to their own unmounted branch through a private index.
 archived tasks; `doctor` checks all tasks and the full configured S3 prefix.
 It reports extra or misplaced remote objects, obsolete keys with retained
 versions/delete markers, and mismatches between storage metadata, exact remote
-versions and materialized local bytes. The audit is read-only and downloads
-current objects into temporary scratch space to verify their checksums. See the
+versions and materialized local bytes. The audit is read-only: it verifies exact
+versions through suitable provider checksums or parallel streamed downloads. See the
 [diagnostic command](docs/commands.md#workspace-mgr-doctor) for its scope and
-history rules.
+history rules, and [performance notes](docs/performance.md) for batching,
+concurrency, checksum requirements, and measured results.
 
 Private product state lives in the primary checkout's `.workspace-mgr/local/`,
 which the generated root `.gitignore` ignores. All linked worktrees use that
