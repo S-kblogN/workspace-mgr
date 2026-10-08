@@ -1298,8 +1298,7 @@ fn parse_xml(raw: &[u8]) -> S3Result<XmlNode> {
                 if stack.len() > 64 {
                     return Err(S3Error::local("S3 XML response is too deeply nested"));
                 }
-                let name = String::from_utf8(element.local_name().as_ref().to_vec())
-                    .map_err(|_| S3Error::local("S3 XML has an invalid name"))?;
+                let name = element.local_name().as_ref().to_owned();
                 stack.push(XmlNode {
                     name,
                     text: String::new(),
@@ -1307,8 +1306,7 @@ fn parse_xml(raw: &[u8]) -> S3Result<XmlNode> {
                 });
             }
             Event::Empty(element) => {
-                let name = String::from_utf8(element.local_name().as_ref().to_vec())
-                    .map_err(|_| S3Error::local("S3 XML has an invalid name"))?;
+                let name = element.local_name().as_ref().to_owned();
                 let node = XmlNode {
                     name,
                     text: String::new(),
@@ -1322,30 +1320,20 @@ fn parse_xml(raw: &[u8]) -> S3Result<XmlNode> {
             }
             Event::Text(text) => {
                 if let Some(parent) = stack.last_mut() {
-                    let decoded = text
-                        .decode()
-                        .map_err(|_| S3Error::local("S3 XML has invalid text"))?;
                     parent.text.push_str(
-                        &quick_xml::escape::unescape(&decoded)
+                        &quick_xml::escape::unescape(text.as_ref())
                             .map_err(|_| S3Error::local("S3 XML has an invalid entity"))?,
                     );
                 }
             }
             Event::CData(text) => {
                 if let Some(parent) = stack.last_mut() {
-                    parent.text.push_str(
-                        &text
-                            .decode()
-                            .map_err(|_| S3Error::local("S3 XML has invalid CDATA"))?,
-                    );
+                    parent.text.push_str(text.as_ref());
                 }
             }
             Event::GeneralRef(reference) => {
                 if let Some(parent) = stack.last_mut() {
-                    let name = reference
-                        .decode()
-                        .map_err(|_| S3Error::local("S3 XML has invalid entity"))?;
-                    let escaped = format!("&{name};");
+                    let escaped = format!("&{};", reference.as_ref());
                     parent.text.push_str(
                         &quick_xml::escape::unescape(&escaped)
                             .map_err(|_| S3Error::local("S3 XML has invalid entity"))?,
@@ -1428,8 +1416,8 @@ fn operation_result(operation: &str, node: &XmlNode) -> S3Result<Value> {
                     | ("list_parts", "Parts")
             )
         {
-            result.insert(section.to_owned(), values.into());
             result.remove(element);
+            result.insert(section.to_owned(), values.into());
         }
     }
     if operation.starts_with("list_") && !result.contains_key("IsTruncated") {
@@ -3330,6 +3318,69 @@ pub(crate) mod tests {
                 .contains("NextVersionIdMarker")
         );
         worker.finish_requests();
+    }
+
+    #[test]
+    fn xml_listing_preserves_namespaced_elements_and_key_text() {
+        let node = parse_xml(
+            "<s3:ListBucketResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <s3:IsTruncated>false</s3:IsTruncated><s3:KeyCount>2</s3:KeyCount><s3:Contents>\
+             <s3:Key> 目录/&amp;&lt;&gt;&quot;&apos;&amp;lt;&#65;&#x4E2D;&#x1F600;\
+             <![CDATA[/raw&<>&amp;\r\n]]>tail </s3:Key>\
+             <s3:Size>7</s3:Size><s3:StorageClass/></s3:Contents>\
+             <s3:Contents><s3:Key>second</s3:Key><s3:Size>0</s3:Size></s3:Contents>\
+             <s3:CommonPrefixes><s3:Prefix>目录/</s3:Prefix></s3:CommonPrefixes>\
+             <s3:CommonPrefixes><s3:Prefix>other/</s3:Prefix></s3:CommonPrefixes>\
+             </s3:ListBucketResult>"
+                .as_bytes(),
+        )
+        .unwrap();
+        let result = operation_result("list_objects_v2", &node).unwrap();
+        assert_eq!(result["IsTruncated"], false);
+        assert_eq!(result["KeyCount"], 2);
+        assert_eq!(result["Contents"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            result["Contents"][0]["Key"],
+            " 目录/&<>\"'&lt;A中😀/raw&<>&amp;\r\ntail "
+        );
+        assert_eq!(result["Contents"][0]["Size"], 7);
+        assert_eq!(result["Contents"][0]["StorageClass"], "");
+        assert_eq!(result["Contents"][1], json!({"Key": "second", "Size": 0}));
+        assert_eq!(
+            result["CommonPrefixes"],
+            json!([{"Prefix": "目录/"}, {"Prefix": "other/"}])
+        );
+    }
+
+    #[test]
+    fn xml_empty_object_listing_retains_contents_array() {
+        let node =
+            parse_xml(b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
+                .unwrap();
+        let result = operation_result("list_objects_v2", &node).unwrap();
+        assert_eq!(result["Contents"], json!([]));
+        assert!(result.get("CommonPrefixes").is_none());
+    }
+
+    #[test]
+    fn xml_text_preserves_line_endings_and_whitespace() {
+        let node = parse_xml(b"<Root><Key> \r\na\rb\nc\t </Key></Root>").unwrap();
+        assert_eq!(node.child("Key").unwrap().text, " \r\na\rb\nc\t ");
+    }
+
+    #[test]
+    fn xml_invalid_utf8_and_entities_fail() {
+        for raw in [
+            b"<Ro\xffot/>".as_slice(),
+            b"<Root>\xff</Root>".as_slice(),
+            b"<Root><![CDATA[\xff]]></Root>".as_slice(),
+            b"<Root>&bad\xff;</Root>".as_slice(),
+            b"<Root>&unknown;</Root>".as_slice(),
+            b"<Root>&#x110000;</Root>".as_slice(),
+            b"<Root>&#not-a-number;</Root>".as_slice(),
+        ] {
+            assert!(parse_xml(raw).is_err(), "accepted invalid XML: {raw:?}");
+        }
     }
 
     #[test]
