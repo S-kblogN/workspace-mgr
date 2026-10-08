@@ -414,10 +414,10 @@ fn rollback_deliverable(
     if let Some((path, contents)) = manifest {
         rollback = combine_rollbacks(rollback, atomic_write(path, contents));
     }
-    if let Some(relocation) = relocation {
-        if let Err(error) = relocation.restore() {
-            return combine_rollbacks(rollback, Err(error));
-        }
+    if let Some(relocation) = relocation
+        && let Err(error) = relocation.restore()
+    {
+        return combine_rollbacks(rollback, Err(error));
     }
     combine_rollbacks(
         rollback,

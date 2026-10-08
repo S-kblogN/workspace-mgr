@@ -98,12 +98,12 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
             dry_run: options.dry_run,
         },
     )?;
-    if let Some(owner) = &owner {
-        if !allowed(&path, &owner.scopes()) {
-            return Err(Error::message(
-                "legacy adoption path escapes the infrastructure task's declared scopes",
-            ));
-        }
+    if let Some(owner) = &owner
+        && !allowed(&path, &owner.scopes())
+    {
+        return Err(Error::message(
+            "legacy adoption path escapes the infrastructure task's declared scopes",
+        ));
     }
     let base = repo.fetch_branch(&config.git.remote, &config.git.branch)?;
     require_supported_cli_at(

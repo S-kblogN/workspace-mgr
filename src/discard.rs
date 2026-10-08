@@ -765,39 +765,38 @@ fn finish_cleanup(context: &DiscardContext, quarantine: &Path) -> Vec<String> {
             )),
         }
     }
-    if let Err(error) = fs::remove_dir_all(&context.state_dir) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            warnings.push(format!(
-                "failed to remove private task state {}: {error}",
-                context.state_dir.display()
-            ));
-        }
+    if let Err(error) = fs::remove_dir_all(&context.state_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warnings.push(format!(
+            "failed to remove private task state {}: {error}",
+            context.state_dir.display()
+        ));
     }
     if context.task.kind == TaskKind::Infrastructure {
-        if let Err(error) = fs::remove_file(&context.task.manifest_path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warnings.push(format!(
-                    "failed to remove private infrastructure manifest: {error}"
-                ));
-            }
-        }
-        if let Some(parent) = context.task.manifest_path.parent() {
-            if let Err(error) = fs::remove_dir(parent) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warnings.push(format!(
-                        "failed to remove private infrastructure task directory: {error}"
-                    ));
-                }
-            }
-        }
-    }
-    if let Err(error) = fs::remove_dir_all(quarantine) {
-        if error.kind() != std::io::ErrorKind::NotFound {
+        if let Err(error) = fs::remove_file(&context.task.manifest_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
             warnings.push(format!(
-                "failed to remove private discard quarantine {}: {error}",
-                quarantine.display()
+                "failed to remove private infrastructure manifest: {error}"
             ));
         }
+        if let Some(parent) = context.task.manifest_path.parent()
+            && let Err(error) = fs::remove_dir(parent)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warnings.push(format!(
+                "failed to remove private infrastructure task directory: {error}"
+            ));
+        }
+    }
+    if let Err(error) = fs::remove_dir_all(quarantine)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warnings.push(format!(
+            "failed to remove private discard quarantine {}: {error}",
+            quarantine.display()
+        ));
     }
     warnings
 }

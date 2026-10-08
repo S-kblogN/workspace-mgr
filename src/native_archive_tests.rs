@@ -391,14 +391,13 @@ impl Storage for Memory {
                 | "delete_object"
                 | "put_object"
                 | "put_object_tagging"
-        ) {
-            if let Some(path) = &self.state.borrow().require_fenced_journal {
-                let private: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-                assert_eq!(
-                    private["schema_version"], 2,
-                    "private fence must precede {method}"
-                );
-            }
+        ) && let Some(path) = &self.state.borrow().require_fenced_journal
+        {
+            let private: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(
+                private["schema_version"], 2,
+                "private fence must precede {method}"
+            );
         }
         {
             let mut state = self.state.borrow_mut();

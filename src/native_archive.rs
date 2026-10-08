@@ -659,19 +659,19 @@ fn verify_reservation(
             "archive copy reservation does not contain a normalized planned receipt",
         ));
     }
-    if let Some(planned) = payload.get("planned") {
-        if crate::archive_reservation::normalized_receipt(planned)? != *receipt {
-            return Err(message(
-                "archive copy reservation selects another planned receipt",
-            ));
-        }
+    if let Some(planned) = payload.get("planned")
+        && crate::archive_reservation::normalized_receipt(planned)? != *receipt
+    {
+        return Err(message(
+            "archive copy reservation selects another planned receipt",
+        ));
     }
-    if let Some(journal) = journal {
-        if source_signature(rows(journal)?) != source_signature(rows(receipt)?) {
-            return Err(message(
-                "archive copy reservation selects another original source snapshot",
-            ));
-        }
+    if let Some(journal) = journal
+        && source_signature(rows(journal)?) != source_signature(rows(receipt)?)
+    {
+        return Err(message(
+            "archive copy reservation selects another original source snapshot",
+        ));
     }
     let root = text(proof, "repo_path")?;
     let canonical_root = repo.root.canonicalize().at(&repo.root)?;
@@ -1098,17 +1098,16 @@ fn cancel_inventory(
         let records = row["cancel_owned_versions"].as_array().ok_or_else(|| {
             message("archive cancellation contains an invalid private version inventory")
         })?;
-        if let Some(version) = &version {
-            if !records
+        if let Some(version) = &version
+            && !records
                 .iter()
                 .any(|record| record["version_id"] == *version)
-            {
-                let record = json!({"version_id":version,"etag":row["destination_etag"],"delete_marker":row["delete_marker"],"started":row["cancel_started"] == true,"deleted":row["cancel_deleted"] == true});
-                row["cancel_owned_versions"]
-                    .as_array_mut()
-                    .ok_or_else(|| message("invalid cancel inventory"))?
-                    .push(record);
-            }
+        {
+            let record = json!({"version_id":version,"etag":row["destination_etag"],"delete_marker":row["delete_marker"],"started":row["cancel_started"] == true,"deleted":row["cancel_deleted"] == true});
+            row["cancel_owned_versions"]
+                .as_array_mut()
+                .ok_or_else(|| message("invalid cancel inventory"))?
+                .push(record);
         }
         let records = row["cancel_owned_versions"]
             .as_array()

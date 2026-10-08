@@ -1601,13 +1601,15 @@ fn ini_section(raw: &str, section: &str) -> BTreeMap<String, String> {
                 name
             };
             active = name == section;
-        } else if active && !line.starts_with('#') && !line.starts_with(';') {
-            if let Some((key, value)) = line.split_once('=') {
-                found.insert(
-                    key.trim().to_ascii_lowercase(),
-                    value.trim().trim_matches('"').to_owned(),
-                );
-            }
+        } else if active
+            && !line.starts_with('#')
+            && !line.starts_with(';')
+            && let Some((key, value)) = line.split_once('=')
+        {
+            found.insert(
+                key.trim().to_ascii_lowercase(),
+                value.trim().trim_matches('"').to_owned(),
+            );
         }
     }
     found

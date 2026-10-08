@@ -737,10 +737,11 @@ fn legacy_controls(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
             )));
         }
     }
-    if let Some(value) = settings.get("version_aware") {
-        if value != "true" && value != "false" {
-            return Err(Error::message("legacy version_aware must be true or false"));
-        }
+    if let Some(value) = settings.get("version_aware")
+        && value != "true"
+        && value != "false"
+    {
+        return Err(Error::message("legacy version_aware must be true or false"));
     }
     plan.legacy_version_aware = settings
         .get("version_aware")
@@ -997,10 +998,8 @@ fn reject_pending_transactions(repo: &GitRepo) -> Result<()> {
                     "archive-attempts" => {
                         let terminal =
                             matches!(value["status"].as_str(), Some("published" | "cancelled"));
-                        if terminal {
-                            if let Some(source) = value["source"].as_str() {
-                                terminal_sources.insert(source.to_owned());
-                            }
+                        if terminal && let Some(source) = value["source"].as_str() {
+                            terminal_sources.insert(source.to_owned());
                         }
                         terminal
                     }

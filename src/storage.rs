@@ -758,12 +758,11 @@ pub fn is_local(repo: &GitRepo, path: &str) -> Result<bool> {
 pub fn local_boundaries(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String>> {
     let mut result = BTreeSet::new();
     for path in repo.visible_paths(scopes)? {
-        if let Some(boundary) = path.strip_suffix(PLACEMENT_SUFFIX) {
-            if read_placement(repo, boundary)?
+        if let Some(boundary) = path.strip_suffix(PLACEMENT_SUFFIX)
+            && read_placement(repo, boundary)?
                 .is_some_and(|value| value.target == StorageTarget::Local)
-            {
-                result.insert(boundary.to_owned());
-            }
+        {
+            result.insert(boundary.to_owned());
         }
     }
     Ok(result)

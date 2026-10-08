@@ -220,7 +220,7 @@ fn opaque_ignored_directories(repo: &GitRepo, source: &str) -> Result<BTreeSet<V
         .split(|byte| *byte == b'\0')
         .collect::<Vec<_>>();
     let mut opaque = BTreeSet::new();
-    for fields in fields.chunks_exact(4) {
+    for fields in fields.as_chunks::<4>().0 {
         if candidates.contains(fields[3]) && !fields[0].is_empty() && !fields[2].starts_with(b"!") {
             opaque.insert(fields[3].to_vec());
         }

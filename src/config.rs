@@ -275,14 +275,14 @@ fn require_supported_cli_at_by(
     installed: &Version,
 ) -> Result<Option<Version>> {
     let declared = minimum_cli_version_at(repo, revision)?;
-    if let Some(required) = &declared {
-        if !cli_version_satisfies(installed, required) {
-            return Err(unsupported_cli_error(
-                installed,
-                required,
-                &format!("{CONFIG_NAME} on {location}"),
-            ));
-        }
+    if let Some(required) = &declared
+        && !cli_version_satisfies(installed, required)
+    {
+        return Err(unsupported_cli_error(
+            installed,
+            required,
+            &format!("{CONFIG_NAME} on {location}"),
+        ));
     }
     Ok(declared)
 }
