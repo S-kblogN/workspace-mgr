@@ -404,6 +404,167 @@ fn generic_purge_deletes_complete_exact_object_history_including_markers() {
     );
 }
 
+fn oversized_purge_candidates() -> Value {
+    // Real candidate fields carry the size: every distinct, exact version ID
+    // is 480 ASCII bytes, rather than padding an ignored metadata field.
+    let suffix = "v".repeat(475);
+    let candidates = (0..6_869)
+        .map(|index| {
+            json!({"pointer":"task/a.dvc","object":"task/a","version_id":format!("{index:04}-{suffix}")})
+        })
+        .collect::<Vec<_>>();
+    let payload = Value::Array(candidates);
+    assert!(serde_json::to_vec(&payload).unwrap().len() > 3 * 1024 * 1024);
+    payload
+}
+
+#[test]
+fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let (_directory, repo) = repo();
+    let payload = oversized_purge_candidates();
+    let candidates = payload.as_array().unwrap();
+    assert_eq!(candidates.len(), 6_869);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate["version_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        candidates.len()
+    );
+    // All other requested versions have already disappeared during a prior
+    // attempt. Two payload versions and one delete marker remain to retire.
+    let present =
+        [0, 3_000, 6_868].map(|index| candidates[index]["version_id"].as_str().unwrap().to_owned());
+    let expected_deleted = present.iter().cloned().collect::<BTreeSet<_>>();
+    let retired = Arc::new(Mutex::new(BTreeSet::new()));
+    let inventory_reads = Arc::new(AtomicUsize::new(0));
+    let handler_retired = retired.clone();
+    let handler_reads = inventory_reads.clone();
+    let handler_present = present.clone();
+    // Public adapter registry inspection: versioning + two empty listings (3).
+    // Native purge: versioning (1), generic registry lookup (2), history (1),
+    // three exact DELETEs (3), then complete post-delete history verification (1).
+    let (client, worker) = fixture_handler(11, move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if request.method == "DELETE" {
+            assert_eq!(url.path(), "/fixture-bucket/root/task/a");
+            let version = query.get("versionId").unwrap();
+            assert!(
+                handler_present.contains(version),
+                "unrequested deletion: {version}"
+            );
+            assert!(handler_retired.lock().unwrap().insert(version.clone()));
+            return deleted();
+        }
+        assert_eq!(request.method, "GET");
+        if query.contains_key("versioning") {
+            return versioning();
+        }
+        assert!(query.contains_key("versions"));
+        let prefix = query.get("prefix").unwrap();
+        if *prefix == registry_object() {
+            return history("");
+        }
+        assert_eq!(prefix, "root/task/a");
+        let scan = handler_reads.fetch_add(1, Ordering::SeqCst);
+        let retired = handler_retired.lock().unwrap();
+        assert_eq!(retired.len(), if scan == 0 { 0 } else { 3 });
+        let mut rows = String::new();
+        for version in &handler_present[..2] {
+            if !retired.contains(version) {
+                rows.push_str(&version_row("root/task/a", version));
+            }
+        }
+        if !retired.contains(&handler_present[2]) {
+            rows.push_str(&marker_row("root/task/a", &handler_present[2]));
+        }
+        // S3 prefix listings also return this neighboring key. It remains in
+        // both inventories while the exact target's final history is empty.
+        rows.push_str(&version_row("root/task/ab", "neighbor-version"));
+        history(&rows)
+    });
+    configure_repo(&client, &repo);
+    let result = crate::dvc::version_purge_adapter(&repo, "delete", &payload).unwrap();
+    assert_eq!(result["mode"], "permanent-version-deletion");
+    assert_eq!(result["remote"], "workspace-mgr");
+    assert_eq!(result["deleted"].as_array().unwrap().len(), 1);
+    assert_eq!(result["deleted"][0]["object"], "task/a");
+    assert_eq!(result["deleted"][0]["pointer"], "task/a.dvc");
+    assert_eq!(
+        result["deleted"][0]["deleted_version_ids"],
+        json!(expected_deleted.iter().cloned().collect::<Vec<_>>())
+    );
+    assert_eq!(*retired.lock().unwrap(), expected_deleted);
+    assert_eq!(inventory_reads.load(Ordering::SeqCst), 2);
+    // Generic retirement reports per object, including retries with absent IDs.
+    assert_eq!(result["already_absent"], json!([]));
+    assert_eq!(result["retained_unmapped"], json!([]));
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 11);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .count(),
+        3
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .all(|request| {
+                request
+                    .target
+                    .starts_with("/fixture-bucket/root/task/a?versionId=")
+                    && !request.target.contains("neighbor-version")
+            })
+    );
+    assert_eq!(requests.last().unwrap().method, "GET");
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .target
+            .contains("prefix=root%2Ftask%2Fa")
+    );
+}
+
+#[test]
+fn large_purge_adapter_validates_last_candidate_before_any_deletion() {
+    let (_directory, repo) = repo();
+    let mut payload = oversized_purge_candidates();
+    payload.as_array_mut().unwrap().last_mut().unwrap()["version_id"] = json!("");
+    assert_eq!(payload.as_array().unwrap().len(), 6_869);
+    assert!(serde_json::to_vec(&payload).unwrap().len() > 3 * 1024 * 1024);
+    // Public adapter inspect (3 requests) and native bucket versioning (1)
+    // precede validation. No object history or DELETE may be reached.
+    let (client, worker) = fixture(vec![versioning(), history(""), history(""), versioning()]);
+    configure_repo(&client, &repo);
+    let error = crate::dvc::version_purge_adapter(&repo, "delete", &payload)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing or invalid version_id"), "{error}");
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| request.method == "GET"));
+    for request in requests {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if query.contains_key("versions") {
+            assert_eq!(query.get("prefix").unwrap(), &registry_object());
+        } else {
+            assert!(query.contains_key("versioning"));
+        }
+    }
+}
+
 #[test]
 fn archive_purge_rejects_missing_coordination_and_unpublished_private_proof() {
     let (_directory, repo) = repo();

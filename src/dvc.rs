@@ -893,6 +893,8 @@ pub fn version_purge_adapter(
     if !coordination.is_empty() {
         request["coordination"] = coordination.into();
     }
+    // Purge journals can exceed execve's argument-size limit; keep the full
+    // request in-process instead of handing serialized JSON to a subprocess.
     crate::native_versions::purge(repo, operation, &request)
 }
 

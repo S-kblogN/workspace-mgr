@@ -23,6 +23,7 @@ use crate::hex::encode_lower;
 const MAX_LIST_PAGES: usize = 100_000;
 const XML_LIMIT: u64 = 64 * 1024 * 1024;
 const MEMORY_GET_LIMIT: u64 = 64 * 1024 * 1024;
+const INTERRUPTED_READ_RETRIES: usize = 2;
 
 #[derive(Clone)]
 struct Credentials {
@@ -248,11 +249,7 @@ impl S3Client {
         body: Option<&[u8]>,
     ) -> S3Result<S3Response> {
         let plan = self.plan(operation, args, body)?;
-        let request = self.request(&plan, &plan.body, None)?;
-        let response = self
-            .agent
-            .run(request)
-            .map_err(|error| S3Error::transport(error.to_string()))?;
+        let response = self.run_buffered_request(&plan, &plan.body)?;
         self.read_response(operation, response)
     }
 
@@ -260,11 +257,7 @@ impl S3Client {
     /// count and digest before atomically installing the cache object.
     pub fn get_to_file(&self, args: &Value, destination: &Path) -> S3Result<S3Response> {
         let plan = self.plan("get_object", args, None)?;
-        let request = self.request(&plan, &[][..], None)?;
-        let mut response = self
-            .agent
-            .run(request)
-            .map_err(|error| S3Error::transport(error.to_string()))?;
+        let mut response = self.run_buffered_request(&plan, &[])?;
         if !response.status().is_success() {
             return self.read_response("get_object", response);
         }
@@ -647,6 +640,31 @@ impl S3Client {
                 .or_insert_with(|| "application/xml".to_owned());
         }
         Ok(plan)
+    }
+
+    fn run_buffered_request(
+        &self,
+        plan: &RequestPlan,
+        body: &[u8],
+    ) -> S3Result<ureq::http::Response<ureq::Body>> {
+        let mut retries = 0;
+        loop {
+            // Rebuild and sign each attempt. Only interrupted GET/HEAD I/O
+            // before a response is available can be replayed; response-body
+            // validation remains outside this loop, and writes are never retried.
+            let request = self.request(plan, body, None)?;
+            match self.agent.run(request) {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if matches!(plan.method, "GET" | "HEAD")
+                        && retries < INTERRUPTED_READ_RETRIES
+                        && matches!(&error, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted) =>
+                {
+                    retries += 1;
+                }
+                Err(error) => return Err(S3Error::transport(error.to_string())),
+            }
+        }
     }
 
     fn request<B: ureq::AsSendBody>(
@@ -1601,7 +1619,66 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::thread;
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{ConnectionDetails, Connector, DefaultConnector, Transport};
+
+    #[derive(Debug, Clone, Copy)]
+    enum InjectedFailure {
+        Io(std::io::ErrorKind),
+        Timeout,
+    }
+
+    #[derive(Debug)]
+    struct FailingConnector {
+        attempts: Arc<AtomicUsize>,
+        failures: usize,
+        failure: InjectedFailure,
+        delegate: DefaultConnector,
+    }
+
+    impl Connector for FailingConnector {
+        type Out = Box<dyn Transport>;
+
+        fn connect(
+            &self,
+            details: &ConnectionDetails,
+            chained: Option<()>,
+        ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < self.failures {
+                return Err(match self.failure {
+                    InjectedFailure::Io(kind) => {
+                        ureq::Error::Io(std::io::Error::new(kind, "injected connection failure"))
+                    }
+                    InjectedFailure::Timeout => ureq::Error::Timeout(ureq::Timeout::Connect),
+                });
+            }
+            self.delegate.connect(details, chained)
+        }
+    }
+
+    fn inject_connector_failure(
+        mut client: S3Client,
+        failures: usize,
+        failure: InjectedFailure,
+    ) -> (S3Client, Arc<AtomicUsize>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        client.agent = ureq::Agent::with_parts(
+            client.agent.config().clone(),
+            FailingConnector {
+                attempts: attempts.clone(),
+                failures,
+                failure,
+                delegate: DefaultConnector::default(),
+            },
+            DefaultResolver::default(),
+        );
+        (client, attempts)
+    }
 
     #[derive(Debug)]
     pub(crate) struct WireRequest {
@@ -1948,6 +2025,171 @@ pub(crate) mod tests {
             requests[1].headers["x-amz-content-sha256"],
             encode_lower(Sha256::digest(&bytes))
         );
+    }
+
+    #[test]
+    fn interrupted_read_connections_recover_exact_metadata_and_bytes() {
+        let bytes = vec![0, 255, 42, 13, 10];
+        for (operation, streamed, failures) in [
+            ("head_object", false, 1),
+            ("get_object", false, 1),
+            ("get_object", true, 2),
+        ] {
+            let (client, worker) = fixture(vec![Reply {
+                status: 200,
+                headers: vec![
+                    ("Content-Length", bytes.len().to_string()),
+                    ("x-amz-version-id", "v/+=1".into()),
+                    ("ETag", "\"abc\"".into()),
+                    ("x-amz-meta-proof", "exact".into()),
+                ],
+                body: if operation == "head_object" {
+                    Vec::new()
+                } else {
+                    bytes.clone()
+                },
+            }]);
+            let (client, attempts) = inject_connector_failure(
+                client,
+                failures,
+                InjectedFailure::Io(std::io::ErrorKind::Interrupted),
+            );
+            let args = json!({"Key":"root/a//b","VersionId":"v/+=1","IfMatch":"\"abc\""});
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("scratch");
+            let response = if streamed {
+                client.get_to_file(&args, &destination).unwrap()
+            } else {
+                client.call_s3(operation, &args, None).unwrap()
+            };
+            assert_eq!(attempts.load(Ordering::SeqCst), failures + 1);
+            assert_eq!(response.value["ContentLength"], bytes.len());
+            assert_eq!(response.value["VersionId"], "v/+=1");
+            assert_eq!(response.value["ETag"], "\"abc\"");
+            assert_eq!(response.value["Metadata"]["proof"], "exact");
+            if streamed {
+                assert_eq!(fs::read(destination).unwrap(), bytes);
+                assert!(response.body.is_empty());
+            } else if operation == "get_object" {
+                assert_eq!(response.body, bytes);
+            } else {
+                assert!(response.body.is_empty());
+            }
+            let requests = worker.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].method,
+                if operation == "head_object" {
+                    "HEAD"
+                } else {
+                    "GET"
+                }
+            );
+            assert_eq!(
+                requests[0].target,
+                "/fixture-bucket/root/a//b?versionId=v%2F%2B%3D1"
+            );
+            assert_eq!(requests[0].headers["if-match"], "\"abc\"");
+            assert!(requests[0].headers["authorization"].contains("if-match"));
+        }
+    }
+
+    #[test]
+    fn interrupted_read_connections_are_bounded_to_three_attempts() {
+        for (operation, streamed) in [
+            ("head_object", false),
+            ("get_object", false),
+            ("get_object", true),
+        ] {
+            let (client, worker) = fixture(Vec::new());
+            let (client, attempts) = inject_connector_failure(
+                client,
+                usize::MAX,
+                InjectedFailure::Io(std::io::ErrorKind::Interrupted),
+            );
+            let args = json!({"Key":"root/a","VersionId":"v1"});
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("scratch");
+            let error = if streamed {
+                client.get_to_file(&args, &destination).unwrap_err()
+            } else {
+                client.call_s3(operation, &args, None).unwrap_err()
+            };
+            assert_eq!(error.code, "TransportError");
+            assert!(error.message.contains("injected connection failure"));
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            assert!(!destination.exists());
+            assert!(worker.join().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn read_connections_do_not_retry_other_io_errors_or_timeouts() {
+        for failure in [
+            InjectedFailure::Io(std::io::ErrorKind::PermissionDenied),
+            InjectedFailure::Io(std::io::ErrorKind::TimedOut),
+            InjectedFailure::Io(std::io::ErrorKind::ConnectionReset),
+            InjectedFailure::Timeout,
+        ] {
+            let (client, worker) = fixture(Vec::new());
+            let (client, attempts) = inject_connector_failure(client, usize::MAX, failure);
+            let error = client
+                .call_s3(
+                    "get_object",
+                    &json!({"Key":"root/a","VersionId":"v1"}),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "TransportError");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(worker.join().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn interrupted_mutation_connections_are_never_replayed() {
+        let args = json!({"Key":"root/a","VersionId":"v1","CopySource":{"Bucket":"fixture-bucket","Key":"root/source","VersionId":"src"},"UploadId":"upload","PartNumber":1,"MultipartUpload":{"Parts":[{"PartNumber":1,"ETag":"\"part\""}]}});
+        for operation in [
+            "put_object",
+            "copy_object",
+            "delete_object",
+            "delete_object_tagging",
+            "create_multipart_upload",
+            "upload_part",
+            "upload_part_copy",
+            "complete_multipart_upload",
+            "abort_multipart_upload",
+        ] {
+            let (client, worker) = fixture(Vec::new());
+            let (client, attempts) = inject_connector_failure(
+                client,
+                usize::MAX,
+                InjectedFailure::Io(std::io::ErrorKind::Interrupted),
+            );
+            let error = client.call_s3(operation, &args, Some(b"abc")).unwrap_err();
+            assert_eq!(error.code, "TransportError", "{operation}");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "{operation}");
+            assert!(worker.join().unwrap().is_empty());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::write(&source, b"abc").unwrap();
+        for part in [false, true] {
+            let (client, worker) = fixture(Vec::new());
+            let (client, attempts) = inject_connector_failure(
+                client,
+                usize::MAX,
+                InjectedFailure::Io(std::io::ErrorKind::Interrupted),
+            );
+            let error = if part {
+                client.upload_part_file(&args, &source, 0, 3).unwrap_err()
+            } else {
+                client.put_file(&args, &source).unwrap_err()
+            };
+            assert_eq!(error.code, "TransportError");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(worker.join().unwrap().is_empty());
+        }
     }
 
     #[test]
