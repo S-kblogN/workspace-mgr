@@ -529,11 +529,9 @@ fn paths_at(repo: &GitRepo, revision: &str, scopes: &[String]) -> Result<Vec<Str
 fn pointers_at(repo: &GitRepo, revision: &str, scopes: &[String]) -> Result<Vec<String>> {
     Ok(paths_at(repo, revision, scopes)?
         .into_iter()
-        // Metadata whose path contains a backslash stays in: the purge adapter
-        // collects each pointer through the engine's Python API, which reads
-        // that path literally, unlike the engine's `status` command. Dropping
-        // it here would leave the versions of a path a rename or deletion
-        // retires in the bucket forever.
+        // Keep literal backslashes: native metadata reads each pointer through
+        // Git at this revision. Dropping such a path would leave retired object
+        // versions in the bucket after a rename or deletion.
         .filter(|path| path.ends_with(".dvc"))
         .collect())
 }
@@ -594,8 +592,24 @@ fn referenced_objects(
         .collect::<BTreeSet<_>>();
     let mut requests = Vec::new();
     let mut archive_protected = BTreeSet::new();
+    let mut live_trees = BTreeSet::new();
     for revision in revisions {
-        let mut pointers = Vec::new();
+        // Coordination tags can name blobs; commit and tree references can
+        // contain live pointers. Peel nested annotated tags recursively.
+        let kind = repo.run(["cat-file", "-t", &format!("{revision}^{{}}")])?;
+        if kind.stdout.trim() == "blob" {
+            continue;
+        }
+        let tree = repo.run(["rev-parse", "--verify", &format!("{revision}^{{tree}}")])?;
+        let revision = tree.stdout.trim().to_owned();
+        if !live_trees.insert(revision.clone()) {
+            continue;
+        }
+        // A pending child pointer can disappear while a newly published
+        // parent or renamed pointer still references the same object. Generic
+        // retirement deletes its entire history, so collect references by
+        // actual object identity through every live pointer, not its old name.
+        let mut pointers = pointers_at(repo, &revision, &[])?;
         for pointer in &candidate_pointers {
             if let Some(source) =
                 pointer.strip_suffix(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
@@ -608,20 +622,13 @@ fn referenced_objects(
                 // path; a same-named blob or coordination tag is not.
                 let source_tree =
                     repo.run_unchecked(["cat-file", "-t", &format!("{revision}:{source}")])?;
-                if source_tree.success() && source_tree.stdout.trim() == "tree" {
-                    if published_archive_sources.contains(source) {
-                        pointers.extend(pointers_at(repo, &revision, &[source.to_owned()])?);
-                    } else {
-                        archive_protected.insert(format!("{source}/"));
-                    }
+                if source_tree.success()
+                    && source_tree.stdout.trim() == "tree"
+                    && !published_archive_sources.contains(source)
+                {
+                    archive_protected.insert(format!("{source}/"));
                 }
                 continue;
-            }
-            if repo
-                .run_unchecked(["cat-file", "-e", &format!("{revision}:{pointer}")])?
-                .success()
-            {
-                pointers.push(pointer.clone());
             }
         }
         pointers.sort();
@@ -1504,5 +1511,263 @@ mod tests {
             .filter(|candidate| !protected.contains(candidate))
             .collect::<Vec<_>>();
         assert_eq!(destructive, [&candidates[2]]);
+    }
+
+    fn write_reference_directory(
+        repo: &GitRepo,
+        pointer: &str,
+        output: &str,
+        relpath: &str,
+        version: &str,
+    ) {
+        let files = [dvc::PointerFileVersion {
+            relpath: relpath.to_owned(),
+            md5: Some("900150983cd24fb0d6963f7d28e17f72".to_owned()),
+            size: Some(3),
+            version_id: Some(version.to_owned()),
+            etag: Some("abc".to_owned()),
+        }];
+        let digest = crate::native_engine::directory_digest(&files).unwrap();
+        let path = repo.root.join(pointer);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!(
+                "outs:\n- path: {output}\n  hash: md5\n  md5: {digest}\n  size: 3\n  nfiles: 1\n  files:\n  - relpath: {relpath}\n    md5: 900150983cd24fb0d6963f7d28e17f72\n    size: 3\n    cloud:\n      workspace-mgr:\n        version_id: {version}\n        etag: abc\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn parent_reference_fixture(tag: bool) -> (tempfile::TempDir, GitRepo, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let remote = directory.path().join("remote.git");
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let repo = GitRepo { root: checkout };
+        repo.run(["init", "-q", "--bare", remote.to_str().unwrap()])
+            .unwrap();
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        repo.run(["config", "user.name", "Parent reference fixture"])
+            .unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        fs::write(repo.root.join("README.md"), "isolated reference fixture\n").unwrap();
+        write_reference_directory(
+            &repo,
+            "task/data/child.dvc",
+            "child",
+            "a.bin",
+            "old-version",
+        );
+        repo.run(["add", "."]).unwrap();
+        repo.run(["commit", "-m", "Publish the original child pointer"])
+            .unwrap();
+        repo.run(["rm", "task/data/child.dvc"]).unwrap();
+        repo.run(["commit", "-m", "Retire the child pointer before cleanup"])
+            .unwrap();
+        repo.run(["remote", "add", "origin", remote.to_str().unwrap()])
+            .unwrap();
+        repo.run(["push", "origin", "main"]).unwrap();
+
+        // Only a new parent pointer names the same physical object, now at a
+        // different version. The original candidate pointer is absent.
+        write_reference_directory(&repo, "task/data.dvc", "data", "child/a.bin", "new-version");
+        repo.run(["add", "task/data.dvc"]).unwrap();
+        repo.run(["commit", "-m", "Repack the object under a parent pointer"])
+            .unwrap();
+        let reference = if tag {
+            repo.run(["tag", "-a", "parent-inner", "-m", "inner"])
+                .unwrap();
+            repo.run(["tag", "-a", "parent-live", "-m", "outer", "parent-inner"])
+                .unwrap();
+            repo.run(["push", "origin", "refs/tags/parent-live"])
+                .unwrap();
+            "refs/tags/parent-live"
+        } else {
+            repo.run(["push", "origin", "HEAD:refs/heads/parent-live"])
+                .unwrap();
+            "refs/heads/parent-live"
+        };
+        // Registry coordination tags can point directly to blobs, not trees.
+        let blob = repo.run(["hash-object", "-w", "README.md"]).unwrap();
+        repo.run([
+            "update-ref",
+            "refs/tags/workspace-mgr/archive-registry/fixture",
+            blob.stdout.trim(),
+        ])
+        .unwrap();
+        repo.run([
+            "push",
+            "origin",
+            "refs/tags/workspace-mgr/archive-registry/fixture",
+        ])
+        .unwrap();
+        (directory, repo, reference.to_owned())
+    }
+
+    fn retired_child_version() -> ObjectVersion {
+        ObjectVersion {
+            pointer: "task/data/child.dvc".to_owned(),
+            object: "task/data/child/a.bin".to_owned(),
+            version_id: "old-version".to_owned(),
+        }
+    }
+
+    fn check_live_parent_reference(tag: bool) {
+        let (_directory, repo, reference) = parent_reference_fixture(tag);
+        check_parent_object_protection(&repo, &reference);
+    }
+
+    fn check_parent_object_protection(repo: &GitRepo, reference: &str) {
+        let old = retired_child_version();
+        let neighbor = ObjectVersion {
+            object: format!("{}-neighbor", old.object),
+            ..old.clone()
+        };
+        let candidates = [old.clone(), neighbor];
+        let protected =
+            referenced_objects(repo, &Config::default(), "origin", &candidates).unwrap();
+        assert_eq!(protected, [old]);
+
+        // Local pointers and ancestor commits are not live remote references.
+        // Removing the only live parent releases both objects for retirement.
+        repo.run(["push", "origin", &format!(":{reference}")])
+            .unwrap();
+        assert!(
+            referenced_objects(repo, &Config::default(), "origin", &candidates)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_parent_pointer_on_remote_branch_protects_old_child_versions() {
+        check_live_parent_reference(false);
+    }
+
+    #[test]
+    fn live_parent_pointer_on_remote_tag_protects_old_child_versions() {
+        check_live_parent_reference(true);
+    }
+
+    #[test]
+    fn differently_named_live_pointer_protects_its_actual_object() {
+        let (_directory, repo, reference) = parent_reference_fixture(false);
+        repo.run(["rm", "task/data.dvc"]).unwrap();
+        // The metadata filename is not an ancestor of the retired object, and
+        // its output path differs from its own name. Protection must follow the
+        // parsed object reference rather than guess possible parent filenames.
+        write_reference_directory(
+            &repo,
+            "renamed-manifest.dvc",
+            "task/data",
+            "child/a.bin",
+            "new-version",
+        );
+        repo.run(["add", "renamed-manifest.dvc"]).unwrap();
+        repo.run([
+            "commit",
+            "-m",
+            "Publish an independently named reference manifest",
+        ])
+        .unwrap();
+        repo.run(["push", "origin", &format!("HEAD:{reference}")])
+            .unwrap();
+        check_parent_object_protection(&repo, &reference);
+    }
+
+    #[test]
+    fn parent_pointer_discovery_keeps_archive_retirement_exact_to_the_version() {
+        let (_directory, repo, _reference) = parent_reference_fixture(false);
+        let path = "2026/07/task/.workspace-mgr-archive.json";
+        fs::create_dir_all(repo.root.join("2026/07/task")).unwrap();
+        let receipt = serde_json::json!({
+            "schema_version":1,"task_id":"task","source":"task",
+            "destination":"2026/07/task","status":"copied",
+            "versions":[{
+                "source_object":"task/data/child/a.bin","source_version_id":"old-version",
+                "destination_object":"2026/07/task/data/child/a.bin",
+                "destination_version_id":"copied-version","delete_marker":false
+            }]
+        });
+        fs::write(repo.root.join(path), receipt.to_string()).unwrap();
+        repo.run(["add", path]).unwrap();
+        repo.run(["commit", "-m", "Publish the complete archive mapping"])
+            .unwrap();
+        repo.run(["push", "origin", "main"]).unwrap();
+        let mapped = archive_version("task", "data/child/a.bin", "old-version");
+        let live = archive_version("task", "data/child/a.bin", "new-version");
+        let unreferenced = archive_version("task", "data/child/a.bin", "unreferenced-version");
+        let protected = referenced_objects(
+            &repo,
+            &Config::default(),
+            "origin",
+            &[mapped, live.clone(), unreferenced],
+        )
+        .unwrap();
+        // Published mapped history can retire, while an unmapped generation
+        // requires an exact live reference rather than object-wide protection.
+        assert_eq!(protected, [live]);
+    }
+
+    #[test]
+    fn unrelated_live_pointer_without_an_exact_version_blocks_retirement() {
+        let (_directory, repo, _reference) = parent_reference_fixture(false);
+        fs::create_dir_all(repo.root.join("unrelated")).unwrap();
+        fs::write(
+            repo.root.join("unrelated/data.dvc"),
+            "outs:\n- path: data\n  hash: md5\n  md5: 900150983cd24fb0d6963f7d28e17f72\n  size: 3\n",
+        )
+        .unwrap();
+        repo.run(["add", "unrelated/data.dvc"]).unwrap();
+        repo.run([
+            "commit",
+            "-m",
+            "Publish incomplete unrelated version metadata",
+        ])
+        .unwrap();
+        repo.run(["push", "origin", "HEAD:refs/heads/parent-live"])
+            .unwrap();
+        let error = referenced_objects(
+            &repo,
+            &Config::default(),
+            "origin",
+            &[retired_child_version()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no exact version ID"));
+    }
+
+    #[test]
+    fn purge_pending_never_deletes_versions_referenced_by_a_new_parent_pointer() {
+        use crate::native_s3::tests::{Reply, configure_repo, fixture};
+
+        let (_directory, repo, _reference) = parent_reference_fixture(false);
+        let old = retired_child_version();
+        let (client, worker) = fixture(vec![Reply::xml(
+            "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+        )]);
+        configure_repo(&client, &repo);
+        let (_, endpoint_url) = dvc::internal_location(&repo).unwrap().unwrap();
+        let config = Config {
+            s3: Some(crate::config::S3Config {
+                url: "s3://fixture-bucket/root".to_owned(),
+                endpoint_url,
+            }),
+            ..Config::default()
+        };
+        dvc::write_internal_config(&repo, &config).unwrap();
+        queue(&repo, std::slice::from_ref(&old)).unwrap();
+        let report = purge_pending(&repo, &config, "origin").unwrap();
+        assert_eq!(report.status, "cleanup_pending");
+        assert_eq!(report.protected.as_slice(), std::slice::from_ref(&old));
+        assert_eq!(report.pending, [old]);
+        assert!(report.deleted.is_empty());
+        let requests = worker.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert!(requests[0].target.contains("versioning="));
+        assert!(requests.iter().all(|request| request.method != "DELETE"));
     }
 }

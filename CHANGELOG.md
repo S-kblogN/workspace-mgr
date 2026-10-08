@@ -5,6 +5,15 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-07
+
+### Fixed
+
+- Pending S3 retirement discovers every pointer in live remote branches and
+  tags, preserving objects republished under a parent or renamed pointer.
+  Blob coordination tags are skipped, nested annotated tags are peeled, and
+  archive exact-version and complete-prefix protection remain unchanged.
+
 ## [0.7.2] - 2026-10-07
 
 ### Fixed
