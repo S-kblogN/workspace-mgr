@@ -756,15 +756,15 @@ fn validate_pointer_bytes(metadata: &Metadata, path: &Path, current: &[u8]) -> R
 
 fn validate_metadata_mode(metadata: &Metadata, path: &Path) -> Result<()> {
     #[cfg(unix)]
-    if metadata.before.is_some() {
-        if let Some(mode) = metadata.unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            if fs::metadata(path).at(path)?.permissions().mode() != mode {
-                return Err(Error::message(format!(
-                    "archive metadata permissions changed independently: {}",
-                    path.display()
-                )));
-            }
+    if metadata.before.is_some()
+        && let Some(mode) = metadata.unix_mode
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path).at(path)?.permissions().mode() != mode {
+            return Err(Error::message(format!(
+                "archive metadata permissions changed independently: {}",
+                path.display()
+            )));
         }
     }
     #[cfg(not(unix))]

@@ -191,10 +191,10 @@ pub fn migrate(repo: &GitRepo, destination: &Path) -> Result<Vec<File>> {
             }
             aliases.insert(key, value);
         }
-        if let Some(previous) = destinations.insert(target.clone(), source.clone()) {
-            if !same_file(&previous, source)? {
-                return Err(conflict(target));
-            }
+        if let Some(previous) = destinations.insert(target.clone(), source.clone())
+            && !same_file(&previous, source)?
+        {
+            return Err(conflict(target));
         }
     }
     for target in destinations.keys() {
@@ -267,10 +267,10 @@ fn collect_moves(
         }
         let metadata = fs::symlink_metadata(&from).at(&from)?;
         if metadata.is_dir() {
-            if let Ok(existing) = fs::symlink_metadata(&to) {
-                if !existing.is_dir() || existing.file_type().is_symlink() {
-                    return Err(conflict(&to));
-                }
+            if let Ok(existing) = fs::symlink_metadata(&to)
+                && (!existing.is_dir() || existing.file_type().is_symlink())
+            {
+                return Err(conflict(&to));
             }
             collect_moves(&from, &to, false, moves)?;
         } else if metadata.is_file() || metadata.file_type().is_symlink() {

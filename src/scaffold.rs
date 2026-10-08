@@ -323,10 +323,10 @@ fn repository_rules_from_root(existing: &str) -> String {
             open = Some((key, index));
         } else if let Some(key) = line.strip_prefix(LOCAL_IGNORE_END) {
             managed.insert(index);
-            if let Some((expected, first)) = open.take() {
-                if expected == key {
-                    managed.extend(first..=index);
-                }
+            if let Some((expected, first)) = open.take()
+                && expected == key
+            {
+                managed.extend(first..=index);
             }
         }
     }
@@ -782,10 +782,10 @@ fn established_s3_location(
     if let Some(location) = committed_s3_location(repo)? {
         return Ok(location);
     }
-    if current.is_none() {
-        if let Some((url, endpoint, _)) = crate::native_s3::legacy_s3_configuration(&repo.root)? {
-            return Ok((url, endpoint));
-        }
+    if current.is_none()
+        && let Some((url, endpoint, _)) = crate::native_s3::legacy_s3_configuration(&repo.root)?
+    {
+        return Ok((url, endpoint));
     }
     current.and_then(|config| config.s3.as_ref()).map(|s3| (s3.url.clone(), s3.endpoint_url.clone())).ok_or_else(|| {
         Error::message(

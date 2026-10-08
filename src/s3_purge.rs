@@ -167,12 +167,12 @@ pub fn queue_archive_prefixes(repo: &GitRepo, receipts: &[serde_json::Value]) ->
             continue;
         }
         let source = receipt_prefix(receipt)?;
-        if let Some(previous) = state.pending_prefixes.get(&source) {
-            if previous != receipt {
-                return Err(Error::message(format!(
-                    "pending archive prefix {source:?} has a different immutable receipt"
-                )));
-            }
+        if let Some(previous) = state.pending_prefixes.get(&source)
+            && previous != receipt
+        {
+            return Err(Error::message(format!(
+                "pending archive prefix {source:?} has a different immutable receipt"
+            )));
         }
         state.pending_prefixes.insert(source, receipt.clone());
     }
@@ -376,12 +376,12 @@ fn promote_archive_prefixes(
         {
             continue;
         }
-        if let Some(previous) = state.pending_prefixes.get(&source) {
-            if previous != receipt {
-                return Err(Error::message(
-                    "pending source retirement differs from its published archive receipt",
-                ));
-            }
+        if let Some(previous) = state.pending_prefixes.get(&source)
+            && previous != receipt
+        {
+            return Err(Error::message(
+                "pending source retirement differs from its published archive receipt",
+            ));
         }
         state.pending_prefixes.insert(source, receipt.clone());
         state

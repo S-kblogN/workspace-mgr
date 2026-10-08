@@ -412,10 +412,10 @@ impl GitRepo {
         {
             if let Some(path) = line.strip_prefix("worktree ") {
                 worktree = Some(PathBuf::from(path));
-            } else if line == target {
-                if let Some(path) = worktree.take() {
-                    matches.push(path);
-                }
+            } else if line == target
+                && let Some(path) = worktree.take()
+            {
+                matches.push(path);
             }
         }
         Ok(matches)

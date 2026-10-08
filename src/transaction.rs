@@ -1877,10 +1877,11 @@ fn bulk_publication_volume(
         // A staged path always exists, and an automatic S3 candidate was just
         // measured; a path that disappeared under a concurrent edit simply adds
         // nothing to the total rather than failing an advisory count.
-        if let Ok(metadata) = fs::symlink_metadata(&absolute) {
-            if metadata.is_file() && !metadata.file_type().is_symlink() {
-                bytes += metadata.len();
-            }
+        if let Ok(metadata) = fs::symlink_metadata(&absolute)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+        {
+            bytes += metadata.len();
         }
     }
     Ok((files, bytes))
@@ -2600,45 +2601,45 @@ fn require_publishable(
             )));
         }
     }
-    if let Some(path) = &needs.archive_protocol {
-        if !cli_version_satisfies(installed, &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION) {
-            return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish archive receipt {path}, because safe archive coordination and protected source retirement require workspace-mgr {ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION} or newer; update workspace-mgr"
-            )));
-        }
+    if let Some(path) = &needs.archive_protocol
+        && !cli_version_satisfies(installed, &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION)
+    {
+        return Err(Error::message(format!(
+            "this build (workspace-mgr {installed}) cannot publish archive receipt {path}, because safe archive coordination and protected source retirement require workspace-mgr {ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION} or newer; update workspace-mgr"
+        )));
     }
-    if let Some(other) = &needs.others {
-        if !cli_version_satisfies(installed, &other.version) {
-            if other.archived {
-                return Err(Error::message(format!(
-                    "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
-                    other.path, other.version
-                )));
-            }
+    if let Some(other) = &needs.others
+        && !cli_version_satisfies(installed, &other.version)
+    {
+        if other.archived {
             return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because its schema {} requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
-                other.path, other.schema, other.version
+                "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                other.path, other.version
             )));
         }
+        return Err(Error::message(format!(
+            "this build (workspace-mgr {installed}) cannot publish {}, another task's manifest in this publication, because its schema {} requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+            other.path, other.schema, other.version
+        )));
     }
-    if let Some(own) = &needs.own {
-        if !cli_version_satisfies(installed, &own.version) {
-            if own.archived {
-                return Err(Error::message(format!(
-                    "this build (workspace-mgr {installed}) cannot publish {}, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
-                    own.path, own.version
-                )));
-            }
-            let advice = if own.schema == 3 {
-                "update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval."
-            } else {
-                "update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`."
-            };
+    if let Some(own) = &needs.own
+        && !cli_version_satisfies(installed, &own.version)
+    {
+        if own.archived {
             return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; {advice}",
-                own.schema, own.version
+                "this build (workspace-mgr {installed}) cannot publish {}, because reading its archived task manifest requires workspace-mgr {} or newer; update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`.",
+                own.path, own.version
             )));
         }
+        let advice = if own.schema == 3 {
+            "update workspace-mgr, or record the default limit to remove the approval. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr` or removing the approval."
+        } else {
+            "update workspace-mgr. Tell the user both versions and ask before updating with `cargo install --locked workspace-mgr`."
+        };
+        return Err(Error::message(format!(
+            "this build (workspace-mgr {installed}) cannot publish task manifest schema {}, which requires workspace-mgr {} or newer; {advice}",
+            own.schema, own.version
+        )));
     }
     if !cli_version_satisfies(installed, declaration) {
         return Err(Error::message(format!(

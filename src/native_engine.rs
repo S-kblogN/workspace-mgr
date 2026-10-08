@@ -1182,12 +1182,11 @@ fn recorded_files(
         }]);
     }
     let mut path = existing_cache_with_algorithm(repo, digest, algorithm)?;
-    if !path.is_file() {
-        if let Ok(remote) = remote_root(repo) {
-            if !remote.contains("://") {
-                path = remote_cache_path(&remote, digest, repo, algorithm)?;
-            }
-        }
+    if !path.is_file()
+        && let Ok(remote) = remote_root(repo)
+        && !remote.contains("://")
+    {
+        path = remote_cache_path(&remote, digest, repo, algorithm)?;
     }
     let bytes = fs::read(&path).at(&path)?;
     if crate::hex::encode_lower(Md5::digest(&bytes)) != digest.trim_end_matches(".dir") {
@@ -1405,10 +1404,10 @@ fn algorithms_for_pointer(repo: &GitRepo, pointer: &str) -> Result<BTreeMap<Stri
     let algorithm = pointer_algorithm(repo, pointer)?;
     let mut hashes = BTreeMap::new();
     for out in storage_metadata::read_pointer_document(repo, pointer)?.outs {
-        if pointer.ends_with(".dvc") {
-            if let Some(digest) = &out.md5 {
-                hashes.insert(digest.clone(), algorithm.clone());
-            }
+        if pointer.ends_with(".dvc")
+            && let Some(digest) = &out.md5
+        {
+            hashes.insert(digest.clone(), algorithm.clone());
         }
         for file in recorded_files(repo, pointer, &out, &algorithm)? {
             hashes.insert(file.md5, algorithm.clone());
@@ -1696,12 +1695,12 @@ fn verify_uploaded_version(
             "uploaded exact version has a content hash mismatch; its private journal is retained for reconciliation",
         ));
     }
-    if let Some(wanted) = raw_sha256 {
-        if file_sha256(temporary.path())? != wanted {
-            return Err(Error::message(
-                "uploaded exact version has a raw content hash mismatch; its private journal is retained for reconciliation",
-            ));
-        }
+    if let Some(wanted) = raw_sha256
+        && file_sha256(temporary.path())? != wanted
+    {
+        return Err(Error::message(
+            "uploaded exact version has a raw content hash mismatch; its private journal is retained for reconciliation",
+        ));
     }
     info["ETag"]
         .as_str()
@@ -2134,11 +2133,10 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                 {
                     return Err(Error::message("cached content changed during checkout"));
                 }
-                if let Ok(metadata) = fs::metadata(&existing) {
-                    if metadata.is_file() {
-                        fs::set_permissions(&destination, metadata.permissions())
-                            .at(&destination)?;
-                    }
+                if let Ok(metadata) = fs::metadata(&existing)
+                    && metadata.is_file()
+                {
+                    fs::set_permissions(&destination, metadata.permissions()).at(&destination)?;
                 }
             }
             staged.push((root, temporary, replacement));
@@ -2310,12 +2308,11 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                     modified.insert(label.clone());
                 }
             }
-            if pointer.ends_with(".dvc") {
-                if let Some(digest) = &out.md5 {
-                    if !existing_cache_with_algorithm(repo, digest, algorithm)?.is_file() {
-                        not_in_cache.insert(label);
-                    }
-                }
+            if pointer.ends_with(".dvc")
+                && let Some(digest) = &out.md5
+                && !existing_cache_with_algorithm(repo, digest, algorithm)?.is_file()
+            {
+                not_in_cache.insert(label);
             }
             for file in &files {
                 let label = if file.relpath.is_empty() {
