@@ -633,6 +633,11 @@ LFS objects, and every retained S3 object version of its paths, plus the
 uploads its next publication would add. `plan` reports the published and
 projected totals, the limit, and the largest contributors under `cloud_usage`.
 
+Verified archive relocation does not charge existing payload a second time.
+Pure relocation adds only new control data; genuinely new or changed payload
+still counts. S3 copies can temporarily coexist with the old prefix until the
+shared receipt permits verified source retirement.
+
 When the projected total exceeds the limit, `plan` reports
 `cloud_usage.status: approval_required` and `publish` refuses before it places,
 commits, or uploads anything. The task is then waiting for the user's decision.
@@ -909,13 +914,16 @@ Concurrent unmapped history is preserved and blocks completion. Preview and
 cancel an unpublished attempt with `archive --cancel --manifest <path> --dry-run`;
 apply restores local contents and metadata after verifying removal of its
 remote copies, markers, registry records and unfinished uploads.
-The copied history counts toward the infrastructure task's
-cloud-usage limit. Local-only content remains local and travels with the task.
+Verified copies of existing history do not count as newly retained payload
+of the infrastructure task. New or changed payload and new control data still
+count. Local-only content remains local and travels with the task.
 
 To hydrate a historical Git checkout after source cleanup, use
 `workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
 the archive registry. Publishing nested archived task state requires at least
-0.5.0; the new archive protocol and schema 4 completion evidence require 0.7.0. Removing a
+0.5.0; the new archive protocol and schema 4 completion evidence require 0.7.0.
+Archived Git LFS pointers require 0.8.8 to preserve their published identities.
+Removing a
 cloud-usage approval does not clear this path requirement; an older CLI needs
 an update.
 

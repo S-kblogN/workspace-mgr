@@ -5,6 +5,21 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-10-08
+
+### Fixed
+
+- Archive publication preserves each moved task's existing Git, Git LFS and
+  S3 placement, including batch archives with newly adopted legacy tasks.
+  Existing large Git/LFS payloads are no longer classified as new S3 uploads
+  merely because their directory moved.
+  Publications retaining archived Git LFS pointers require CLI 0.8.8 so older
+  clients cannot write the materialized payload as an ordinary Git blob.
+- Verified relocation of existing S3 history is no longer charged again as
+  newly retained payload of the archive task. New or changed payloads and
+  new control objects still count toward its limit. Copy verification and
+  protected source retirement remain required.
+
 ## [0.8.6] - 2026-10-08
 
 ### Fixed

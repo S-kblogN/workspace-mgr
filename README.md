@@ -166,6 +166,8 @@ duplicate source history. See the [archive command](docs/commands.md#workspace-m
 for review, conflict, and cancellation guarantees.
 Every archive publication requires 0.7.0 independently of task schema; private
 purge/copy journals use schema 2 so 0.6.0 refuses protected retry state.
+An archive that retains Git LFS pointers requires 0.8.8 to preserve their
+identities even when the old filter no longer matches the archived path.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.
 
@@ -220,6 +222,11 @@ where metadata that only drops entries is free, remain allowed. The agent then
 stops the task and asks the user, who either approves a higher limit, recorded
 in the task manifest with `task approve-cloud-usage` and published with the
 task for review, or chooses the cleanup to publish.
+
+Verified archive relocation does not charge existing payload again. A pure
+archive adds only its new control data to the task's cloud usage; new or changed
+payload still counts normally. S3 copies may temporarily coexist with the
+source until the shared archive receipt permits verified source retirement.
 
 ## Placement policy
 

@@ -648,9 +648,14 @@ pointers. It verifies destination versions, rewrites standalone and directory
 managed-storage cloud metadata automatically, and publishes the archive
 registry before publishing Git. Content hashes and file sizes stay fixed;
 copied versions and recreated markers receive new native IDs and timestamps,
-which the receipt maps to their originals. Copying history is charged to the
-infrastructure task's cloud-usage projection, so its full retained history must
-fit that task's approved limit before migration starts.
+which the receipt maps to their originals. A verified relocation of existing
+payload is not charged again to the infrastructure task's cloud-usage
+projection. New or changed payload and new Git/registry control data still
+count. The complete copy inventory remains in the archive receipts; temporary
+copies do not bypass verification or authorize early source retirement.
+Published Git and Git LFS files retain their original placement and object
+identity, even when several tasks move in one infrastructure publication or a
+legacy task has just been adopted.
 
 Before the copied receipt merges into the configured shared branch, current
 remote branches or tags containing the source directory defer cleanup,
@@ -674,8 +679,10 @@ preserves source history and retry journals. Historical Git checkouts use
 original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
 resolve the changed keys and version IDs.
 
-Archive publication requires `minimum_cli_version = "0.7.0"` regardless of
+Archive publication requires at least `minimum_cli_version = "0.7.0"` regardless of
 the task manifest schema, including archives with an empty S3 inventory.
+Archived tasks retaining Git LFS pointers require 0.8.8, preventing older
+clients from staging a materialized LFS file as an ordinary Git blob.
 The CLI reconciles this declaration in its private publication index before
 upload. Private S3 purge queues and archive copy journals use schema 2; 0.6.0
 rejects them before deletion rather than ignoring newer protection fields.

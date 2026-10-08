@@ -221,6 +221,246 @@ fn organizer(fixture: &GitFixture, scopes: &[&str]) -> (PathBuf, PathBuf) {
     )
 }
 
+#[test]
+fn batch_archive_preserves_published_git_and_lfs_bytes_for_managed_and_adopted_tasks() {
+    const LEGACY: &str = "20260711-100000-legacy";
+    const LEGACY_DEST: &str = "2026/07/20260711-100000-legacy";
+    const PAYLOAD_BYTES: u64 = 10_485_777;
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["manage"]);
+    for root in [LEGACY, DONE] {
+        std::fs::create_dir_all(fixture.seed.join(root)).unwrap();
+        if root == DONE {
+            write_task(&fixture.seed, DONE, "completed", false);
+        } else {
+            std::fs::write(fixture.seed.join(root).join("README.md"), "# Legacy task\n").unwrap();
+        }
+        std::fs::File::create(fixture.seed.join(root).join("large.bin"))
+            .unwrap()
+            .set_len(PAYLOAD_BYTES)
+            .unwrap();
+        // This is a previously published LFS pointer. Its materialized bytes
+        // will replace it after clone, without needing an external LFS server.
+        std::fs::write(
+            fixture.seed.join(root).join("large-lfs.bin"),
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {PAYLOAD_BYTES}\n",
+                sha256_zero_bytes(PAYLOAD_BYTES)
+            ),
+        )
+        .unwrap();
+    }
+    // A root-prefix rule intentionally stops matching when the legacy task
+    // moves. The task-local rule remains valid for the managed task.
+    std::fs::write(
+        fixture.seed.join(".gitattributes"),
+        format!("{LEGACY}/large-lfs.bin filter=archive-fixture -text\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.seed.join(DONE).join(".gitattributes"),
+        "large-lfs.bin filter=archive-fixture -text\n",
+    )
+    .unwrap();
+    fixture.commit_seed("Publish retained Git and LFS payloads before adoption");
+    let base = oid(&fixture.seed, "HEAD");
+    let old_blobs = [LEGACY, DONE].map(|root| {
+        ["large.bin", "large-lfs.bin"]
+            .map(|file| oid(&fixture.seed, &format!("{base}:{root}/{file}")))
+    });
+    fixture.clone_shared();
+    let pointer = fixture.root.join("fixture-lfs-pointer");
+    std::fs::write(
+        &pointer,
+        git(
+            &fixture.shared,
+            ["show", &format!("{base}:{DONE}/large-lfs.bin")],
+        )
+        .stdout,
+    )
+    .unwrap();
+    let clean = format!("cat >/dev/null; cat '{}'", pointer.display());
+    git(
+        &fixture.shared,
+        ["config", "filter.archive-fixture.clean", clean.as_str()],
+    );
+    for root in [LEGACY, DONE] {
+        std::fs::File::create(fixture.shared.join(root).join("large-lfs.bin"))
+            .unwrap()
+            .set_len(PAYLOAD_BYTES)
+            .unwrap();
+    }
+    let (workplace, manifest) = organizer(&fixture, &[LEGACY, LEGACY_DEST, DONE, DESTINATION]);
+    let gh = write_gh(&fixture, &BTreeMap::new());
+    json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "task",
+            "adopt",
+            LEGACY,
+            "--title",
+            "Legacy task",
+            "--purpose",
+            "Retain already published opaque payloads",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ],
+    ));
+    json(&workspace(
+        &workplace,
+        [
+            "storage",
+            "set",
+            &format!("{LEGACY}/large-lfs.bin"),
+            "--to",
+            "git",
+            "--reason",
+            "Keep the existing published Git LFS placement",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ],
+    ));
+    json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            LEGACY,
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ],
+    ));
+    for _ in 0..2 {
+        let plan = json(&workspace(
+            &workplace,
+            ["plan", "--manifest", manifest.to_str().unwrap()],
+        ));
+        assert!(
+            plan["storage"]["placement"]["placed_in_s3"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let tree = plan["tree_oid"].as_str().unwrap();
+        assert_eq!(plan["cloud_usage"]["projected"]["git_lfs_bytes"], 0);
+        for (task, destination) in [LEGACY_DEST, DESTINATION].iter().enumerate() {
+            for (file, name) in ["large.bin", "large-lfs.bin"].iter().enumerate() {
+                assert_eq!(
+                    oid(&workplace, &format!("{tree}:{destination}/{name}")),
+                    old_blobs[task][file]
+                );
+                assert_eq!(
+                    std::fs::metadata(workplace.join(destination).join(name))
+                        .unwrap()
+                        .len(),
+                    PAYLOAD_BYTES
+                );
+            }
+        }
+    }
+    let managed_lfs = workplace.join(DESTINATION).join("large-lfs.bin");
+    git(&workplace, ["config", "--unset", "core.filemode"]);
+    std::fs::set_permissions(&managed_lfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = json(&workspace(
+        &workplace,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+    ));
+    let tree = plan["tree_oid"].as_str().unwrap();
+    let entry = String::from_utf8(
+        git(
+            &workplace,
+            ["ls-tree", tree, &format!("{DESTINATION}/large-lfs.bin")],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(entry.starts_with("100755 blob "));
+    assert_eq!(
+        oid(&workplace, &format!("{tree}:{DESTINATION}/large-lfs.bin")),
+        old_blobs[1][1]
+    );
+
+    // Real byte changes cannot be hidden behind the old pointer. A missing
+    // filter refuses before staging the materialized bytes as an ordinary blob.
+    use std::io::Write;
+    let legacy_lfs = workplace.join(LEGACY_DEST).join("large-lfs.bin");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&legacy_lfs)
+        .unwrap()
+        .write_all(&[1])
+        .unwrap();
+    let refused = workspace_unchecked(
+        &workplace,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("changed but has no configured LFS filter")
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&legacy_lfs)
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+
+    // A configured filter must emit the pointer for the new materialized
+    // bytes; stale filter output is rejected instead of silently reusing it.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&managed_lfs)
+        .unwrap()
+        .write_all(&[1])
+        .unwrap();
+    let refused = workspace_unchecked(
+        &workplace,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("did not stage a matching LFS pointer")
+    );
+    use sha2::Digest;
+    let checksum = sha2::Sha256::digest(std::fs::read(&managed_lfs).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::fs::write(&pointer, format!("version https://git-lfs.github.com/spec/v1\noid sha256:{checksum}\nsize {PAYLOAD_BYTES}\n")).unwrap();
+    let changed = json(&workspace(
+        &workplace,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+    ));
+    let tree = changed["tree_oid"].as_str().unwrap();
+    assert_ne!(
+        oid(&workplace, &format!("{tree}:{DESTINATION}/large-lfs.bin")),
+        old_blobs[1][1]
+    );
+    assert_eq!(
+        changed["cloud_usage"]["projected"]["git_lfs_bytes"],
+        PAYLOAD_BYTES
+    );
+}
+
+fn sha256_zero_bytes(bytes: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let block = [0_u8; 65_536];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let count = remaining.min(block.len() as u64) as usize;
+        hash.update(&block[..count]);
+        remaining -= count as u64;
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn archive(cwd: &Path, gh: &Path, args: &[&str]) -> std::process::Output {
     let environment = archive_environment(gh);
     let values = environment

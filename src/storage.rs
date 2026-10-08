@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1136,19 +1136,67 @@ fn warning_relevant_boundaries(
 }
 
 #[derive(Debug, Clone)]
-struct HistoryContext {
+pub(crate) struct HistoryContext {
     oid: String,
     current_task_path: Option<String>,
     published_task_path: Option<String>,
+    archive_paths: BTreeMap<String, String>,
 }
 
 impl HistoryContext {
-    fn object_path(&self, current: &str) -> String {
+    pub(crate) fn object_path(&self, current: &str) -> String {
+        // A single infrastructure publication can relocate many independent
+        // tasks, including legacy tasks which had no published manifest. Each
+        // validated receipt supplies its own current-to-published path mapping.
+        if let Some((destination, source)) = self.archive_paths.iter().find(|(destination, _)| {
+            current == destination.as_str() || is_descendant(current, destination)
+        }) {
+            return format!("{source}{}", &current[destination.len()..]);
+        }
         published_history_path(
             current,
             self.current_task_path.as_deref(),
             self.published_task_path.as_deref(),
         )
+    }
+
+    fn with_archives(mut self, repo: &GitRepo, config: &Config, scopes: &[String]) -> Result<Self> {
+        for (_, receipt) in crate::archive_migration::receipts(repo, scopes)? {
+            let destination = receipt["destination"]
+                .as_str()
+                .expect("validated destination");
+            let source = receipt["source"].as_str().expect("validated source");
+            let task = ResolvedTask::load(
+                repo,
+                config,
+                &repo.root.join(destination).join(TASK_MANIFEST_NAME),
+            )?;
+            if receipt["task_id"] != task.task_id {
+                return Err(Error::message(
+                    "archived task identity differs from its storage history receipt",
+                ));
+            }
+            // Once this destination is in the selected publication, its own
+            // tree is authoritative. Retained receipts must not send future
+            // plans back to an older source that may no longer exist.
+            if repo
+                .run_unchecked(["cat-file", "-e", &format!("{}:{destination}", self.oid)])?
+                .success()
+            {
+                self.archive_paths
+                    .insert(destination.to_owned(), destination.to_owned());
+                continue;
+            }
+            crate::archive_cancel::validate_migration(repo, &receipt)?;
+            if repo
+                .run_unchecked(["cat-file", "-e", &format!("{}:{source}", self.oid)])?
+                .success()
+            {
+                self.archive_paths
+                    .insert(destination.to_owned(), source.to_owned());
+            }
+        }
+        Ok(self)
     }
 }
 
@@ -1174,13 +1222,15 @@ fn task_history(
         format!("refs/heads/{}", task.base_branch),
     ] {
         if let Some(oid) = repo.optional_oid(&reference)? {
-            return history_context(repo, &task, &oid).map(Some);
+            return history_context(repo, &task, &oid)?
+                .with_archives(repo, config, scopes)
+                .map(Some);
         }
     }
     Ok(None)
 }
 
-fn history_for_oid(
+pub(crate) fn history_for_oid(
     repo: &GitRepo,
     config: &Config,
     scopes: &[String],
@@ -1198,15 +1248,260 @@ fn history_for_oid(
         None => match ResolvedTask::discover(repo, &repo.root) {
             Ok(path) => ResolvedTask::load(repo, config, &path)?,
             Err(_) => {
-                return Ok(HistoryContext {
+                return HistoryContext {
                     oid: oid.to_owned(),
                     current_task_path: None,
                     published_task_path: None,
-                });
+                    archive_paths: BTreeMap::new(),
+                }
+                .with_archives(repo, config, scopes);
             }
         },
     };
-    history_context(repo, &task, oid)
+    history_context(repo, &task, oid)?.with_archives(repo, config, scopes)
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchivedLfsEntry {
+    pub path: String,
+    pub unchanged: bool,
+    mode: String,
+    blob: String,
+    pointer: ArchivedLfsPointer,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchivedLfsPointer {
+    sha256: String,
+    size: u64,
+}
+
+fn archived_lfs_pointer(raw: &[u8]) -> Option<ArchivedLfsPointer> {
+    let mut lines = std::str::from_utf8(raw).ok()?.lines();
+    if !matches!(
+        lines.next()?,
+        "version https://git-lfs.github.com/spec/v1" | "version https://hawser.github.com/spec/v1"
+    ) {
+        return None;
+    }
+    let mut sha256 = None;
+    let mut size = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("oid sha256:") {
+            if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            sha256 = Some(value.to_ascii_lowercase());
+        } else if let Some(value) = line.strip_prefix("size ") {
+            size = value.parse().ok();
+        }
+    }
+    Some(ArchivedLfsPointer {
+        sha256: sha256?,
+        size: size?,
+    })
+}
+
+pub(crate) fn is_git_lfs_pointer(raw: &[u8]) -> bool {
+    archived_lfs_pointer(raw).is_some()
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path).at(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        let read = file.read(&mut buffer).at(path)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(crate::hex::encode_lower(hash.finalize().as_slice()))
+}
+
+/// Preserve unchanged, already-published LFS identities when an archive makes
+/// an old root-prefix filter stop matching. No LFS executable or remote is
+/// needed to prove that the materialized bytes match their published pointer.
+pub(crate) fn archived_lfs_entries(
+    repo: &GitRepo,
+    config: &Config,
+    scopes: &[String],
+    base: &str,
+) -> Result<Vec<ArchivedLfsEntry>> {
+    let history = history_for_oid(repo, config, scopes, base)?;
+    if history.archive_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let visible = repo
+        .visible_paths(scopes)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut args = vec![
+        "ls-tree".to_owned(),
+        "-r".to_owned(),
+        "-l".to_owned(),
+        "-z".to_owned(),
+        base.to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(history.archive_paths.values().cloned());
+    let listed = repo.run(args)?;
+    let mut result = Vec::new();
+    for entry in listed.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+        let Some((header, old_path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        let [old_mode, "blob", blob, size] = fields.as_slice() else {
+            continue;
+        };
+        if !matches!(*old_mode, "100644" | "100755")
+            || size.parse::<u64>().unwrap_or(u64::MAX) > 1024
+        {
+            continue;
+        }
+        let Some((destination, source)) = history
+            .archive_paths
+            .iter()
+            .find(|(_, source)| is_descendant(old_path, source))
+        else {
+            continue;
+        };
+        let path = format!("{destination}{}", &old_path[source.len()..]);
+        if !visible.contains(&path)
+            || matches!(
+                explicit_target(repo, &path)?,
+                Some(StorageTarget::S3 | StorageTarget::Local)
+            )
+        {
+            continue;
+        }
+        let absolute = repo.root.join(&path);
+        let metadata = fs::symlink_metadata(&absolute).at(&absolute)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let raw = repo.run_bytes(["cat-file", "blob", blob], None)?.stdout;
+        let Some(old_pointer) = archived_lfs_pointer(&raw) else {
+            continue;
+        };
+        let current_raw = (metadata.len() <= 1024)
+            .then(|| fs::read(&absolute).at(&absolute))
+            .transpose()?;
+        let current_pointer = current_raw.as_deref().and_then(archived_lfs_pointer);
+        let (unchanged, pointer) = if let Some(pointer) = current_pointer {
+            (current_raw.as_deref() == Some(raw.as_slice()), pointer)
+        } else {
+            let pointer = ArchivedLfsPointer {
+                sha256: sha256_file(&absolute)?,
+                size: metadata.len(),
+            };
+            let unchanged = pointer == old_pointer;
+            if !unchanged {
+                let attributes = repo.run(["check-attr", "-z", "filter", "--", &path])?;
+                let filter = attributes
+                    .stdout
+                    .split('\0')
+                    .nth(2)
+                    .unwrap_or("unspecified");
+                let mut configured = false;
+                for kind in ["clean", "process"] {
+                    let output = repo.run_unchecked([
+                        "config",
+                        "--get",
+                        &format!("filter.{filter}.{kind}"),
+                    ])?;
+                    configured |= output.success() && !output.stdout.trim().is_empty();
+                }
+                if !configured {
+                    return Err(Error::message(format!(
+                        "archived LFS payload {path:?} changed but has no configured LFS filter; configure its LFS filter or explicitly migrate it to S3 before publishing"
+                    )));
+                }
+            }
+            (unchanged, pointer)
+        };
+        let mut mode = old_mode.to_string();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if repo
+                .run_unchecked(["config", "--bool", "core.filemode"])?
+                .stdout
+                .trim()
+                != "false"
+            {
+                mode = if metadata.permissions().mode() & 0o111 != 0 {
+                    "100755"
+                } else {
+                    "100644"
+                }
+                .to_owned();
+            }
+        }
+        result.push(ArchivedLfsEntry {
+            path,
+            unchanged,
+            mode,
+            blob: blob.to_string(),
+            pointer,
+        });
+    }
+    Ok(result)
+}
+
+pub(crate) fn reconcile_archived_lfs_index(
+    repo: &GitRepo,
+    index: &Path,
+    entries: &[ArchivedLfsEntry],
+) -> Result<()> {
+    for entry in entries {
+        if entry.unchanged {
+            repo.run_with_index(
+                index,
+                [
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &entry.mode,
+                    &entry.blob,
+                    &entry.path,
+                ],
+                None,
+                true,
+            )?;
+        } else {
+            let blob = repo
+                .run_with_index(
+                    index,
+                    ["rev-parse", &format!(":{}", entry.path)],
+                    None,
+                    true,
+                )?
+                .stdout
+                .trim()
+                .to_owned();
+            let size = repo
+                .run(["cat-file", "-s", &blob])?
+                .stdout
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(u64::MAX);
+            let valid = size <= 1024
+                && archived_lfs_pointer(&repo.run_bytes(["cat-file", "blob", &blob], None)?.stdout)
+                    .as_ref()
+                    == Some(&entry.pointer);
+            if !valid {
+                return Err(Error::message(format!(
+                    "archived LFS payload {:?} did not stage a matching LFS pointer; configure its LFS filter or explicitly migrate it to S3 before publishing",
+                    entry.path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn history_context(repo: &GitRepo, task: &ResolvedTask, oid: &str) -> Result<HistoryContext> {
@@ -1221,6 +1516,7 @@ fn history_context(repo: &GitRepo, task: &ResolvedTask, oid: &str) -> Result<His
         oid: oid.to_owned(),
         current_task_path: task.task_path.clone(),
         published_task_path: paths.into_iter().next(),
+        archive_paths: BTreeMap::new(),
     })
 }
 
@@ -2050,6 +2346,166 @@ mod tests {
 
     fn metrics(bytes: u64) -> Option<PayloadMetrics> {
         Some(PayloadMetrics { bytes, files: 1 })
+    }
+
+    #[test]
+    fn archive_history_preserves_all_published_placements_independent_of_scope_order() {
+        let (_temporary, repo) = private_state_fixture();
+        repo.run(["config", "user.name", "Storage test"]).unwrap();
+        repo.run(["config", "user.email", "storage@example.invalid"])
+            .unwrap();
+        fs::write(repo.root.join(".gitignore"), ".workspace-mgr/local/\n").unwrap();
+        let config = Config {
+            s3: Some(crate::config::S3Config {
+                url: "s3://not-contacted-by-this-test".to_owned(),
+                endpoint_url: None,
+            }),
+            ..Config::default()
+        };
+        let roots = ["20260711-100000-legacy", "20260712-120000-completed"];
+        for root in roots {
+            fs::create_dir_all(repo.root.join(root)).unwrap();
+            let file = fs::File::create(repo.root.join(root).join("large.bin")).unwrap();
+            file.set_len(AUTO_S3_ABOVE_BYTES + 1).unwrap();
+            fs::write(
+                repo.root.join(root).join("large-lfs.bin"),
+                format!(
+                    "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+                    "1".repeat(64),
+                    AUTO_S3_ABOVE_BYTES + 2
+                ),
+            )
+            .unwrap();
+            fs::write(
+                repo.root.join(root).join("stored.bin.wm-storage.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version":1,"path":"stored.bin",
+                    "kind":"file","checksum":{"algorithm":"md5","digest":"0".repeat(32)},
+                    "size":42,"version":{"id":"existing-version"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        repo.run(["add", "--", roots[0], roots[1]]).unwrap();
+        repo.run([
+            "commit",
+            "-m",
+            "Publish Git and LFS payloads before adoption",
+        ])
+        .unwrap();
+        let base = repo
+            .run(["rev-parse", "HEAD"])
+            .unwrap()
+            .stdout
+            .trim()
+            .to_owned();
+        let mut scopes = Vec::new();
+        for root in roots {
+            let destination = format!("2026/07/{root}");
+            fs::create_dir_all(repo.root.join("2026/07")).unwrap();
+            fs::rename(repo.root.join(root), repo.root.join(&destination)).unwrap();
+            fs::write(
+                repo.root
+                    .join(&destination)
+                    .join("stored.bin.wm-storage.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version":1,"path":"stored.bin",
+                    "kind":"file","checksum":{"algorithm":"md5","digest":"0".repeat(32)},
+                    "size":42,"version":{"id":"existing-version"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                repo.root.join(&destination).join(TASK_MANIFEST_NAME),
+                format!(
+                    "schema_version = 2\nkind = \"deliverable\"\nid = \"{root}\"\nslug = \"{}\"\npath = \"{destination}\"\nbranch = \"codex/{}\"\ntitle = \"Archived task\"\npurpose = \"Retain opaque payloads\"\nadditional_scopes = []\n",
+                    &root[16..], &root[16..]
+                ),
+            )
+            .unwrap();
+            fs::write(
+                repo.root
+                    .join(&destination)
+                    .join(crate::archive_migration::RECEIPT_NAME),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version":1,"source":root,"destination":destination,
+                    "task_id":root,"status":"planned","versions":[]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::File::create(repo.root.join(&destination).join("large-lfs.bin"))
+                .unwrap()
+                .set_len(AUTO_S3_ABOVE_BYTES + 2)
+                .unwrap();
+            scopes.extend([destination, root.to_owned()]);
+        }
+        for _ in 0..2 {
+            let history = history_for_oid(&repo, &config, &scopes, &base).unwrap();
+            for root in roots {
+                let destination = format!("2026/07/{root}");
+                for file in ["large.bin", "large-lfs.bin"] {
+                    let placement = placement_status(
+                        &repo,
+                        &config,
+                        &format!("{destination}/{file}"),
+                        Some(&history),
+                    )
+                    .unwrap();
+                    assert_eq!(placement.target, StorageTarget::Git);
+                    assert_eq!(placement.basis, PlacementBasis::PublishedHistory);
+                }
+                let placement = placement_status(
+                    &repo,
+                    &config,
+                    &format!("{destination}/stored.bin"),
+                    Some(&history),
+                )
+                .unwrap();
+                assert_eq!(placement.target, StorageTarget::S3);
+                assert_eq!(placement.basis, PlacementBasis::PublishedHistory);
+            }
+            assert!(
+                apply_automatic(&repo, &config, &scopes, &base, true)
+                    .unwrap()
+                    .automatic_s3()
+                    .is_empty()
+            );
+            // A later retry must use the current published destination rather
+            // than blindly mapping it back to the older receipt source.
+            repo.run(["add", "-A", "--", "."]).unwrap();
+            let tree = repo.run(["write-tree"]).unwrap().stdout.trim().to_owned();
+            let published = history_for_oid(&repo, &config, &scopes, &tree).unwrap();
+            for root in roots {
+                let path = format!("2026/07/{root}/large.bin");
+                assert_eq!(published.object_path(&path), path);
+            }
+            scopes.reverse();
+        }
+        let new_path = format!("2026/07/{}/new.bin", roots[1]);
+        fs::File::create(repo.root.join(&new_path))
+            .unwrap()
+            .set_len(AUTO_S3_ABOVE_BYTES + 3)
+            .unwrap();
+        assert_eq!(
+            apply_automatic(&repo, &config, &scopes, &base, true)
+                .unwrap()
+                .automatic_s3(),
+            &[new_path]
+        );
+        for root in roots {
+            fs::write(
+                repo.root.join(format!("2026/07/{root}/large-lfs.bin{PLACEMENT_SUFFIX}")),
+                "schema_version = 1\ntarget = \"s3\"\nreason = \"The user selected an explicit transport migration\"\n",
+            ).unwrap();
+        }
+        assert!(
+            archived_lfs_entries(&repo, &config, &scopes, &base)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
