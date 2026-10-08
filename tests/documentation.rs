@@ -245,13 +245,17 @@ fn approved_runtime_and_historical_content_proof_removals_are_documented() {
         .unwrap();
     let archive = archive.split_whitespace().collect::<Vec<_>>().join(" ");
     for fact in [
-        "Both merged PRs and PRs closed without merging qualify",
+        "An OPEN PR means pending",
+        "MERGED, CLOSED without merging, or a successful query finding no corresponding PR means done",
+        "hosting-query failures are reported as errors",
         "The PR need not target today's configured base branch",
         "Archive does not inspect historical configuration, directory-tree history",
         "It does not scan runtime paths or cross-task dependencies",
         "Ordinary tracked, staged, untracked, ignored, and local-only contents move with the directory",
         "Local `.git/info/exclude` or a global ignore file is insufficient",
         "new attempts do not rewrite nested Git controls",
+        "`--pull-request` is optional",
+        "Without it, adoption writes current task metadata without querying old PRs or creating a review record",
     ] {
         assert!(archive.contains(fact), "archive reference omits {fact:?}");
     }

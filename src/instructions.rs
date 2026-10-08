@@ -59,7 +59,7 @@ pub fn render(repo: &GitRepo, config: &Config, topic: Option<&str>) -> Result<In
 
     if topic == "all" {
         sections.push(format!(
-            "## Repository control facts\n\nThe shared checkout stays on `{}` and uses remote `{}`. Task-scoped commands discover a deliverable manifest from the selected path; infrastructure tasks always use their explicit `--manifest`. Read the relevant command's `--help` before acting. Detailed compatibility topics remain available with `workspace-mgr instructions <topic>`.",
+            "## Repository control facts\n\nThe shared checkout stays on `{}` and uses remote `{}`. Task-scoped commands discover a deliverable manifest from the selected path; infrastructure tasks always use their explicit `--manifest`. Read the relevant command's `--help` before acting. Use `archive --help` for current PR pending/done rules and `task adopt --help` for legacy directories without a manifest. Detailed compatibility topics remain available with `workspace-mgr instructions <topic>`.",
             config.git.branch, config.git.remote
         ));
     } else if topic != "model" && topic != "repository" {

@@ -51,7 +51,10 @@ const PAGES: &[(&[&str], &[&str])] = &[
         &["task", "adopt"],
         &[
             "legacy directory",
-            "live PR",
+            "--pull-request is optional",
+            "without querying old PRs or creating a review record",
+            "known merged PR",
+            "live control metadata",
             "historical Git tree",
             "Existing content remains unchanged",
         ],
@@ -152,7 +155,10 @@ const PAGES: &[(&[&str], &[&str])] = &[
     (
         &["archive"],
         &[
-            "MERGED and CLOSED",
+            "OPEN PR means pending",
+            "MERGED, CLOSED without merging",
+            "successful query finding no corresponding PR means done",
+            "hosting-query failures are errors, never a no-PR result",
             "current task configuration",
             "complete S3",
             "--cancel",
@@ -215,6 +221,19 @@ fn every_operation_has_contextual_help_without_a_repository() {
             assert!(
                 lowercase.contains(&fragment.to_ascii_lowercase()),
                 "{args:?} lacks {fragment:?}:\n{output}"
+            );
+        }
+        if *args == ["task", "adopt"] {
+            let usage = output
+                .split("Usage:")
+                .nth(1)
+                .unwrap()
+                .split("\n\n")
+                .next()
+                .unwrap();
+            assert!(
+                !usage.contains("--pull-request"),
+                "adoption usage still requires a PR: {usage}"
             );
         }
         assert!(

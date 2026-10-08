@@ -110,8 +110,8 @@ They report current placement and local archive receipts; they do not verify
 PR merge or S3 publication status. See the
 [discovery commands](docs/commands.md#workspace-mgr-task-list).
 
-Active deliverable task directories stay at the repository's top level. After
-the task's corresponding pull request is closed, the user may request
+Pending deliverable task directories stay at the repository's top level. Once
+the task is done, the user may request
 that its directory be grouped under a time folder, such as `2026/`, `202607/`,
 or `2026/07/`. Organizing completed tasks is an explicitly requested
 infrastructure task, never an automatic action after merge or at turn end. If
@@ -125,15 +125,24 @@ and destination scopes, then apply `archive` in that infrastructure task.
 The command moves local directories; normal publication copies and verifies
 their complete retained S3 history, rewrites storage metadata, and records
 durable exact-version mappings before obsolete source objects are purged.
-Archive uses the current task configuration, including saved branch hints
-after a branch change, to identify a corresponding closed PR and confirm
-there is no associated open PR. Both merged and closed without merging
-qualify. It checks current managed-storage integrity, source and destination
-scopes, and move conflicts. It does not inspect historical task configuration,
-require earlier commits to have reviews, or replay a completion checkpoint's
-historical proof. Manifestless legacy tasks use explicit `task adopt` to
-establish current task metadata. `task upgrade` remains a separate metadata
-operation, not an archive prerequisite.
+Archive queries GitHub using the current task branch and saved branch hints.
+An OPEN PR means pending. A MERGED or CLOSED PR, or a successful query finding
+no corresponding PR, means done. A hosting-query failure is reported as an
+error. Archive does not require finding a historical PR, reviewing old commits,
+or upgrading task metadata. It checks managed storage, authorized source and
+destination scopes, and move conflicts.
+
+Legacy directories without a manifest first need current task metadata. Adopt
+them in a scoped infrastructure task; no PR is required:
+
+```sh
+workspace-mgr task adopt <legacy-task-path> --title "Task title" \
+  --purpose "Task purpose" --manifest "$task_manifest" --dry-run
+```
+
+Repeat without `--dry-run`, then plan and publish the control change. Optional
+`--pull-request <number>` records a known merged PR; omitting it does not search
+old PRs. Adoption applies only to directories without a manifest.
 
 Ordinary contents, scripts, README commands, historical logs, and environments
 move unchanged, even if their paths no longer work after relocation. Nested

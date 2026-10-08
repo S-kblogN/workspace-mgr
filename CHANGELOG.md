@@ -5,6 +5,20 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-08
+
+### Fixed
+
+- Archive treats only an open associated pull request as pending. A successful
+  current-metadata lookup with no matching pull request qualifies as done,
+  without reconstructing historical branch names or requiring a closed review.
+  Hosting failures still report errors, and every saved branch hint is checked
+  for open reviews. No-review archive receipts retain a null PR association.
+- Legacy task adoption no longer requires a pull request. Without
+  `--pull-request`, it creates current task metadata without querying historical
+  reviews or writing review evidence; existing explicit-review adoption remains
+  available.
+
 ## [0.8.4] - 2026-10-08
 
 ### Added

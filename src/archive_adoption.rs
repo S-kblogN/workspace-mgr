@@ -1,4 +1,4 @@
-//! Explicit, reviewed adoption of pre-manifest task directories.
+//! Explicit adoption of pre-manifest task directories, with optional review hints.
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ pub struct ArchiveAdoptionOptions {
     pub start: PathBuf,
     pub manifest: Option<PathBuf>,
     pub path: String,
-    pub pull_request: u64,
+    pub pull_request: Option<u64>,
     pub title: String,
     pub purpose: String,
     pub dry_run: bool,
@@ -34,8 +34,8 @@ pub struct AdoptionReport {
     pub task_id: String,
     pub path: String,
     pub branch: String,
-    pub legacy_branch: String,
-    pub pull_request: MergedPullRequest,
+    pub legacy_branch: Option<String>,
+    pub pull_request: Option<MergedPullRequest>,
     pub required_scopes: Vec<String>,
     pub review_required_before_archive: bool,
     pub remote_writes: bool,
@@ -105,15 +105,6 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
             "legacy adoption path escapes the infrastructure task's declared scopes",
         ));
     }
-    let base = repo.fetch_branch(&config.git.remote, &config.git.branch)?;
-    require_supported_cli_at(
-        &repo,
-        &base,
-        &format!("{}/{}", config.git.remote, config.git.branch),
-    )?;
-    let host = archive::hosting_repository(&repo, &config.git.remote)?;
-    let (review, legacy_branch) =
-        legacy_review(&repo, &config, &host, options.pull_request, &base)?;
     let next = TaskManifest {
         schema_version: 2,
         kind: TaskKind::Deliverable,
@@ -127,48 +118,79 @@ pub fn adopt(options: &ArchiveAdoptionOptions) -> Result<AdoptionReport> {
         cloud_usage_approval: None,
         archive_completion: None,
     };
-    let record = LegacyRecord {
-        schema_version: 1,
-        task_id: task_id.clone(),
-        path: path.clone(),
-        branch: legacy_branch.clone(),
-        pull_request: review.clone(),
-    };
     let manifest_path = directory.join(TASK_MANIFEST_NAME);
-    let record_path = directory.join(LEGACY_RECORD);
-    for metadata in [TASK_MANIFEST_NAME, LEGACY_RECORD] {
+    reject_symlink_traversal(
+        &repo.root,
+        &format!("{path}/{TASK_MANIFEST_NAME}"),
+        "legacy adoption metadata",
+    )?;
+    let next_raw = next.render()?;
+    let (review, legacy_branch, already) = if let Some(number) = options.pull_request {
+        // The optional reviewed-adoption path retains its existing verification
+        // and record format. Metadata-only adoption never enters this path.
+        let base = repo.fetch_branch(&config.git.remote, &config.git.branch)?;
+        require_supported_cli_at(
+            &repo,
+            &base,
+            &format!("{}/{}", config.git.remote, config.git.branch),
+        )?;
+        let host = archive::hosting_repository(&repo, &config.git.remote)?;
+        let (review, legacy_branch) = legacy_review(&repo, &config, &host, number, &base)?;
+        let record = LegacyRecord {
+            schema_version: 1,
+            task_id: task_id.clone(),
+            path: path.clone(),
+            branch: legacy_branch.clone(),
+            pull_request: review.clone(),
+        };
+        let record_path = directory.join(LEGACY_RECORD);
         reject_symlink_traversal(
             &repo.root,
-            &format!("{path}/{metadata}"),
+            &format!("{path}/{LEGACY_RECORD}"),
             "legacy adoption metadata",
         )?;
-    }
-    let next_raw = next.render()?;
-    let record_raw = serde_json::to_string_pretty(&record).map_err(|error| {
-        Error::message(format!("failed to render legacy adoption record: {error}"))
-    })? + "\n";
-    let already = manifest_path.exists() || record_path.exists();
-    if already {
-        let existing: LegacyRecord = serde_json::from_str(
-            &fs::read_to_string(&record_path).at(&record_path)?,
-        )
-        .map_err(|error| {
-            Error::message(format!("invalid current legacy adoption metadata: {error}"))
-        })?;
-        if fs::read_to_string(&manifest_path).at(&manifest_path)? != next_raw || existing != record
-        {
-            return Err(Error::message(
-                "legacy adoption metadata already exists with different evidence; preserve it before retrying",
-            ));
+        let record_raw = serde_json::to_string_pretty(&record).map_err(|error| {
+            Error::message(format!("failed to render legacy adoption record: {error}"))
+        })? + "\n";
+        let already = manifest_path.exists() || record_path.exists();
+        if already {
+            let existing: LegacyRecord = serde_json::from_str(
+                &fs::read_to_string(&record_path).at(&record_path)?,
+            )
+            .map_err(|error| {
+                Error::message(format!("invalid current legacy adoption metadata: {error}"))
+            })?;
+            if fs::read_to_string(&manifest_path).at(&manifest_path)? != next_raw
+                || existing != record
+            {
+                return Err(Error::message(
+                    "legacy adoption metadata already exists with different evidence; preserve it before retrying",
+                ));
+            }
+        } else if !options.dry_run {
+            // Create both files without replacing any existing local content.
+            create_new(&manifest_path, &next_raw)?;
+            if let Err(error) = create_new(&record_path, &record_raw) {
+                let _ = fs::remove_file(&manifest_path);
+                return Err(error);
+            }
         }
-    } else if !options.dry_run {
-        // Create both files without replacing any existing local content.
-        create_new(&manifest_path, &next_raw)?;
-        if let Err(error) = create_new(&record_path, &record_raw) {
-            let _ = fs::remove_file(&manifest_path);
-            return Err(error);
+        (Some(review), Some(legacy_branch), already)
+    } else {
+        // Only the manifest belongs to this operation. An existing legacy
+        // record or any other directory content is neither inspected nor changed.
+        let already = manifest_path.exists();
+        if already {
+            if fs::read_to_string(&manifest_path).at(&manifest_path)? != next_raw {
+                return Err(Error::message(
+                    "legacy adoption task metadata already exists with different configuration; preserve it before retrying",
+                ));
+            }
+        } else if !options.dry_run {
+            create_new(&manifest_path, &next_raw)?;
         }
-    }
+        (None, None, already)
+    };
     Ok(AdoptionReport {
         status: if already {
             "no_changes"

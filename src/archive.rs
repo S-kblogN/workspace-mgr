@@ -48,7 +48,7 @@ pub struct ArchiveTask {
     pub branch: String,
     pub source: String,
     pub destination: String,
-    pub pull_request: ArchivePullRequest,
+    pub pull_request: Option<ArchivePullRequest>,
     pub receipt: serde_json::Value,
 }
 
@@ -95,6 +95,13 @@ struct HostingPullRequest {
 #[derive(Debug, Deserialize)]
 struct HostingCommit {
     oid: String,
+}
+
+/// Only a live open review keeps a task pending. A successful lookup with no
+/// matching review is done, without inventing a historical review association.
+enum TaskReviewState {
+    Pending,
+    Done(Option<ArchivePullRequest>),
 }
 
 struct PreparedTask {
@@ -151,7 +158,7 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         }
         let manifest_path = source_dir.join(TASK_MANIFEST_NAME);
         if !manifest_path.exists() {
-            let reason = "legacy task has no manifest; explicitly adopt it with task adopt and a verified merged pull request before archiving";
+            let reason = "legacy task has no manifest; explicitly adopt it with task adopt before archiving; no pull request is required";
             if !options.paths.is_empty() {
                 return Err(Error::message(format!(
                     "archive refuses {source}: {reason}"
@@ -174,20 +181,20 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
                 "archive source must be a deliverable task's declared directory: {source}"
             )));
         }
-        let eligible = closed_pull_request(
+        let review_state = task_review_state(
             &repo,
             host.as_deref().expect("a source has a hosting repository"),
             &task,
         )?;
-        let Some(completion) = eligible else {
+        let TaskReviewState::Done(completion) = review_state else {
             if !options.paths.is_empty() {
                 return Err(Error::message(format!(
-                    "archive refuses active or unverified task {source}; its associated pull request must be closed"
+                    "archive refuses pending task {source}; its associated pull request is open"
                 )));
             }
             skipped.push(SkippedTask {
                 path: source.clone(),
-                reason: "no associated closed pull request for this task".to_owned(),
+                reason: "task has an open pull request (pending)".to_owned(),
             });
             continue;
         };
@@ -470,89 +477,63 @@ pub(crate) fn hosting_repository(repo: &GitRepo, remote: &str) -> Result<String>
     Ok(format!("{host}/{path}"))
 }
 
-/// Archive eligibility depends on current configuration and live PR state.
-/// Saved branch names are lookup hints, not assertions about historical trees.
-fn closed_pull_request(
-    repo: &GitRepo,
-    host: &str,
-    task: &ResolvedTask,
-) -> Result<Option<ArchivePullRequest>> {
+/// Archive eligibility depends on current metadata and live PR state. Saved
+/// branch names are lookup hints, never requirements for historical matches.
+fn task_review_state(repo: &GitRepo, host: &str, task: &ResolvedTask) -> Result<TaskReviewState> {
     let mut branches = BTreeSet::from([task.branch.clone()]);
     if let Some(record) = &task.archive_completion {
         branches.extend(record.branches.iter().cloned());
         branches.extend(record.reviews.iter().map(|review| review.branch.clone()));
     }
+    // Existing adoption metadata can name another associated branch. Check
+    // its live state alongside the current branch, even when that branch has
+    // a closed PR. No historical branch or payload needs to be reconstructed.
+    let source = task.task_path.as_deref().expect("deliverable path");
+    let path = resolved_under(&repo.root, source).join(crate::archive_adoption::LEGACY_RECORD);
+    if fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 16 * 1024 * 1024)
+    {
+        let hint = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        if let Some(branch) = hint
+            .as_ref()
+            .filter(|hint| hint["task_id"].as_str() == Some(task.task_id.as_str()))
+            .and_then(|hint| hint["branch"].as_str())
+            .filter(|branch| repo.validate_branch(branch).is_ok())
+        {
+            branches.insert(branch.to_owned());
+        }
+    }
     let mut closed = Vec::new();
     for branch in branches {
-        // Query live open state separately so a reopened request cannot hide
-        // behind a closed one or another repository's similarly named branch.
+        // Query open state separately: a large closed history must not hide
+        // an open review. Failed hosting queries propagate as errors, rather
+        // than being mistaken for a successful empty result.
         if current_branch_requests(repo, host, &branch, "open")?
             .iter()
             .any(|request| request.state == "OPEN")
         {
-            return Ok(None);
+            return Ok(TaskReviewState::Pending);
         }
         for request in current_branch_requests(repo, host, &branch, "all")? {
-            match request.state.as_str() {
-                "OPEN" => return Ok(None),
-                "CLOSED" | "MERGED" => {}
-                _ => {
-                    return Err(Error::message(
-                        "archive cannot verify the current pull request state",
-                    ));
-                }
+            if request.state == "OPEN" {
+                return Ok(TaskReviewState::Pending);
             }
             closed.push(request);
         }
     }
     closed.sort_by_key(|request| request.number);
-    if closed.is_empty() {
-        // Pre-0.7 adoption stored the PR's branch beside the manifest. This
-        // optional current lookup hint is used only when the manifest has no
-        // associated closed PR; its historical trees are never inspected.
-        let source = task.task_path.as_deref().expect("deliverable path");
-        let path = resolved_under(&repo.root, source).join(crate::archive_adoption::LEGACY_RECORD);
-        if fs::symlink_metadata(&path)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 16 * 1024 * 1024)
-        {
-            let hint = fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-            if let Some(branch) = hint
-                .as_ref()
-                .filter(|hint| hint["task_id"].as_str() == Some(task.task_id.as_str()))
-                .and_then(|hint| hint["branch"].as_str())
-                .filter(|branch| repo.validate_branch(branch).is_ok())
-            {
-                if current_branch_requests(repo, host, branch, "open")?
-                    .iter()
-                    .any(|request| request.state == "OPEN")
-                {
-                    return Ok(None);
-                }
-                for request in current_branch_requests(repo, host, branch, "all")? {
-                    match request.state.as_str() {
-                        "OPEN" => return Ok(None),
-                        "CLOSED" | "MERGED" => closed.push(request),
-                        _ => {
-                            return Err(Error::message(
-                                "archive cannot verify the current pull request state",
-                            ));
-                        }
-                    }
-                }
-                closed.sort_by_key(|request| request.number);
-            }
+    Ok(TaskReviewState::Done(closed.pop().map(|request| {
+        ArchivePullRequest {
+            number: request.number,
+            url: request.url,
+            state: request.state,
+            head_commit: request.head_ref_oid,
+            merged_at: request.merged_at,
+            merge_commit: request.merge_commit.map(|commit| commit.oid),
         }
-    }
-    Ok(closed.pop().map(|request| ArchivePullRequest {
-        number: request.number,
-        url: request.url,
-        state: request.state,
-        head_commit: request.head_ref_oid,
-        merged_at: request.merged_at,
-        merge_commit: request.merge_commit.map(|commit| commit.oid),
-    }))
+    })))
 }
 
 fn current_branch_requests(
@@ -893,14 +874,14 @@ mod tests {
                     branch: format!("codex/{name}"),
                     source,
                     destination: destination.clone(),
-                    pull_request: ArchivePullRequest {
+                    pull_request: Some(ArchivePullRequest {
                         number: index as u64 + 1,
                         url: "https://example.invalid/pull/1".to_owned(),
                         state: "MERGED".to_owned(),
                         merged_at: Some("2026-07-12T20:00:00Z".to_owned()),
                         merge_commit: Some("a".repeat(40)),
                         head_commit: "b".repeat(40),
-                    },
+                    }),
                     receipt: serde_json::json!({"status": "planned"}),
                 },
                 original_manifest: original,
