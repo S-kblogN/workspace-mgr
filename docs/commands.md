@@ -948,6 +948,13 @@ workspace-mgr storage status 20260829-180000-report/results/model.bin
 
 Record an explicit Git or S3 placement.
 
+Cloned external Git repositories stay local and ignored as whole directories.
+Do not select a clone, a copy of its repository contents, or a containing
+boundary that would publish it to Git or S3. Deleting `.git`, flattening,
+copying or packaging the clone into an archive does not make it publishable.
+Keep its source URL, exact commit and re-clone commands in task notes, and keep
+task-authored patches, tools and results separately outside the ignored clone.
+
 For a local-only path, this explicitly resumes tracking and removes only the
 ignore rule owned by `untrack`. User-authored ignore rules are preserved; if
 they still prevent tracking, resolve the reported conflict first.
@@ -1118,6 +1125,16 @@ workspace-mgr publish -m "Keep data.bin local only"
 ## `workspace-mgr plan`
 
 Preview the complete task transaction.
+
+External Git clones are local reference material and must be ignored as whole
+directories by a shared repository or task-local `.gitignore` rule carried by
+the publication. Ignoring only `.git` or using a global ignore or
+`.git/info/exclude` is insufficient. Neither the checkout nor a copy of its
+repository contents may enter Git or S3; deleting `.git`, flattening, copying,
+packaging into an archive or selecting a containing S3 boundary cannot bypass
+that rule. The same policy applies to `publish`; see
+[artifact hygiene](guide.md#5-choose-where-retained-content-lives)
+for provenance and task-authored artifacts to retain separately.
 
 ```text
 workspace-mgr plan [--manifest <path>]
