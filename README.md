@@ -263,7 +263,7 @@ workspace-mgr setup
 workspace-mgr --help
 ```
 
-Building the crates.io package requires Rust 1.85 or newer. To install without
+Building the crates.io package requires Rust 1.99 or newer. To install without
 a Rust toolchain, download a prebuilt native archive for Linux x86-64/arm64 or
 Apple Silicon macOS from the
 [latest GitHub release](https://github.com/S-kblogN/workspace-mgr/releases/latest),

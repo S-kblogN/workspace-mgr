@@ -5,6 +5,13 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-07
+
+### Changed
+
+- Raise the minimum supported Rust version from 1.85 to 1.99 and pin repository
+  development, CI, native packaging, and crate publication to Rust 1.99.0.
+
 ## [0.8.1] - 2026-10-07
 
 ### Changed

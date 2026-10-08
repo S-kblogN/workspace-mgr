@@ -1,8 +1,8 @@
 [package]
 name = "workspace-mgr"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.99"
 description = "Fixed-policy repository workspace manager for coding agents"
 license = "MIT"
 repository = "https://github.com/S-kblogN/workspace-mgr"

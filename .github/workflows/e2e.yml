@@ -42,8 +42,9 @@ jobs:
           python-version: "3.13"
       - name: Set up Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
       - name: Install isolated S3 fixture client
         run: python -m pip install --disable-pip-version-check "boto3>=1.40,<2"
       - name: Check external commands

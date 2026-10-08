@@ -48,8 +48,9 @@ jobs:
           ref: ${{ inputs.ref }}
       - name: Set up Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
       - name: Build and assemble native archive
         env:
           EXPECTED_VERSION: ${{ inputs.version }}

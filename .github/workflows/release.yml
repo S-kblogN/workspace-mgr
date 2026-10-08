@@ -127,9 +127,11 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 3
           test "$(find . -maxdepth 1 -name '*.sha256' | wc -l | tr -d ' ')" = 3
       - name: Set up Rust
+        working-directory: source
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
       - name: Recheck release state
         id: current
         working-directory: control

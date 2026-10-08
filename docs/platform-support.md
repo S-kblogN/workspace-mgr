@@ -5,8 +5,10 @@ Release artifacts are built and tested natively on:
 - Linux x86-64 and arm64;
 - macOS on Apple Silicon.
 
-Building from source requires Rust 1.85 or newer. The native installer and
-`workspace-mgr setup` require platform Git. Storage operations run in the Rust
+Building from source requires Rust 1.99 or newer. Repository development, CI,
+and release builds use Rust 1.99.0, pinned in `rust-toolchain.toml`.
+The native installer and `workspace-mgr setup` require platform Git.
+Storage operations run in the Rust
 binary, including AWS Signature Version 4, exact-version reads, history copying,
 registry publication, and cancellation. They require no Python or DVC install.
 
