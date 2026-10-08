@@ -108,6 +108,17 @@ fn only_missing_exact_head_resolves_verified_historical_mapping() {
 }
 
 #[test]
+fn publishing_exact_versions_never_substitutes_a_historical_archive_location() {
+    let (_directory, repo) = repo();
+    let (client, worker) = single_reply_fixture(missing("NoSuchVersion", 404));
+    assert!(verify_storage_entries(&client, &repo, &[entry("task/a").metadata]).is_err());
+    let requests = worker.finish_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "HEAD");
+    assert!(requests[0].target.contains("/root/task/a?versionId=v1"));
+}
+
+#[test]
 fn historical_mapping_mismatched_size_or_etag_never_heads_destination() {
     let (_directory, repo) = repo();
     for field in ["size", "source_etag"] {
@@ -445,6 +456,43 @@ fn deleted() -> Reply {
     }
 }
 
+fn batch_delete_items(request: &WireRequest) -> Vec<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(rename = "Object")]
+        objects: Vec<Object>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Object {
+        #[serde(rename = "Key")]
+        key: String,
+        #[serde(rename = "VersionId")]
+        version: String,
+    }
+    assert_eq!(request.method, "POST");
+    let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+    assert_eq!(url.path().trim_end_matches('/'), "/fixture-bucket");
+    assert!(url.query_pairs().any(|(name, _)| name == "delete"));
+    let parsed: Request = quick_xml::de::from_reader(request.body.as_slice()).unwrap();
+    assert!((1..=1_000).contains(&parsed.objects.len()));
+    parsed
+        .objects
+        .into_iter()
+        .map(|object| (object.key, object.version))
+        .collect()
+}
+
+fn batch_deleted(items: &[(String, String)]) -> Reply {
+    let mut body = String::from("<DeleteResult>");
+    for (key, version) in items {
+        body.push_str(&format!(
+            "<Deleted><Key>{key}</Key><VersionId>{version}</VersionId></Deleted>"
+        ));
+    }
+    body.push_str("</DeleteResult>");
+    Reply::xml(&body)
+}
+
 #[test]
 fn generic_purge_deletes_complete_exact_object_history_including_markers() {
     let (_directory, repo) = repo();
@@ -452,12 +500,15 @@ fn generic_purge_deletes_complete_exact_object_history_including_markers() {
     let (client, worker) = routed_fixture(move |request| {
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
-        if request.method == "DELETE" {
-            assert_eq!(url.path(), "/fixture-bucket/root/task/a");
-            let version = query["versionId"].clone();
-            assert!(matches!(version.as_str(), "v1" | "d1"));
-            assert!(retired.lock().unwrap().insert(version));
-            return deleted();
+        if request.method == "POST" {
+            let items = batch_delete_items(request);
+            assert_eq!(items.len(), 2);
+            for (object, version) in &items {
+                assert_eq!(object, "root/task/a");
+                assert!(matches!(version.as_str(), "v1" | "d1"));
+                assert!(retired.lock().unwrap().insert(version.clone()));
+            }
+            return batch_deleted(&items);
         }
         assert_eq!(request.method, "GET");
         assert!(query.contains_key("versions"));
@@ -491,24 +542,205 @@ fn generic_purge_deletes_complete_exact_object_history_including_markers() {
     let requests = worker.finish_requests();
     let deleted = requests
         .iter()
-        .filter(|request| request.method == "DELETE")
+        .filter(|request| request.method == "POST")
         .collect::<Vec<_>>();
-    assert_eq!(deleted.len(), 2);
-    assert!(deleted.iter().all(|request| {
-        request
-            .target
-            .starts_with("/fixture-bucket/root/task/a?versionId=")
-    }));
-    assert!(
-        deleted
-            .iter()
-            .any(|request| request.target.ends_with("versionId=d1"))
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(
+        batch_delete_items(deleted[0])
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            ("root/task/a".into(), "v1".into()),
+            ("root/task/a".into(), "d1".into())
+        ])
     );
-    assert!(
-        !deleted
-            .iter()
-            .any(|request| request.target.contains("sibling"))
+}
+
+#[test]
+fn generic_purge_preserves_single_deletes_for_history_with_a_null_generation() {
+    use std::sync::{Arc, Mutex};
+
+    let (_directory, repo) = repo();
+    let retired = Arc::new(Mutex::new(BTreeSet::new()));
+    let observed = retired.clone();
+    let (client, worker) = routed_fixture(move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if request.method == "DELETE" {
+            assert_eq!(url.path(), "/fixture-bucket/root/task/a");
+            let version = query["versionId"].clone();
+            assert!(matches!(version.as_str(), "v1" | "null"));
+            assert!(observed.lock().unwrap().insert(version));
+            return deleted();
+        }
+        assert_eq!(request.method, "GET");
+        assert!(query.contains_key("versions"));
+        if query["prefix"] == registry_object() {
+            return history("");
+        }
+        assert_eq!(query["prefix"], "root/task/a");
+        let retired = observed.lock().unwrap();
+        let mut rows = version_row("root/task/ab", "neighbor");
+        for version in ["v1", "null"] {
+            if !retired.contains(version) {
+                rows.push_str(&version_row("root/task/a", version));
+            }
+        }
+        history(&rows)
+    });
+    let result = delete_candidates(
+        &client,
+        &repo,
+        &json!([{"pointer":"task/a.wm-storage.json","object":"task/a","version_id":"v1"}]),
+    )
+    .unwrap();
+    assert_eq!(
+        result["deleted"][0]["deleted_version_ids"],
+        json!(["null", "v1"])
     );
+    assert_eq!(
+        *retired.lock().unwrap(),
+        BTreeSet::from(["null".into(), "v1".into()])
+    );
+    let requests = worker.finish_requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "DELETE").count(), 2);
+    assert!(requests.iter().all(|r| r.method != "POST"));
+    assert_eq!(requests.last().unwrap().method, "GET");
+}
+
+#[test]
+fn generic_batch_purge_partial_failure_keeps_candidates_and_retries_remaining_version() {
+    use std::sync::{Arc, Mutex};
+
+    let (_directory, repo) = repo();
+    let retired = Arc::new(Mutex::new(BTreeSet::new()));
+    let observed = retired.clone();
+    let (client, worker) = routed_fixture(move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if request.method == "POST" {
+            assert_eq!(
+                batch_delete_items(request)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    ("root/task/a".into(), "v1".into()),
+                    ("root/task/a".into(), "v2".into())
+                ])
+            );
+            assert!(observed.lock().unwrap().insert("v1".to_owned()));
+            return Reply::xml(
+                "<DeleteResult><Deleted><Key>root/task/a</Key><VersionId>v1</VersionId></Deleted><Error><Key>root/task/a</Key><VersionId>v2</VersionId><Code>AccessDenied</Code><Message>fixture partial failure</Message></Error></DeleteResult>",
+            );
+        }
+        if request.method == "DELETE" {
+            assert_eq!(url.path(), "/fixture-bucket/root/task/a");
+            assert_eq!(query["versionId"], "v2");
+            assert!(observed.lock().unwrap().insert("v2".to_owned()));
+            return deleted();
+        }
+        assert_eq!(request.method, "GET");
+        assert!(query.contains_key("versions"));
+        if query["prefix"] == registry_object() {
+            return history("");
+        }
+        assert_eq!(query["prefix"], "root/task/a");
+        let retired = observed.lock().unwrap();
+        let mut rows = version_row("root/task/ab", "neighbor");
+        for version in ["v1", "v2"] {
+            if !retired.contains(version) {
+                rows.push_str(&version_row("root/task/a", version));
+            }
+        }
+        history(&rows)
+    });
+    let payload = json!([{"pointer":"task/a.wm-storage.json","object":"task/a","version_id":"v1"}]);
+    let unchanged = payload.clone();
+    let error = delete_candidates(&client, &repo, &payload).unwrap_err();
+    assert!(error.to_string().contains("AccessDenied"), "{error}");
+    assert_eq!(payload, unchanged);
+    assert_eq!(*retired.lock().unwrap(), BTreeSet::from(["v1".into()]));
+    let result = delete_candidates(&client, &repo, &payload).unwrap();
+    assert_eq!(result["deleted"][0]["deleted_version_ids"], json!(["v2"]));
+    assert_eq!(
+        *retired.lock().unwrap(),
+        BTreeSet::from(["v1".into(), "v2".into()])
+    );
+    let requests = worker.finish_requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "POST").count(), 1);
+    assert_eq!(requests.iter().filter(|r| r.method == "DELETE").count(), 1);
+    assert_eq!(requests.last().unwrap().method, "GET");
+}
+
+#[test]
+fn generic_batch_purge_caps_large_exact_history_at_one_thousand_items_per_request() {
+    use std::sync::{Arc, Mutex};
+
+    let (_directory, repo) = repo();
+    const COUNT: usize = 2_005;
+    let retired = Arc::new(Mutex::new(BTreeSet::new()));
+    let observed = retired.clone();
+    let (client, worker) = routed_fixture(move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if request.method == "POST" {
+            let items = batch_delete_items(request);
+            let mut retired = observed.lock().unwrap();
+            for (key, version) in &items {
+                assert_eq!(key, "root/task/a");
+                assert!(version.strip_prefix('v').unwrap().parse::<usize>().unwrap() < COUNT);
+                assert!(retired.insert(version.clone()));
+            }
+            return batch_deleted(&items);
+        }
+        assert_eq!(request.method, "GET");
+        assert!(query.contains_key("versions"));
+        if query["prefix"] == registry_object() {
+            return history("");
+        }
+        assert_eq!(query["prefix"], "root/task/a");
+        if observed.lock().unwrap().len() == COUNT {
+            return history(&version_row("root/task/ab", "neighbor"));
+        }
+        let start = query
+            .get("version-id-marker")
+            .map_or(0, |version| version[1..].parse::<usize>().unwrap() + 1);
+        let end = (start + 1_000).min(COUNT);
+        let mut rows = (start..end)
+            .map(|index| version_row("root/task/a", &format!("v{index:05}")))
+            .collect::<String>();
+        if end < COUNT {
+            Reply::xml(&format!(
+                "<ListVersionsResult>{rows}<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a</NextKeyMarker><NextVersionIdMarker>v{:05}</NextVersionIdMarker></ListVersionsResult>",
+                end - 1
+            ))
+        } else {
+            rows.push_str(&version_row("root/task/ab", "neighbor"));
+            history(&rows)
+        }
+    });
+    let result = delete_candidates(
+        &client,
+        &repo,
+        &json!([{"pointer":"task/a.wm-storage.json","object":"task/a","version_id":"v00000"}]),
+    )
+    .unwrap();
+    assert_eq!(retired.lock().unwrap().len(), COUNT);
+    let ids = result["deleted"][0]["deleted_version_ids"]
+        .as_array()
+        .unwrap();
+    assert_eq!(ids.len(), COUNT);
+    assert_eq!(ids.first().unwrap(), "v00000");
+    assert_eq!(ids.last().unwrap(), "v02004");
+    let requests = worker.finish_requests();
+    let sizes = requests
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|request| batch_delete_items(request).len())
+        .collect::<Vec<_>>();
+    assert_eq!(sizes, [1_000, 1_000, 5]);
+    assert!(requests.iter().all(|r| r.method != "DELETE"));
+    assert_eq!(requests.last().unwrap().method, "GET");
 }
 
 #[derive(Default)]
@@ -550,18 +782,30 @@ fn concurrent_purge_fixture(
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
         let query = url.query_pairs().collect::<BTreeMap<_, _>>();
         let (lock, changed) = &*observed;
-        if request.method == "DELETE" {
-            let object = url.path().strip_prefix("/fixture-bucket/").unwrap();
-            assert!(objects.iter().any(|expected| expected == object));
-            let version = query.get("versionId").unwrap().as_ref();
-            assert!(version == "v1" || (marker && version == "d1"));
+        if request.method == "DELETE" || request.method == "POST" {
+            let items = if request.method == "POST" {
+                batch_delete_items(request)
+            } else {
+                vec![(
+                    url.path().strip_prefix("/fixture-bucket/").unwrap().into(),
+                    query.get("versionId").unwrap().to_string(),
+                )]
+            };
             let mut state = lock.lock().unwrap();
-            if fail_first_delete && object == objects[0] && !state.failed {
-                state.failed = true;
-                return missing("InternalError", 500);
+            for (object, version) in &items {
+                assert!(objects.iter().any(|expected| expected == object));
+                assert!(version == "v1" || (marker && version == "d1"));
+                if fail_first_delete && object == &objects[0] && !state.failed {
+                    state.failed = true;
+                    return missing("InternalError", 500);
+                }
+                assert!(state.deleted.insert((object.clone(), version.clone())));
             }
-            assert!(state.deleted.insert((object.into(), version.into())));
-            return deleted();
+            return if request.method == "POST" {
+                batch_deleted(&items)
+            } else {
+                deleted()
+            };
         }
         assert_eq!(request.method, "GET");
         if !query.contains_key("versions") {
@@ -656,9 +900,9 @@ fn generic_purge_pipelines_distinct_objects_with_four_workers_and_fresh_shared_a
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request.method == "DELETE")
+            .filter(|request| request.method == "POST")
             .count(),
-        count * 2
+        count
     );
     assert_eq!(state.post_lists, count);
     assert_eq!(result["deleted"].as_array().unwrap().len(), count);
@@ -796,15 +1040,18 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
     let (client, worker) = routed_fixture(move |request| {
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
-        if request.method == "DELETE" {
-            assert_eq!(url.path(), "/fixture-bucket/root/task/a");
-            let version = query.get("versionId").unwrap();
-            assert!(
-                handler_present.contains(version),
-                "unrequested deletion: {version}"
-            );
-            assert!(handler_retired.lock().unwrap().insert(version.clone()));
-            return deleted();
+        if request.method == "POST" {
+            let items = batch_delete_items(request);
+            assert_eq!(items.len(), 3);
+            for (object, version) in &items {
+                assert_eq!(object, "root/task/a");
+                assert!(
+                    handler_present.contains(version),
+                    "unrequested deletion: {version}"
+                );
+                assert!(handler_retired.lock().unwrap().insert(version.clone()));
+            }
+            return batch_deleted(&items);
         }
         assert_eq!(request.method, "GET");
         if query.contains_key("versioning") {
@@ -852,19 +1099,18 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request.method == "DELETE")
+            .filter(|request| request.method == "POST")
             .count(),
-        3
+        1
     );
     assert!(
         requests
             .iter()
-            .filter(|request| request.method == "DELETE")
+            .filter(|request| request.method == "POST")
             .all(|request| {
-                request
-                    .target
-                    .starts_with("/fixture-bucket/root/task/a?versionId=")
-                    && !request.target.contains("neighbor-version")
+                batch_delete_items(request).iter().all(|(object, version)| {
+                    object == "root/task/a" && version != "neighbor-version"
+                })
             })
     );
     assert_eq!(requests.last().unwrap().method, "GET");

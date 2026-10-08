@@ -594,12 +594,12 @@ pub(crate) fn archive_receipts_at(
     scopes: &[String],
 ) -> Result<Vec<serde_json::Value>> {
     let mut receipts = Vec::new();
-    for path in paths_at(repo, revision, scopes)? {
-        if !path.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)) {
-            continue;
-        }
-        let raw = repo.run(["show", &format!("{revision}:{path}")])?;
-        let receipt: serde_json::Value = serde_json::from_str(&raw.stdout).map_err(|error| {
+    let paths = paths_at(repo, revision, scopes)?
+        .into_iter()
+        .filter(|path| path.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME)))
+        .collect::<Vec<_>>();
+    for (path, raw) in repo.show_files(revision, &paths)? {
+        let receipt: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
             Error::message(format!("invalid published archive receipt {path}: {error}"))
         })?;
         crate::archive_migration::validate(&path, &receipt)?;
@@ -630,49 +630,34 @@ fn referenced_objects(
         .cloned()
         .map(|item| (item.object, item.version_id))
         .collect::<BTreeSet<_>>();
-    let candidate_pointers = candidates
+    let candidate_sources = candidates
         .iter()
-        .map(|candidate| candidate.pointer.clone())
-        .collect::<BTreeSet<_>>();
+        .filter_map(|candidate| {
+            candidate
+                .pointer
+                .strip_suffix(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
+        })
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut requests = Vec::new();
     let mut archive_protected = BTreeSet::new();
-    let mut live_trees = BTreeSet::new();
-    for revision in revisions {
-        // Coordination tags can name blobs; commit and tree references can
-        // contain live pointers. Peel nested annotated tags recursively.
-        let kind = repo.run(["cat-file", "-t", &format!("{revision}^{{}}")])?;
-        if kind.stdout.trim() == "blob" {
-            continue;
-        }
-        let tree = repo.run(["rev-parse", "--verify", &format!("{revision}^{{tree}}")])?;
-        let revision = tree.stdout.trim().to_owned();
-        if !live_trees.insert(revision.clone()) {
-            continue;
-        }
+    for revision in remote_trees(repo, &revisions)? {
         // A pending child pointer can disappear while a newly published
         // parent or renamed pointer still references the same object. Generic
         // retirement deletes its entire history, so collect references by
         // actual object identity through every live pointer, not its old name.
         let mut pointers = pointers_at(repo, &revision, &[])?;
-        for pointer in &candidate_pointers {
-            if let Some(source) =
-                pointer.strip_suffix(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
-            {
-                // An archive retires the entire prefix, including historical
-                // files no current pointer names. Keep that complete snapshot
-                // while any live branch or tag still contains the source task.
-                // Pre-adoption tags can contain the task directory without a
-                // manifest. Its tree is still a live reference to that logical
-                // path; a same-named blob or coordination tag is not.
-                let source_tree =
-                    repo.run_unchecked(["cat-file", "-t", &format!("{revision}:{source}")])?;
-                if source_tree.success()
-                    && source_tree.stdout.trim() == "tree"
-                    && !published_archive_sources.contains(source)
-                {
-                    archive_protected.insert(format!("{source}/"));
-                }
-                continue;
+        for source in archive_source_trees(repo, &revision, &candidate_sources)? {
+            // An archive retires the entire prefix, including historical
+            // files no current pointer names. Keep that complete snapshot
+            // while any live branch or tag still contains the source task.
+            // Pre-adoption tags can contain the task directory without a
+            // manifest. Its tree is still a live reference to that logical
+            // path; a same-named blob or coordination tag is not.
+            if !published_archive_sources.contains(source.as_str()) {
+                archive_protected.insert(format!("{source}/"));
             }
         }
         pointers.sort();
@@ -729,6 +714,122 @@ fn referenced_objects(
             }
         })
         .cloned()
+        .collect())
+}
+
+/// Resolve every live branch/tag through the same two batched object queries.
+/// Coordination tags can point at blobs; nested annotated tags are peeled
+/// recursively before the remaining references are required to name trees.
+fn remote_trees(repo: &GitRepo, revisions: &[String]) -> Result<BTreeSet<String>> {
+    if revisions.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let peeled = revisions
+        .iter()
+        .map(|revision| format!("{revision}^{{}}\n"))
+        .collect::<String>();
+    let output = repo.run_bytes(
+        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        Some(peeled.as_bytes()),
+    )?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| Error::message("Git object types are not UTF-8"))?;
+    let records = text.lines().collect::<Vec<_>>();
+    if records.len() != revisions.len() {
+        return Err(Error::message(
+            "Git object type batch omitted remote references",
+        ));
+    }
+    let mut tree_requests = String::new();
+    let mut expected = 0;
+    for (revision, record) in revisions.iter().zip(records) {
+        let Some((_, kind)) = record.split_once(' ') else {
+            return Err(Error::message("unexpected Git object type entry"));
+        };
+        match kind {
+            "blob" => {}
+            "commit" | "tree" => {
+                tree_requests.push_str(&format!("{revision}^{{tree}}\n"));
+                expected += 1;
+            }
+            _ => {
+                return Err(Error::message(format!(
+                    "remote Git reference {revision} has unexpected type {kind:?}"
+                )));
+            }
+        }
+    }
+    if expected == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let output = repo.run_bytes(
+        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        Some(tree_requests.as_bytes()),
+    )?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| Error::message("Git trees are not UTF-8"))?;
+    if text.lines().count() != expected {
+        return Err(Error::message("Git tree batch omitted remote references"));
+    }
+    text.lines()
+        .map(|line| match line.split_once(' ') {
+            Some((oid, "tree"))
+                if matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                Ok(oid.to_owned())
+            }
+            _ => Err(Error::message(format!(
+                "unexpected Git tree entry {line:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn archive_source_trees(
+    repo: &GitRepo,
+    revision: &str,
+    sources: &[String],
+) -> Result<BTreeSet<String>> {
+    let requested = sources.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let literal = sources
+        .iter()
+        .map(|source| format!(":(literal){source}"))
+        .collect::<Vec<_>>();
+    let mut candidates = BTreeMap::new();
+    for batch in crate::git::pathspec_batches(&literal) {
+        let mut args = vec![
+            "ls-tree".to_owned(),
+            "-d".to_owned(),
+            "-z".to_owned(),
+            revision.to_owned(),
+            "--".to_owned(),
+        ];
+        args.extend(batch.iter().cloned());
+        let output = repo.run_bytes(args, None)?;
+        for record in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let record = std::str::from_utf8(record)
+                .map_err(|_| Error::message("archive source tree path is not UTF-8"))?;
+            let Some((header, path)) = record.split_once('\t') else {
+                return Err(Error::message("unexpected archive source tree entry"));
+            };
+            let fields = header.split(' ').collect::<Vec<_>>();
+            if fields.get(1) == Some(&"tree") && requested.contains(path) {
+                let oid = fields
+                    .get(2)
+                    .ok_or_else(|| Error::message("archive source tree entry has no object ID"))?;
+                candidates.insert(path.to_owned(), (*oid).to_owned());
+            }
+        }
+    }
+    let ids = candidates.values().cloned().collect::<Vec<_>>();
+    let types = repo.object_types(&ids)?;
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(path, oid)| (types[&oid].as_deref() == Some("tree")).then_some(path))
         .collect())
 }
 
@@ -868,6 +969,51 @@ mod tests {
             "destination":format!("2026/07/{source}"),"status":"copied",
             "bucket":"isolated-fixture","remote_prefix":"dvc","versions":[]
         })
+    }
+
+    #[test]
+    fn archive_source_tree_batch_rejects_missing_referenced_tree_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_owned(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        repo.run(["config", "user.name", "Purge fixture"]).unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        for (path, content) in [
+            ("outer/[literal]/file", "missing tree"),
+            ("other/file", "live tree"),
+        ] {
+            let file = repo.root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
+        }
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "source trees"]).unwrap();
+        let sources = ["outer/[literal]".to_owned(), "other".to_owned()];
+        assert_eq!(
+            archive_source_trees(&repo, "HEAD", &sources).unwrap(),
+            sources.clone().into_iter().collect()
+        );
+        let oid = repo
+            .run(["rev-parse", "HEAD:outer/[literal]"])
+            .unwrap()
+            .stdout
+            .trim()
+            .to_owned();
+        fs::remove_file(
+            repo.git_dir()
+                .unwrap()
+                .join("objects")
+                .join(&oid[..2])
+                .join(&oid[2..]),
+        )
+        .unwrap();
+        assert_eq!(
+            archive_source_trees(&repo, "HEAD", &sources).unwrap(),
+            BTreeSet::from(["other".to_owned()])
+        );
     }
 
     #[test]

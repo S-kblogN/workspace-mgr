@@ -217,6 +217,51 @@ pub(crate) fn read_pointer_document(repo: &GitRepo, pointer: &str) -> Result<Poi
     parse_pointer_document_in_repo(repo, None, &raw, pointer)
 }
 
+/// Read a command's metadata inventory once. Legacy remote selection belongs
+/// to the repository/revision, rather than to every file in that inventory.
+/// Native manifests yield their logical document and algorithm from one parse.
+pub(crate) fn read_pointer_documents(
+    repo: &GitRepo,
+    revision: Option<&str>,
+    pointers: &[String],
+) -> Result<BTreeMap<String, (PointerDocument, String)>> {
+    let selected_remote = if pointers.iter().any(|pointer| pointer.ends_with(".dvc")) {
+        crate::legacy_dvc::selected_remote(repo, revision)?
+    } else {
+        None
+    };
+    let historical = revision
+        .map(|revision| repo.show_files(revision, pointers))
+        .transpose()?;
+    let mut documents = BTreeMap::new();
+    for pointer in pointers {
+        let raw = match &historical {
+            Some(files) => files[pointer].clone(),
+            None => {
+                reject_symlink_traversal(&repo.root, pointer, "managed-storage metadata")?;
+                let path = resolved_under(&repo.root, pointer);
+                fs::read_to_string(&path).at(&path)?
+            }
+        };
+        let parsed = if pointer.ends_with(".dvc") {
+            let normalized = crate::legacy_dvc::normalize_remote_binding(
+                &raw,
+                pointer,
+                selected_remote.as_deref(),
+            )?;
+            (
+                crate::legacy_dvc::parse_document(&normalized, pointer)?,
+                crate::legacy_dvc::hash_algorithm(&normalized, pointer)?,
+            )
+        } else {
+            let manifest = crate::storage_format::Manifest::parse(&raw, pointer)?;
+            (logical_document(&manifest), manifest.checksum.algorithm)
+        };
+        documents.insert(pointer.clone(), parsed);
+    }
+    Ok(documents)
+}
+
 pub(crate) fn normalize_pointer_in_repo(
     repo: &GitRepo,
     revision: Option<&str>,
@@ -471,6 +516,14 @@ pub fn output_paths(repo: &GitRepo, pointers: &[String]) -> Result<BTreeMap<Stri
 /// engine command, so it also validates metadata taken from a Git revision.
 pub fn metadata_output(repo: &GitRepo, pointer: &str, raw: &str) -> Result<String> {
     let parsed = parse_pointer_document(raw, pointer)?;
+    metadata_output_from_document(repo, pointer, &parsed)
+}
+
+pub(crate) fn metadata_output_from_document(
+    repo: &GitRepo,
+    pointer: &str,
+    parsed: &PointerDocument,
+) -> Result<String> {
     let [output] = parsed.outs.as_slice() else {
         return Err(Error::message(format!(
             "managed-storage metadata must define exactly one output: {pointer}"
@@ -523,17 +576,22 @@ pub fn require_addressable_metadata(pointers: &[String]) -> Result<()> {
 }
 
 pub fn status(repo: &GitRepo, pointer: &str) -> Result<serde_json::Value> {
+    statuses(repo, &[pointer.to_owned()])
+}
+
+fn statuses(repo: &GitRepo, pointers: &[String]) -> Result<serde_json::Value> {
     let output = inspect_engine(
         &repo.root,
         &Operation::Status {
-            pointers: vec![pointer.to_owned()],
+            pointers: pointers.to_vec(),
             cloud: false,
             quiet: false,
         },
     )?;
     if !output.success() {
         return Err(Error::message(format!(
-            "managed-storage status failed for {pointer}: {}",
+            "managed-storage status failed for {}: {}",
+            pointers.join(", "),
             private_detail(&output)
         )));
     }
@@ -560,17 +618,20 @@ pub fn reconcile(
         verify_object_versioning(repo, config)?;
     }
     let outputs = output_paths(repo, pointers)?;
-    let mut dirty = Vec::new();
-    for pointer in pointers {
-        let value = status(repo, pointer)?;
-        let is_dirty = value
-            .as_object()
-            .map(|object| !object.is_empty())
-            .unwrap_or(true);
-        if is_dirty {
-            dirty.push(pointer.clone());
-        }
-    }
+    let states = if pointers.is_empty() {
+        serde_json::json!({})
+    } else {
+        statuses(repo, pointers)?
+    };
+    let dirty = pointers
+        .iter()
+        .filter(|pointer| {
+            states
+                .as_object()
+                .is_none_or(|object| object.contains_key(pointer.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let missing: Vec<String> = dirty
         .iter()
         .flat_map(|pointer| outputs.get(pointer).into_iter().flatten())
@@ -597,11 +658,11 @@ pub fn reconcile(
     if dry_run {
         return Ok(report);
     }
-    for pointer in &dirty {
+    if !dirty.is_empty() {
         execute_engine(
             &repo.root,
             &Operation::Record {
-                pointers: vec![pointer.to_owned()],
+                pointers: dirty.clone(),
             },
         )?;
     }
@@ -914,13 +975,23 @@ pub struct HydrateReport {
 pub fn validate_worktree(repo: &GitRepo, config: &Config, pointers: &[String]) -> Result<()> {
     ensure_ready(repo, config)?;
     let mut conflicts = Vec::new();
+    let existing = pointers
+        .iter()
+        .filter(|pointer| resolved_under(&repo.root, pointer).is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    let states = if existing.is_empty() {
+        serde_json::json!({})
+    } else {
+        statuses(repo, &existing)?
+    };
     for pointer in pointers {
         if !resolved_under(&repo.root, pointer).is_file() {
             continue;
         }
-        let dirty = status(repo, pointer)?
+        let dirty = states
             .as_object()
-            .map(|object| !object.is_empty())
+            .map(|object| object.contains_key(pointer))
             .unwrap_or(true);
         if !dirty {
             continue;

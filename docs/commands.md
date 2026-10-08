@@ -267,10 +267,32 @@ separately from payload paths; arbitrary control-looking keys are not exempt.
 
 The audit checks materialized local bytes and directory membership against the
 manifest too. Unmaterialized outputs use the manifest as the logical local tree
-and are counted separately; doctor does not hydrate them. Exact remote checksum
-verification downloads each current object into temporary scratch space, without
-installing a cache or changing repository files. Large tasks can take time and
-incur S3 read/transfer costs.
+and are counted separately; doctor does not hydrate them. Local hashes run in
+parallel across available CPU cores. Independent S3 checks use at most sixteen
+workers, preserving exact version, ETag, size and inventory checks.
+
+Doctor requests S3 `HeadObject` with `ChecksumMode=ENABLED`. A provider's
+`FULL_OBJECT` MD5 can validate a raw-MD5 manifest without downloading the object.
+When checked local bytes are present, a full-object MD5 or SHA256 also establishes
+raw-byte checksum equality; the local manifest checksum is still checked,
+including the legacy `md5-dos2unix` normalization rule. This uses the provider's
+content checksum, never a generic ETag or uploader-controlled user metadata.
+Checksum equality is a digest-based integrity proof; it is not a mathematical
+collision-free proof of literal byte equality.
+
+Missing, malformed, composite, CRC-only or incompatible checksums retain the
+full read check. An unmaterialized normalized manifest also requires this
+fallback. Doctor streams each exact remote version directly through checksum
+verification and literal local-byte comparison in the same pass, without a
+scratch file, cache installation or filesystem sync. Both remote inventories
+and local file generations are compared before and after the audit. Large
+tasks can still incur S3 read/transfer costs when the provider lacks a suitable
+full-object checksum.
+
+Interactive terminals show stages and object progress. JSON storage reports
+include `remote_checksum_objects`, `streamed_objects` and `streamed_bytes` so
+callers can see which verification path ran. Configuration remains `[s3]`:
+all remote checks use the S3 API, including on Backblaze endpoints.
 
 A selected task also checks its former prefixes recorded in locally available
 Git history and archive receipts. Doctor never fetches refs or follows archive

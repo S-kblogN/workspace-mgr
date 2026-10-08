@@ -445,6 +445,89 @@ impl Storage for Memory {
     }
 }
 
+#[test]
+fn immutable_archive_reads_overlap_with_a_bounded_worker_count_and_keep_request_order() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct ConcurrentReads {
+        memory: Mutex<Memory>,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+    impl Storage for ConcurrentReads {
+        fn call(
+            &self,
+            operation: &str,
+            args: &Value,
+            body: Option<&[u8]>,
+        ) -> std::result::Result<S3Response, S3Error> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(3));
+            let result = self.memory.lock().unwrap().call(operation, args, body);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        fn bucket(&self) -> &str {
+            "fixture"
+        }
+        fn prefix(&self) -> &str {
+            "storage"
+        }
+        fn b2(&self) -> bool {
+            false
+        }
+    }
+    let memory = Memory::new();
+    let requests = (0..33)
+        .map(|index| {
+            let object = format!("storage/archive/object-{index}");
+            let version = format!("version-{index}");
+            memory.add(
+                &object,
+                &version,
+                format!("{{\"receipt\":{index}}}").as_bytes(),
+                false,
+                None,
+                Value::Null,
+            );
+            json!({"Bucket":"fixture","Key":object,"VersionId":version})
+        })
+        .collect::<Vec<_>>();
+    let store = ConcurrentReads {
+        memory: Mutex::new(memory),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    };
+    let heads = parallel_heads(&store, &requests).unwrap();
+    for (request, head) in requests.iter().zip(heads) {
+        assert_eq!(head["VersionId"], request["VersionId"]);
+    }
+    assert!((2..=READ_WORKERS).contains(&store.peak.load(Ordering::SeqCst)));
+    store.peak.store(0, Ordering::SeqCst);
+    let receipts = parallel_registries(&store, &requests, READ_WORKERS).unwrap();
+    for (index, receipt) in receipts.into_iter().enumerate() {
+        assert_eq!(receipt["receipt"], index);
+    }
+    assert!((2..=READ_WORKERS).contains(&store.peak.load(Ordering::SeqCst)));
+    store.peak.store(0, Ordering::SeqCst);
+    parallel_registries(&store, &requests, 2).unwrap();
+    assert_eq!(store.peak.load(Ordering::SeqCst), 2);
+    store
+        .memory
+        .lock()
+        .unwrap()
+        .state
+        .borrow_mut()
+        .fail
+        .insert("head_object".to_owned(), 38);
+    assert!(parallel_heads(&store, &requests).is_err());
+    assert_eq!(store.active.load(Ordering::SeqCst), 0);
+    assert_eq!(store.memory.lock().unwrap().count("head_object"), 66);
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     repo: GitRepo,
@@ -792,6 +875,105 @@ fn lost_copy_response_is_recovered_without_another_copy() {
     assert!(fixture.run("copy").is_err());
     assert_eq!(fixture.run("copy").unwrap()["status"], "copied");
     assert_eq!(fixture.store.count("copy_object"), 1);
+}
+
+#[test]
+fn cancel_inventory_reads_each_exact_version_once_and_keeps_same_key_ownership_separate() {
+    let store = Memory::new();
+    let context = json!({"source":"task","destination":"2026/07/task"});
+    let mut journal = json!({"transaction_id":"attempt","versions":[]});
+    for (source_version, destination, body) in [
+        ("old", "2026/07/task/data", b"a".as_slice()),
+        ("middle", "2026/07/task/data", b"bb".as_slice()),
+        ("latest", "2026/07/task/data", b"ccc".as_slice()),
+        ("different-key", "2026/07/task/other", b"dddd".as_slice()),
+    ] {
+        let row = json!({"source_object":"task/data","source_version_id":source_version,
+            "destination_object":destination,"destination_version_id":null,"destination_etag":null,
+            "delete_marker":false,"size":body.len(),"started":true});
+        let ownership = token(&journal, &row).unwrap();
+        // The latest data and other key deliberately share a VersionId.
+        let copied_version = if source_version == "different-key" {
+            "latest"
+        } else {
+            source_version
+        };
+        store.add(
+            &format!("storage/{destination}"),
+            copied_version,
+            body,
+            false,
+            None,
+            json!({"Metadata":{metadata_key(&journal).unwrap():ownership}}),
+        );
+        journal["versions"].as_array_mut().unwrap().push(row);
+    }
+    store.add(
+        "storage/2026/07/task/data",
+        "foreign",
+        b"new unrelated payload",
+        false,
+        None,
+        Value::Null,
+    );
+    store.add(
+        "storage/2026/07/task/data",
+        "foreign-marker",
+        b"",
+        true,
+        None,
+        Value::Null,
+    );
+    let (owned, unrelated) = cancel_inventory(&store, &context, &mut journal, false).unwrap();
+    assert_eq!(owned.len(), 4);
+    assert_eq!(unrelated.len(), 2);
+    assert_eq!(store.count("head_object"), 5);
+    for version in &owned {
+        let row = &journal["versions"][version.row];
+        let record = &row["cancel_owned_versions"][version.record];
+        assert_eq!(record["version_id"], version.version);
+        assert_eq!(
+            key(&store, text(row, "destination_object").unwrap()),
+            version.key
+        );
+    }
+    let before = store.count("head_object");
+    cancel_inventory(&store, &context, &mut journal, false).unwrap();
+    assert_eq!(store.count("head_object"), before + 5);
+    store.add(
+        "storage/2026/07/task/data",
+        "null",
+        b"mutable legacy generation",
+        false,
+        None,
+        Value::Null,
+    );
+    let before = store.count("head_object");
+    let (_, unrelated) = cancel_inventory(&store, &context, &mut journal, false).unwrap();
+    assert_eq!(unrelated.len(), 3);
+    assert_eq!(
+        store.count("head_object"),
+        before + 8,
+        "null versions are rechecked for each of the three source rows"
+    );
+    let mut mismatched = journal.clone();
+    mismatched["versions"][1]["size"] = 99.into();
+    assert!(
+        cancel_inventory(&store, &context, &mut mismatched, false)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("payload version is missing or mismatched")
+    );
+    store.state.borrow_mut().versions[0].value["Metadata"] = json!({});
+    assert!(
+        cancel_inventory(&store, &context, &mut journal, false)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cannot verify copied version ownership")
+    );
+    assert_eq!(store.count("delete_object"), 0);
 }
 
 #[test]
@@ -1630,23 +1812,24 @@ fn large_registry_read(interrupt: bool) {
     let attempts = worker.finish();
     let listing_target = attempts[0].request.target.as_str();
     assert!(listing_target.contains("versions="));
-    let mut logical_targets = Vec::new();
-    for attempt in &attempts {
-        let target = attempt.request.target.as_str();
-        if logical_targets.last().copied() != Some(target) {
-            logical_targets.push(target);
-        }
-    }
-    // Adjacent physical retries do not add a logical read or advance the
-    // registry's version sequence, even when a small response was fully sent.
+    assert_eq!(attempts.last().unwrap().request.target, listing_target);
+    // Immutable versions may interleave, including retries of r1. Both reads
+    // remain bounded by the same before/after inventory, and r2 is read once.
+    let reads = &attempts[1..attempts.len() - 1];
+    assert!(reads.iter().all(|attempt| {
+        attempt.request.target == first_target || attempt.request.target == second_target
+    }));
     assert_eq!(
-        logical_targets,
-        [
-            listing_target,
-            &first_target,
-            &second_target,
-            listing_target
-        ]
+        reads
+            .iter()
+            .filter(|attempt| attempt.request.target == second_target)
+            .count(),
+        1
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|attempt| attempt.request.target == first_target)
     );
     let successful = attempts
         .iter()

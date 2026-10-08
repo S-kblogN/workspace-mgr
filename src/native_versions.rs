@@ -41,18 +41,23 @@ fn identity(value: &Value) -> Result<(String, String)> {
         string(value, "VersionId")?.to_owned(),
     ))
 }
-fn bounded_map<T: Sync, R: Send>(
+pub(crate) fn bounded_map<T: Sync, R: Send>(
     items: &[T],
     function: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
     bounded_map_with_workers(items, WORKERS, false, function)
 }
-fn bounded_map_with_workers<T: Sync, R: Send>(
+/// Executes independent work concurrently, returning values in input order.
+/// All started workers are joined before reporting any failure.
+pub(crate) fn bounded_map_with_workers<T: Sync, R: Send>(
     items: &[T],
     limit: usize,
     stop_after_error: bool,
     function: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
+    if limit <= 1 || items.len() <= 1 {
+        return items.iter().map(function).collect();
+    }
     let next = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -69,7 +74,7 @@ fn bounded_map_with_workers<T: Sync, R: Send>(
                         break;
                     };
                     match function(item) {
-                        Ok(value) => output.push(value),
+                        Ok(value) => output.push((index, value)),
                         Err(error) => {
                             if stop_after_error {
                                 stopped.store(true, Ordering::Release);
@@ -97,7 +102,10 @@ fn bounded_map_with_workers<T: Sync, R: Send>(
         }
         match first_error {
             Some(error) => Err(error),
-            None => Ok(output),
+            None => {
+                output.sort_unstable_by_key(|(index, _)| *index);
+                Ok(output.into_iter().map(|(_, value)| value).collect())
+            }
         }
     })
 }
@@ -177,7 +185,15 @@ pub(crate) fn validate_digest(entry: &StorageEntry) -> Result<()> {
     Ok(())
 }
 fn content_matches(entry: &Entry, path: &Path) -> Result<bool> {
-    let mut input = match fs::File::open(path) {
+    content_matches_with_inventory(entry, path, &mut native_engine::HashInventory::new())
+}
+
+fn content_matches_with_inventory(
+    entry: &Entry,
+    path: &Path,
+    hashes: &mut native_engine::HashInventory,
+) -> Result<bool> {
+    let input = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
@@ -196,7 +212,7 @@ fn content_matches(entry: &Entry, path: &Path) -> Result<bool> {
     {
         return Ok(false);
     }
-    let digest = native_engine::stream_digest(&mut input, path, &entry.metadata.hash_name)?;
+    let digest = hashes.digest(path, &entry.metadata.hash_name)?;
     Ok(entry.metadata.md5.as_deref() == Some(digest.as_str()))
 }
 fn pending_aliases(client: &S3Client, entries: &mut [Entry], receipts: &[Value]) -> Result<()> {
@@ -342,6 +358,15 @@ fn verify_head(client: &S3Client, repo: &GitRepo, entry: &Entry) -> Result<()> {
     }
 }
 fn verify_entries(client: &S3Client, repo: &GitRepo, entries: &[Entry]) -> Result<()> {
+    verify_entries_with_placement(client, repo, entries, true)
+}
+
+fn verify_entries_with_placement(
+    client: &S3Client,
+    repo: &GitRepo,
+    entries: &[Entry],
+    allow_archive: bool,
+) -> Result<()> {
     let mut groups: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
     for entry in entries {
         let prefix = entry
@@ -413,8 +438,49 @@ fn verify_entries(client: &S3Client, repo: &GitRepo, entries: &[Entry]) -> Resul
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    bounded_map(&remaining, |entry| verify_head(client, repo, entry))?;
+    bounded_map(&remaining, |entry| {
+        if allow_archive {
+            verify_head(client, repo, entry)
+        } else {
+            let info = client.call_s3(
+                "head_object",
+                &json!({"Bucket":client.bucket,"Key":entry.key,"VersionId":entry.version}),
+                None,
+            )?;
+            validate_info(entry, &info.value)
+        }
+    })?;
     Ok(())
+}
+
+pub(crate) fn verify_storage_entries(
+    client: &S3Client,
+    repo: &GitRepo,
+    metadata: &[StorageEntry],
+) -> Result<()> {
+    let entries = metadata
+        .iter()
+        .map(|metadata| {
+            validate_digest(metadata)?;
+            let version = metadata
+                .version_id
+                .clone()
+                .filter(|version| !version.is_empty() && version != "null")
+                .ok_or_else(|| {
+                    Error::message(format!(
+                        "managed-storage object has no exact version ID: {}",
+                        metadata.object
+                    ))
+                })?;
+            Ok(Entry {
+                key: key(client, &metadata.object),
+                version,
+                etag: metadata.etag.clone(),
+                metadata: metadata.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    verify_entries_with_placement(client, repo, &entries, false)
 }
 
 pub(crate) fn read(
@@ -450,24 +516,32 @@ pub(crate) fn read(
     }
     pending_aliases(&client, &mut entries, receipts)?;
     if operation == "--fetch" {
+        let cache = native_engine::CachePaths::new(repo)?;
         let mut cached = Vec::new();
         let mut missing = Vec::new();
-        for entry in &entries {
-            let path = native_engine::cache_path_for_entry(repo, &entry.metadata)?;
-            if content_matches(entry, &path)? {
-                cached.push(entry.clone());
+        let cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let local = bounded_map_with_workers(&entries, cpus, false, |entry| {
+            let path = cache.entry(&entry.metadata)?;
+            Ok((entry.clone(), content_matches(entry, &path)?))
+        })?;
+        for (entry, available) in local {
+            if available {
+                cached.push(entry);
             } else {
-                missing.push(entry.clone());
+                missing.push(entry);
             }
         }
         verify_entries(&client, repo, &cached)?;
-        let cache_root = native_engine::cache_root(repo)?;
-        fs::create_dir_all(&cache_root).at(&cache_root)?;
-        let scratch = tempfile::tempdir_in(&cache_root).at(&cache_root)?;
+        let cache_root = cache.root();
+        fs::create_dir_all(cache_root).at(cache_root)?;
+        let scratch = tempfile::tempdir_in(cache_root).at(cache_root)?;
         let requests = missing.iter().enumerate().collect::<Vec<_>>();
         let downloaded = bounded_map(&requests, |(index, entry)| {
             let destination = scratch.path().join(index.to_string());
             let mut current = (*entry).clone();
+            let mut hashes = native_engine::HashInventory::new();
             let mut seen = BTreeSet::new();
             loop {
                 let mut args =
@@ -488,13 +562,13 @@ pub(crate) fn read(
                 match response {
                     Ok(response) => {
                         validate_info(&current, &response.value)?;
-                        if !content_matches(entry, &destination)? {
+                        if !content_matches_with_inventory(entry, &destination, &mut hashes)? {
                             return Err(Error::message(format!(
                                 "downloaded content hash mismatch: {}",
                                 entry.metadata.object
                             )));
                         }
-                        return Ok((entry.metadata.clone(), destination));
+                        return Ok((entry.metadata.clone(), destination, hashes));
                     }
                     Err(error) if error.is_missing() => {
                         current = mapped_entry(&client, repo, &current, &mut seen)?
@@ -503,9 +577,9 @@ pub(crate) fn read(
                 }
             }
         })?;
-        for (metadata, path) in downloaded {
-            native_engine::install_cache_for_entry(repo, &metadata, &path)?;
-        }
+        bounded_map_with_workers(&downloaded, cpus, false, |(metadata, path, verified)| {
+            cache.install_entry_with_inventory(metadata, path, &mut verified.clone())
+        })?;
         native_engine::install_directory_manifests(repo, pointers)?;
     } else {
         verify_entries(&client, repo, &entries)?;
@@ -529,27 +603,25 @@ fn path_version_pointers(
         return Ok(pointers);
     }
     let mut retained = Vec::new();
+    let legacy = pointers
+        .iter()
+        .filter(|pointer| pointer.ends_with(".dvc"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let documents = storage_metadata::read_pointer_documents(repo, Some(revision), &legacy)?;
+    let raw_files = repo.show_regular_files(revision, &legacy)?;
     for pointer in pointers {
         if !pointer.ends_with(".dvc") {
             retained.push(pointer);
             continue;
         }
-        let mode = repo.run(["ls-tree", "-z", revision, "--", &pointer])?;
-        if !mode.stdout.starts_with("100644 blob ") && !mode.stdout.starts_with("100755 blob ") {
-            return Err(Error::message(format!(
-                "historical storage metadata is not a regular file: {pointer}"
-            )));
-        }
-        let raw = repo.run(["show", &format!("{revision}:{pointer}")])?.stdout;
-        let raw =
-            storage_metadata::normalize_pointer_in_repo(repo, Some(revision), &raw, &pointer)?;
-        let document = crate::legacy_dvc::parse_document(&raw, &pointer)?;
+        let raw = &raw_files[&pointer];
+        let (document, _) = &documents[&pointer];
         let [output] = document.outs.as_slice() else {
             return Err(Error::message(format!(
                 "historical storage metadata must define one output: {pointer}"
             )));
         };
-        crate::legacy_dvc::hash_algorithm(&raw, &pointer)?;
         let identity = output.md5.as_deref().unwrap_or_default();
         let digest = identity.strip_suffix(".dir").unwrap_or(identity);
         if digest.len() != 32
@@ -561,7 +633,7 @@ fn path_version_pointers(
                 "historical storage metadata has no supported checksum: {pointer}"
             )));
         }
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|_| {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|_| {
             Error::message(format!("invalid historical storage metadata: {pointer}"))
         })?;
         let row = &yaml["outs"][0];
@@ -879,15 +951,31 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
                     absent.push(candidates[0].clone());
                     return Ok((*index, deleted, absent, retained));
                 }
-                let mut ids = Vec::new();
-                for item in versions {
-                    let version = string(&item, "VersionId")?;
-                    client.call_s3(
-                        "delete_object",
-                        &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
-                        None,
-                    )?;
-                    ids.push(version.to_owned());
+                let mut ids = versions
+                    .iter()
+                    .map(|item| string(item, "VersionId").map(str::to_owned))
+                    .collect::<Result<Vec<_>>>()?;
+                if ids.len() == 1 || ids.iter().any(|version| version == "null") {
+                    // A bucket can retain its pre-versioning null generation.
+                    // Keep the existing explicit single-delete behavior for
+                    // that inventory; the batch helper accepts immutable IDs.
+                    for version in &ids {
+                        client.call_s3(
+                            "delete_object",
+                            &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
+                            None,
+                        )?;
+                    }
+                } else {
+                    // This branch has no canonical archive mapping or per-
+                    // version registry guard. Retire this one logical object's
+                    // exact versions together; the client validates every
+                    // reported result and bounds requests to S3's 1,000 items.
+                    let exact = ids
+                        .iter()
+                        .map(|version| (remote.clone(), version.clone()))
+                        .collect::<Vec<_>>();
+                    client.delete_versions(&exact)?;
                 }
                 if client
                     .list_versions(&remote)?
@@ -927,6 +1015,51 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_workers_preserve_input_order_after_out_of_order_completion() {
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
+        let finished = (Mutex::new(0_usize), Condvar::new());
+        let input = (0..32).collect::<Vec<_>>();
+        let first_wave = (Mutex::new(0_usize), Condvar::new());
+        let output = bounded_map_with_workers(&input, 4, false, |value| {
+            if *value < 4 {
+                let (lock, changed) = &first_wave;
+                let mut arrived = lock.lock().unwrap();
+                *arrived += 1;
+                changed.notify_all();
+                let (arrived, _) = changed
+                    .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| *arrived < 4)
+                    .unwrap();
+                assert_eq!(*arrived, 4, "the first four callbacks must overlap");
+            }
+            let (lock, changed) = &finished;
+            if *value == 0 {
+                let (completed, _) = changed
+                    .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |done| {
+                        *done < input.len() - 1
+                    })
+                    .unwrap();
+                assert_eq!(
+                    *completed,
+                    input.len() - 1,
+                    "all other inputs finish before input zero"
+                );
+            } else {
+                *lock.lock().unwrap() += 1;
+                changed.notify_all();
+            }
+            Ok(value * value)
+        })
+        .unwrap();
+        assert_eq!(
+            output,
+            input.iter().map(|value| value * value).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn key_preserves_literal_s3_segments_and_folder_markers() {
         // The low-level client receives the literal name; only task prefixes
