@@ -214,7 +214,6 @@ pub(crate) fn command(operation: &str) -> String {
                 EXTRA_SCOPES.into(),
                 CHECKOUT_EXCEPTION.into(),
                 "Inspect changed_paths, ignored_paths, placement decisions, warnings, cloud_usage and repository_requirement. A plan does not publish a revision, upload content or change working-tree placement metadata; it previews automatic classification in a private index. Resolve structural refusals before asking about a newly detected cloud limit, because the fix can change the projected publication.".into(),
-                crate::guidance::EXTERNAL_GIT_CHECKOUT_POLICY.into(),
                 publication_checks(),
                 placement_policy(),
                 cloud_pause(),
@@ -230,7 +229,6 @@ pub(crate) fn command(operation: &str) -> String {
                 EXTRA_SCOPES.into(),
                 CHECKOUT_EXCEPTION.into(),
                 "Run task-targeted plan first and provide a nonempty -m/--message. --dry-run previews publication. The tool stages only authorized scopes in a private index, commits directly to the task branch, verifies the remote revision and preserves shared HEAD, the real index and unrelated overlays. New S3 content is uploaded and verified before Git publication; obsolete paths are purged afterward.".into(),
-                crate::guidance::EXTERNAL_GIT_CHECKOUT_POLICY.into(),
                 publication_checks(),
                 cloud_pause(),
                 REVIEW.into(),
@@ -244,7 +242,6 @@ pub(crate) fn command(operation: &str) -> String {
             "Inspect or explicitly choose Git, S3 or local-only storage placement.",
             vec![
                 "Use status to inspect target, basis, semantic reason, boundary size/file count and warnings; set to choose Git or S3, reset to remove an explicit choice, hydrate to materialize exact remote bytes, and untrack to retain content locally without a remote payload.".into(),
-                crate::guidance::EXTERNAL_GIT_CHECKOUT_POLICY.into(),
                 placement_policy(),
                 "Read workspace-mgr storage <operation> --help for its effects and next steps. Storage commands own the underlying mechanics; do not invoke lower-level tools or hand-edit metadata.".into(),
             ],
@@ -256,7 +253,6 @@ pub(crate) fn command(operation: &str) -> String {
                 SCOPED.into(),
                 EXTRA_SCOPES.into(),
                 "Inspect target, basis, reason, boundary size, file count and structured warnings. With no paths, inspect the selected task scope. Size and warning reports are input for a semantic choice, not permission to change scope or discard content.".into(),
-                crate::guidance::EXTERNAL_GIT_CHECKOUT_POLICY.into(),
                 placement_policy(),
                 READ_ONLY.into(),
             ],
@@ -268,7 +264,6 @@ pub(crate) fn command(operation: &str) -> String {
                 SCOPED.into(),
                 EXTRA_SCOPES.into(),
                 "Use --to git|s3 and --reason <reason>; --dry-run previews metadata changes. A user's explicit choice wins at any size. Selecting a directory is an intentional boundary choice and does not promise one packed remote object. Published placement stays stable when size changes. This is the only way to resume tracking local-only content.".into(),
-                crate::guidance::EXTERNAL_GIT_CHECKOUT_POLICY.into(),
                 placement_policy(),
                 NEXT_PUBLICATION.into(),
                 DELETE_HISTORY.into(),
@@ -282,7 +277,6 @@ pub(crate) fn command(operation: &str) -> String {
                 SCOPED.into(),
                 EXTRA_SCOPES.into(),
                 "--dry-run previews the reset. Published placement remains stable after its explicit override is removed; new unclassified content uses the size fallback. A reset must not silently migrate existing Git/S3 history. Local-only paths refuse reset; resume tracking with storage set --to git|s3.".into(),
-                crate::guidance::EXTERNAL_GIT_CHECKOUT_POLICY.into(),
                 placement_policy(),
                 NEXT_PUBLICATION.into(),
             ],
@@ -378,7 +372,7 @@ fn artifact_workplace() -> String {
 
 fn publication_checks() -> String {
     format!(
-        "Publication retains its existing structural checks: a deliverable README and, for content-bearing deliverable changes, a task-owned Markdown record (an edited README can qualify; initial control-only scaffolds need no extra record). Infrastructure tasks have no task directory and no deliverable README requirement. Other checks include Git whitespace checks, no staged symlink escaping the repository, no outer gitlinks/tracked nested repositories, and shared ignore rules carried by the publication rather than only a global exclude or .git/info/exclude. Task-specific ignores belong in the task's .gitignore; repository rules belong in .workspace-mgr/repository.gitignore and are reconciled by manage under authorized infrastructure scope. Product ignore rules do not trigger the machine-local-ignore refusal. Keep the README's Directory map current; decisions, process, tools and hard-to-reproduce results belong in the task's other Markdown records. task-record-unchanged is a reminder to review the record. bulk-publication warns above {BULK_PUBLICATION_FILES} added files or {} added bytes; confirm retained inputs/tools/evidence/deliverables, otherwise ignore regenerable by-products narrowly or keep them local with untrack, then re-plan. Every visible unignored task file is included in the next publication; there is no remembered do-not-commit state. Nested Git repositories must be wholly shared-ignored with no outer-tracked files or gitlinks. S3 is not a dumping ground for bulk by-products.",
+        "Publication retains its existing structural checks: a deliverable README and, for content-bearing deliverable changes, a task-owned Markdown record (an edited README can qualify; initial control-only scaffolds need no extra record). Infrastructure tasks have no task directory and no deliverable README requirement. Other checks include Git whitespace checks, no staged symlink escaping the repository, no outer gitlinks/tracked nested repositories, and shared ignore rules carried by the publication rather than only a global exclude or .git/info/exclude. Task-specific ignores belong in the task's .gitignore; repository rules belong in .workspace-mgr/repository.gitignore and are reconciled by manage under authorized infrastructure scope. Product ignore rules do not trigger the machine-local-ignore refusal. Keep the README's Directory map current; decisions, process, tools and hard-to-reproduce results belong in the task's other Markdown records. task-record-unchanged is a reminder to review the record. bulk-publication warns above {BULK_PUBLICATION_FILES} added files or {} added bytes; confirm retained inputs/tools/evidence/deliverables, otherwise ignore regenerable by-products narrowly or keep them local with untrack, then re-plan. Every visible unignored task file is included in the next publication; there is no remembered do-not-commit state. External Git clones stay local and ignored; never publish them to Git or S3. Nested Git repositories must be wholly shared-ignored with no outer-tracked files or gitlinks; do not flatten one unless explicitly requested. S3 is not a dumping ground for bulk by-products.",
         BULK_PUBLICATION_BYTES
     )
 }

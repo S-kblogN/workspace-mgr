@@ -46,11 +46,6 @@ Do not bypass a refusal with lower-level Git or object-store mutation commands.
 Preserve other tasks' staged, modified and untracked overlays. Do not hand-edit
 product-owned control files or private state in `.workspace-mgr/local/`.
 
-External Git repositories cloned for reference, dependencies or inspection stay
-local and ignored as whole directories. Do not publish their checkout or copies
-of their repository contents to this workspace's Git or S3. Read `plan`,
-`publish` or `storage` command help for the ignore procedure.
-
 The user controls cloud-usage approval, CLI installation and updates, merge and
 other PR state transitions. The agent owns the task's draft PR and must reconcile
 its authorized local, remote and review state before every writable-task turn

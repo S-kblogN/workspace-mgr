@@ -338,21 +338,13 @@ Git, place them with `workspace-mgr storage` or keep the bytes locally with
 `workspace-mgr untrack`; do not move them outside the repository to avoid the
 decision, and do not route bulk by-products to S3 to keep Git small.
 
-External Git repositories cloned for reference, dependencies or inspection
-stay local and ignored. Never publish the checkout or a copy of its repository
-contents to Git or S3, including through a containing storage boundary. Cover
-the whole clone directory with a shared repository or task-local `.gitignore`
-rule, such as `/references/upstream-tool/`; ignoring only `.git` is insufficient.
-Do not delete `.git`, flatten or copy the clone, or package it into an archive
-to bypass this rule. Record the source URL, exact commit and commands to clone
-and check out that commit in the task's notes. Keep task-authored patches, tools
-and results separately outside the ignored clone.
-
-Every nested Git repository must be ignored as an entire directory and have
-no outer-tracked files or gitlinks. `plan` and `publish` check the whole-directory
-ignore boundary before storage placement. A new task-local ignore file can be
-published with the task; a global ignore or `.git/info/exclude` alone does not
-satisfy the rule.
+Nested Git repositories, including external clones, stay local and are
+excluded from Git and S3 publication. Cover the whole nested directory with a
+shared repository or task-local `.gitignore` rule and remove any outer-tracked
+files or gitlinks. `plan` and `publish`
+check this boundary before storage placement. A new task-local ignore file
+can be published with the task; a global ignore or `.git/info/exclude` alone
+does not satisfy the rule.
 
 Every remaining file under the task is in one of two states: selected, meaning
 published in Git or placement-recorded for S3 or local-only retention, or
