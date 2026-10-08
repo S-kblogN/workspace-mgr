@@ -214,7 +214,36 @@ pub(crate) fn read_pointer_document(repo: &GitRepo, pointer: &str) -> Result<Poi
     reject_symlink_traversal(&repo.root, pointer, "managed-storage metadata")?;
     let pointer_path = resolved_under(&repo.root, pointer);
     let raw = fs::read_to_string(&pointer_path).at(&pointer_path)?;
-    parse_pointer_document(&raw, pointer)
+    parse_pointer_document_in_repo(repo, None, &raw, pointer)
+}
+
+pub(crate) fn normalize_pointer_in_repo(
+    repo: &GitRepo,
+    revision: Option<&str>,
+    raw: &str,
+    pointer: &str,
+) -> Result<String> {
+    if pointer.ends_with(".dvc") {
+        crate::legacy_dvc::normalize_remote_binding(
+            raw,
+            pointer,
+            crate::legacy_dvc::selected_remote(repo, revision)?.as_deref(),
+        )
+    } else {
+        Ok(raw.into())
+    }
+}
+
+pub(crate) fn parse_pointer_document_in_repo(
+    repo: &GitRepo,
+    revision: Option<&str>,
+    raw: &str,
+    pointer: &str,
+) -> Result<PointerDocument> {
+    parse_pointer_document(
+        &normalize_pointer_in_repo(repo, revision, raw, pointer)?,
+        pointer,
+    )
 }
 
 impl PointerDocument {
@@ -928,8 +957,9 @@ fn pointer_matches_worktree(repo: &GitRepo, pointer: &str) -> Result<bool> {
 /// this way, so it never matches: callers treat a mismatch as a conflict, never
 /// as permission to overwrite.
 pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Result<bool> {
-    let parsed = parse_pointer_document(raw, pointer)?;
-    let algorithm = hash_algorithm(raw, pointer)?;
+    let raw = normalize_pointer_in_repo(repo, None, raw, pointer)?;
+    let parsed = parse_pointer_document(&raw, pointer)?;
+    let algorithm = hash_algorithm(&raw, pointer)?;
     if parsed.outs.len() != 1 {
         return Err(Error::message(format!(
             "managed-storage metadata must define exactly one output: {pointer}"

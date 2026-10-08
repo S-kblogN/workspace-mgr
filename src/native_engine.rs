@@ -232,6 +232,7 @@ pub(crate) fn fetch_historical_cas(repo: &GitRepo, pointers: &[String]) -> Resul
     let mut checked = BTreeSet::new();
     for pointer in pointers {
         let raw = fs::read_to_string(repo.root.join(pointer)).at(repo.root.join(pointer))?;
+        let raw = storage_metadata::normalize_pointer_in_repo(repo, None, &raw, pointer)?;
         let algorithm = storage_metadata::hash_algorithm(&raw, pointer)?;
         let document = storage_metadata::parse_pointer_document(&raw, pointer)?;
         let [out] = document.outs.as_slice() else {
@@ -936,7 +937,13 @@ fn output_object(pointer: &str, path: &str) -> Result<String> {
 fn pointer_algorithm(repo: &GitRepo, pointer: &str) -> Result<String> {
     reject_symlink_traversal(&repo.root, pointer, "storage metadata")?;
     let path = repo.root.join(pointer);
-    storage_metadata::hash_algorithm(&fs::read_to_string(&path).at(&path)?, pointer)
+    let raw = storage_metadata::normalize_pointer_in_repo(
+        repo,
+        None,
+        &fs::read_to_string(&path).at(&path)?,
+        pointer,
+    )?;
+    storage_metadata::hash_algorithm(&raw, pointer)
 }
 
 pub(crate) fn metadata_entries(
@@ -954,6 +961,7 @@ pub(crate) fn metadata_entries(
                 fs::read_to_string(repo.root.join(pointer)).at(repo.root.join(pointer))?
             }
         };
+        let raw = storage_metadata::normalize_pointer_in_repo(repo, revision, &raw, pointer)?;
         let parsed = storage_metadata::parse_pointer_document(&raw, pointer)?;
         let hash_name = storage_metadata::hash_algorithm(&raw, pointer)?;
         if parsed.outs.is_empty() {
@@ -2221,14 +2229,14 @@ fn status(repo: &GitRepo, pointers: &[String], cloud: bool, quiet: bool) -> Resu
                         .map(|file| file.md5.clone())
                         .unwrap_or_default()
                 };
-                if actual != digest {
-                    Some("modified")
-                } else if !normalized_exact_bytes_match(
-                    repo,
-                    &object,
-                    &recorded_files(repo, pointer, &out, algorithm)?,
-                    algorithm,
-                )? {
+                if actual != digest
+                    || !normalized_exact_bytes_match(
+                        repo,
+                        &object,
+                        &recorded_files(repo, pointer, &out, algorithm)?,
+                        algorithm,
+                    )?
+                {
                     Some("modified")
                 } else if !recorded_files(repo, pointer, &out, algorithm).is_ok_and(|files| {
                     files.iter().all(|file| {

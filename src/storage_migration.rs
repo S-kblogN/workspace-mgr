@@ -526,7 +526,11 @@ fn preflight(repo: &GitRepo) -> Result<Plan> {
         let origin = repo.root.join(&source);
         let raw = fs::read_to_string(&origin).at(&origin)?;
         record_expected(&mut plan, &source, Some(raw.as_bytes().to_vec()))?;
-        let raw = normalize_remote_binding(&raw, &source, plan.selected_remote.as_deref())?;
+        let raw = crate::legacy_dvc::normalize_remote_binding(
+            &raw,
+            &source,
+            plan.selected_remote.as_deref(),
+        )?;
         let manifest = if let Some(import) = &mut plan.import {
             let (manifest, objects, metadata_sources) =
                 crate::storage_import::import_manifest(&import.client, &repo.root, &raw, &source)?;
@@ -892,60 +896,6 @@ fn legacy_controls(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
                     .insert(".gitattributes".to_owned(), retained.into_bytes());
             }
         }
-    }
-    Ok(())
-}
-
-fn normalize_remote_binding(raw: &str, origin: &str, selected: Option<&str>) -> Result<String> {
-    let Some(selected) = selected.filter(|name| *name != "workspace-mgr") else {
-        return Ok(raw.to_owned());
-    };
-    let mut document: serde_yaml::Value = serde_yaml::from_str(raw)
-        .map_err(|_| Error::message(format!("invalid legacy pointer {origin:?}")))?;
-    if let Some(outputs) = document
-        .get_mut("outs")
-        .and_then(serde_yaml::Value::as_sequence_mut)
-    {
-        for output in outputs {
-            normalize_cloud(output, selected, origin)?;
-            if let Some(remote) = output.get_mut("remote") {
-                if remote.as_str() != Some(selected) {
-                    return Err(Error::message(format!(
-                        "legacy pointer {origin:?} selects another remote"
-                    )));
-                }
-                *remote = serde_yaml::Value::String("workspace-mgr".to_owned());
-            }
-            if let Some(files) = output
-                .get_mut("files")
-                .and_then(serde_yaml::Value::as_sequence_mut)
-            {
-                for file in files {
-                    normalize_cloud(file, selected, origin)?;
-                }
-            }
-        }
-    }
-    serde_yaml::to_string(&document)
-        .map_err(|_| Error::message("cannot normalize selected legacy storage remote"))
-}
-
-fn normalize_cloud(row: &mut serde_yaml::Value, selected: &str, origin: &str) -> Result<()> {
-    if let Some(cloud) = row.get_mut("cloud") {
-        let cloud = cloud
-            .as_mapping_mut()
-            .ok_or_else(|| Error::message(format!("invalid remote binding in {origin:?}")))?;
-        let key = serde_yaml::Value::String(selected.to_owned());
-        if cloud.len() != 1 || !cloud.contains_key(&key) {
-            return Err(Error::message(format!(
-                "legacy pointer {origin:?} has cloud bindings outside its selected remote"
-            )));
-        }
-        let binding = cloud.remove(&key).expect("selected cloud binding");
-        cloud.insert(
-            serde_yaml::Value::String("workspace-mgr".to_owned()),
-            binding,
-        );
     }
     Ok(())
 }

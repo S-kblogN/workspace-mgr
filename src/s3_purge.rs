@@ -1616,9 +1616,38 @@ mod tests {
             version_id: Some(version.to_owned()),
             etag: Some("abc".to_owned()),
         }];
-        let digest = crate::legacy_dvc::directory_digest(&files).unwrap();
         let path = repo.root.join(pointer);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if pointer.ends_with(crate::storage_format::SUFFIX) {
+            use crate::storage_format::{Checksum, Entry, Kind, Manifest, Version};
+            let entries = vec![Entry {
+                path: relpath.to_owned(),
+                checksum: Checksum {
+                    algorithm: "md5".to_owned(),
+                    digest: files[0].md5.clone().unwrap(),
+                },
+                size: 3,
+                version: Some(Version {
+                    id: version.to_owned(),
+                    etag: Some("abc".to_owned()),
+                }),
+            }];
+            let manifest = Manifest {
+                schema_version: 1,
+                path: output.to_owned(),
+                kind: Kind::Directory,
+                checksum: Checksum {
+                    algorithm: "md5".to_owned(),
+                    digest: crate::storage_format::directory_digest(&entries).unwrap(),
+                },
+                size: 3,
+                version: None,
+                entries: Some(entries),
+            };
+            fs::write(path, manifest.serialize().unwrap()).unwrap();
+            return;
+        }
+        let digest = crate::legacy_dvc::directory_digest(&files).unwrap();
         fs::write(
             path,
             format!(
@@ -1644,7 +1673,7 @@ mod tests {
         fs::write(repo.root.join("README.md"), "isolated reference fixture\n").unwrap();
         write_reference_directory(
             &repo,
-            "task/data/child.dvc",
+            "task/data/child.wm-storage.json",
             "child",
             "a.bin",
             "old-version",
@@ -1652,7 +1681,7 @@ mod tests {
         repo.run(["add", "."]).unwrap();
         repo.run(["commit", "-m", "Publish the original child pointer"])
             .unwrap();
-        repo.run(["rm", "task/data/child.dvc"]).unwrap();
+        repo.run(["rm", "task/data/child.wm-storage.json"]).unwrap();
         repo.run(["commit", "-m", "Retire the child pointer before cleanup"])
             .unwrap();
         repo.run(["remote", "add", "origin", remote.to_str().unwrap()])
@@ -1661,8 +1690,14 @@ mod tests {
 
         // Only a new parent pointer names the same physical object, now at a
         // different version. The original candidate pointer is absent.
-        write_reference_directory(&repo, "task/data.dvc", "data", "child/a.bin", "new-version");
-        repo.run(["add", "task/data.dvc"]).unwrap();
+        write_reference_directory(
+            &repo,
+            "task/data.wm-storage.json",
+            "data",
+            "child/a.bin",
+            "new-version",
+        );
+        repo.run(["add", "task/data.wm-storage.json"]).unwrap();
         repo.run(["commit", "-m", "Repack the object under a parent pointer"])
             .unwrap();
         let reference = if tag {
@@ -1697,7 +1732,7 @@ mod tests {
 
     fn retired_child_version() -> ObjectVersion {
         ObjectVersion {
-            pointer: "task/data/child.dvc".to_owned(),
+            pointer: "task/data/child.wm-storage.json".to_owned(),
             object: "task/data/child/a.bin".to_owned(),
             version_id: "old-version".to_owned(),
         }
@@ -1743,7 +1778,7 @@ mod tests {
     #[test]
     fn differently_named_live_pointer_protects_its_actual_object() {
         let (_directory, repo, reference) = parent_reference_fixture(false);
-        repo.run(["rm", "task/data.dvc"]).unwrap();
+        repo.run(["rm", "task/data.wm-storage.json"]).unwrap();
         // The metadata filename is not an ancestor of the retired object, and
         // its output path differs from its own name. Protection must follow the
         // parsed object reference rather than guess possible parent filenames.

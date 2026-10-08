@@ -5,6 +5,31 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-07
+
+### Changed
+
+- `manage` replaces `init` as the repository adoption and reconciliation command,
+  combining current scaffolding and legacy storage migration. `init` remains a
+  hidden compatibility alias.
+- Native storage uses strict, versioned `.wm-storage.json` manifests and typed
+  Rust operations. `.workspace-mgr.toml` supplies public S3 routing directly;
+  credentials, cache and retry state stay in ignored shared local storage.
+  Native repositories require CLI 0.8.0 or later.
+
+### Added
+
+- Whole-checkout migration supports complete path-based exact-version DVC
+  manifests and ordinary DVC 2/3 S3 content stores, including remote-only
+  directory listings. Imports verify physical bytes and exact destination
+  versions before removing old sidecars and recognized obsolete controls.
+- Read-only migration previews, durable transfer/local recovery, ownership-based
+  retry and cancellation preserve existing objects, uploaded versions, caches
+  and receipts. Historical CAS objects remain available to old Git revisions.
+- Raw-byte proofs and version-isolated caches protect imported normalized text
+  identities. Publication refuses partial migration that removes routing
+  controls still required by legacy manifests.
+
 ## [0.7.4] - 2026-10-07
 
 ### Fixed

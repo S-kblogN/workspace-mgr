@@ -39,7 +39,11 @@ also live below `.workspace-mgr/local/`, shared by linked worktrees.
 A sidecar named `model.bin.wm-storage.json` addresses the adjacent `model.bin`.
 Each manifest describes exactly one file or directory boundary and carries a
 strict `schema_version`. File manifests record an explicit checksum algorithm,
-physical size, and optional exact remote version binding:
+physical size, and optional exact remote version binding.
+
+New native recordings use MD5 over physical bytes. An imported normalized-text
+binding is retained only when its exact-version cache proves the raw bytes are
+unchanged; otherwise recording uses a raw checksum and requires a new binding.
 
 ```json
 {

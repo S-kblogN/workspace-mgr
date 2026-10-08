@@ -91,6 +91,140 @@ pub(crate) fn parse_document(raw: &str, origin: &str) -> Result<PointerDocument>
     })
 }
 
+pub(crate) fn normalize_remote_binding(
+    raw: &str,
+    origin: &str,
+    selected: Option<&str>,
+) -> Result<String> {
+    let Some(selected) = selected.filter(|name| *name != "workspace-mgr") else {
+        return Ok(raw.to_owned());
+    };
+    let mut document: Value = serde_yaml::from_str(raw)
+        .map_err(|_| Error::message(format!("invalid legacy pointer {origin:?}")))?;
+    if let Some(outputs) = document.get_mut("outs").and_then(Value::as_sequence_mut) {
+        for output in outputs {
+            normalize_remote_row(output, selected, origin)?;
+            if let Some(files) = output.get_mut("files").and_then(Value::as_sequence_mut) {
+                for file in files {
+                    normalize_remote_row(file, selected, origin)?;
+                }
+            }
+        }
+    }
+    serde_yaml::to_string(&document)
+        .map_err(|_| Error::message("cannot normalize selected legacy storage remote"))
+}
+
+fn normalize_remote_row(row: &mut Value, selected: &str, origin: &str) -> Result<()> {
+    if let Some(cloud) = row.get_mut("cloud") {
+        let cloud = cloud
+            .as_mapping_mut()
+            .ok_or_else(|| Error::message(format!("invalid remote binding in {origin:?}")))?;
+        let key = Value::String(selected.into());
+        if cloud.len() != 1 || !cloud.contains_key(&key) {
+            return Err(Error::message(format!(
+                "legacy pointer {origin:?} has cloud bindings outside its selected remote"
+            )));
+        }
+        let binding = cloud.remove(&key).expect("selected cloud binding");
+        cloud.insert(Value::String("workspace-mgr".into()), binding);
+    }
+    if let Some(remote) = row.get_mut("remote") {
+        if remote.as_str() != Some(selected) {
+            return Err(Error::message(format!(
+                "legacy pointer {origin:?} selects another remote"
+            )));
+        }
+        *remote = Value::String("workspace-mgr".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn selected_remote(
+    repo: &crate::git::GitRepo,
+    revision: Option<&str>,
+) -> Result<Option<String>> {
+    let raw = if let Some(revision) = revision {
+        let listing = repo.run(["ls-tree", "-z", revision, "--", ".dvc/config"])?;
+        if listing.stdout.is_empty() {
+            return Ok(None);
+        }
+        if !listing.stdout.starts_with("100644 blob ")
+            && !listing.stdout.starts_with("100755 blob ")
+        {
+            return Err(Error::message(
+                "historical legacy storage configuration is not a regular file",
+            ));
+        }
+        repo.run(["show", &format!("{revision}:.dvc/config")])?
+            .stdout
+    } else {
+        crate::path::reject_symlink_traversal(
+            &repo.root,
+            ".dvc/config",
+            "legacy storage configuration",
+        )?;
+        match fs::read_to_string(repo.root.join(".dvc/config")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::message(error.to_string())),
+        }
+    };
+    let mut section = String::new();
+    let mut sections = BTreeSet::new();
+    let mut core_keys = BTreeSet::new();
+    let mut selected = None;
+    for line in raw.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') {
+            let name = line
+                .strip_prefix('[')
+                .and_then(|name| name.strip_suffix(']'))
+                .ok_or_else(|| Error::message("invalid legacy storage configuration section"))?
+                .trim();
+            section = if name.len() >= 2
+                && ((name.starts_with('\'') && name.ends_with('\''))
+                    || (name.starts_with('"') && name.ends_with('"')))
+            {
+                name[1..name.len() - 1].into()
+            } else {
+                name.into()
+            };
+            if !sections.insert(section.clone()) {
+                return Err(Error::message(
+                    "duplicate legacy storage configuration section",
+                ));
+            }
+        } else if section == "core" {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| Error::message("invalid legacy core setting"))?;
+            let key = key.trim().to_ascii_lowercase();
+            if !core_keys.insert(key.clone()) {
+                return Err(Error::message("duplicate legacy core setting"));
+            }
+            if key == "remote" {
+                let value = value.trim();
+                if value.is_empty() || value.starts_with('"') != value.ends_with('"') {
+                    return Err(Error::message("invalid selected legacy remote"));
+                }
+                selected = Some(value.trim_matches('"').to_owned());
+            }
+        }
+    }
+    if selected
+        .as_ref()
+        .is_some_and(|remote| !sections.contains(&format!("remote \"{remote}\"")))
+    {
+        return Err(Error::message(
+            "selected legacy remote has no matching configuration section",
+        ));
+    }
+    Ok(selected)
+}
+
 pub(crate) fn hash_algorithm(raw: &str, origin: &str) -> Result<String> {
     let yaml: Value = serde_yaml::from_str(raw).map_err(|error| {
         Error::message(format!("invalid legacy DVC metadata {origin}: {error}"))
@@ -786,6 +920,33 @@ pub(crate) fn directory_digest(files: &[PointerFileVersion]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_remote_normalization_preserves_file_and_directory_exact_bindings() {
+        let raw = "outs:\n- path: data\n  hash: md5\n  md5: 0cc175b9c0f1b6a831c399e269772661\n  size: 1\n  remote: research-data\n  cloud:\n    research-data:\n      version_id: file-original\n      etag: file-etag\n  files:\n  - relpath: a\n    md5: 0cc175b9c0f1b6a831c399e269772661\n    size: 1\n    remote: research-data\n    cloud:\n      research-data:\n        version_id: entry-original\n        etag: entry-etag\n";
+        let normalized = normalize_remote_binding(raw, "data.dvc", Some("research-data")).unwrap();
+        assert_eq!(hash_algorithm(&normalized, "data.dvc").unwrap(), "md5");
+        let document = parse_document(&normalized, "data.dvc").unwrap();
+        assert_eq!(
+            document.outs[0].version_id.as_deref(),
+            Some("file-original")
+        );
+        assert_eq!(
+            document.outs[0].files.as_ref().unwrap()[0]
+                .version_id
+                .as_deref(),
+            Some("entry-original")
+        );
+        assert!(normalize_remote_binding(raw, "data.dvc", Some("another-remote")).is_err());
+        assert!(
+            normalize_remote_binding(
+                &raw.replace("    research-data:", "    unselected:"),
+                "data.dvc",
+                Some("research-data")
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn normalized_text_cache_resolves_algorithm_specific_file_and_directory_objects() {

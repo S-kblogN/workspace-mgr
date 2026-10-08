@@ -931,6 +931,176 @@ fn fetch_streams_exact_version_with_ifmatch_and_installs_only_verified_bytes() {
 }
 
 #[test]
+fn named_remote_git_history_hydrates_original_file_and_directory_versions() {
+    let (_directory, repo) = repo();
+    let (client, worker) = fixture_handler(8, |request| {
+        if request.target.contains("versioning=") {
+            assert_eq!(request.method, "GET");
+            return versioning();
+        }
+        match (request.method.as_str(), request.target.as_str()) {
+            ("GET", "/fixture-bucket/root/task/file.bin?versionId=old-file-version") => {
+                assert_eq!(request.headers["if-match"], "\"old-file-etag\"");
+                downloaded(b"abc", "old-file-version", "old-file-etag")
+            }
+            ("HEAD", "/fixture-bucket/root/task/file.bin?versionId=old-file-version") => {
+                head("old-file-version", "old-file-etag", 3)
+            }
+            ("GET", "/fixture-bucket/root/task/tree/nested/b.bin?versionId=old-entry-version") => {
+                assert_eq!(request.headers["if-match"], "\"old-entry-etag\"");
+                downloaded(b"xyz", "old-entry-version", "old-entry-etag")
+            }
+            ("HEAD", "/fixture-bucket/root/task/tree/nested/b.bin?versionId=old-entry-version") => {
+                head("old-entry-version", "old-entry-etag", 3)
+            }
+            _ => panic!(
+                "unexpected historical request: {} {}",
+                request.method, request.target
+            ),
+        }
+    });
+    configure_repo(&client, &repo);
+    repo.run(["config", "user.name", "Fixture"]).unwrap();
+    repo.run(["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    let config = crate::config::Config::load_compatible(&repo).unwrap();
+    let location = config.s3.as_ref().unwrap();
+    let public_config = fs::read(repo.root.join(".workspace-mgr.toml")).unwrap();
+    fs::create_dir(repo.root.join(".dvc")).unwrap();
+    fs::write(
+        repo.root.join(".dvc/config"),
+        format!(
+            "[core]\nremote = research-data\n['remote \"research-data\"']\nurl = {}\nendpointurl = {}\nversion_aware = true\n",
+            location.url,
+            location.endpoint_url.as_deref().unwrap(),
+        ),
+    )
+    .unwrap();
+    fs::create_dir(repo.root.join("task")).unwrap();
+    fs::write(repo.root.join("task/.gitignore"), "/file.bin\n/tree/\n").unwrap();
+    let file_pointer = "outs:\n- path: file.bin\n  remote: research-data\n  hash: md5\n  md5: 900150983cd24fb0d6963f7d28e17f72\n  size: 3\n  cloud:\n    research-data:\n      version_id: old-file-version\n      etag: old-file-etag\n";
+    let directory_rows =
+        b"[{\"md5\": \"d16fb36f0911f878998c136191af705e\", \"relpath\": \"nested/b.bin\"}]";
+    let directory_digest = crate::hex::encode_lower(Md5::digest(directory_rows));
+    let directory_pointer = format!(
+        "outs:\n- path: tree\n  remote: research-data\n  hash: md5\n  md5: {directory_digest}.dir\n  size: 3\n  files:\n  - relpath: nested/b.bin\n    md5: d16fb36f0911f878998c136191af705e\n    size: 3\n    cloud:\n      research-data:\n        version_id: old-entry-version\n        etag: old-entry-etag\n"
+    );
+    fs::write(repo.root.join("task/file.bin.dvc"), file_pointer).unwrap();
+    fs::write(repo.root.join("task/tree.dvc"), &directory_pointer).unwrap();
+    repo.run(["add", ".workspace-mgr.toml", ".dvc/config", "task"])
+        .unwrap();
+    repo.run(["commit", "-q", "-m", "named exact legacy storage"])
+        .unwrap();
+    let old_oid = repo
+        .run(["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_owned();
+    repo.run(["rm", ".dvc/config", "task/file.bin.dvc", "task/tree.dvc"])
+        .unwrap();
+    repo.run(["commit", "-q", "-m", "retire legacy controls"])
+        .unwrap();
+    let current_oid = repo.run(["rev-parse", "HEAD"]).unwrap().stdout;
+    let pointers = vec!["task/file.bin.dvc".to_owned(), "task/tree.dvc".to_owned()];
+
+    // The selected remote must come from this Git revision, even though the
+    // primary checkout has already removed its legacy configuration.
+    let historical = native_engine::metadata_entries(&repo, Some(&old_oid), &pointers).unwrap();
+    assert_eq!(historical.len(), 2);
+    assert!(
+        historical
+            .iter()
+            .any(|entry| entry.object == "task/file.bin"
+                && entry.version_id.as_deref() == Some("old-file-version"))
+    );
+    assert!(
+        historical
+            .iter()
+            .any(|entry| entry.object == "task/tree/nested/b.bin"
+                && entry.version_id.as_deref() == Some("old-entry-version"))
+    );
+    let prepared =
+        crate::storage_metadata::prepare_revision(&repo, &config, &old_oid, &pointers).unwrap();
+    assert_eq!(prepared.prepared_files, pointers);
+
+    let detached = tempfile::tempdir().unwrap();
+    let checkout = detached.path().join("historical");
+    repo.run([
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        checkout.to_str().unwrap(),
+        &old_oid,
+    ])
+    .unwrap();
+    let historical_repo = GitRepo {
+        root: checkout.clone(),
+    };
+    crate::storage_metadata::link_private_worktree_state(&repo, &historical_repo).unwrap();
+    let report = crate::storage_metadata::hydrate(
+        &historical_repo,
+        &config,
+        &["task".to_owned()],
+        &pointers,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.status, "hydrated");
+    assert_eq!(fs::read(checkout.join("task/file.bin")).unwrap(), b"abc");
+    assert_eq!(
+        fs::read(checkout.join("task/tree/nested/b.bin")).unwrap(),
+        b"xyz"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("task/file.bin.dvc")).unwrap(),
+        file_pointer
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("task/tree.dvc")).unwrap(),
+        directory_pointer
+    );
+    repo.run([
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        checkout.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(repo.run(["rev-parse", "HEAD"]).unwrap().stdout, current_oid);
+    assert_eq!(
+        fs::read(repo.root.join(".workspace-mgr.toml")).unwrap(),
+        public_config
+    );
+    assert!(!repo.root.join("task/file.bin").exists());
+    assert!(!repo.root.join("task/tree").exists());
+    let requests = worker.join().unwrap();
+    for (object, version) in [
+        ("task/file.bin", "old-file-version"),
+        ("task/tree/nested/b.bin", "old-entry-version"),
+    ] {
+        let target = format!("/fixture-bucket/root/{object}?versionId={version}");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "GET" && request.target == target)
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "HEAD" && request.target == target)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(requests.len(), 8);
+}
+
+#[test]
 fn exact_fetch_preserves_legacy_binary_and_chunk_boundary_hash_semantics() {
     // Fixed digests from DVC 3.67.1's fobj_md5(..., name="md5-dos2unix").
     for (body, digest) in [

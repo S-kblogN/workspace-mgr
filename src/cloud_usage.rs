@@ -25,7 +25,7 @@ pub const THRESHOLD_OVERRIDE_ENV: &str = "WORKSPACE_MGR_TEST_CLOUD_USAGE_THRESHO
 pub const APPROVAL_TRAILER: &str = "Cloud-Usage-Approval";
 const STATE_SCHEMA: u32 = 1;
 const STATE_NAME: &str = "cloud-usage.json";
-const CACHE_SCHEMA: u32 = 1;
+const CACHE_SCHEMA: u32 = 2;
 const CACHE_NAME: &str = "cloud-usage-cache.json";
 const LFS_POINTER_MAX_BYTES: u64 = 1024;
 /// New workspace-mgr control-file content that a cleanup-only publication may
@@ -1361,11 +1361,58 @@ fn control_file_charge(
     }
 }
 
+/// Immutable-blob accounting preserves a unique legacy version label without
+/// using its remote name as authority to read, write or retire an S3 object.
+/// Operational readers resolve the selected remote from repository controls.
+fn parse_accounting_document(raw: &str, origin: &str) -> Result<storage_metadata::PointerDocument> {
+    let value: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|error| {
+        Error::message(format!(
+            "invalid storage accounting metadata {origin}: {error}"
+        ))
+    })?;
+    let mut remotes = BTreeSet::new();
+    if let Some(outputs) = value["outs"].as_sequence() {
+        for output in outputs {
+            let rows =
+                std::iter::once(output).chain(output["files"].as_sequence().into_iter().flatten());
+            for row in rows {
+                if let Some(cloud) = row.get("cloud") {
+                    let bindings = cloud
+                        .as_mapping()
+                        .filter(|bindings| !bindings.is_empty())
+                        .ok_or_else(|| {
+                            Error::message("invalid cloud binding in storage accounting metadata")
+                        })?;
+                    for name in bindings.keys() {
+                        let name =
+                            name.as_str()
+                                .filter(|name| !name.is_empty())
+                                .ok_or_else(|| {
+                                    Error::message(
+                                        "invalid cloud name in storage accounting metadata",
+                                    )
+                                })?;
+                        remotes.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    if remotes.len() > 1 {
+        return Err(Error::message(
+            "ambiguous legacy cloud bindings in storage accounting metadata",
+        ));
+    }
+    let normalized =
+        crate::legacy_dvc::normalize_remote_binding(raw, origin, remotes.first().copied())?;
+    storage_metadata::parse_pointer_document(&normalized, origin)
+}
+
 /// Whether every entry of the new metadata names an object that the old
 /// metadata already names.
 fn drops_entries_only(path: &str, old: &[u8], new: &[u8]) -> bool {
     let parse = |content: &[u8]| {
-        storage_metadata::parse_pointer_document(&String::from_utf8_lossy(content), path)
+        parse_accounting_document(&String::from_utf8_lossy(content), path)
             .ok()
             .map(|document| document.entries(path))
     };
@@ -1404,7 +1451,7 @@ pub(crate) fn retires_content_only(
     }
     let listings = DirectoryListings::new(storage_metadata::local_object_stores(repo, config));
     let parse = |content: &[u8]| {
-        storage_metadata::parse_pointer_document(&String::from_utf8_lossy(content), path)
+        parse_accounting_document(&String::from_utf8_lossy(content), path)
             .ok()
             .map(|document| listings.expand(document.entries(path)))
     };
@@ -2304,7 +2351,7 @@ impl UsageCache {
             let raw = String::from_utf8_lossy(content);
             parsed.insert(
                 oid.to_owned(),
-                storage_metadata::parse_pointer_document(&raw, &format!("in Git blob {oid}"))?,
+                parse_accounting_document(&raw, &format!("in Git blob {oid}"))?,
             );
             Ok(())
         })?;
@@ -2337,6 +2384,30 @@ impl UsageCache {
 mod tests {
     use super::*;
     use crate::config::S3Config;
+
+    #[test]
+    fn named_legacy_accounting_preserves_exact_versions_and_refuses_ambiguous_clouds() {
+        let raw = "outs:\n- path: data\n  hash: md5\n  md5: 900150983cd24fb0d6963f7d28e17f72\n  size: 3\n  cloud:\n    research-data:\n      version_id: exact-a\n";
+        let a = parse_accounting_document(raw, "data.dvc").unwrap();
+        let b = parse_accounting_document(&raw.replace("exact-a", "exact-b"), "data.dvc").unwrap();
+        assert_eq!(a.outs[0].version_id.as_deref(), Some("exact-a"));
+        assert_eq!(b.outs[0].version_id.as_deref(), Some("exact-b"));
+        assert!(!drops_entries_only(
+            "data.dvc",
+            raw.as_bytes(),
+            raw.replace("exact-a", "exact-b").as_bytes()
+        ));
+        let ambiguous = raw.replace(
+            "      version_id: exact-a",
+            "      version_id: exact-a\n    second-remote:\n      version_id: exact-b",
+        );
+        assert!(
+            parse_accounting_document(&ambiguous, "data.dvc")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
 
     fn entry(key: &str, size: u64, version: Option<&str>) -> PointerEntry {
         PointerEntry {

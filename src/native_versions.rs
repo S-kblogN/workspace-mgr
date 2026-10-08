@@ -12,6 +12,7 @@ use crate::git::GitRepo;
 use crate::native_archive;
 use crate::native_engine::{self, StorageEntry};
 use crate::native_s3::S3Client;
+use crate::storage_metadata;
 
 const ARCHIVE_SUFFIX: &str = "/.workspace-mgr-archive.json";
 const MAX_ARCHIVE_HOPS: usize = 32;
@@ -540,6 +541,8 @@ fn path_version_pointers(
             )));
         }
         let raw = repo.run(["show", &format!("{revision}:{pointer}")])?.stdout;
+        let raw =
+            storage_metadata::normalize_pointer_in_repo(repo, Some(revision), &raw, &pointer)?;
         let document = crate::legacy_dvc::parse_document(&raw, &pointer)?;
         let [output] = document.outs.as_slice() else {
             return Err(Error::message(format!(
