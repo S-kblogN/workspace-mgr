@@ -35,6 +35,7 @@ workspace-mgr manage \
   --s3-url s3://example-bucket/workspace \
   --s3-endpoint-url https://s3.example.invalid
 workspace-mgr doctor
+workspace-mgr doctor example-task
 workspace-mgr instructions
 workspace-mgr task create example-task \
   --title "Example task" \
@@ -50,6 +51,15 @@ Infrastructure tasks work in the same shared checkout, which stays on the
 configured main branch. Creation returns a private manifest path; pass it as
 `--manifest <path>` to task-scoped commands such as `plan` and `publish`.
 Both task kinds publish to their own unmounted branch through a private index.
+
+`doctor <task>` checks one task by ID, name, slug or current path, including
+archived tasks; `doctor` checks all tasks and the full configured S3 prefix.
+It reports extra or misplaced remote objects, obsolete keys with retained
+versions/delete markers, and mismatches between storage metadata, exact remote
+versions and materialized local bytes. The audit is read-only and downloads
+current objects into temporary scratch space to verify their checksums. See the
+[diagnostic command](docs/commands.md#workspace-mgr-doctor) for its scope and
+history rules.
 
 Private product state lives in the primary checkout's `.workspace-mgr/local/`,
 which the generated root `.gitignore` ignores. All linked worktrees use that

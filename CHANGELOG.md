@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `doctor [<task>]` resolves one current task by ID, name, slug or path, including
+  archived tasks; omission audits every task and the full configured S3 prefix.
+- Read-only storage diagnostics compare local manifests, materialized payloads,
+  complete S3 version/delete-marker inventories and exact remote GET checksums.
+  They report stale bindings, extra or misplaced objects, obsolete historical
+  paths, and incomplete or changing audit evidence without hydrating or deleting
+  data. Historical versions at valid current keys remain permitted.
+
 ## [0.8.3] - 2026-10-07
 
 ### Fixed

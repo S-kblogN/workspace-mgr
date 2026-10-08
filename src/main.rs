@@ -13,6 +13,7 @@ mod command_guidance;
 mod config;
 mod discard;
 mod doctor;
+mod doctor_storage;
 mod error;
 mod git;
 mod guidance;
@@ -131,7 +132,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Doctor(args) => {
-            let report = doctor::inspect(&args.repo)?;
+            let report = doctor::inspect(&args.repo, args.task.as_deref())?;
             if cli.format == Format::Json {
                 print_json(&report)?;
             } else {

@@ -8,6 +8,7 @@ git-daemon. It intentionally uses the compiled CLI as an opaque executable.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -240,6 +241,27 @@ class Harness:
         versions.sort(key=lambda value: (value["key"], value["version_id"]))
         self.record("s3-state", {"versions": versions})
         return versions
+
+    def s3_version_inventory(self) -> list[dict[str, Any]]:
+        """Include tombstones so a read-only diagnostic cannot silently delete them."""
+        inventory: list[dict[str, Any]] = []
+        paginator = self.s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix="objects/"):
+            for group in ("Versions", "DeleteMarkers"):
+                for item in page.get(group, []):
+                    inventory.append(
+                        {
+                            "key": item["Key"],
+                            "version_id": item["VersionId"],
+                            "delete_marker": group == "DeleteMarkers",
+                            "is_latest": item["IsLatest"],
+                            "size": item.get("Size"),
+                            "etag": item.get("ETag", "").strip('"'),
+                        }
+                    )
+        inventory.sort(key=lambda value: (value["key"], value["version_id"]))
+        self.record("s3-version-inventory", {"versions": inventory})
+        return inventory
 
     def s3_bodies(self) -> list[bytes]:
         bodies = []
@@ -1310,6 +1332,7 @@ class Harness:
         versions_v1 = self.list_s3_versions()
         self.check(len(versions_v1) >= 3, "MinIO contains S3 payload versions")
         self.check(all(item["version_id"] not in ("", "null") for item in versions_v1), "all S3 objects have version IDs")
+        self.exercise_doctor_storage(task_id, task, branch)
         beta_key = self.s3_version_for_body(bundle_v1_b)["key"]
         config_before_relocation = (self.shared / ".workspace-mgr.toml").read_bytes()
         relocation = self.wm(self.shared, "manage", "--s3-url", "s3://workspace-mgr-other/objects", expected=2)
@@ -1551,6 +1574,147 @@ class Harness:
         self.check(self.remote_path_exists(untracked_oid, f"{task_id}/bundle.wm-storage.json"), "other S3 boundary remains stored")
         self.check(self.wm(task, "plan")["status"] == "no_changes", "storage lifecycle ends cleanly")
 
+    def exercise_doctor_storage(self, task_id: str, task: Path, branch: str) -> None:
+        assert self.shared is not None
+        self.section("read-only task-scoped doctor with exact S3 layout and metadata")
+        pointer = task / "data.bin.wm-storage.json"
+        original_pointer = pointer.read_bytes()
+        data = task / "data.bin"
+        original_data = data.read_bytes()
+        injected: list[tuple[str, str]] = []
+
+        def snapshot() -> dict[str, Any]:
+            files = {}
+            for root in (task, self.shared / ".workspace-mgr" / "local"):
+                if root.exists():
+                    for path in root.rglob("*"):
+                        if path.is_file():
+                            files[str(path.relative_to(self.shared))] = hashlib.sha256(path.read_bytes()).hexdigest()
+            return {
+                "files": files,
+                "git_status": self.git(self.shared, "status", "--porcelain=v1", "--untracked-files=all").stdout,
+                "task_ref": self.remote_ref(branch),
+                "main_ref": self.remote_ref("main"),
+                "versions": self.s3_version_inventory(),
+            }
+
+        def inspect(*selectors: str, expected: int = 0, cwd: Path | None = None) -> dict[str, Any]:
+            before = snapshot()
+            output = self.wm(cwd or self.shared, "doctor", *selectors, expected=expected)
+            report = output if expected == 0 else json.loads(output["stdout"])
+            self.check(snapshot() == before, "doctor preserves payloads, metadata, private state, Git refs, S3 versions, and markers")
+            integrity = next(check for check in report["checks"] if check["name"] == "managed-storage-integrity")
+            self.check(integrity["status"] == ("ok" if expected == 0 else "error"), "doctor storage check controls its failing exit status")
+            return report
+
+        def put(key: str, body: bytes) -> None:
+            response = self.s3.put_object(Bucket=self.bucket, Key=key, Body=body)
+            injected.append((key, response["VersionId"]))
+
+        def mark_deleted(key: str) -> None:
+            response = self.s3.delete_object(Bucket=self.bucket, Key=key)
+            injected.append((key, response["VersionId"]))
+
+        def cleanup() -> None:
+            for key, version in reversed(injected):
+                self.s3.delete_object(Bucket=self.bucket, Key=key, VersionId=version)
+            injected.clear()
+
+        selected = inspect(task_id, "--repo", str(self.shared), cwd=self.root)
+        self.check(selected["storage"]["issues"] == [] and selected["storage"]["expected_objects"] == 5,
+                   "selected doctor verifies every standalone and directory object")
+        self.check(inspect()["storage"]["issues"] == [], "doctor without a selector audits all tasks")
+
+        try:
+            wrong_path = f"objects/{task_id}/wrong-directory/data.bin"
+            retired_path = f"objects/{task_id}/retired.bin"
+            marker_only_path = f"objects/{task_id}/marker-only.bin"
+            put(wrong_path, original_data)
+            put(retired_path, b"retired remote-only payload\n")
+            mark_deleted(retired_path)
+            mark_deleted(marker_only_path)
+            stale = inspect(task_id, expected=2)
+            unexpected = {issue["path"] for issue in stale["storage"]["issues"] if issue["code"] == "unexpected-object"}
+            self.check({path.removeprefix("objects/") for path in (wrong_path, retired_path, marker_only_path)}.issubset(unexpected),
+                       "doctor finds misplaced objects, retained deleted history, and keys with only a delete marker", issues=stale["storage"]["issues"])
+        finally:
+            cleanup()
+
+        try:
+            metadata = json.loads(original_pointer)
+            metadata["size"] += 1
+            pointer.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            mismatch = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "remote-size-mismatch" for issue in mismatch["storage"]["issues"]),
+                       "doctor compares metadata size with the exact remote version")
+            metadata = json.loads(original_pointer)
+            metadata["version"]["etag"] = "0" * 32
+            pointer.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            mismatch = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "remote-etag-mismatch" for issue in mismatch["storage"]["issues"]),
+                       "doctor compares metadata ETag with the exact remote version")
+            metadata = json.loads(original_pointer)
+            metadata["checksum"]["digest"] = "0" * 32
+            pointer.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            mismatch = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "remote-content-mismatch" for issue in mismatch["storage"]["issues"]),
+                       "doctor hashes remote GET bytes even when version, ETag, and size match metadata")
+        finally:
+            pointer.write_bytes(original_pointer)
+
+        try:
+            data_key = f"objects/{task_id}/data.bin"
+            put(data_key, b"unexpected latest content at the correct path\n")
+            latest = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "remote-latest-mismatch" for issue in latest["storage"]["issues"]),
+                       "doctor detects a newer S3 version although the metadata's exact version still exists")
+            mark_deleted(data_key)
+            deleted = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "remote-latest-mismatch" for issue in deleted["storage"]["issues"]),
+                       "doctor detects a current delete marker hiding a metadata-bound remote object")
+        finally:
+            cleanup()
+
+        try:
+            data.write_bytes(b"locally modified materialized payload\n")
+            local = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "local-content-mismatch" for issue in local["storage"]["issues"]),
+                       "doctor compares materialized local bytes with metadata")
+            self.check(any(issue["code"] == "local-remote-bytes-mismatch" for issue in local["storage"]["issues"]),
+                       "doctor also compares materialized local bytes directly with the exact remote payload")
+            data.write_bytes(original_data)
+            extra = task / "bundle" / "unlisted.bin"
+            extra.write_bytes(b"unlisted local directory entry\n")
+            layout = inspect(task_id, expected=2)
+            self.check(any(issue["code"] == "local-layout-mismatch" for issue in layout["storage"]["issues"]),
+                       "doctor detects materialized directory entries absent from metadata")
+        finally:
+            data.write_bytes(original_data)
+            (task / "bundle" / "unlisted.bin").unlink(missing_ok=True)
+
+        try:
+            data.unlink()
+            self.check(inspect(task_id)["storage"]["issues"] == [], "doctor verifies remote bytes when a local payload is not hydrated")
+            self.check(not data.exists(), "doctor leaves an unmaterialized local payload absent")
+        finally:
+            data.write_bytes(original_data)
+
+        isolated_id = "20260829-183000-doctor-isolation"
+        created = self.wm(self.shared, "task", "create", "doctor-isolation", "--title", "Doctor isolation",
+                          "--purpose", "Prove selected doctor ignores other tasks' remote corruption.", "--timestamp", "20260829-183000")
+        isolated_task = Path(created["path"])
+        isolated_manifest = Path(created["manifest"])
+        try:
+            put(f"objects/{isolated_id}/unexpected.bin", b"another task's remote-only content\n")
+            self.check(inspect(task_id)["storage"]["issues"] == [], "selected doctor excludes another task's S3 corruption")
+            self.check(inspect(isolated_id, expected=2)["storage"]["issues"], "selecting the corrupt task diagnoses its own S3 objects")
+            self.check(inspect(expected=2, cwd=task)["storage"]["issues"], "doctor without a selector audits every task even from inside a healthy task")
+        finally:
+            cleanup()
+        self.wm(isolated_task, "task", "discard", "--dry-run")
+        self.wm(self.shared, "task", "discard", "--manifest", str(isolated_manifest), "--confirm", isolated_id)
+        self.check(inspect()["storage"]["issues"] == [], "exact fixture cleanup restores a healthy all-task diagnosis")
+
     def rename_published_task(self) -> None:
         assert self.shared is not None
         self.section("published task slug rename with versioned S3 content")
@@ -1697,6 +1861,21 @@ class Harness:
             all(item["key"] != old_artifact_key for item in self.list_s3_versions()),
             "renamed publication permanently removes every S3 version at the old task path",
         )
+        self.check(self.wm(self.shared, "doctor", renamed_id)["storage"]["issues"] == [],
+                   "doctor accepts a published task at its current renamed path")
+        stale_version = self.s3.put_object(Bucket=self.bucket, Key=old_artifact_key, Body=payload)["VersionId"]
+        stale_marker = self.s3.delete_object(Bucket=self.bucket, Key=old_artifact_key)["VersionId"]
+        try:
+            stale = json.loads(self.wm(self.shared, "doctor", renamed_id, expected=2)["stdout"])
+            self.check(any(issue["code"] == "unexpected-object" and issue["path"] == f"{task_id}/artifact.bin"
+                           for issue in stale["storage"]["issues"]),
+                       "current task selection diagnoses leftover versions and markers at its historical pre-rename path")
+            old_rows = [row for row in self.s3_version_inventory() if row["key"] == old_artifact_key]
+            self.check({row["version_id"] for row in old_rows} == {stale_version, stale_marker},
+                       "doctor reports retired S3 history without cleaning it")
+        finally:
+            self.s3.delete_object(Bucket=self.bucket, Key=old_artifact_key, VersionId=stale_marker)
+            self.s3.delete_object(Bucket=self.bucket, Key=old_artifact_key, VersionId=stale_version)
         self.check(
             self.wm(renamed_task, "task", "status")["slug"] == "current-topic",
             "task status reports the current slug separately from stable identity",
