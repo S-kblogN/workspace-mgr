@@ -186,6 +186,12 @@ pub fn moved(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
 /// Older receipts without an undo journal still use current manifest and
 /// exact-version transport validation, but cannot promise lossless cancel.
 pub(crate) fn validate_migration(repo: &GitRepo, receipt: &Value) -> Result<()> {
+    has_trusted_migration(repo, receipt).map(|_| ())
+}
+
+/// An exact locally recorded move is evidence that archive payloads already
+/// exist. Missing legacy journals allow migration, but confer no usage credit.
+pub(crate) fn has_trusted_migration(repo: &GitRepo, receipt: &Value) -> Result<bool> {
     let source = receipt["source"].as_str().ok_or_else(receipt_edit_error)?;
     let destination = receipt["destination"]
         .as_str()
@@ -194,7 +200,7 @@ pub(crate) fn validate_migration(repo: &GitRepo, receipt: &Value) -> Result<()> 
     let attempt: Attempt = match fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str(&raw)
             .map_err(|error| Error::message(format!("invalid archive attempt: {error}")))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(source) => return Err(Error::Io { path, source }),
     };
     if attempt.schema_version != 1
@@ -208,7 +214,8 @@ pub(crate) fn validate_migration(repo: &GitRepo, receipt: &Value) -> Result<()> 
         ));
     }
     validate_current_receipt(repo, &attempt, receipt)?;
-    validate_metadata(repo, &resolved_under(&repo.root, destination), &attempt)
+    validate_metadata(repo, &resolved_under(&repo.root, destination), &attempt)?;
+    Ok(true)
 }
 
 /// Used after an in-process apply rollback has already restored the directory.

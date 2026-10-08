@@ -1726,6 +1726,208 @@ fn native_storage_metadata_requires_a_compatible_writer_before_publication() {
 }
 
 #[cfg(feature = "test-storage")]
+const ARCHIVE_SOURCE: &str = "20260712-120000-completed";
+#[cfg(feature = "test-storage")]
+const ARCHIVE_DESTINATION: &str = "2026/07/20260712-120000-completed";
+
+#[cfg(feature = "test-storage")]
+fn archived_requirement_fixture(has_lfs: bool) -> (GitFixture, Vec<u8>) {
+    use sha2::Digest;
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["manage"]);
+    let archived = fixture.seed.join(ARCHIVE_DESTINATION);
+    std::fs::create_dir_all(&archived).unwrap();
+    std::fs::write(
+        archived.join(MANIFEST),
+        format!(
+            "schema_version = 2\nkind = \"deliverable\"\nid = \"{ARCHIVE_SOURCE}\"\nslug = \"completed\"\npath = \"{ARCHIVE_DESTINATION}\"\nbranch = \"codex/completed\"\ntitle = \"Archived task\"\npurpose = \"Retain published payloads\"\nadditional_scopes = []\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(archived.join("README.md"), "# Completed task\n").unwrap();
+    std::fs::write(
+        archived.join(".workspace-mgr-archive.json"),
+        serde_json::to_vec(&json!({
+            "schema_version":1,"task_id":ARCHIVE_SOURCE,
+            "source":ARCHIVE_SOURCE,"destination":ARCHIVE_DESTINATION,
+            "status":"copied","versions":[]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let payload = b"published LFS payload\n".to_vec();
+    let digest = sha2::Sha256::digest(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{digest}\nsize {}\n",
+        payload.len()
+    );
+    std::fs::write(
+        archived.join("artifact.bin"),
+        if has_lfs {
+            pointer.as_bytes()
+        } else {
+            payload.as_slice()
+        },
+    )
+    .unwrap();
+    // An unrelated LFS pointer never imposes the archive-specific floor.
+    std::fs::write(fixture.seed.join("outside-lfs.bin"), pointer).unwrap();
+    // This old rule intentionally does not match the archived destination.
+    std::fs::write(
+        fixture.seed.join(".gitattributes"),
+        format!("{ARCHIVE_SOURCE}/artifact.bin filter=archive-fixture -text\n"),
+    )
+    .unwrap();
+    fixture.commit_seed("Published archived control metadata and payloads");
+    fixture.clone_shared();
+    (fixture, payload)
+}
+
+#[cfg(feature = "test-storage")]
+fn archive_requirement_organizer(fixture: &GitFixture) -> (PathBuf, PathBuf, String) {
+    let created = json(&workspace(
+        &fixture.shared,
+        [
+            "task",
+            "create",
+            "archive-requirement",
+            "--kind",
+            "infrastructure",
+            "--title",
+            "Retain archived placement",
+            "--purpose",
+            "Publish only writers that preserve archived Git LFS identities",
+            "--scope",
+            ARCHIVE_DESTINATION,
+            "--scope-note",
+            "The user authorized this archived task's publication",
+        ],
+    ));
+    let worktree = PathBuf::from(created["path"].as_str().unwrap());
+    let manifest = PathBuf::from(created["manifest"].as_str().unwrap());
+    let document = toml::from_str::<toml::Table>(&read(&manifest)).unwrap();
+    let branch = document["branch"].as_str().unwrap().to_owned();
+    (worktree, manifest, branch)
+}
+
+#[cfg(feature = "test-storage")]
+#[test]
+fn archived_git_lfs_requires_its_safe_writer_before_publication() {
+    let (fixture, payload) = archived_requirement_fixture(true);
+    let (worktree, manifest, branch) = archive_requirement_organizer(&fixture);
+    let manifest_arg = manifest.to_str().unwrap();
+    let artifact = format!("{ARCHIVE_DESTINATION}/artifact.bin");
+    let base = rev(&worktree, "HEAD").unwrap();
+    let old_pointer = show(&worktree, &format!("{base}:{artifact}"));
+    let config = read(&worktree.join(CONFIG));
+    let index = git(&worktree, ["ls-files", "--stage", "-z"]).stdout;
+    // The on-disk file is materialized, and the old filter is no longer
+    // effective. The requirement still derives from the private Git tree.
+    std::fs::write(worktree.join(&artifact), &payload).unwrap();
+    for args in [
+        vec!["plan", "--manifest", manifest_arg],
+        vec![
+            "publish",
+            "--manifest",
+            manifest_arg,
+            "--dry-run",
+            "-m",
+            "Retain LFS",
+        ],
+        vec!["publish", "--manifest", manifest_arg, "-m", "Retain LFS"],
+    ] {
+        let refused = workspace_env_unchecked(&worktree, args, &[(CLI_VERSION_ENV, "0.8.6")]);
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(
+            stderr(&refused).contains("archived Git LFS pointer"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(stderr(&refused).contains("0.8.8"), "{}", stderr(&refused));
+        assert_eq!(git(&worktree, ["ls-files", "--stage", "-z"]).stdout, index);
+        assert_eq!(rev(&worktree, "HEAD").as_deref(), Some(base.as_str()));
+        assert!(rev(&fixture.remote, &format!("refs/heads/{branch}")).is_none());
+        assert_eq!(std::fs::read(worktree.join(&artifact)).unwrap(), payload);
+    }
+    let plan = json(&workspace(&worktree, ["plan", "--manifest", manifest_arg]));
+    assert_eq!(
+        plan["repository_requirement"]["minimum_cli_version"],
+        "0.8.8"
+    );
+    let tree = plan["tree_oid"].as_str().unwrap();
+    assert_eq!(show(&worktree, &format!("{tree}:{artifact}")), old_pointer);
+    assert_eq!(read(&worktree.join(CONFIG)), config);
+    let published = json(&workspace(
+        &worktree,
+        [
+            "publish",
+            "--manifest",
+            manifest_arg,
+            "-m",
+            "Retain archived LFS identity",
+        ],
+    ));
+    let target = published["remote_oid"].as_str().unwrap();
+    assert_eq!(
+        show(&fixture.remote, &format!("{target}:{CONFIG}")),
+        declaring("0.8.8", &config)
+    );
+    assert_eq!(
+        show(&fixture.remote, &format!("{target}:{artifact}")),
+        old_pointer
+    );
+    // Publication remains scoped: neither shared configuration nor entity bytes
+    // are rewritten merely to establish the safe writer declaration.
+    assert_eq!(read(&worktree.join(CONFIG)), config);
+    assert_eq!(std::fs::read(worktree.join(&artifact)).unwrap(), payload);
+}
+
+#[cfg(feature = "test-storage")]
+#[test]
+fn plain_archives_keep_the_existing_protocol_floor() {
+    let (fixture, _) = archived_requirement_fixture(false);
+    let (worktree, manifest, _) = archive_requirement_organizer(&fixture);
+    let plan = json(&workspace_env(
+        &worktree,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+        &[(CLI_VERSION_ENV, "0.7.0")],
+    ));
+    assert_eq!(
+        plan["repository_requirement"]["minimum_cli_version"],
+        "0.7.0"
+    );
+    let tree = plan["tree_oid"].as_str().unwrap();
+    assert!(
+        show(&worktree, &format!("{tree}:{CONFIG}")).starts_with("minimum_cli_version = \"0.7.0\"")
+    );
+}
+
+#[cfg(feature = "test-storage")]
+#[test]
+fn archived_lfs_preserves_a_higher_shared_requirement() {
+    let (fixture, _) = archived_requirement_fixture(true);
+    let (worktree, manifest, _) = archive_requirement_organizer(&fixture);
+    let original = read(&fixture.seed.join(CONFIG));
+    std::fs::write(fixture.seed.join(CONFIG), declaring("0.9.0", &original)).unwrap();
+    fixture.commit_seed("Shared branch requires a newer writer");
+    workspace_env(&worktree, ["refresh"], &[(CLI_VERSION_ENV, "0.9.0")]);
+    let plan = json(&workspace_env(
+        &worktree,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+        &[(CLI_VERSION_ENV, "0.9.0")],
+    ));
+    let tree = plan["tree_oid"].as_str().unwrap();
+    assert_eq!(
+        show(&worktree, &format!("{tree}:{CONFIG}")),
+        declaring("0.9.0", &original)
+    );
+    assert_eq!(read(&worktree.join(CONFIG)), declaring("0.9.0", &original));
+}
+
+#[cfg(feature = "test-storage")]
 #[test]
 fn schema_two_storage_requires_0_8_7_without_raising_the_schema_one_floor() {
     let fixture = GitFixture::new();

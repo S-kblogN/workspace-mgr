@@ -1747,54 +1747,256 @@ fn measure_storage(
                 dirty_uploads(&repo.root, &status, &sources.worktree, version_aware);
         }
     }
-    let mut usage = if version_aware {
-        versioned_storage(&history_commits, &projection_rows, &sources)
-    } else {
-        content_storage(&history_commits, &projection_rows, &sources)
-    };
-    if version_aware {
-        // A copied prefix also retains superseded versions and files which
-        // disappeared before the current storage manifests. Charge those bytes
-        // before the first copy, using the immutable source inventory.
-        let changed = repo.run([
-            "diff-tree",
-            "-r",
-            "-z",
-            "--name-only",
-            base,
-            inputs.projected_tree_oid,
-            "--",
-            ":(glob)**/.workspace-mgr-archive.json",
-        ])?;
-        let selected = changed
-            .stdout
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<BTreeSet<_>>();
-        let projected = archive_history_usage(
-            repo,
-            inputs.projected_tree_oid,
-            &sources.worktree,
-            &selected,
-            false,
-        )?;
-        let published = archive_history_usage(repo, base, &sources.worktree, &selected, true)?;
-        usage.published_bytes = usage
-            .published_bytes
-            .saturating_add(published.values().map(|tally| tally.bytes).sum::<u64>());
-        usage.projected_bytes = usage
-            .projected_bytes
-            .saturating_add(projected.values().map(|tally| tally.bytes).sum::<u64>());
-        usage.pending_uploads |= projected.values().any(|tally| tally.pending);
-        for (key, tally) in projected {
-            let current = usage.contributors.entry(key).or_default();
-            current.bytes = current.bytes.saturating_add(tally.bytes);
-            current.versions = current.versions.saturating_add(tally.versions);
-            current.pending |= tally.pending;
-        }
+    if !version_aware {
+        return Ok(content_storage(
+            &history_commits,
+            &projection_rows,
+            &sources,
+        ));
+    }
+    let changed = repo.run([
+        "diff-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        base,
+        inputs.projected_tree_oid,
+        "--",
+        ":(glob)**/.workspace-mgr-archive.json",
+    ])?;
+    let selected = changed
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let transfers = ArchiveTransfers::read(repo, config, inputs, &sources.worktree, &selected)?;
+    let history_commits = history_commits
+        .into_iter()
+        .map(|rows| transfers.normalize_rows(rows))
+        .collect::<Result<Vec<_>>>()?;
+    let projection_rows = transfers.normalize_rows(projection_rows)?;
+    sources.worktree = transfers.normalize_entries(sources.worktree)?;
+    let accounting =
+        account_versioned_storage(&history_commits, &projection_rows, &sources, &transfers);
+    let projected = archive_history_usage(
+        repo,
+        inputs.projected_tree_oid,
+        &sources.worktree,
+        &selected,
+        false,
+        &transfers,
+        &accounting,
+    )?;
+    let published = archive_history_usage(
+        repo,
+        base,
+        &sources.worktree,
+        &selected,
+        true,
+        &transfers,
+        &accounting,
+    )?;
+    let mut usage = accounting.usage;
+    usage.published_bytes = usage
+        .published_bytes
+        .saturating_add(published.values().map(|tally| tally.bytes).sum::<u64>());
+    usage.projected_bytes = usage
+        .projected_bytes
+        .saturating_add(projected.values().map(|tally| tally.bytes).sum::<u64>());
+    usage.pending_uploads |= projected.values().any(|tally| tally.pending);
+    for (key, tally) in projected {
+        let current = usage.contributors.entry(key).or_default();
+        current.bytes = current.bytes.saturating_add(tally.bytes);
+        current.versions = current.versions.saturating_add(tally.versions);
+        current.pending |= tally.pending;
     }
     Ok(usage)
+}
+
+/// A verified archive transfers existing versions to another object key. The
+/// copied byte count is a temporary storage peak, not new retained payload.
+#[derive(Debug, Default)]
+struct ArchiveTransfers {
+    shared_receipts: BTreeMap<String, serde_json::Value>,
+    receipts: BTreeSet<String>,
+    task_receipts: BTreeSet<String>,
+    aliases: BTreeMap<(String, String), ((String, String), u64)>,
+    destinations: BTreeMap<(String, String), String>,
+}
+
+impl ArchiveTransfers {
+    fn read(
+        repo: &GitRepo,
+        config: &Config,
+        inputs: &UsageInputs<'_>,
+        current: &[PointerEntry],
+        selected: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let mut transfers = Self {
+            shared_receipts: archive_receipt_documents(repo, inputs.remote_base_oid)?,
+            ..Self::default()
+        };
+        for (path, receipt) in archive_receipt_documents(repo, inputs.projected_tree_oid)? {
+            let Some(destination) = receipt["destination"].as_str() else {
+                return Err(Error::message("archive usage destination missing"));
+            };
+            let recorded = transfers.shared_receipts.get(&path) == Some(&receipt);
+            if !recorded {
+                // A task still owns its receipt when its last current pointer
+                // disappears. Complete retained history remains chargeable on
+                // a no-op/retry after publishing, without changed receipt paths.
+                transfers.task_receipts.insert(path.to_owned());
+            }
+            if recorded
+                && !selected.contains(&path)
+                && !current.iter().any(|entry| beneath(&entry.key, destination))
+            {
+                continue;
+            }
+            if receipt["source"].as_str().is_none() || receipt["schema_version"] != 1 {
+                continue;
+            }
+            // An unbound/legacy receipt keeps the conservative gross accounting.
+            // Existing remote receipts and exact local attempts provide authority;
+            // the copy path still validates the live inventory before any write.
+            if !recorded && !crate::archive_cancel::has_trusted_migration(repo, &receipt)? {
+                continue;
+            }
+            crate::archive_migration::validate(&path, &receipt)?;
+            let source = receipt["source"].as_str().expect("validated source");
+            let location = format!(
+                "s3://{}/{}",
+                receipt["bucket"].as_str().unwrap_or_default(),
+                receipt["remote_prefix"].as_str().unwrap_or_default()
+            );
+            if config.s3.as_ref().is_none_or(|remote| {
+                remote.url.trim_end_matches('/') != location.trim_end_matches('/')
+            }) {
+                return Err(Error::message(
+                    "archive usage receipt selects another storage location",
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for row in receipt["versions"].as_array().expect("validated versions") {
+                let old = row["source_object"]
+                    .as_str()
+                    .expect("validated source object");
+                let new = row["destination_object"]
+                    .as_str()
+                    .expect("validated destination object");
+                let version = row["source_version_id"]
+                    .as_str()
+                    .expect("validated source version");
+                let identity = (old.to_owned(), version.to_owned());
+                if !seen.insert(identity.clone()) {
+                    return Err(Error::message(
+                        "archive usage receipt repeats a source version",
+                    ));
+                }
+                if row["delete_marker"] == true {
+                    if !row["size"].is_null() {
+                        return Err(Error::message(
+                            "archive usage delete marker has payload bytes",
+                        ));
+                    }
+                    continue;
+                }
+                let bytes = row["size"]
+                    .as_u64()
+                    .ok_or_else(|| Error::message("archive usage version size missing"))?;
+                if let Some(previous) = transfers
+                    .destinations
+                    .insert(identity.clone(), new.to_owned())
+                    && previous != new
+                {
+                    return Err(Error::message(
+                        "archive usage receipts conflict on a source version",
+                    ));
+                }
+                for alias in [Some(version), row["destination_version_id"].as_str()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let key = (new.to_owned(), alias.to_owned());
+                    let value = (identity.clone(), bytes);
+                    if let Some(previous) = transfers.aliases.insert(key, value.clone())
+                        && previous != value
+                    {
+                        return Err(Error::message(
+                            "archive usage receipts conflict on a destination version",
+                        ));
+                    }
+                }
+            }
+            if source == destination {
+                return Err(Error::message("archive usage source equals destination"));
+            }
+            transfers.receipts.insert(path.to_owned());
+        }
+        Ok(transfers)
+    }
+
+    fn normalize_entries(&self, entries: Vec<PointerEntry>) -> Result<Vec<PointerEntry>> {
+        entries
+            .into_iter()
+            .map(|mut entry| {
+                if let Some(version) = &entry.version_id
+                    && let Some((original, bytes)) =
+                        self.aliases.get(&(entry.key.clone(), version.clone()))
+                {
+                    if entry.aggregate || entry.size != Some(*bytes) {
+                        return Err(Error::message(
+                            "archive usage metadata differs from its frozen source version",
+                        ));
+                    }
+                    entry.key.clone_from(&original.0);
+                    entry.version_id = Some(original.1.clone());
+                }
+                Ok(entry)
+            })
+            .collect()
+    }
+
+    fn normalize_rows(&self, rows: Vec<EntryRow>) -> Result<Vec<EntryRow>> {
+        rows.into_iter()
+            .map(|(old, new)| Ok((self.normalize_entries(old)?, self.normalize_entries(new)?)))
+            .collect()
+    }
+
+    fn credit_inherited(&self, ledger: &mut VersionLedger, owned: &BTreeSet<(String, String)>) {
+        for original in self
+            .destinations
+            .keys()
+            .filter(|original| !owned.contains(*original))
+        {
+            if let Some(versions) = ledger.keys.get_mut(&original.0) {
+                versions.remove(&original.1);
+            }
+        }
+    }
+}
+
+fn archive_receipt_documents(
+    repo: &GitRepo,
+    tree: &str,
+) -> Result<BTreeMap<String, serde_json::Value>> {
+    let names = repo.run(["ls-tree", "-r", "-z", "--name-only", tree, "--"])?;
+    let paths = names
+        .stdout
+        .split('\0')
+        .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    repo.show_files(tree, &paths)?
+        .into_iter()
+        .map(|(path, raw)| {
+            let receipt = serde_json::from_str(&raw).map_err(|error| {
+                Error::message(format!("invalid archive usage receipt {path}: {error}"))
+            })?;
+            Ok((path, receipt))
+        })
+        .collect()
 }
 
 fn archive_history_usage(
@@ -1803,28 +2005,32 @@ fn archive_history_usage(
     current: &[PointerEntry],
     selected: &BTreeSet<String>,
     published: bool,
+    transfers: &ArchiveTransfers,
+    accounting: &VersionAccounting,
 ) -> Result<BTreeMap<String, Tally>> {
-    let names = repo.run(["ls-tree", "-r", "-z", "--name-only", tree, "--"])?;
-    let paths = names
-        .stdout
-        .split('\0')
-        .filter(|path| path.ends_with("/.workspace-mgr-archive.json"))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let receipts = repo.show_files(tree, &paths)?;
+    let charged = if published {
+        &accounting.published
+    } else {
+        &accounting.projected
+    };
     let mut totals = BTreeMap::<String, Tally>::new();
     let mut seen = BTreeSet::new();
-    for (path, raw) in receipts {
-        let receipt: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
-            Error::message(format!("invalid archive usage receipt {path}: {error}"))
-        })?;
+    for (path, receipt) in archive_receipt_documents(repo, tree)? {
         let destination = receipt["destination"]
             .as_str()
             .ok_or_else(|| Error::message("archive usage destination missing"))?;
+        // Shared-branch receipts are inherited state, just like shared pointer
+        // versions. Reorganizing an already archived task does not reassign its
+        // existing registry or complete historical payload to the new task.
+        if transfers.shared_receipts.get(&path) == Some(&receipt) {
+            continue;
+        }
         if published && receipt["status"] != "copied" {
             continue;
         }
         if !selected.contains(&path)
+            && !transfers.task_receipts.contains(&path)
+            && !transfers.receipts.contains(&path)
             && !current
                 .iter()
                 .any(|entry| entry.key.starts_with(&format!("{destination}/")))
@@ -1865,6 +2071,20 @@ fn archive_history_usage(
                 .as_str()
                 .ok_or_else(|| Error::message("archive usage version missing"))?;
             let copied = version["destination_version_id"].as_str();
+            let mut key = key.to_owned();
+            if transfers.receipts.contains(&path) {
+                let source = version["source_object"]
+                    .as_str()
+                    .ok_or_else(|| Error::message("archive usage source object missing"))?;
+                if !accounting
+                    .owned
+                    .contains(&(source.to_owned(), original.to_owned()))
+                    || charged.contains(source, original)
+                {
+                    continue;
+                }
+                key = source.to_owned();
+            }
             if current.iter().any(|entry| {
                 entry.key == key
                     && entry
@@ -2103,17 +2323,59 @@ impl VersionLedger {
     }
 }
 
+#[cfg(test)]
 fn versioned_storage(
     history: &[Vec<EntryRow>],
     projection: &[EntryRow],
     sources: &PendingSources,
 ) -> StorageUsage {
+    account_versioned_storage(history, projection, sources, &ArchiveTransfers::default()).usage
+}
+
+struct VersionAccounting {
+    usage: StorageUsage,
+    owned: BTreeSet<(String, String)>,
+    published: VersionLedger,
+    projected: VersionLedger,
+}
+
+fn account_versioned_storage(
+    history: &[Vec<EntryRow>],
+    projection: &[EntryRow],
+    sources: &PendingSources,
+    transfers: &ArchiveTransfers,
+) -> VersionAccounting {
     let mut ledger = VersionLedger::default();
+    let mut owned = BTreeSet::new();
     for commit in history {
+        let inherited = commit
+            .iter()
+            .flat_map(|(old, _)| old)
+            .filter_map(|entry| {
+                entry
+                    .version_id
+                    .as_ref()
+                    .map(|version| (entry.key.clone(), version.clone()))
+            })
+            .collect::<BTreeSet<_>>();
+        owned.extend(
+            commit
+                .iter()
+                .flat_map(|(_, new)| new)
+                .filter_map(|entry| {
+                    entry
+                        .version_id
+                        .as_ref()
+                        .map(|version| (entry.key.clone(), version.clone()))
+                })
+                .filter(|version| !inherited.contains(version)),
+        );
         ledger.apply(commit);
     }
+    transfers.credit_inherited(&mut ledger, &owned);
     let published = ledger.clone();
     ledger.apply(projection);
+    transfers.credit_inherited(&mut ledger, &owned);
     let mut pending: BTreeMap<String, u64> = BTreeMap::new();
     for entry in &sources.worktree {
         if entry.version_id.is_none() {
@@ -2141,13 +2403,18 @@ fn versioned_storage(
             .or_default()
             .add(*size, true);
     }
-    StorageUsage {
-        published_bytes: published.total(),
-        projected_bytes: ledger
-            .total()
-            .saturating_add(saturating_sum(pending.values().copied())),
-        pending_uploads: !pending.is_empty(),
-        contributors,
+    VersionAccounting {
+        usage: StorageUsage {
+            published_bytes: published.total(),
+            projected_bytes: ledger
+                .total()
+                .saturating_add(saturating_sum(pending.values().copied())),
+            pending_uploads: !pending.is_empty(),
+            contributors,
+        },
+        owned,
+        published,
+        projected: ledger,
     }
 }
 
@@ -3758,22 +4025,51 @@ mod tests {
         }
         let selected = paths.into_iter().map(str::to_owned).collect();
         let tree = fixture.tree();
-        let projected = archive_history_usage(&fixture.repo, &tree, &[], &selected, false).unwrap();
+        let transfers = ArchiveTransfers::default();
+        let accounting =
+            account_versioned_storage(&[], &[], &PendingSources::default(), &transfers);
+        let projected = archive_history_usage(
+            &fixture.repo,
+            &tree,
+            &[],
+            &selected,
+            false,
+            &transfers,
+            &accounting,
+        )
+        .unwrap();
         assert_eq!(projected.len(), 2);
         assert_eq!(projected["archive/destination/data"].bytes, 11);
         assert_eq!(projected["archive/destination/data"].versions, 1);
         assert!(projected["archive/destination/pending"].pending);
-        let published = archive_history_usage(&fixture.repo, &tree, &[], &selected, true).unwrap();
+        let published = archive_history_usage(
+            &fixture.repo,
+            &tree,
+            &[],
+            &selected,
+            true,
+            &transfers,
+            &accounting,
+        )
+        .unwrap();
         assert_eq!(published.len(), 1);
         fixture.write(
             "archive/unselected/.workspace-mgr-archive.json",
             b"invalid json",
         );
         assert!(
-            archive_history_usage(&fixture.repo, &fixture.tree(), &[], &selected, false)
-                .unwrap_err()
-                .to_string()
-                .contains("invalid archive usage receipt archive/unselected/")
+            archive_history_usage(
+                &fixture.repo,
+                &fixture.tree(),
+                &[],
+                &selected,
+                false,
+                &transfers,
+                &accounting
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid archive usage receipt archive/unselected/")
         );
     }
 
@@ -3848,6 +4144,347 @@ mod tests {
             measure_tree(&fixture.tree(), &[]).projected_bytes,
             180 + serde_json::to_vec(&receipt).unwrap().len() as u64
         );
+    }
+
+    fn archive_transfer_receipt(source: &str, destination: &str) -> serde_json::Value {
+        serde_json::json!({"schema_version":1,"status":"planned","task_id":"archive-test",
+        "source":source,"destination":destination,"bucket":"bucket","remote_prefix":"prefix",
+        "source_cleanup":"after_verified_git_publication","versions":[
+            {"source_object":format!("{source}/data.bin"),"destination_object":format!("{destination}/data.bin"),
+             "source_version_id":"old","size":30,"source_etag":"e-old","delete_marker":false},
+            {"source_object":format!("{source}/data.bin"),"destination_object":format!("{destination}/data.bin"),
+             "source_version_id":"head","size":100,"source_etag":"e-head","delete_marker":false},
+            {"source_object":format!("{source}/retired.bin"),"destination_object":format!("{destination}/retired.bin"),
+             "source_version_id":"retired","size":50,"source_etag":"e-retired","delete_marker":false},
+            {"source_object":format!("{source}/retired.bin"),"destination_object":format!("{destination}/retired.bin"),
+             "source_version_id":"marker","size":null,"source_etag":null,"delete_marker":true}
+        ]})
+    }
+
+    fn trust_archive_attempt(fixture: &Fixture, receipt: &serde_json::Value) {
+        fs::write(
+            fixture.repo.root.join(".git/info/exclude"),
+            b"/.workspace-mgr/local/\n",
+        )
+        .unwrap();
+        let source = receipt["source"].as_str().unwrap();
+        let destination = receipt["destination"].as_str().unwrap();
+        let digest = crate::hex::encode_lower(Sha256::digest(
+            format!("{source}\0{destination}").as_bytes(),
+        ));
+        let path = fixture
+            .repo
+            .local_state_dir()
+            .unwrap()
+            .join("archive-attempts")
+            .join(format!("{digest}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // This test only constructs the accounting proof. Archive/cancellation
+        // tests exercise the original metadata and transport journals.
+        let attempt = serde_json::json!({"schema_version":1,"root":fixture.repo.root,"owner":"infra",
+            "branch":"codex/infra-archive","source":source,"destination":destination,
+            "base":fixture.oid("HEAD"),"previous_local":null,"previous_remote":null,"status":"moved",
+            "metadata":[],"relocation":{"source":fixture.repo.root.join(source),
+                "destination":fixture.repo.root.join(destination),"references":[]},
+            "previous_purge":[],"expected_receipt":receipt});
+        fs::write(path, serde_json::to_vec(&attempt).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn verified_archive_transfer_charges_only_new_control_and_unmapped_payloads() {
+        let fixture = Fixture::new();
+        let source = "20260712-121000-history";
+        let destination = "2026/07/20260712-121000-history";
+        let source_pointer = format!("{source}/data.bin.dvc");
+        let pointer = format!("{destination}/data.bin.dvc");
+        let receipt_path = format!("{destination}/.workspace-mgr-archive.json");
+        fixture.write(
+            &source_pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let base = fixture.commit("already published source");
+        fixture.remove(&source_pointer);
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let receipt = archive_transfer_receipt(source, destination);
+        fixture.write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).unwrap().as_slice(),
+        );
+        trust_archive_attempt(&fixture, &receipt);
+        let registry_bytes = serde_json::to_vec(&receipt).unwrap().len() as u64;
+        let pointers = vec![pointer.clone()];
+        let measure_tree = |pointers: &[String]| {
+            measure_storage(
+                &fixture.repo,
+                &versioned_config(),
+                &fixture.inputs(&base, None, &fixture.tree(), pointers, &[]),
+                &mut UsageCache::default(),
+            )
+            .unwrap()
+        };
+        let usage = measure_tree(&pointers);
+        assert_eq!(usage.published_bytes, 0);
+        assert_eq!(usage.projected_bytes, registry_bytes);
+        let added_pointer = format!("{destination}/new.bin.dvc");
+        fixture.write(&added_pointer, file_pointer("new.bin", 75, None).as_bytes());
+        assert_eq!(
+            measure_tree(&[pointer.clone(), added_pointer.clone()]).projected_bytes,
+            registry_bytes + 75
+        );
+        fixture.remove(&added_pointer);
+        // A metadata version not present in the frozen inventory is not a move.
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 120, Some("changed")).as_bytes(),
+        );
+        assert_eq!(
+            measure_tree(&pointers).projected_bytes,
+            registry_bytes + 120
+        );
+    }
+
+    #[test]
+    fn archive_transfer_preserves_bytes_this_task_originally_published() {
+        let fixture = Fixture::new();
+        let source = "20260712-121000-history";
+        let destination = "2026/07/20260712-121000-history";
+        fixture.write("README.md", b"base\n");
+        let base = fixture.commit("base");
+        let source_pointer = format!("{source}/data.bin.dvc");
+        fixture.write(
+            &source_pointer,
+            file_pointer("data.bin", 30, Some("old")).as_bytes(),
+        );
+        let retired_pointer = format!("{source}/retired.bin.dvc");
+        fixture.write(
+            &retired_pointer,
+            file_pointer("retired.bin", 50, Some("retired")).as_bytes(),
+        );
+        fixture.commit("task adds first version");
+        fixture.remove(&retired_pointer);
+        fixture.write(
+            &source_pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let target = fixture.commit("task adds second version");
+        let pointer = format!("{destination}/data.bin.dvc");
+        fixture.remove(&source_pointer);
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let receipt = archive_transfer_receipt(source, destination);
+        fixture.write(
+            &format!("{destination}/.workspace-mgr-archive.json"),
+            serde_json::to_vec(&receipt).unwrap().as_slice(),
+        );
+        trust_archive_attempt(&fixture, &receipt);
+        let usage = measure_storage(
+            &fixture.repo,
+            &versioned_config(),
+            &fixture.inputs(&base, Some(&target), &fixture.tree(), &[pointer], &[]),
+            &mut UsageCache::default(),
+        )
+        .unwrap();
+        assert_eq!(usage.published_bytes, 130);
+        assert_eq!(
+            usage.projected_bytes,
+            180 + serde_json::to_vec(&receipt).unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn archive_transfer_copy_retry_and_published_measurements_keep_payload_credit() {
+        let fixture = Fixture::new();
+        let source = "20260712-121000-history";
+        let destination = "2026/07/20260712-121000-history";
+        let source_pointer = format!("{source}/data.bin.dvc");
+        let pointer = format!("{destination}/data.bin.dvc");
+        let receipt_path = format!("{destination}/.workspace-mgr-archive.json");
+        fixture.write(
+            &source_pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let base = fixture.commit("existing source");
+        fixture.remove(&source_pointer);
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let mut receipt = archive_transfer_receipt(source, destination);
+        fixture.write(&receipt_path, &serde_json::to_vec(&receipt).unwrap());
+        trust_archive_attempt(&fixture, &receipt);
+        receipt["status"] = "copied".into();
+        for row in receipt["versions"].as_array_mut().unwrap() {
+            row["destination_version_id"] =
+                format!("copy-{}", row["source_version_id"].as_str().unwrap()).into();
+        }
+        let copied_bytes = serde_json::to_vec(&receipt).unwrap();
+        fixture.write(&receipt_path, &copied_bytes);
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("copy-head")).as_bytes(),
+        );
+        let journal =
+            crate::archive_cancel::copy_journal(&fixture.repo, source, destination).unwrap();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(journal, &copied_bytes).unwrap();
+        let pointers = [pointer];
+        for _ in 0..2 {
+            let usage = measure_storage(
+                &fixture.repo,
+                &versioned_config(),
+                &fixture.inputs(&base, None, &fixture.tree(), &pointers, &[]),
+                &mut UsageCache::default(),
+            )
+            .unwrap();
+            assert_eq!(usage.projected_bytes, copied_bytes.len() as u64);
+        }
+        let target = fixture.commit("publish verified archive");
+        let usage = measure_storage(
+            &fixture.repo,
+            &versioned_config(),
+            &fixture.inputs(&base, Some(&target), &fixture.tree(), &pointers, &[]),
+            &mut UsageCache::default(),
+        )
+        .unwrap();
+        assert_eq!(usage.published_bytes, copied_bytes.len() as u64);
+        assert_eq!(usage.projected_bytes, copied_bytes.len() as u64);
+        // Once merged, the complete receipt and registry are shared inherited
+        // state; another checkout needs no private attempt to recognize them.
+        let local_state = fixture.repo.local_state_dir().unwrap();
+        fs::remove_dir_all(local_state.join("archive-attempts")).unwrap();
+        fs::remove_dir_all(local_state.join("archive")).unwrap();
+        let inherited = measure_storage(
+            &fixture.repo,
+            &versioned_config(),
+            &fixture.inputs(&target, None, &fixture.tree(), &pointers, &[]),
+            &mut UsageCache::default(),
+        )
+        .unwrap();
+        assert_eq!(inherited.published_bytes, 0);
+        assert_eq!(inherited.projected_bytes, 0);
+        fixture.write(
+            &pointers[0],
+            file_pointer("data.bin", 120, Some("changed")).as_bytes(),
+        );
+        let changed = measure_storage(
+            &fixture.repo,
+            &versioned_config(),
+            &fixture.inputs(&target, None, &fixture.tree(), &pointers, &[]),
+            &mut UsageCache::default(),
+        )
+        .unwrap();
+        assert_eq!(changed.projected_bytes, 120);
+    }
+
+    #[test]
+    fn unbound_or_forged_archive_receipts_cannot_credit_existing_versions() {
+        let fixture = Fixture::new();
+        let source = "20260712-121000-history";
+        let destination = "2026/07/20260712-121000-history";
+        fixture.write("README.md", b"base\n");
+        let base = fixture.commit("base");
+        let pointer = format!("{destination}/data.bin.dvc");
+        let receipt_path = format!("{destination}/.workspace-mgr-archive.json");
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 100, Some("head")).as_bytes(),
+        );
+        let mut receipt = archive_transfer_receipt(source, destination);
+        fixture.write(&receipt_path, &serde_json::to_vec(&receipt).unwrap());
+        assert!(!crate::archive_cancel::has_trusted_migration(&fixture.repo, &receipt).unwrap());
+        let pointers = [pointer];
+        let measure_tree = || {
+            measure_storage(
+                &fixture.repo,
+                &versioned_config(),
+                &fixture.inputs(&base, None, &fixture.tree(), &pointers, &[]),
+                &mut UsageCache::default(),
+            )
+        };
+        assert_eq!(
+            measure_tree().unwrap().projected_bytes,
+            180 + serde_json::to_vec(&receipt).unwrap().len() as u64
+        );
+        let target = fixture.commit("unverified receipt on own task branch");
+        let remote_only = measure_storage(
+            &fixture.repo,
+            &versioned_config(),
+            &fixture.inputs(&base, Some(&target), &fixture.tree(), &pointers, &[]),
+            &mut UsageCache::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_only.projected_bytes,
+            180 + serde_json::to_vec(&receipt).unwrap().len() as u64
+        );
+        trust_archive_attempt(&fixture, &receipt);
+        receipt["versions"][0]["size"] = 1.into();
+        fixture.write(&receipt_path, &serde_json::to_vec(&receipt).unwrap());
+        assert!(
+            measure_tree()
+                .unwrap_err()
+                .to_string()
+                .contains("receipt was edited")
+        );
+        // Even a matching local journal cannot authorize conflicting bindings.
+        let repeated = receipt["versions"][1].clone();
+        receipt["versions"].as_array_mut().unwrap().push(repeated);
+        fixture.write(&receipt_path, &serde_json::to_vec(&receipt).unwrap());
+        trust_archive_attempt(&fixture, &receipt);
+        assert!(
+            measure_tree()
+                .unwrap_err()
+                .to_string()
+                .contains("repeats a source version")
+        );
+    }
+
+    #[test]
+    fn archive_transfer_pointerless_retry_preserves_own_retained_history() {
+        let fixture = Fixture::new();
+        fixture.write("README.md", b"base\n");
+        let base = fixture.commit("base");
+        let source = "20260712-121000-history";
+        let destination = "2026/07/20260712-121000-history";
+        let pointer = format!("{source}/data.bin.dvc");
+        fixture.write(
+            &pointer,
+            file_pointer("data.bin", 30, Some("old")).as_bytes(),
+        );
+        fixture.commit("own task adds retained historical version");
+        fixture.remove(&pointer);
+        fixture.commit("no current pointers remain");
+        let mut receipt = archive_transfer_receipt(source, destination);
+        trust_archive_attempt(&fixture, &receipt);
+        receipt["status"] = "copied".into();
+        for row in receipt["versions"].as_array_mut().unwrap() {
+            row["destination_version_id"] =
+                format!("copy-{}", row["source_version_id"].as_str().unwrap()).into();
+        }
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        fixture.write(
+            &format!("{destination}/.workspace-mgr-archive.json"),
+            &bytes,
+        );
+        let journal =
+            crate::archive_cancel::copy_journal(&fixture.repo, source, destination).unwrap();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(journal, &bytes).unwrap();
+        let target = fixture.commit("publish complete pointerless history");
+        let usage = measure_storage(
+            &fixture.repo,
+            &versioned_config(),
+            &fixture.inputs(&base, Some(&target), &fixture.tree(), &[], &[]),
+            &mut UsageCache::default(),
+        )
+        .unwrap();
+        assert_eq!(usage.published_bytes, 30 + bytes.len() as u64);
+        assert_eq!(usage.projected_bytes, 30 + bytes.len() as u64);
     }
 
     fn file_pointer(name: &str, size: u64, version: Option<&str>) -> String {

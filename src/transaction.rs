@@ -27,10 +27,11 @@ use crate::manifest::{
 };
 use crate::path::{allowed, repo_path, resolved_under};
 use crate::policy::{
-    ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION,
-    AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES, BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB,
-    REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE, REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY,
-    REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME, TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
+    ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, ARCHIVED_GIT_LFS_MINIMUM_CLI_VERSION,
+    ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES,
+    BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB, REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE,
+    REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME,
+    TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
@@ -347,7 +348,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     }
     repo.run_with_index(&preview_index, ["read-tree", &base_oid], None, true)?;
     remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
-    stage_scopes(&repo, &preview_index, &scopes)?;
+    stage_scopes(&repo, &config, &base_oid, &preview_index, &scopes)?;
     remove_stored_outputs_from_index(&repo, &preview_index, &initial_outputs)?;
     remove_output_paths_from_index(&repo, &preview_index, preview_automatic_s3.iter())?;
     remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
@@ -477,7 +478,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         }
         repo.run_with_index(&preflight_index, ["read-tree", &base_oid], None, true)?;
         remove_output_paths_from_index(&repo, &preflight_index, local_only.iter())?;
-        stage_scopes(&repo, &preflight_index, &scopes)?;
+        stage_scopes(&repo, &config, &base_oid, &preflight_index, &scopes)?;
         remove_stored_outputs_from_index(&repo, &preflight_index, &preflight_outputs)?;
         remove_output_paths_from_index(&repo, &preflight_index, local_only.iter())?;
         reconcile_repository_requirement(&repo, &preflight_index, &requirement_inputs)?;
@@ -508,7 +509,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     };
     let mut s3 = storage_metadata::reconcile(&repo, &config, &ordinary_pointers, dry_run)?;
     if !dry_run {
-        stage_scopes(&repo, &preview_index, &scopes)?;
+        stage_scopes(&repo, &config, &base_oid, &preview_index, &scopes)?;
         remove_stored_outputs_from_index(
             &repo,
             &preview_index,
@@ -600,7 +601,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     }
     repo.run_with_index(&index, ["read-tree", &base_oid], None, true)?;
     remove_output_paths_from_index(&repo, &index, local_only.iter())?;
-    stage_scopes(&repo, &index, &scopes)?;
+    stage_scopes(&repo, &config, &base_oid, &index, &scopes)?;
     remove_stored_outputs_from_index(&repo, &index, &s3.outputs)?;
     remove_output_paths_from_index(&repo, &index, automatic_s3.iter())?;
     remove_output_paths_from_index(&repo, &index, local_only.iter())?;
@@ -954,7 +955,14 @@ fn check_storage_import_projection(repo: &GitRepo, index: &Path, base_oid: &str)
     Ok(())
 }
 
-fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
+fn stage_scopes(
+    repo: &GitRepo,
+    config: &Config,
+    base_oid: &str,
+    index: &Path,
+    scopes: &[String],
+) -> Result<()> {
+    let archived_lfs = storage::archived_lfs_entries(repo, config, scopes, base_oid)?;
     let literal = scopes
         .iter()
         .map(|scope| format!(":(literal){scope}"))
@@ -1004,6 +1012,12 @@ fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
     if present.is_empty() {
         return Ok(());
     }
+    present.extend(
+        archived_lfs
+            .iter()
+            .filter(|entry| entry.unchanged)
+            .map(|entry| format!(":(exclude,literal){}", entry.path)),
+    );
     // An upgraded repository may still have its older root ignore file.
     // Scope-wide staging must exclude product state independently of it.
     present.extend(crate::local_state::LOCAL_STATE_EXCLUDE_PATHSPECS.map(str::to_owned));
@@ -1015,6 +1029,7 @@ fn stage_scopes(repo: &GitRepo, index: &Path, scopes: &[String]) -> Result<()> {
         Some(&input),
         true,
     )?;
+    storage::reconcile_archived_lfs_index(repo, index, &archived_lfs)?;
     Ok(())
 }
 
@@ -1626,7 +1641,7 @@ fn check_committed_documentation(
     }
     repo.run_with_index(&index, ["read-tree", base_oid], None, true)?;
     remove_output_paths_from_index(repo, &index, policy.local_only.iter())?;
-    stage_scopes(repo, &index, scopes)?;
+    stage_scopes(repo, policy.config, base_oid, &index, scopes)?;
     remove_stored_outputs_from_index(repo, &index, &s3.outputs)?;
     remove_output_paths_from_index(repo, &index, policy.local_only.iter())?;
     let paths = changed_paths(repo, &index, base_oid)?;
@@ -1976,6 +1991,7 @@ fn check_large_files(
     base_oid: &str,
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
+    let history = storage::history_for_oid(repo, policy.config, scopes, base_oid)?;
     let mut candidates = Vec::new();
     for relative in repo.visible_paths(scopes)? {
         if relative.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
@@ -2000,22 +2016,16 @@ fn check_large_files(
         if storage::explicit_target(repo, &relative)? == Some(crate::config::StorageTarget::Git) {
             continue;
         }
-        let history_path = published_history_path(
-            &relative,
-            policy.task.task_path.as_deref(),
-            policy.published_task_path,
-        );
+        let history_path = history.object_path(&relative);
         candidates.push((relative, history_path));
     }
-    let history = repo.existing_paths(
-        base_oid,
-        &candidates
-            .iter()
-            .map(|(_, path)| path.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    for (relative, path) in candidates {
-        if history.contains(&path) {
+    let history_paths = candidates
+        .iter()
+        .map(|(_, history_path)| history_path.clone())
+        .collect::<Vec<_>>();
+    let existing = repo.existing_paths(base_oid, &history_paths)?;
+    for (relative, history_path) in candidates {
+        if existing.contains(&history_path) {
             continue;
         }
         return Err(Error::message(format!(
@@ -2644,6 +2654,13 @@ fn require_publishable(
     needs: &ManifestNeeds,
     declaration: &Version,
 ) -> Result<()> {
+    if let Some(path) = &needs.archived_git_lfs
+        && !cli_version_satisfies(installed, &ARCHIVED_GIT_LFS_MINIMUM_CLI_VERSION)
+    {
+        return Err(Error::message(format!(
+            "this build (workspace-mgr {installed}) cannot publish archived Git LFS pointer {path}; preserving its published LFS identity requires workspace-mgr {ARCHIVED_GIT_LFS_MINIMUM_CLI_VERSION} or newer; update workspace-mgr"
+        )));
+    }
     if let Some(storage) = &needs.native_storage {
         let required = &storage.version;
         if !cli_version_satisfies(installed, required) {
@@ -2704,6 +2721,11 @@ fn require_publishable(
 
 fn missing_configuration(required: &Version, schema: Option<u32>, needs: &ManifestNeeds) -> Error {
     let Some(schema) = schema else {
+        if let Some(path) = &needs.archived_git_lfs {
+            return Error::message(format!(
+                "archived Git LFS pointer {path} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; publish the repository configuration first"
+            ));
+        }
         if let Some(storage) = &needs.native_storage {
             return Error::message(format!(
                 "native storage manifest {} (schema {}) requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; run `workspace-mgr manage` first",
@@ -2758,33 +2780,48 @@ struct ManifestNeeds {
     /// and public data schemas. This floor must not depend on schema 4.
     archive_protocol: Option<String>,
     native_storage: Option<StorageManifestNeed>,
+    /// Older writers can stage a materialized archived LFS file as ordinary
+    /// Git after its original root-prefix filter stops matching.
+    archived_git_lfs: Option<String>,
 }
 
 impl ManifestNeeds {
     /// The newest workspace-mgr any manifest needs, with that manifest
     /// instance's schema.
     fn highest(&self) -> Option<(Version, Option<u32>)> {
-        let manifest = self.highest_need();
-        if let Some(storage) = &self.native_storage
-            && manifest.is_none_or(|need| storage.version.cmp_precedence(&need.version).is_ge())
-            && (self.archive_protocol.is_none()
-                || storage
-                    .version
-                    .cmp_precedence(&ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION)
-                    .is_ge())
-        {
-            return Some((storage.version.clone(), None));
+        let mut required = self
+            .highest_need()
+            .map(|need| (need.version.clone(), Some(need.schema)));
+        for (version, prefer_control) in [
+            (
+                self.native_storage
+                    .as_ref()
+                    .map(|storage| storage.version.clone()),
+                true,
+            ),
+            (
+                self.archive_protocol
+                    .as_ref()
+                    .map(|_| ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION),
+                false,
+            ),
+            (
+                self.archived_git_lfs
+                    .as_ref()
+                    .map(|_| ARCHIVED_GIT_LFS_MINIMUM_CLI_VERSION),
+                true,
+            ),
+        ] {
+            if let Some(version) = version
+                && required.as_ref().is_none_or(|(current, _)| {
+                    let comparison = version.cmp_precedence(current);
+                    comparison.is_gt() || prefer_control && comparison.is_eq()
+                })
+            {
+                required = Some((version, None));
+            }
         }
-        if self.archive_protocol.is_some()
-            && manifest.is_none_or(|need| {
-                ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION
-                    .cmp_precedence(&need.version)
-                    .is_gt()
-            })
-        {
-            return Some((ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION, None));
-        }
-        manifest.map(|need| (need.version.clone(), Some(need.schema)))
+        required
     }
 
     fn highest_need(&self) -> Option<&ManifestNeed> {
@@ -2860,17 +2897,20 @@ fn manifest_requirement(
         }
         Ok(())
     })?;
+    let archive_receipts = entries
+        .iter()
+        .filter(|entry| {
+            Path::new(&entry.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(archive_migration::RECEIPT_NAME)
+        })
+        .filter(|entry| entry.is_regular_file())
+        .cloned()
+        .collect::<Vec<_>>();
     let mut needs = ManifestNeeds {
-        archive_protocol: entries
-            .iter()
-            .filter(|entry| {
-                Path::new(&entry.path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    == Some(archive_migration::RECEIPT_NAME)
-            })
-            .find(|entry| entry.is_regular_file())
-            .map(|entry| entry.path.clone()),
+        archive_protocol: archive_receipts.first().map(|entry| entry.path.clone()),
+        archived_git_lfs: archived_git_lfs_requirement(repo, index, &archive_receipts)?,
         ..ManifestNeeds::default()
     };
     for entry in entries.iter().filter(|entry| {
@@ -2925,6 +2965,84 @@ fn manifest_requirement(
         }
     }
     Ok(needs)
+}
+
+/// The requirement describes the published tree, independently of this
+/// checkout's materialized files or configured clean filters. Only small Git
+/// control blobs beneath validated archive destinations are read.
+fn archived_git_lfs_requirement(
+    repo: &GitRepo,
+    index: &Path,
+    receipts: &[IndexEntry],
+) -> Result<Option<String>> {
+    if receipts.is_empty() {
+        return Ok(None);
+    }
+    let oids = receipts
+        .iter()
+        .map(|entry| entry.oid.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut documents = BTreeMap::new();
+    read_blobs(repo, &oids, |oid, content| {
+        if let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(content) {
+            documents.insert(oid.to_owned(), receipt);
+        }
+        Ok(())
+    })?;
+    let destinations = receipts
+        .iter()
+        .filter_map(|entry| {
+            let receipt = documents.get(&entry.oid)?;
+            archive_migration::validate(&entry.path, receipt).ok()?;
+            receipt["destination"].as_str().map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    if destinations.is_empty() {
+        return Ok(None);
+    }
+    let tree = repo
+        .run_with_index(index, ["write-tree"], None, true)?
+        .stdout
+        .trim()
+        .to_owned();
+    let mut args = vec![
+        "ls-tree".to_owned(),
+        "-r".to_owned(),
+        "-l".to_owned(),
+        "-z".to_owned(),
+        tree,
+        "--".to_owned(),
+    ];
+    args.extend(destinations);
+    let listed = repo.run(args)?;
+    let mut candidates = BTreeMap::new();
+    for entry in listed.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+        let Some((header, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        let [mode, "blob", oid, size] = fields.as_slice() else {
+            continue;
+        };
+        if matches!(*mode, "100644" | "100755")
+            && size.parse::<u64>().is_ok_and(|size| size <= 1024)
+        {
+            candidates
+                .entry(oid.to_string())
+                .or_insert_with(|| path.to_owned());
+        }
+    }
+    let oids = candidates.keys().cloned().collect::<Vec<_>>();
+    let mut found = None;
+    read_blobs(repo, &oids, |oid, content| {
+        if found.is_none() && storage::is_git_lfs_pointer(content) {
+            found = candidates.get(oid).cloned();
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 fn highest(required: &Version, other: Option<&Version>) -> Version {
@@ -3500,6 +3618,8 @@ mod tests {
         fixture.write("new\nname", "new payload");
         stage_scopes(
             &fixture.repo,
+            &Config::default(),
+            &base,
             &fixture.index,
             &[
                 "deleted[?]*".to_owned(),
@@ -3666,6 +3786,73 @@ mod tests {
             error.contains("publication has no .workspace-mgr.toml"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn archived_lfs_requirement_uses_private_controls_and_outranks_native_storage() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let directory = "2026/09/20260918-120000-completed";
+        fixture.manifest(directory, 2);
+        fixture.write(
+            &format!("{directory}/{}", archive_migration::RECEIPT_NAME),
+            &serde_json::json!({
+                "schema_version":1,"task_id":"20260918-120000-completed",
+                "source":"20260918-120000-completed","destination":directory,
+                "status":"copied","versions":[]
+            })
+            .to_string(),
+        );
+        let pointer = format!("{directory}/artifact.bin");
+        fixture.write(
+            &pointer,
+            &format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 10485777\n",
+                "1".repeat(64)
+            ),
+        );
+        fixture.write(
+            &format!("{directory}/stored.bin.wm-storage.json"),
+            &serde_json::json!({
+                "schema_version":2,"path":"stored.bin","kind":"file",
+                "checksum":{"algorithm":"md5","digest":"0".repeat(32)},
+                "size":3
+            })
+            .to_string(),
+        );
+        fixture.stage(&fixture.main, &["2026"]);
+        // Changing the worktree representation or a machine-local filter never
+        // changes the compatibility requirement of this immutable index.
+        fixture.write(&pointer, "materialized bytes\n");
+        fixture
+            .repo
+            .run(["config", "filter.lfs.clean", "false"])
+            .unwrap();
+        let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+        assert_eq!(needs.highest(), Some((Version::new(0, 8, 8), None)));
+        let error = fixture
+            .reconcile(&fixture.main, &fixture.main, None, false, "0.8.6")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("archived Git LFS pointer"), "{error}");
+        assert_eq!(fixture.staged_config().as_deref(), Some(PLAIN_CONFIG));
+        fixture
+            .reconcile(&fixture.main, &fixture.main, None, false, "0.8.8")
+            .unwrap();
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.8.8", PLAIN_CONFIG)
+        );
+        fixture
+            .repo
+            .run_with_index(
+                &fixture.index,
+                ["update-index", "--force-remove", "--", &pointer],
+                None,
+                true,
+            )
+            .unwrap();
+        let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+        assert_eq!(needs.highest(), Some((Version::new(0, 8, 7), None)));
     }
 
     #[test]
