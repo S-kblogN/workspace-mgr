@@ -824,8 +824,12 @@ fn legacy_controls(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
         })?;
         plan.credentials.render()?;
     }
+    // Native commands run before migration may already own the cache root.
+    // The legacy layout stays readable below `legacy/`, as for CAS imports.
+    let native_cache = fs::symlink_metadata(repo.root.join(".workspace-mgr/local/cache"))
+        .is_ok_and(|metadata| metadata.is_dir());
     for item in &mut plan.moves {
-        if item.source == ".dvc/cache" && plan.legacy_cas_proven {
+        if item.source == ".dvc/cache" && (plan.legacy_cas_proven || native_cache) {
             item.destination = ".workspace-mgr/local/cache/legacy".to_owned();
         }
         reject_symlink_traversal(&repo.root, &item.destination, "retained local storage")?;
@@ -1540,6 +1544,35 @@ mod tests {
         );
         assert!(repo.root.join(".dvc/cache").is_dir());
         assert!(!repo.root.join(".workspace-mgr/local/cache/legacy").exists());
+    }
+
+    #[test]
+    fn version_aware_cache_moves_below_an_existing_native_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-b", "main"]).unwrap();
+        let config = "[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = \"s3://offline.invalid/repository\"\n";
+        fs::write(repo.root.join(CONFIG_NAME), config).unwrap();
+        fs::create_dir_all(repo.root.join(".dvc/cache/files")).unwrap();
+        fs::write(
+            repo.root.join(".dvc/config"),
+            "[core]\nremote = workspace-mgr\n['remote \"workspace-mgr\"']\nurl = s3://offline.invalid/repository\nversion_aware = true\n",
+        )
+        .unwrap();
+        let mut plan = Plan::default();
+        legacy_controls(&repo, &mut plan).unwrap();
+        assert!(!plan.legacy_cas_proven);
+        assert_eq!(plan.moves[0].destination, ".workspace-mgr/local/cache");
+        // A native command such as refresh created the cache root first.
+        fs::create_dir_all(repo.root.join(".workspace-mgr/local/cache/objects")).unwrap();
+        let mut plan = Plan::default();
+        legacy_controls(&repo, &mut plan).unwrap();
+        assert_eq!(
+            plan.moves[0].destination,
+            ".workspace-mgr/local/cache/legacy"
+        );
     }
 
     #[test]

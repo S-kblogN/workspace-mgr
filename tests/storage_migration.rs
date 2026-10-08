@@ -323,6 +323,36 @@ fn files_only_directory_manifest_migrates_without_its_omitted_aggregate() {
 }
 
 #[test]
+fn manage_keeps_an_existing_native_cache_and_retains_the_legacy_cache_below_it() {
+    let fixture = legacy_repository();
+    // Native commands such as refresh populate the cache before migration.
+    let native = fixture
+        .shared
+        .join(".workspace-mgr/local/cache/objects/md5/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    fs::create_dir_all(native.parent().unwrap()).unwrap();
+    fs::write(&native, b"native").unwrap();
+    assert_eq!(
+        json(&workspace(&fixture.shared, ["manage", "--dry-run"]))["status"],
+        "dry_run"
+    );
+    assert!(fixture.shared.join(".dvc/cache").is_dir());
+    let report = json(&workspace(&fixture.shared, ["manage"]));
+    assert_eq!(report["status"], "managed");
+    assert_eq!(fs::read(&native).unwrap(), b"native");
+    assert_eq!(
+        fs::read(
+            fixture.shared.join(
+                ".workspace-mgr/local/cache/legacy/files/md5/90/0150983cd24fb0d6963f7d28e17f72"
+            )
+        )
+        .unwrap(),
+        b"abc"
+    );
+    assert!(!fixture.shared.join(".dvc").exists());
+    assert_eq!(fs::read(fixture.shared.join("data.bin")).unwrap(), b"abc");
+}
+
+#[test]
 fn legacy_pointer_cannot_overlap_an_existing_native_boundary() {
     let fixture = legacy_repository();
     pointer(&fixture.shared, "mixed/data.bin.dvc", "data.bin");
