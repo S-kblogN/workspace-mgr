@@ -723,10 +723,12 @@ preserves source history and retry journals. Historical Git checkouts use
 original content hashes after source cleanup. Reading old pointers directly with the underlying storage engine cannot
 resolve the changed keys and version IDs.
 
-Archive publication requires at least `minimum_cli_version = "0.7.0"` regardless of
-the task manifest schema, including archives with an empty S3 inventory.
-Archived tasks retaining Git LFS pointers require 0.8.8, preventing older
-clients from staging a materialized LFS file as an ordinary Git blob.
+Archive publication requires at least `minimum_cli_version = "0.8.9"` regardless of
+the task manifest schema, including archives with an empty S3 inventory. Source
+reservations and registry coordination tags point to deterministic, parentless
+commits whose only file is control JSON. Readers accept this exact envelope or
+legacy blob bindings; retries and cancellation preserve existing references.
+Published Git LFS pointers retain their original identities.
 The CLI reconciles this declaration in its private publication index before
 upload. Private S3 purge queues and archive copy journals use schema 2; 0.6.0
 rejects them before deletion rather than ignoring newer protection fields.

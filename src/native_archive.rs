@@ -830,9 +830,9 @@ fn verify_reservation(
             "archive copy reservation Git claim was removed or replaced",
         ));
     }
-    if git(repo, &["cat-file", "blob", oid])? != body {
+    if crate::archive_git_control::read_body(&repo.root, oid)?.as_bytes() != body {
         return Err(message(
-            "archive copy reservation Git blob differs from its descriptor",
+            "archive copy reservation Git control body differs from its descriptor",
         ));
     }
     Ok(())
@@ -1930,9 +1930,9 @@ fn verify_coordination_with(
             "archive registry Git CAS binding was removed or replaced",
         ));
     }
-    if git(repo, &["cat-file", "blob", oid])? != body {
+    if crate::archive_git_control::read_body(&repo.root, oid)?.as_bytes() != body {
         return Err(message(
-            "archive registry Git CAS blob differs from its receipt",
+            "archive registry Git CAS control body differs from its receipt",
         ));
     }
     if let Some(revision) = publication {

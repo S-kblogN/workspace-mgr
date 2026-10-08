@@ -245,8 +245,18 @@ class ArchiveHarness(e2e.Harness):
         reservation = self.registry_binding(receipt, "archive-copy")
         self.check(registry and binding is not None and reservation is not None,
                    "failed task push retains its copy reservation, registry and immutable canonical binding")
-        canonical = self.run(["git", "--git-dir", self.remote, "cat-file", "blob", binding]).stdout
-        self.check(json.loads(canonical) == receipt, "coordination blob binds the exact complete copied receipt")
+        git_control = ["git", "--git-dir", self.remote]
+        control_type = self.run([*git_control, "cat-file", "-t", binding]).stdout.strip()
+        self.check(control_type == "commit", "new registry bindings use a Git commit")
+        ancestry = self.run([*git_control, "rev-list", "--parents", "--max-count=1", binding]).stdout.split()
+        self.check(ancestry == [binding], "registry control commits have no parent task history")
+        entries = self.run([*git_control, "ls-tree", "-z", binding]).stdout.rstrip("\0").split("\0")
+        header, _, name = entries[0].partition("\t")
+        self.check(len(entries) == 1 and header.startswith("100644 blob ")
+                   and name == "workspace-mgr-control.json",
+                   "registry control commits contain only one regular control JSON file")
+        canonical = self.run([*git_control, "show", f"{binding}:workspace-mgr-control.json"]).stdout
+        self.check(json.loads(canonical) == receipt, "coordination commit binds the exact complete copied receipt")
         self.check(not (worktree / DESTINATION / "single.txt").exists()
                    and not (worktree / DESTINATION / "bundle").exists(),
                    "server-side history copy does not materialize absent outputs")

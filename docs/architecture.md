@@ -382,8 +382,11 @@ registry mutation, source deletion or remote cancellation. Restoring an old
 purge snapshot through cancel also writes schema 2. Public receipt/registry
 contexts normalize to schema 1 so immutable receipt bindings and old data
 formats remain stable. Any archive receipt in the publication index requires
-workspace-mgr 0.7.0 independently of task schema or S3 inventory size, and the
-managed repository declaration rises before uploads.
+workspace-mgr 0.8.9 independently of task schema or S3 inventory size, and the
+managed repository declaration rises before uploads. Source and registry Git
+bindings use deterministic parentless commits with one control JSON file; they
+do not reference task trees or payload history. Exact legacy blob bindings remain
+readable for retries and cancellation, without rewriting existing tags.
 
 The executable, local storage engine, S3 transport, archive registry, and
 history copy/cancel adapters are Rust. Native storage uses versioned JSON

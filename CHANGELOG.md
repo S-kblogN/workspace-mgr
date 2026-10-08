@@ -5,6 +5,19 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-10-08
+
+### Fixed
+
+- Archive source reservations and canonical registry bindings use deterministic
+  Git commits containing only control JSON, instead of tags pointing directly
+  to large blobs that GitHub can reject with a Git LFS integrity-check error.
+  Exact compare-and-create ownership, copy verification and protected retirement
+  remain required. Existing blob bindings retain retry and cancellation support
+  without rewriting their references.
+- Archive publications require CLI 0.8.9 so older readers cannot misread the
+  new Git control bindings. Public receipt and S3 registry formats are unchanged.
+
 ## [0.8.8] - 2026-10-08
 
 ### Fixed
