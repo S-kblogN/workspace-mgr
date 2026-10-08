@@ -853,10 +853,16 @@ fn inspect_remote_entry(
     }
     let mut head_args = args.clone();
     head_args["ChecksumMode"] = "ENABLED".into();
+    let local = repo.root.join(&entry.object);
+    // Missing local hashes do not establish that the payload is absent: a
+    // failed local read must still receive the streamed byte comparison.
+    let local_absent = fs::symlink_metadata(&local)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     if let Ok(head) = client.call_s3("head_object", &head_args, None) {
         let prior_issues = report.issues.len();
         validate_remote_response(entry, recorded, version, &head.value, report);
         if prior_issues == report.issues.len()
+            && (local_hashes.is_some() || local_absent)
             && checksum_proof(entry, &head.value, local_hashes, report)
         {
             report.remote_checksum_objects += 1;
@@ -866,7 +872,6 @@ fn inspect_remote_entry(
     // Unsupported, absent, composite or weak checksums cannot replace the
     // manifest checksum check. Read the exact version once, hashing and
     // comparing raw local bytes while they arrive; no scratch write/fsync.
-    let local = repo.root.join(&entry.object);
     let mut local_reader = if fs::symlink_metadata(&local)
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
         && reject_symlink_traversal(&repo.root, &entry.object, "doctor local payload").is_ok()
@@ -1005,44 +1010,36 @@ fn checksum_proof(
     let sha256 = decode("ChecksumSHA256", 32);
     if entry.hash_name == "md5"
         && let Some(remote) = md5.as_deref()
+        && entry.md5.as_deref() != Some(remote)
     {
-        if entry.md5.as_deref() != Some(remote) {
-            report.entry_issue(
-                "remote-content-mismatch",
-                entry,
-                "S3 full-object MD5 differs from the manifest checksum",
-            );
-        }
-        if let Some(local) = local
-            && (local.md5 != remote
-                || sha256
-                    .as_deref()
-                    .is_some_and(|digest| local.sha256 != digest))
-        {
-            report.entry_issue(
-                "local-remote-bytes-mismatch",
-                entry,
-                "local raw-byte checksum differs from the exact S3 version's full-object checksum",
-            );
-        }
-        return true;
+        report.entry_issue(
+            "remote-content-mismatch",
+            entry,
+            "S3 full-object MD5 differs from the manifest checksum",
+        );
     }
     let Some(local) = local else {
-        return false;
+        // This replaces only the remote manifest MD5 calculation. There are
+        // no materialized bytes whose literal equality also needs checking.
+        return entry.hash_name == "md5" && md5.is_some();
     };
     // Normalized manifests alone cannot establish a raw-byte remote digest.
-    // A strong raw checksum matching the locally checked bytes bridges that
-    // distinction; a mismatch falls back to reading and checking remote bytes.
-    let has_proof = md5.as_deref().is_some_and(|digest| local.md5 == digest)
-        || sha256
-            .as_deref()
-            .is_some_and(|digest| local.sha256 == digest);
-    if !has_proof
-        || md5.as_deref().is_some_and(|digest| local.md5 != digest)
-        || sha256
-            .as_deref()
-            .is_some_and(|digest| local.sha256 != digest)
-    {
+    // Matching MD5 alone also cannot replace the existing local/remote byte
+    // comparison: distinct known MD5 collisions must still be detected. Only
+    // a matching full-object SHA256 can bridge checked local raw bytes to the
+    // remote version; missing or differing SHA256 retains the streamed check.
+    let md5_differs = md5.as_deref().is_some_and(|digest| local.md5 != digest);
+    let sha256_differs = sha256
+        .as_deref()
+        .is_some_and(|digest| local.sha256 != digest);
+    if md5_differs || sha256_differs {
+        report.entry_issue(
+            "local-remote-bytes-mismatch",
+            entry,
+            "local raw-byte checksum differs from the exact S3 version's full-object checksum",
+        );
+    }
+    if sha256.as_deref() != Some(local.sha256.as_str()) || md5_differs {
         return false;
     }
     match local.digest(&entry.hash_name) {
@@ -1706,15 +1703,14 @@ mod tests {
             None,
             &mut AuditReport::new()
         ));
-        assert_eq!(
-            checksum_proof(
-                &normalized,
+        for entry in [&raw, &normalized] {
+            assert!(!checksum_proof(
+                entry,
                 &full_md5,
                 Some(&hashes),
                 &mut AuditReport::new()
-            ),
-            cfg!(unix)
-        );
+            ));
+        }
         assert!(!checksum_proof(
             &normalized,
             &full_md5,
@@ -1722,15 +1718,12 @@ mod tests {
             &mut AuditReport::new()
         ));
         let full_sha = json!({"ChecksumType":"FULL_OBJECT","ChecksumSHA256": STANDARD.encode(Sha256::digest(body))});
-        assert_eq!(
-            checksum_proof(
-                &normalized,
-                &full_sha,
-                Some(&hashes),
-                &mut AuditReport::new()
-            ),
-            cfg!(unix)
-        );
+        for entry in [&raw, &normalized] {
+            assert_eq!(
+                checksum_proof(entry, &full_sha, Some(&hashes), &mut AuditReport::new()),
+                cfg!(unix)
+            );
+        }
         assert!(!checksum_proof(
             &raw,
             &full_sha,
@@ -1776,6 +1769,140 @@ mod tests {
             Some(&changed),
             &mut AuditReport::new()
         ));
+    }
+
+    #[test]
+    fn full_object_md5_collisions_retain_materialized_literal_byte_comparison() {
+        // Public 128-byte Wang/Yu collision pair, reproduced by Peter Selinger:
+        // https://www.mscs.dal.ca/~selinger/md5collision/
+        // Verify the collision here instead of trusting the fixture's label.
+        let decode = |hex: &str| {
+            let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+            assert!(remainder.is_empty());
+            pairs
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let local = decode(concat!(
+            "d131dd02c5e6eec4693d9a0698aff95c2fcab58712467eab4004583eb8fb7f89",
+            "55ad340609f4b30283e488832571415a085125e8f7cdc99fd91dbdf280373c5b",
+            "d8823e3156348f5bae6dacd436c919c6dd53e2b487da03fd02396306d248cda0",
+            "e99f33420f577ee8ce54b67080a80d1ec69821bcb6a8839396f9652b6ff72a70"
+        ));
+        let remote = decode(concat!(
+            "d131dd02c5e6eec4693d9a0698aff95c2fcab50712467eab4004583eb8fb7f89",
+            "55ad340609f4b30283e4888325f1415a085125e8f7cdc99fd91dbd7280373c5b",
+            "d8823e3156348f5bae6dacd436c919c6dd53e23487da03fd02396306d248cda0",
+            "e99f33420f577ee8ce54b67080280d1ec69821bcb6a8839396f965ab6ff72a70"
+        ));
+        assert_eq!(local.len(), 128);
+        assert_eq!(remote.len(), local.len());
+        assert_ne!(local, remote);
+        assert_eq!(md5::Md5::digest(&local), md5::Md5::digest(&remote));
+        assert_eq!(
+            crate::hex::encode_lower(md5::Md5::digest(&local)),
+            "79054025255fb1a26e4bc422aef54eb4"
+        );
+        assert_ne!(Sha256::digest(&local), Sha256::digest(&remote));
+
+        for algorithm in ["md5", "md5-dos2unix"] {
+            assert_eq!(checksum(&local, algorithm), checksum(&remote, algorithm));
+            for include_sha256 in [false, true] {
+                let fixture = Fixture::new();
+                fixture.file("task/data", &local, algorithm, true);
+                let remote = remote.clone();
+                let (client, server) = replayable_read_fixture(move |request| {
+                    let url =
+                        url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+                    let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                    if query.contains_key("versions") {
+                        return Arc::new(Reply::xml(&listing(
+                            &[row("task/data", "v1", true, &remote, false)],
+                            &query["prefix"],
+                        )));
+                    }
+                    assert_eq!(query.get("versionId").map(String::as_str), Some("v1"));
+                    let mut headers = vec![
+                        ("x-amz-version-id", "v1".into()),
+                        ("etag", "\"remote-etag\"".into()),
+                    ];
+                    if request.method == "HEAD" {
+                        headers.push(("x-amz-checksum-type", "FULL_OBJECT".into()));
+                        headers.push((
+                            "x-amz-checksum-md5",
+                            STANDARD.encode(md5::Md5::digest(&remote)),
+                        ));
+                        if include_sha256 {
+                            headers.push((
+                                "x-amz-checksum-sha256",
+                                STANDARD.encode(Sha256::digest(&remote)),
+                            ));
+                        }
+                    }
+                    Arc::new(Reply {
+                        status: 200,
+                        headers,
+                        body: remote.clone(),
+                    })
+                });
+                configure_repo(&client, &fixture.repo);
+                let before = snapshot(&fixture.repo);
+                let report =
+                    inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+                assert!(has(&report, "local-remote-bytes-mismatch", "task/data"));
+                assert!(!has(&report, "local-content-mismatch", "task/data"));
+                assert!(!has(&report, "remote-content-mismatch", "task/data"));
+                assert_eq!(report.remote_checksum_objects, 0);
+                assert_eq!(report.streamed_objects, 1);
+                assert_eq!(report.streamed_bytes, 128);
+                assert_eq!(snapshot(&fixture.repo), before);
+                let requests = server.finish_requests();
+                assert_eq!(requests.len(), 4, "two inventories, HEAD and GET");
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| matches!(request.method.as_str(), "GET" | "HEAD"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_local_hashes_never_turn_a_present_payload_into_unmaterialized_proof() {
+        let fixture = Fixture::new();
+        fixture.file("task/data", b"abc", "md5", true);
+        let (client, server) = replayable_read_fixture(move |request| {
+            assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
+            Arc::new(Reply {
+                status: 200,
+                headers: vec![
+                    ("x-amz-version-id", "v1".into()),
+                    ("etag", "\"remote-etag\"".into()),
+                    ("x-amz-checksum-type", "FULL_OBJECT".into()),
+                    (
+                        "x-amz-checksum-md5",
+                        STANDARD.encode(md5::Md5::digest(b"abc")),
+                    ),
+                ],
+                body: b"abc".to_vec(),
+            })
+        });
+        let entry = proof_entry(b"abc", "md5");
+        let recorded = row("task/data", "v1", true, b"abc", false);
+        let mut report = AuditReport::new();
+        inspect_remote_entry(
+            &fixture.repo,
+            &client,
+            &entry,
+            &[&recorded],
+            None,
+            &mut report,
+        );
+        assert_eq!(report.remote_checksum_objects, 0);
+        assert_eq!(report.streamed_objects, 1);
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(server.finish_requests().len(), 2, "HEAD followed by GET");
     }
 
     #[test]

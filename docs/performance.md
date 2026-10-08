@@ -53,11 +53,14 @@ constraints, not unchecked performance shortcuts.
 ## S3 checksums
 
 Doctor requests `HeadObject` for the exact version with `ChecksumMode=ENABLED`.
-It accepts a correctly encoded `FULL_OBJECT` MD5 or SHA256 only when that digest
-can prove the manifest checksum and, where present, the checked local bytes.
-For normalized MD5, a raw provider checksum needs the verified local raw digest
-to bridge the two representations. A SHA256 alone cannot prove an unmaterialized
-MD5 manifest. ETags and arbitrary user metadata are not checksum evidence.
+It accepts a correctly encoded `FULL_OBJECT` MD5 to verify an unmaterialized
+raw-MD5 manifest. When local bytes are present, skipping GET requires a matching
+`FULL_OBJECT` SHA256 of those checked raw bytes; matching MD5 alone retains the
+literal byte comparison. The local manifest checksum is still checked, including
+normalized MD5. A regression test verifies a [public MD5 collision pair](https://www.mscs.dal.ca/~selinger/md5collision/)
+and proves its differing local and remote bytes are detected. A SHA256 alone
+cannot prove an unmaterialized MD5 manifest. ETags and arbitrary user metadata
+are not checksum evidence.
 
 CRC checksums, composite checksums, unavailable or malformed checksums, and
 normalization ambiguities fall back to a full exact-version GET. The GET is
@@ -110,8 +113,8 @@ build or test work. Release 0.8.5's doctor storage source is unchanged from 0.8.
 
 | Provider checksum | Release time | Current time | Payload GETs, release → current | Peak concurrency, release → current |
 | --- | --- | --- | --- | --- |
-| CRC32 only | 4.8434 s | 0.9963 s | 128 → 128 | 1 → 16 |
-| FULL_OBJECT SHA256 | 4.8495 s | 0.7751 s | 128 → 0 | 1 → 16 |
+| CRC32 only | 4.8413 s | 0.9691 s | 128 → 128 | 1 → 16 |
+| FULL_OBJECT SHA256 | 4.8355 s | 0.7415 s | 128 → 0 | 1 → 16 |
 
 All four audits reported the same 128 expected objects and no integrity issues.
 The CRC32 case downloaded the full 8 MiB in both builds; the SHA256 case reduced

@@ -272,18 +272,21 @@ parallel across available CPU cores. Independent S3 checks use at most sixteen
 workers, preserving exact version, ETag, size and inventory checks.
 
 Doctor requests S3 `HeadObject` with `ChecksumMode=ENABLED`. A provider's
-`FULL_OBJECT` MD5 can validate a raw-MD5 manifest without downloading the object.
-When checked local bytes are present, a full-object MD5 or SHA256 also establishes
-raw-byte checksum equality; the local manifest checksum is still checked,
-including the legacy `md5-dos2unix` normalization rule. This uses the provider's
-content checksum, never a generic ETag or uploader-controlled user metadata.
+`FULL_OBJECT` MD5 can validate an unmaterialized raw-MD5 manifest without
+downloading the object. When checked local bytes are present, skipping GET
+requires a matching full-object SHA256; MD5 alone retains the literal local-byte
+comparison, including for distinct files with the same MD5. The local manifest
+checksum is still checked, including the legacy `md5-dos2unix` normalization rule.
+This uses the provider's content checksum, never a generic ETag or
+uploader-controlled user metadata.
 Checksum equality is a digest-based integrity proof; it is not a mathematical
 collision-free proof of literal byte equality.
 
 Missing, malformed, composite, CRC-only or incompatible checksums retain the
-full read check. An unmaterialized normalized manifest also requires this
-fallback. Doctor streams each exact remote version directly through checksum
-verification and literal local-byte comparison in the same pass, without a
+full read check, as does a materialized payload with MD5 alone. An unmaterialized
+normalized manifest also requires this fallback. Doctor streams each exact
+remote version directly through checksum verification and literal local-byte
+comparison in the same pass, without a
 scratch file, cache installation or filesystem sync. Both remote inventories
 and local file generations are compared before and after the audit. Large
 tasks can still incur S3 read/transfer costs when the provider lacks a suitable
