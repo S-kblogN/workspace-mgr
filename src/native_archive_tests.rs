@@ -1546,7 +1546,21 @@ fn missing_bucket_error_does_not_erase_owned_multipart_upload_journal() {
 
 #[test]
 fn registry_streaming_reads_over_64mib_and_compares_formatted_history_semantically() {
-    use crate::native_s3::tests::{Reply, fixture};
+    large_registry_read(false);
+}
+
+#[test]
+fn registry_streaming_replays_same_version_after_request_sent_header_interruption() {
+    large_registry_read(true);
+}
+
+fn large_registry_read(interrupt: bool) {
+    use crate::native_s3::tests::{Reply, interrupt_response_once, replayable_read_fixture};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
     let mut task = Fixture::new();
     task.store.source("data", "source", b"payload", false);
     task.reserve();
@@ -1564,23 +1578,97 @@ fn registry_streaming_reads_over_64mib_and_compares_formatted_history_semantical
         formatted.len(),
         compact.len()
     );
-    let (client, worker) = fixture(vec![
-        Reply::xml(&listing),
-        Reply {
-            status: 200,
-            headers: vec![("x-amz-version-id", "r1".into())],
-            body: formatted,
-        },
-        Reply {
-            status: 200,
-            headers: vec![("x-amz-version-id", "r2".into())],
-            body: compact.clone(),
-        },
-        Reply::xml(&listing),
-    ]);
+    let listing_reply = Arc::new(Reply::xml(&listing));
+    let first_reply = Arc::new(Reply {
+        status: 200,
+        headers: vec![("x-amz-version-id", "r1".into())],
+        body: formatted,
+    });
+    let second_reply = Arc::new(Reply {
+        status: 200,
+        headers: vec![("x-amz-version-id", "r2".into())],
+        body: compact.clone(),
+    });
+    let first_target = format!("/fixture-bucket/{object}?versionId=r1");
+    let second_target = format!("/fixture-bucket/{object}?versionId=r2");
+    let first_requests = Arc::new(AtomicUsize::new(0));
+    let received = first_requests.clone();
+    let (request_sent, request_received) = mpsc::channel();
+    let (client, worker) = replayable_read_fixture(move |request| {
+        assert_eq!(request.method, "GET");
+        assert!(request.body.is_empty());
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if query.contains_key("versions") {
+            assert_eq!(url.path(), "/fixture-bucket");
+            assert_eq!(query["prefix"], object);
+            assert_eq!(query["max-keys"], "1000");
+            assert_eq!(query.len(), 3);
+            return listing_reply.clone();
+        }
+        assert_eq!(url.path(), format!("/fixture-bucket/{object}"));
+        assert_eq!(query.len(), 1);
+        match query["versionId"].as_str() {
+            "r1" => {
+                if interrupt && received.fetch_add(1, Ordering::SeqCst) == 0 {
+                    request_sent.send(()).unwrap();
+                }
+                first_reply.clone()
+            }
+            "r2" => second_reply.clone(),
+            version => panic!("unexpected registry version {version}"),
+        }
+    });
+    let (client, injected) = if interrupt {
+        interrupt_response_once(client, first_target.clone(), request_received)
+    } else {
+        (client, Arc::new(AtomicUsize::new(0)))
+    };
     let read = registry_read(&client, &task.repo, "task").unwrap().unwrap();
     assert_eq!(canonical(&read).unwrap(), compact);
-    assert_eq!(worker.join().unwrap().len(), 4);
+    let attempts = worker.finish();
+    let listing_target = attempts[0].request.target.as_str();
+    assert!(listing_target.contains("versions="));
+    let mut logical_targets = Vec::new();
+    for attempt in &attempts {
+        let target = attempt.request.target.as_str();
+        if logical_targets.last().copied() != Some(target) {
+            logical_targets.push(target);
+        }
+    }
+    // Adjacent physical retries do not add a logical read or advance the
+    // registry's version sequence, even when a small response was fully sent.
+    assert_eq!(
+        logical_targets,
+        [
+            listing_target,
+            &first_target,
+            &second_target,
+            listing_target
+        ]
+    );
+    let successful = attempts
+        .iter()
+        .filter(|attempt| attempt.response_sent)
+        .collect::<Vec<_>>();
+    assert!(successful.len() >= 4);
+    let first = attempts
+        .iter()
+        .filter(|attempt| attempt.request.target == first_target)
+        .collect::<Vec<_>>();
+    assert!(first.iter().any(|attempt| attempt.response_sent));
+    assert_eq!(injected.load(Ordering::SeqCst), usize::from(interrupt));
+    if interrupt {
+        // A real r1 request was already parsed by the server before its header
+        // read failed. The abandoned response must not consume r2's reply.
+        assert!(first.len() >= 2);
+        assert!(first.iter().any(|attempt| !attempt.response_sent));
+        assert!(
+            first
+                .iter()
+                .all(|attempt| attempt.request.headers["authorization"].contains("SignedHeaders="))
+        );
+    }
 }
 
 #[test]

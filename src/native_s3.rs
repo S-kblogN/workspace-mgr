@@ -1620,12 +1620,15 @@ pub(crate) mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     };
     use std::thread;
     use ureq::unversioned::resolver::DefaultResolver;
-    use ureq::unversioned::transport::{ConnectionDetails, Connector, DefaultConnector, Transport};
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+    };
 
     #[derive(Debug, Clone, Copy)]
     enum InjectedFailure {
@@ -1681,6 +1684,112 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug)]
+    struct InterruptResponseConnector {
+        target: String,
+        injected: Arc<AtomicUsize>,
+        request_received: Arc<Mutex<mpsc::Receiver<()>>>,
+        delegate: DefaultConnector,
+    }
+
+    impl Connector for InterruptResponseConnector {
+        type Out = Box<dyn Transport>;
+
+        fn connect(
+            &self,
+            details: &ConnectionDetails,
+            chained: Option<()>,
+        ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+            let interrupt = details.uri.path_and_query().map(|value| value.as_str())
+                == Some(self.target.as_str());
+            Ok(self.delegate.connect(details, chained)?.map(|delegate| {
+                Box::new(InterruptResponseTransport {
+                    delegate,
+                    interrupt,
+                    sent: false,
+                    injected: self.injected.clone(),
+                    request_received: self.request_received.clone(),
+                }) as Box<dyn Transport>
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct InterruptResponseTransport {
+        delegate: Box<dyn Transport>,
+        interrupt: bool,
+        sent: bool,
+        injected: Arc<AtomicUsize>,
+        request_received: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl Transport for InterruptResponseTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.delegate.buffers()
+        }
+
+        fn transmit_output(
+            &mut self,
+            amount: usize,
+            timeout: NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            self.delegate.transmit_output(amount, timeout)?;
+            self.sent = true;
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+            if self.interrupt
+                && self.sent
+                && self
+                    .injected
+                    .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // The server must have parsed this real request before its
+                // response is interrupted. This avoids a connect-only fault or
+                // a race in which a reset discards an unobserved request.
+                self.request_received
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("fixture never received the request before the injected interruption");
+                return Err(ureq::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected response-header interruption after request transmission",
+                )));
+            }
+            self.delegate.await_input(timeout)
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.delegate.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.delegate.is_tls()
+        }
+    }
+
+    pub(crate) fn interrupt_response_once(
+        mut client: S3Client,
+        target: String,
+        request_received: mpsc::Receiver<()>,
+    ) -> (S3Client, Arc<AtomicUsize>) {
+        let injected = Arc::new(AtomicUsize::new(0));
+        client.agent = ureq::Agent::with_parts(
+            client.agent.config().clone(),
+            InterruptResponseConnector {
+                target,
+                injected: injected.clone(),
+                request_received: Arc::new(Mutex::new(request_received)),
+                delegate: DefaultConnector::default(),
+            },
+            DefaultResolver::default(),
+        );
+        (client, injected)
+    }
+
+    #[derive(Debug)]
     pub(crate) struct WireRequest {
         pub method: String,
         pub target: String,
@@ -1700,6 +1809,129 @@ pub(crate) mod tests {
                 body: body.as_bytes().to_vec(),
             }
         }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ReadAttempt {
+        pub request: WireRequest,
+        pub response_sent: bool,
+    }
+
+    pub(crate) struct ReplayableReadFixture {
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<Vec<ReadAttempt>>>,
+    }
+
+    impl ReplayableReadFixture {
+        pub fn finish(mut self) -> Vec<ReadAttempt> {
+            self.stop.store(true, Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for ReplayableReadFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Also stop on a client assertion failure, without double-panicking.
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// Read-only fixture routed by request identity, not connection order.
+    /// Abandoned reads remain recorded and never consume another version's reply.
+    pub(crate) fn replayable_read_fixture(
+        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + 'static,
+    ) -> (S3Client, ReplayableReadFixture) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            let mut attempts = Vec::new();
+            let mut deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !server_stop.load(Ordering::SeqCst) {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "mock S3 read fixture timed out"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock accept: {error}"),
+                };
+                deadline = std::time::Instant::now() + Duration::from_secs(10);
+                connection.set_nonblocking(false).unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                connection
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let request = match read_request_result(&mut connection) {
+                    Ok(request) => request,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("mock read: {error}"),
+                };
+                assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
+                let reply = handler(&request);
+                let mut headers =
+                    format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", reply.status);
+                if !reply
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                {
+                    headers.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+                }
+                for (name, value) in &reply.headers {
+                    headers.push_str(&format!("{name}: {value}\r\n"));
+                }
+                headers.push_str("\r\n");
+                let response_sent = match connection
+                    .write_all(headers.as_bytes())
+                    .and_then(|()| connection.write_all(&reply.body))
+                {
+                    Ok(()) => true,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        false
+                    }
+                    Err(error) => panic!("mock response: {error}"),
+                };
+                attempts.push(ReadAttempt {
+                    request,
+                    response_sent,
+                });
+                // The idle-request deadline must not include a large response's
+                // transmission time on a slower CI runner.
+                deadline = std::time::Instant::now() + Duration::from_secs(10);
+            }
+            attempts
+        });
+        (
+            client(&endpoint),
+            ReplayableReadFixture {
+                stop,
+                worker: Some(worker),
+            },
+        )
     }
 
     fn test_credentials() -> Credentials {
@@ -1831,34 +2063,51 @@ pub(crate) mod tests {
         (client(&endpoint), worker)
     }
     fn read_request(stream: &mut TcpStream) -> WireRequest {
+        read_request_result(stream).unwrap()
+    }
+
+    fn read_request_result(stream: &mut TcpStream) -> std::io::Result<WireRequest> {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        reader.read_line(&mut line)?;
         let mut parts = line.split_ascii_whitespace();
-        let method = parts.next().unwrap().to_owned();
-        let target = parts.next().unwrap().to_owned();
+        let missing = || {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete mock HTTP request",
+            )
+        };
+        let method = parts.next().ok_or_else(missing)?.to_owned();
+        let target = parts.next().ok_or_else(missing)?.to_owned();
         let mut headers = BTreeMap::new();
         loop {
             line.clear();
-            reader.read_line(&mut line).unwrap();
+            if reader.read_line(&mut line)? == 0 {
+                return Err(missing());
+            }
             if line == "\r\n" {
                 break;
             }
-            let (name, value) = line.trim_end().split_once(':').unwrap();
+            let (name, value) = line.trim_end().split_once(':').ok_or_else(missing)?;
             headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
         }
         let length = headers
             .get("content-length")
-            .map(|value| value.parse::<usize>().unwrap())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })
+            .transpose()?
             .unwrap_or(0);
         let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-        WireRequest {
+        reader.read_exact(&mut body)?;
+        Ok(WireRequest {
             method,
             target,
             headers,
             body,
-        }
+        })
     }
 
     #[test]
