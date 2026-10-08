@@ -5,6 +5,29 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-10-08
+
+### Changed
+
+- Batch Git tree, blob, index, receipt and nested-repository checks shared by
+  planning, publication, storage and history operations. Parse directory
+  manifests and resolve cache routing once per verification phase.
+- Reuse local hashes within a phase only while file-generation checks match,
+  compute required digests in one pass, and parallelize independent hashing
+  and cache checks across available CPU cores.
+- Bound independent S3 reads and checks to 16 workers, upload four objects
+  concurrently, and save completed version bindings in one atomic manifest
+  update while preserving durable upload recovery.
+- Doctor uses suitable provider checksums for exact-version verification and
+  otherwise streams complete payload verification without temporary-file
+  writes or rereads. Materialized bytes require full-object SHA256 to skip
+  download; MD5-only evidence retains literal byte comparison. Terminal
+  progress and reports expose checksum proofs and streamed payload counts.
+- Batch ordinary immutable-version retirement with S3 DeleteObjects while
+  retaining per-item result validation, historical null-version handling,
+  archive coordination and final version inventories. All storage transport
+  remains S3, with existing integrity and transaction checks retained.
+
 ## [0.8.6] - 2026-10-08
 
 ### Fixed
