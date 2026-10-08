@@ -263,6 +263,13 @@ class Harness:
         self.record("s3-version-inventory", {"versions": inventory})
         return inventory
 
+    def create_s3_delete_marker(self, key: str) -> str:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+        markers = [row for row in self.s3_version_inventory()
+                   if row["key"] == key and row["delete_marker"] and row["is_latest"]]
+        self.check(len(markers) == 1, "fixture deletion creates one exact latest S3 delete marker", key=key, markers=markers)
+        return markers[0]["version_id"]
+
     def s3_bodies(self) -> list[bytes]:
         bodies = []
         for version in self.list_s3_versions():
@@ -1607,13 +1614,14 @@ class Harness:
             self.check(integrity["status"] == ("ok" if expected == 0 else "error"), "doctor storage check controls its failing exit status")
             return report
 
-        def put(key: str, body: bytes) -> None:
+        def put(key: str, body: bytes) -> str:
             response = self.s3.put_object(Bucket=self.bucket, Key=key, Body=body)
-            injected.append((key, response["VersionId"]))
+            version = response["VersionId"]
+            injected.append((key, version))
+            return version
 
         def mark_deleted(key: str) -> None:
-            response = self.s3.delete_object(Bucket=self.bucket, Key=key)
-            injected.append((key, response["VersionId"]))
+            injected.append((key, self.create_s3_delete_marker(key)))
 
         def cleanup() -> None:
             for key, version in reversed(injected):
@@ -1632,7 +1640,10 @@ class Harness:
             put(wrong_path, original_data)
             put(retired_path, b"retired remote-only payload\n")
             mark_deleted(retired_path)
+            marker_payload = put(marker_only_path, b"payload removed beneath a retained marker\n")
             mark_deleted(marker_only_path)
+            self.s3.delete_object(Bucket=self.bucket, Key=marker_only_path, VersionId=marker_payload)
+            injected.remove((marker_only_path, marker_payload))
             stale = inspect(task_id, expected=2)
             unexpected = {issue["path"] for issue in stale["storage"]["issues"] if issue["code"] == "unexpected-object"}
             self.check({path.removeprefix("objects/") for path in (wrong_path, retired_path, marker_only_path)}.issubset(unexpected),
@@ -1864,7 +1875,7 @@ class Harness:
         self.check(self.wm(self.shared, "doctor", renamed_id)["storage"]["issues"] == [],
                    "doctor accepts a published task at its current renamed path")
         stale_version = self.s3.put_object(Bucket=self.bucket, Key=old_artifact_key, Body=payload)["VersionId"]
-        stale_marker = self.s3.delete_object(Bucket=self.bucket, Key=old_artifact_key)["VersionId"]
+        stale_marker = self.create_s3_delete_marker(old_artifact_key)
         try:
             stale = json.loads(self.wm(self.shared, "doctor", renamed_id, expected=2)["stdout"])
             self.check(any(issue["code"] == "unexpected-object" and issue["path"] == f"{task_id}/artifact.bin"
