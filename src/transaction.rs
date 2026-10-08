@@ -3829,7 +3829,7 @@ mod tests {
             .unwrap();
         let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
         assert_eq!(needs.archived_git_lfs.as_deref(), Some(pointer.as_str()));
-        assert_eq!(needs.highest(), Some((Version::new(0, 8, 9), None)));
+        assert_eq!(needs.highest(), Some((Version::new(0, 8, 10), None)));
         let error = fixture
             .reconcile(&fixture.main, &fixture.main, None, false, "0.8.6")
             .unwrap_err()
@@ -3837,11 +3837,11 @@ mod tests {
         assert!(error.contains("archived Git LFS pointer"), "{error}");
         assert_eq!(fixture.staged_config().as_deref(), Some(PLAIN_CONFIG));
         fixture
-            .reconcile(&fixture.main, &fixture.main, None, false, "0.8.9")
+            .reconcile(&fixture.main, &fixture.main, None, false, "0.8.10")
             .unwrap();
         assert_eq!(
             fixture.staged_config().unwrap(),
-            declaring("0.8.9", PLAIN_CONFIG)
+            declaring("0.8.10", PLAIN_CONFIG)
         );
         fixture
             .repo
@@ -3854,11 +3854,11 @@ mod tests {
             .unwrap();
         let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
         assert!(needs.archived_git_lfs.is_none());
-        assert_eq!(needs.highest(), Some((Version::new(0, 8, 9), None)));
+        assert_eq!(needs.highest(), Some((Version::new(0, 8, 10), None)));
     }
 
     #[test]
-    fn archive_receipts_require_0_8_9_independently_of_manifest_schema_or_storage() {
+    fn archive_receipts_require_0_8_10_independently_of_manifest_schema_or_storage() {
         for schema in [2, 3] {
             let fixture = Fixture::new(Some(PLAIN_CONFIG));
             let main = fixture.main.clone();
@@ -3878,28 +3878,28 @@ mod tests {
             );
             fixture.stage(&main, &["2026"]);
             let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
-            assert_eq!(needs.highest(), Some((Version::new(0, 8, 9), None)));
+            assert_eq!(needs.highest(), Some((Version::new(0, 8, 10), None)));
             let error = fixture
                 .reconcile(&main, &main, None, false, "0.6.0")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("archive receipt"), "{error}");
-            assert!(error.contains("require workspace-mgr 0.8.9"), "{error}");
+            assert!(error.contains("require workspace-mgr 0.8.10"), "{error}");
             assert_eq!(fixture.staged_config().unwrap(), PLAIN_CONFIG);
             assert_eq!(
                 fixture
-                    .reconcile(&main, &main, None, false, "0.8.9")
+                    .reconcile(&main, &main, None, false, "0.8.10")
                     .unwrap(),
                 Some(requirement(
                     RequirementChange::Raise,
-                    Some("0.8.9"),
+                    Some("0.8.10"),
                     None,
                     None
                 ))
             );
             assert_eq!(
                 fixture.staged_config().unwrap(),
-                declaring("0.8.9", PLAIN_CONFIG)
+                declaring("0.8.10", PLAIN_CONFIG)
             );
             assert_eq!(
                 fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
@@ -3909,7 +3909,7 @@ mod tests {
             fixture.stage(&tip, &["2026"]);
             assert!(
                 fixture
-                    .reconcile(&tip, &main, None, false, "0.8.9")
+                    .reconcile(&tip, &main, None, false, "0.8.10")
                     .unwrap()
                     .is_none()
             );
@@ -3927,7 +3927,7 @@ mod tests {
         );
         fixture.stage(&main, &["2026"]);
         let error = fixture
-            .reconcile(&main, &main, None, false, "0.8.9")
+            .reconcile(&main, &main, None, false, "0.8.10")
             .unwrap_err()
             .to_string();
         assert!(error.contains("archive storage protocol"), "{error}");

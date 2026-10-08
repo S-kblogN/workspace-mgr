@@ -5,6 +5,18 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-10-08
+
+### Fixed
+
+- Archive S3 copies use lowercase ownership metadata keys within B2's 50-byte
+  file-info limit. The full per-version ownership token, original metadata,
+  tags and object properties remain intact; retries and cancellation also
+  recognize existing copies with the previous long marker keys.
+- Archive publications require CLI 0.8.10 so older writers and cancellation
+  commands cannot misread the compact ownership markers. Private journals,
+  public receipts and S3 registry formats are unchanged.
+
 ## [0.8.9] - 2026-10-08
 
 ### Fixed

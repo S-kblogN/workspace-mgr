@@ -559,10 +559,32 @@ fn token(journal: &Value, row: &Value) -> Result<String> {
     Ok(digest(ascii.as_bytes()))
 }
 fn metadata_key(journal: &Value) -> Result<String> {
+    // B2 file-info names are limited to 50 UTF-8 bytes and lowercased by
+    // the provider. This selector is 50 ASCII bytes; the value still carries
+    // the complete transaction/source-version token, never a truncated proof.
+    let transaction = digest(text(journal, "transaction_id")?.as_bytes());
+    Ok(format!("wm-ac-{}", &transaction[..44]))
+}
+fn legacy_metadata_key(journal: &Value) -> Result<String> {
     Ok(format!(
         "workspace-mgr-archive-copy-{}",
         text(journal, "transaction_id")?
     ))
+}
+fn metadata_owned(info: &Value, compact: &str, legacy: &str, expected: &str) -> bool {
+    let Some(metadata) = info["Metadata"].as_object() else {
+        return false;
+    };
+    let mut found = false;
+    for (name, value) in metadata {
+        if name.eq_ignore_ascii_case(compact) || name.eq_ignore_ascii_case(legacy) {
+            if value.as_str() != Some(expected) {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 fn public_receipt(journal: &Value, status: Option<&str>) -> Result<Value> {
     if !supported_copy_schema(journal) {
@@ -887,7 +909,12 @@ fn validate_destination(
                     &row["size"],
                     &item["ETag"],
                 )?;
-                info["Metadata"][metadata_key(journal)?] == token(journal, row)?
+                metadata_owned(
+                    &info,
+                    &metadata_key(journal)?,
+                    &legacy_metadata_key(journal)?,
+                    &token(journal, row)?,
+                )
             };
             if owned {
                 wanted.insert(
@@ -1089,7 +1116,10 @@ fn copy_payload(
     }
     let mut metadata = info["Metadata"].as_object().cloned().unwrap_or_default();
     let metadata_key = metadata_key(journal)?;
-    if metadata.contains_key(&metadata_key) {
+    let legacy_key = legacy_metadata_key(journal)?;
+    if metadata.keys().any(|name| {
+        name.eq_ignore_ascii_case(&metadata_key) || name.eq_ignore_ascii_case(&legacy_key)
+    }) {
         return Err(message(
             "archive transaction metadata would replace existing source metadata",
         ));
@@ -1203,6 +1233,7 @@ fn cancel_inventory(
 ) -> Result<(Vec<OwnedVersion>, Vec<Value>)> {
     text(journal, "transaction_id")?;
     let metadata = metadata_key(journal)?;
+    let legacy_metadata = legacy_metadata_key(journal)?;
     let actual = destination_inventory(store, context)?;
     let mut actual_by_id = BTreeMap::new();
     let mut actual_by_key = BTreeMap::<String, Vec<usize>>::new();
@@ -1310,7 +1341,7 @@ fn cancel_inventory(
                     &row["size"],
                     &record["etag"],
                 )?;
-                if info["Metadata"][&metadata] != row_token {
+                if !metadata_owned(info, &metadata, &legacy_metadata, &row_token) {
                     return Err(message(
                         "archive cancellation cannot verify copied version ownership",
                     ));
@@ -1356,7 +1387,7 @@ fn cancel_inventory(
                 continue;
             }
             let info = cached_version_head(store, &id.0, &id.1, &mut heads)?;
-            if info["Metadata"][&metadata] != row_token {
+            if !metadata_owned(info, &metadata, &legacy_metadata, &row_token) {
                 continue;
             }
             if item["VersionId"] == "null"

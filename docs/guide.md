@@ -922,8 +922,11 @@ To hydrate a historical Git checkout after source cleanup, use
 `workspace-mgr storage hydrate`; the underlying storage engine reads of old pointers do not consult
 the archive registry. Publishing nested archived task state requires at least
 0.5.0; schema 4 completion evidence requires 0.7.0. Archive publications require
-0.8.9 to read the commit-based Git control bindings, including archives with no
-S3 versions. Existing blob bindings remain readable for retries and cancellation.
+0.8.10 to read the commit-based Git control bindings and compact S3 copy markers,
+including archives with no S3 versions. Copy metadata keys are lowercase and
+fit B2's 50-byte file-info limit; per-version ownership tokens remain complete.
+Existing blob bindings and copies with long marker keys remain readable for
+retries and cancellation.
 Archived Git LFS pointers keep their published identities.
 Removing a
 cloud-usage approval does not clear this path requirement; an older CLI needs

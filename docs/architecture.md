@@ -382,11 +382,18 @@ registry mutation, source deletion or remote cancellation. Restoring an old
 purge snapshot through cancel also writes schema 2. Public receipt/registry
 contexts normalize to schema 1 so immutable receipt bindings and old data
 formats remain stable. Any archive receipt in the publication index requires
-workspace-mgr 0.8.9 independently of task schema or S3 inventory size, and the
+workspace-mgr 0.8.10 independently of task schema or S3 inventory size, and the
 managed repository declaration rises before uploads. Source and registry Git
 bindings use deterministic parentless commits with one control JSON file; they
 do not reference task trees or payload history. Exact legacy blob bindings remain
 readable for retries and cancellation, without rewriting existing tags.
+New S3 copy ownership keys use `wm-ac-` followed by the first 44 lowercase
+hexadecimal characters of SHA256(transaction ID UTF-8 bytes), fitting
+[B2's 50-byte file-info key limit](https://www.backblaze.com/docs/cloud-storage-add-file-information-with-the-native-api).
+The full per-version ownership token remains the metadata
+value. Recovery and cancellation recognize both compact and previous long keys;
+source metadata, tags and properties remain intact, and a case-insensitive
+source metadata collision with an ownership key is refused.
 
 The executable, local storage engine, S3 transport, archive registry, and
 history copy/cancel adapters are Rust. Native storage uses versioned JSON

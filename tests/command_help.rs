@@ -163,6 +163,9 @@ const PAGES: &[(&[&str], &[&str])] = &[
             "complete S3",
             "--cancel",
             "zero old-prefix",
+            "0.8.10",
+            "compact S3 copy markers",
+            "previous long marker keys",
         ],
     ),
     (

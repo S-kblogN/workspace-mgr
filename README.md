@@ -167,8 +167,11 @@ JSON. Existing blob bindings remain readable and cancellable. This allows
 B2-compatible publication without permanently retaining duplicate source
 history. See the [archive command](docs/commands.md#workspace-mgr-archive)
 for review, conflict, and cancellation guarantees.
-Every archive publication requires 0.8.9 for the Git control bindings,
-independently of task schema or S3 inventory. Private purge/copy journals use
+Every archive publication requires 0.8.10 for the Git control bindings and
+compact S3 copy markers, independently of task schema or S3 inventory. Copy
+ownership metadata uses lowercase keys within B2's 50-byte file-info limit;
+existing copies with longer marker keys remain recoverable and cancellable.
+Private purge/copy journals use
 schema 2 so 0.6.0 refuses protected retry state. Published Git LFS identities
 remain intact even when the old filter no longer matches the archived path.
 Historical Git snapshots remain readable through `workspace-mgr storage
