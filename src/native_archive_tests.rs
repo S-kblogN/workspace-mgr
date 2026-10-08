@@ -96,6 +96,23 @@ impl Memory {
     fn count(&self, method: &str) -> usize {
         *self.state.borrow().counts.get(method).unwrap_or(&0)
     }
+    fn copy_properties(&self, args: &Value) -> std::result::Result<Value, S3Error> {
+        let mut properties = args.clone();
+        if self.b2 {
+            let mut metadata = Map::new();
+            for (name, value) in args["Metadata"].as_object().into_iter().flatten() {
+                if name.len() > 50 {
+                    let mut error = provider("InvalidRequest");
+                    error.status = Some(400);
+                    error.message = format!("File info name too long: {name}");
+                    return Err(error);
+                }
+                metadata.insert(name.to_ascii_lowercase(), value.clone());
+            }
+            properties["Metadata"] = metadata.into();
+        }
+        Ok(properties)
+    }
     fn response(
         &self,
         method: &str,
@@ -224,7 +241,7 @@ impl Memory {
                 };
                 assert_eq!(source.value["ETag"], args["CopySourceIfMatch"]);
                 let version = format!("copied-{}", self.state.borrow().versions.len());
-                let mut properties = args.clone();
+                let mut properties = self.copy_properties(args)?;
                 properties["TagSet"] = source.value["TagSet"].clone();
                 self.add(
                     args["Key"].as_str().unwrap(),
@@ -300,10 +317,11 @@ impl Memory {
             }
             "create_multipart_upload" => {
                 let upload = format!("upload-{}", self.count(method));
+                let properties = self.copy_properties(args)?;
                 self.state
                     .borrow_mut()
                     .uploads
-                    .insert(upload.clone(), args.clone());
+                    .insert(upload.clone(), properties);
                 json!({"UploadId":upload})
             }
             "upload_part_copy" => {
@@ -1054,6 +1072,533 @@ fn copy_keeps_metadata_tags_and_all_supported_properties() {
         receipt["versions"][0]["destination_etag"],
         etag(&copied.value["ETag"]).unwrap()
     );
+}
+
+#[test]
+fn b2_copy_marker_fits_file_info_limit_and_survives_response_loss_and_cancel() {
+    let mut fixture = Fixture::new();
+    fixture.store.b2 = true;
+    let mut properties =
+        json!({"Metadata":{"Original":"kept"},"TagSet":[{"Key":"a b","Value":"x&y"}]});
+    for field in COPY_HEADERS {
+        properties[field] = format!("fixture-{field}").into();
+    }
+    fixture.store.add(
+        "storage/task/data",
+        "source",
+        b"payload",
+        false,
+        None,
+        properties.clone(),
+    );
+    fixture.reserve();
+    fixture
+        .store
+        .state
+        .borrow_mut()
+        .lose
+        .insert("copy_object".to_owned(), 1);
+    assert!(fixture.run("copy").is_err());
+    let receipt = fixture.run("copy").unwrap();
+    assert_eq!(fixture.store.count("copy_object"), 1);
+    let copied = fixture
+        .store
+        .versions("storage/2026/07/task/")
+        .pop()
+        .unwrap();
+    for field in COPY_HEADERS {
+        assert_eq!(copied.value[field], properties[field]);
+    }
+    assert_eq!(copied.value["Metadata"]["original"], "kept");
+    assert_eq!(copied.value["TagSet"], properties["TagSet"]);
+    assert_eq!(copied.body, b"payload");
+    let journal = fixture.journal();
+    let marker = metadata_key(&journal).unwrap();
+    assert_eq!(marker.len(), 50);
+    assert!(marker.starts_with("wm-ac-"));
+    assert!(
+        marker
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    );
+    let ownership = token(&journal, &journal["versions"][0]).unwrap();
+    assert_eq!(ownership.len(), 64);
+    assert_eq!(copied.value["Metadata"][&marker], ownership);
+    assert_eq!(copied.value["Metadata"].as_object().unwrap().len(), 2);
+    assert_eq!(receipt, public_receipt(&journal, None).unwrap());
+    assert!(receipt.get("metadata_key").is_none());
+    let mut expected_fields = fixture.payload["planned"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    expected_fields.insert("transaction_id".to_owned());
+    assert_eq!(
+        receipt
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected_fields
+    );
+    assert_eq!(
+        fixture.run("cancel-preview").unwrap()["delete_versions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fixture.run("cancel").unwrap();
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 1);
+}
+
+#[test]
+fn b2_metadata_fixture_rejects_legacy_names_for_copy_and_multipart_and_folds_legal_keys() {
+    let mut store = Memory::new();
+    store.b2 = true;
+    store.source("data", "source", b"payload", false);
+    let source_etag = store.versions("storage/task/")[0].value["ETag"].clone();
+    for transaction in [
+        "d8345e27-699d-4b8f-b2f5-b7d96367c031".to_owned(),
+        "a".repeat(64),
+    ] {
+        let old_key = format!("workspace-mgr-archive-copy-{transaction}");
+        assert!(old_key.len() > 50);
+        for method in ["copy_object", "create_multipart_upload"] {
+            let request = json!({"Bucket":"fixture","Key":"storage/2026/07/task/data",
+                "CopySource":{"Key":"storage/task/data","VersionId":"source"},
+                "CopySourceIfMatch":source_etag,"Metadata":{old_key.clone():"full-token"}});
+            let error = store.call(method, &request, None).unwrap_err();
+            assert_eq!(error.status, Some(400));
+            assert_eq!(error.code, "InvalidRequest");
+            assert_eq!(error.message, format!("File info name too long: {old_key}"));
+        }
+    }
+    assert!(store.versions("storage/2026/07/task/").is_empty());
+    assert!(store.state.borrow().uploads.is_empty());
+    let metadata = json!({"Metadata":{"UPPERCASE":"full-token","x".repeat(50):"kept"}});
+    let properties = store.copy_properties(&metadata).unwrap();
+    assert_eq!(properties["Metadata"]["uppercase"], "full-token");
+    assert!(properties["Metadata"].get("UPPERCASE").is_none());
+    assert_eq!(properties["Metadata"]["x".repeat(50)], "kept");
+    store.b2 = false;
+    let unrestricted = json!({"Metadata":{"UPPERCASE":"full-token","x".repeat(51):"kept"}});
+    assert_eq!(store.copy_properties(&unrestricted).unwrap(), unrestricted);
+}
+
+#[test]
+fn compact_metadata_selector_uses_utf8_hash_and_requires_full_row_token_for_every_candidate() {
+    for (transaction, expected) in [
+        (
+            "attempt",
+            "wm-ac-c7ce66d0fb14e3c2d4d920918cc6cc7e488668b08ddd",
+        ),
+        (
+            "研究🧬",
+            "wm-ac-86c1a57711e7eb76ed22c8f6ab3dfa09be74e29666d7",
+        ),
+    ] {
+        assert_eq!(
+            metadata_key(&json!({"transaction_id":transaction})).unwrap(),
+            expected
+        );
+        assert_eq!(expected.len(), 50);
+    }
+    let compact = "wm-ac-c7ce66d0fb14e3c2d4d920918cc6cc7e488668b08ddd";
+    let legacy = "workspace-mgr-archive-copy-attempt";
+    let owned = "a".repeat(64);
+    let foreign = "b".repeat(64);
+    for metadata in [
+        json!({compact:owned}),
+        json!({compact.to_uppercase():owned}),
+        json!({legacy:owned}),
+        json!({legacy.to_uppercase():owned}),
+        json!({compact:owned,legacy:owned}),
+        json!({compact:owned,compact.to_uppercase():owned,legacy:owned}),
+    ] {
+        assert!(metadata_owned(
+            &json!({"Metadata":metadata}),
+            compact,
+            legacy,
+            &owned
+        ));
+    }
+    for metadata in [
+        json!({}),
+        json!({"unrelated":owned}),
+        json!({compact:foreign}),
+        json!({legacy:foreign}),
+        json!({compact:owned,legacy:foreign}),
+        json!({compact:foreign,legacy:owned}),
+        json!({compact:owned,compact.to_uppercase():foreign}),
+        json!({legacy:owned,legacy.to_uppercase():foreign}),
+        json!({compact:owned[..44]}),
+        json!({compact:1}),
+    ] {
+        assert!(!metadata_owned(
+            &json!({"Metadata":metadata}),
+            compact,
+            legacy,
+            &owned
+        ));
+    }
+}
+
+#[test]
+fn source_metadata_collision_is_case_insensitive_for_both_compact_and_legacy_names() {
+    let transaction = "a".repeat(64);
+    let binding = json!({"transaction_id":transaction});
+    for marker in [
+        metadata_key(&binding).unwrap(),
+        legacy_metadata_key(&binding).unwrap(),
+    ] {
+        for name in [marker.clone(), marker.to_uppercase()] {
+            let mut fixture = Fixture::new();
+            fixture.store.add(
+                "storage/task/data",
+                "source",
+                b"payload",
+                false,
+                None,
+                json!({"Metadata":{name.clone():"opaque source metadata"}}),
+            );
+            fixture.reserve();
+            let mut journal = fixture.payload["planned"].clone();
+            journal["status"] = "copying".into();
+            journal["transaction_id"] = transaction.clone().into();
+            save_journal(
+                Path::new(fixture.payload["state_path"].as_str().unwrap()),
+                &journal,
+            )
+            .unwrap();
+            assert!(
+                fixture
+                    .run("copy")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("replace existing source metadata")
+            );
+            for method in ["copy_object", "create_multipart_upload", "delete_object"] {
+                assert_eq!(fixture.store.count(method), 0, "source marker {name:?}");
+            }
+            assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+            assert_eq!(
+                fixture.store.versions("storage/task/")[0].value["Metadata"][&name],
+                "opaque source metadata"
+            );
+        }
+    }
+}
+
+#[test]
+fn b2_multipart_marker_preserves_properties_and_recovers_lost_completion_for_cancel() {
+    let mut fixture = Fixture::new();
+    fixture.store.b2 = true;
+    let mut properties =
+        json!({"Metadata":{"Original":"kept"},"TagSet":[{"Key":"a b","Value":"x&y"}]});
+    for field in COPY_HEADERS {
+        properties[field] = format!("fixture-{field}").into();
+    }
+    fixture.store.add(
+        "storage/task/large",
+        "source",
+        b"large",
+        false,
+        Some(COPY_LIMIT + 1),
+        properties.clone(),
+    );
+    fixture.reserve();
+    fixture
+        .store
+        .state
+        .borrow_mut()
+        .lose
+        .insert("complete_multipart_upload".to_owned(), 1);
+    assert!(fixture.run("copy").is_err());
+    let receipt = fixture.run("copy").unwrap();
+    assert_eq!(fixture.store.count("create_multipart_upload"), 1);
+    assert_eq!(fixture.store.count("complete_multipart_upload"), 1);
+    let copied = fixture
+        .store
+        .versions("storage/2026/07/task/")
+        .pop()
+        .unwrap();
+    for field in COPY_HEADERS {
+        assert_eq!(copied.value[field], properties[field]);
+    }
+    assert_eq!(copied.value["Metadata"]["original"], "kept");
+    assert_eq!(copied.value["TagSet"], properties["TagSet"]);
+    let journal = fixture.journal();
+    let marker = metadata_key(&journal).unwrap();
+    assert_eq!(marker.len(), 50);
+    assert_eq!(
+        copied.value["Metadata"][&marker],
+        token(&journal, &journal["versions"][0]).unwrap()
+    );
+    assert_eq!(receipt["versions"][0]["destination_etag"], "multipart-etag");
+    assert_eq!(receipt, public_receipt(&journal, None).unwrap());
+    fixture.run("cancel").unwrap();
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 1);
+}
+
+#[test]
+fn b2_failed_old_journal_with_no_mapped_versions_resumes_using_bounded_marker() {
+    for transaction in [
+        "d8345e27-699d-4b8f-b2f5-b7d96367c031".to_owned(),
+        "a".repeat(64),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.store.b2 = true;
+        fixture.store.source("data", "source", b"payload", false);
+        fixture.reserve();
+        let mut journal = fixture.payload["planned"].clone();
+        journal["status"] = "copying".into();
+        journal["transaction_id"] = transaction.clone().into();
+        journal["versions"][0]["started"] = true.into();
+        save_journal(
+            Path::new(fixture.payload["state_path"].as_str().unwrap()),
+            &journal,
+        )
+        .unwrap();
+        let receipt = fixture.run("copy").unwrap();
+        assert_eq!(receipt["transaction_id"], transaction);
+        assert_eq!(receipt["status"], "copied");
+        assert_eq!(fixture.store.count("copy_object"), 1);
+        assert_eq!(fixture.run("copy").unwrap(), receipt);
+        assert_eq!(fixture.store.count("copy_object"), 1);
+        let copied = fixture
+            .store
+            .versions("storage/2026/07/task/")
+            .pop()
+            .unwrap();
+        assert_eq!(copied.value["Metadata"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            copied.value["Metadata"][metadata_key(&journal).unwrap()],
+            token(&journal, &journal["versions"][0]).unwrap()
+        );
+        assert!(
+            copied.value["Metadata"]
+                .get(legacy_metadata_key(&journal).unwrap())
+                .is_none()
+        );
+        fixture.run("cancel").unwrap();
+        assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    }
+}
+
+#[test]
+fn native_long_legacy_marker_recovers_case_folded_copy_and_cancels_without_recopy() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("data", "source", b"payload", false);
+    fixture.reserve();
+    let mut journal = fixture.payload["planned"].clone();
+    journal["status"] = "copying".into();
+    journal["transaction_id"] = "a".repeat(64).into();
+    journal["versions"][0]["started"] = true.into();
+    save_journal(
+        Path::new(fixture.payload["state_path"].as_str().unwrap()),
+        &journal,
+    )
+    .unwrap();
+    fixture.store.add("storage/2026/07/task/data", "old-native-copy", b"payload", false, None,
+        json!({"Metadata":{legacy_metadata_key(&journal).unwrap().to_uppercase():token(&journal, &journal["versions"][0]).unwrap()}}));
+    let receipt = fixture.run("copy").unwrap();
+    assert_eq!(
+        receipt["versions"][0]["destination_version_id"],
+        "old-native-copy"
+    );
+    assert_eq!(fixture.store.count("copy_object"), 0);
+    assert_eq!(fixture.run("copy").unwrap(), receipt);
+    fixture.run("cancel").unwrap();
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 1);
+    assert_eq!(fixture.store.count("delete_object"), 1);
+}
+
+#[test]
+fn mixed_mapped_legacy_and_lost_compact_copy_resume_and_cancel_both_exact_versions() {
+    let mut fixture = Fixture::new();
+    fixture.store.source("old", "source-old", b"old", false);
+    fixture.store.source("new", "source-new", b"new", false);
+    fixture.reserve();
+    let mut journal = fixture.payload["planned"].clone();
+    journal["status"] = "copying".into();
+    journal["transaction_id"] = "a".repeat(64).into();
+    let old = journal["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|row| row["source_object"] == "task/old")
+        .unwrap();
+    let new = 1 - old;
+    let legacy_token = token(&journal, &journal["versions"][old]).unwrap();
+    let original_etag = journal["versions"][old]["source_etag"].clone();
+    record_destination(
+        &mut journal["versions"][old],
+        &"old-native-copy".into(),
+        &original_etag,
+        &Value::Null,
+    )
+    .unwrap();
+    fixture.store.add(
+        "storage/2026/07/task/old",
+        "old-native-copy",
+        b"old",
+        false,
+        None,
+        json!({"Metadata":{legacy_metadata_key(&journal).unwrap():legacy_token}}),
+    );
+    save_journal(
+        Path::new(fixture.payload["state_path"].as_str().unwrap()),
+        &journal,
+    )
+    .unwrap();
+    fixture
+        .store
+        .state
+        .borrow_mut()
+        .lose
+        .insert("copy_object".to_owned(), 1);
+    assert!(fixture.run("copy").is_err());
+    let interrupted = fixture.journal();
+    assert_eq!(
+        interrupted["versions"][old]["destination_version_id"],
+        "old-native-copy"
+    );
+    assert!(interrupted["versions"][new]["destination_version_id"].is_null());
+    assert_eq!(interrupted["versions"][new]["started"], true);
+    let receipt = fixture.run("copy").unwrap();
+    assert_eq!(fixture.store.count("copy_object"), 1);
+    assert_eq!(
+        receipt["versions"][old]["destination_version_id"],
+        "old-native-copy"
+    );
+    assert!(receipt["versions"][new]["destination_version_id"].is_string());
+    assert_eq!(fixture.run("copy").unwrap(), receipt);
+    assert_eq!(fixture.store.count("copy_object"), 1);
+    assert_eq!(
+        fixture.run("cancel-preview").unwrap()["delete_versions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let cancelled = fixture.run("cancel").unwrap();
+    assert_eq!(cancelled["deleted_versions"].as_array().unwrap().len(), 2);
+    assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+    assert_eq!(fixture.store.versions("storage/task/").len(), 2);
+    assert_eq!(
+        public_receipt(&fixture.journal(), Some("copied")).unwrap(),
+        receipt
+    );
+}
+
+#[test]
+fn matching_selector_with_foreign_token_or_conflicting_legacy_token_never_authorizes_copy_or_cancel()
+ {
+    for conflicting_legacy in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.store.source("data", "source", b"payload", false);
+        fixture.reserve();
+        let mut journal = fixture.payload["planned"].clone();
+        journal["status"] = "copying".into();
+        journal["transaction_id"] = "a".repeat(64).into();
+        journal["versions"][0]["started"] = true.into();
+        save_journal(
+            Path::new(fixture.payload["state_path"].as_str().unwrap()),
+            &journal,
+        )
+        .unwrap();
+        let compact = metadata_key(&journal).unwrap();
+        let legacy = legacy_metadata_key(&journal).unwrap();
+        let metadata = if conflicting_legacy {
+            json!({compact:token(&journal, &journal["versions"][0]).unwrap(),legacy:"foreign-attempt-token"})
+        } else {
+            json!({compact:"foreign-attempt-token"})
+        };
+        fixture.store.add(
+            "storage/2026/07/task/data",
+            "foreign-copy",
+            b"payload",
+            false,
+            None,
+            json!({"Metadata":metadata}),
+        );
+        assert!(
+            fixture
+                .run("copy")
+                .unwrap_err()
+                .to_string()
+                .contains("unrelated or ambiguous")
+        );
+        assert_eq!(fixture.store.count("copy_object"), 0);
+        let cancelled = fixture.run("cancel").unwrap();
+        assert_eq!(cancelled["status"], "cancelled_with_unrelated_history");
+        assert_eq!(fixture.store.count("delete_object"), 0);
+        assert_eq!(
+            fixture.store.versions("storage/2026/07/task/")[0].value["VersionId"],
+            "foreign-copy"
+        );
+    }
+}
+
+#[test]
+fn mapped_copy_with_conflicting_marker_values_cannot_authorize_cancel_deletion() {
+    for matching_compact in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.store.source("data", "source", b"payload", false);
+        fixture.reserve();
+        let mut journal = fixture.payload["planned"].clone();
+        journal["status"] = "copied".into();
+        journal["transaction_id"] = "a".repeat(64).into();
+        let ownership = token(&journal, &journal["versions"][0]).unwrap();
+        let compact = metadata_key(&journal).unwrap();
+        let legacy = legacy_metadata_key(&journal).unwrap();
+        let metadata = if matching_compact {
+            json!({compact:ownership,legacy:"foreign-attempt-token"})
+        } else {
+            json!({compact:"foreign-attempt-token",legacy:ownership})
+        };
+        let original_etag = journal["versions"][0]["source_etag"].clone();
+        record_destination(
+            &mut journal["versions"][0],
+            &"ambiguous-copy".into(),
+            &original_etag,
+            &Value::Null,
+        )
+        .unwrap();
+        save_journal(
+            Path::new(fixture.payload["state_path"].as_str().unwrap()),
+            &journal,
+        )
+        .unwrap();
+        fixture.store.add(
+            "storage/2026/07/task/data",
+            "ambiguous-copy",
+            b"payload",
+            false,
+            None,
+            json!({"Metadata":metadata}),
+        );
+        for operation in ["cancel-preview", "cancel"] {
+            assert!(
+                fixture
+                    .run(operation)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot verify copied version ownership")
+            );
+        }
+        assert_eq!(fixture.store.count("delete_object"), 0);
+        assert_eq!(
+            fixture.store.versions("storage/2026/07/task/")[0].value["VersionId"],
+            "ambiguous-copy"
+        );
+    }
 }
 
 #[test]

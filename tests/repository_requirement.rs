@@ -1855,7 +1855,7 @@ fn archived_git_lfs_requires_its_safe_writer_before_publication() {
     let plan = json(&workspace(&worktree, ["plan", "--manifest", manifest_arg]));
     assert_eq!(
         plan["repository_requirement"]["minimum_cli_version"],
-        "0.8.9"
+        "0.8.10"
     );
     let tree = plan["tree_oid"].as_str().unwrap();
     assert_eq!(show(&worktree, &format!("{tree}:{artifact}")), old_pointer);
@@ -1873,7 +1873,7 @@ fn archived_git_lfs_requires_its_safe_writer_before_publication() {
     let target = published["remote_oid"].as_str().unwrap();
     assert_eq!(
         show(&fixture.remote, &format!("{target}:{CONFIG}")),
-        declaring("0.8.9", &config)
+        declaring("0.8.10", &config)
     );
     assert_eq!(
         show(&fixture.remote, &format!("{target}:{artifact}")),
@@ -1887,21 +1887,33 @@ fn archived_git_lfs_requires_its_safe_writer_before_publication() {
 
 #[cfg(feature = "test-storage")]
 #[test]
-fn plain_archives_require_the_commit_control_protocol() {
+fn plain_archives_require_the_compact_copy_marker_protocol() {
     let (fixture, _) = archived_requirement_fixture(false);
     let (worktree, manifest, _) = archive_requirement_organizer(&fixture);
-    let plan = json(&workspace_env(
+    let refused = workspace_env_unchecked(
         &worktree,
         ["plan", "--manifest", manifest.to_str().unwrap()],
         &[(CLI_VERSION_ENV, "0.8.9")],
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        stderr(&refused).contains("require workspace-mgr 0.8.10"),
+        "{}",
+        stderr(&refused)
+    );
+    let plan = json(&workspace_env(
+        &worktree,
+        ["plan", "--manifest", manifest.to_str().unwrap()],
+        &[(CLI_VERSION_ENV, "0.8.10")],
     ));
     assert_eq!(
         plan["repository_requirement"]["minimum_cli_version"],
-        "0.8.9"
+        "0.8.10"
     );
     let tree = plan["tree_oid"].as_str().unwrap();
     assert!(
-        show(&worktree, &format!("{tree}:{CONFIG}")).starts_with("minimum_cli_version = \"0.8.9\"")
+        show(&worktree, &format!("{tree}:{CONFIG}"))
+            .starts_with("minimum_cli_version = \"0.8.10\"")
     );
 }
 

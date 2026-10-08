@@ -918,10 +918,10 @@ fn archive_moves_an_ignored_external_git_worktree_without_touching_its_administr
 }
 
 #[test]
-fn archive_new_protocol_requires_089_before_creating_local_attempt_state() {
+fn archive_new_protocol_requires_0810_before_creating_local_attempt_state() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
-    for version in ["0.6.0", "0.7.0", "0.8.8"] {
+    for version in ["0.6.0", "0.7.0", "0.8.8", "0.8.9"] {
         let output = workspace_env_unchecked(
             &fixture.shared,
             ["archive", DONE, "--dry-run"],
@@ -933,7 +933,7 @@ fn archive_new_protocol_requires_089_before_creating_local_attempt_state() {
         assert_eq!(output.status.code(), Some(2));
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(
-            error.contains("archive protocol requires workspace-mgr 0.8.9"),
+            error.contains("archive protocol requires workspace-mgr 0.8.10"),
             "{error}"
         );
     }

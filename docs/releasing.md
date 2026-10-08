@@ -43,8 +43,10 @@ an error rather than an instruction to overwrite state.
    minimum. Archive layout has its own compatibility minimum: nested task
    manifests first become readable in 0.5.0, so publishing them requires at
    least that release even when their schemas need an older release. The
-   commit-based archive coordination protocol requires 0.8.9 independently
-   of manifest schema or S3 inventory.
+   archive coordination protocol with commit-based Git bindings and compact
+   S3 copy markers requires 0.8.10 independently of manifest schema or S3
+   inventory. Git bindings first required 0.8.9; clients before 0.8.10 cannot
+   safely recover or cancel copies written with the compact metadata keys.
 2. Move the release notes out of `[Unreleased]` into a dated
    `## [<version>] - YYYY-MM-DD` section.
 3. Review the package with `cargo publish --dry-run --locked` and merge the
