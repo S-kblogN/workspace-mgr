@@ -30,6 +30,10 @@ pub(crate) struct MigrationReport {
     pub remote_objects: Vec<crate::storage_import::RemoteObject>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub remote_transfer_bytes: u64,
+    /// Never-published pointers converted without a version binding. The
+    /// owning task's next publication uploads their verified local payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_upload: Vec<String>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -604,7 +608,7 @@ fn preflight(repo: &GitRepo) -> Result<Plan> {
         reject_pending_transactions(repo)?;
     }
     if !plan.report.converted.is_empty() {
-        verify_s3_bindings(repo, &plan)?;
+        plan.report.pending_upload = verify_s3_bindings(repo, &plan)?;
     }
     plan.report.removed = plan.removes.iter().cloned().collect();
     if plan.legacy_directory {
@@ -905,7 +909,7 @@ fn legacy_controls(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
     Ok(())
 }
 
-fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
+fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<Vec<String>> {
     let url = match plan
         .expected_before
         .get(CONFIG_NAME)
@@ -923,9 +927,10 @@ fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
     let url = url.ok_or_else(|| {
         Error::message("legacy storage pointers require a selected storage URL before manage")
     })?;
+    let mut pending = Vec::new();
     if url.starts_with("s3://") {
         if plan.import.is_some() {
-            return Ok(());
+            return Ok(pending);
         }
         if !plan.legacy_version_aware {
             return Err(Error::message(
@@ -957,6 +962,10 @@ fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
                     }),
             };
             if !exact {
+                if unpublished_with_matching_payload(repo, conversion, &manifest)? {
+                    pending.push(conversion.source.clone());
+                    continue;
+                }
                 return Err(Error::message(format!(
                     "legacy pointer {:?} lacks exact S3 object versions; resolve its path-based bindings with the previous CLI before manage",
                     conversion.source
@@ -964,7 +973,50 @@ fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(pending)
+}
+
+/// A pointer that no index entry or local or remote-tracking revision ever
+/// recorded was never published, so no history needs its missing versions.
+/// When it binds no version at all and its local payload is exactly what it
+/// records, it converts to a pending native placement that the owning task's
+/// next publication uploads.
+fn unpublished_with_matching_payload(
+    repo: &GitRepo,
+    conversion: &Conversion,
+    manifest: &crate::storage_format::Manifest,
+) -> Result<bool> {
+    let unbound = match manifest.kind {
+        crate::storage_format::Kind::File => manifest.version.is_none(),
+        crate::storage_format::Kind::Directory => manifest
+            .entries
+            .as_ref()
+            .is_some_and(|entries| entries.iter().all(|entry| entry.version.is_none())),
+    };
+    if !unbound {
+        return Ok(false);
+    }
+    let indexed = repo.run(["--literal-pathspecs", "ls-files", "--", &conversion.source])?;
+    let recorded = repo.run([
+        "--literal-pathspecs",
+        "log",
+        "--all",
+        "-1",
+        "--format=%H",
+        "--",
+        &conversion.source,
+    ])?;
+    if !indexed.stdout.trim().is_empty() || !recorded.stdout.trim().is_empty() {
+        return Ok(false);
+    }
+    let parent = Path::new(&conversion.source)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let object = repo_path(
+        &to_slash(&parent.join(&manifest.path)),
+        "legacy storage output",
+    )?;
+    crate::native_engine::payload_matches_manifest(repo, &object, manifest)
 }
 
 fn reject_pending_transactions(repo: &GitRepo) -> Result<()> {

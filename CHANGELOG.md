@@ -25,6 +25,13 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   `.workspace-mgr/local/cache/legacy/`, the layout already used for
   content-addressed imports and read by the legacy cache lookup, so existing
   native objects and every legacy object stay in place and reusable.
+- `manage` converts a legacy S3 pointer that was never published, meaning no
+  index entry and no local or remote-tracking revision records it, binds no
+  version, and whose local payload is exactly what it records, into a pending
+  native placement instead of refusing for missing versions. The migration
+  report lists it under `pending_upload`, and the owning task's next
+  publication uploads it. Recorded pointers without exact versions, partly
+  bound pointers and mismatched payloads are still refused.
 
 ## [0.8.3] - 2026-10-07
 
