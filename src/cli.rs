@@ -42,9 +42,9 @@ pub enum Command {
     #[command(long_about = crate::command_guidance::command("instructions"))]
     Instructions(InstructionsArgs),
 
-    /// Diagnose dependencies, configuration, and repository state.
+    /// Diagnose one task or all tasks, including local/S3 storage integrity.
     #[command(long_about = crate::command_guidance::command("doctor"))]
-    Doctor(RepoArgs),
+    Doctor(DoctorArgs),
 
     /// Inspect repository configuration.
     #[command(long_about = crate::command_guidance::command("config"))]
@@ -99,6 +99,15 @@ pub struct SetupArgs {
 
 #[derive(Debug, Args)]
 pub struct RepoArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Exact task ID, current name, slug, or path; omit to inspect all tasks.
+    pub task: Option<String>,
+
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 }
@@ -579,6 +588,7 @@ mod tests {
             &["instructions", "storage", "--repo", "/tmp/repository"],
             &["--format", "json", "instructions", "publish"],
             &["doctor", "--repo", "/tmp/repository"],
+            &["doctor", "example-task", "--repo", "/tmp/repository"],
             &["config", "show", "--repo", "/tmp/repository"],
             &[
                 "task",

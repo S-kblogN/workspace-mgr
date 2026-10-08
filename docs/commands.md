@@ -242,16 +242,43 @@ workspace-mgr --format json instructions publish
 
 ## `workspace-mgr doctor`
 
-Diagnose the repository configuration, product-owned scaffold, Git state, and
-required private execution engines.
+Diagnose one task or all tasks, the repository configuration, product-owned
+scaffold, Git state, and local/S3 storage integrity.
 
 ```text
-workspace-mgr doctor [--repo <path>]
+workspace-mgr doctor [<task>] [--repo <path>]
 ```
 
-The command is read-only. When S3 is configured it reads the bucket-versioning
-setting and rejects a bucket that is not enabled. It exits with status 2 if any
-reported check is not healthy.
+`<task>` resolves an exact immutable ID, current name, slug or current path,
+including nested archive directories, with the same ambiguity rules as
+`task path`. Without it, doctor checks all locally discoverable tasks and the
+entire configured S3 prefix, including orphan keys outside current task paths.
+Repository configuration and dependency checks still run for either scope.
+
+The command is read-only. When S3 is configured, it checks bucket versioning
+and compares the local storage manifests with the complete remote inventory,
+including historical object versions and delete markers. Current objects must
+exist at the exact repository-relative key and have the manifest's latest
+version, size, ETag and checksum. A wrong directory, extra object, retired key
+with surviving history, stale version binding, or invalid metadata is an error.
+Older versions at a valid current key remain permitted by the existing history
+policy. Known archive coordination records are checked as control metadata,
+separately from payload paths; arbitrary control-looking keys are not exempt.
+
+The audit checks materialized local bytes and directory membership against the
+manifest too. Unmaterialized outputs use the manifest as the logical local tree
+and are counted separately; doctor does not hydrate them. Exact remote checksum
+verification downloads each current object into temporary scratch space, without
+installing a cache or changing repository files. Large tasks can take time and
+incur S3 read/transfer costs.
+
+A selected task also checks its former prefixes recorded in locally available
+Git history and archive receipts. Doctor never fetches refs or follows archive
+aliases to make an object at the wrong path pass. A repository-wide audit finds
+orphan paths even when their old task identity is no longer available locally.
+The JSON report includes the selected `tasks` and structured `storage.issues`
+with exact paths and diagnostic codes. Doctor exits with status 2 if any check
+is unhealthy, or if the audit cannot finish; it never deletes or repairs data.
 
 Whenever `.workspace-mgr.toml` is readable, the `cli-version` check follows
 `repository-config`. It compares the installed CLI with the higher of the

@@ -84,9 +84,11 @@ pub(crate) fn command(operation: &str) -> String {
             &[],
         ),
         "doctor" => (
-            "Diagnose dependencies, configuration and repository state.",
+            "Diagnose one task or all tasks, repository state and local/S3 integrity.",
             vec![
                 "Use this when dependencies, configuration, the shared checkout or managed scaffolding appear inconsistent. Read the named checks and repair their specific causes; a refusal is not permission to bypass workspace-mgr with lower-level Git or storage mutation commands.".into(),
+                "doctor <task> selects an exact immutable ID, current name, slug or current path, including archived tasks. Ambiguous selectors list candidates and require an exact path or unique ID. Without a selector, doctor inspects every local task and the entire configured S3 prefix, including orphan objects outside current task directories.".into(),
+                "The read-only S3 audit compares metadata paths and complete remote version/delete-marker inventory, requires each current object to have the recorded latest version, size, ETag and content checksum, and checks materialized local bytes and directory membership. It also checks former task paths available in local Git history and archive receipts; it never fetches Git refs, follows archive aliases to hide misplaced objects, hydrates data or deletes leftovers. Historical versions at a current path remain valid; versions or delete markers at a path absent from the current metadata are reported. Unmaterialized local outputs use the metadata's logical file tree and are counted separately. Exact remote checksum checks download objects into temporary scratch space and can take time for large tasks.".into(),
                 SCAFFOLD.into(),
                 "If a newer CLI is required, report the installed and required versions and ask before updating; after an approved update, run setup. Inspect configuration with config show and storage placement with storage status. doctor reports control state, not whether task scripts, README links or analyses are correct.".into(),
             ],

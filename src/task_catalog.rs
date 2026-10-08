@@ -67,6 +67,71 @@ pub(crate) struct Catalog {
     warnings: Vec<CatalogWarning>,
 }
 
+/// The identity and current ownership boundaries used by a read-only doctor
+/// inspection. Invalid rows remain visible during a repository-wide audit.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DoctorTask {
+    pub(crate) id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) kind: TaskKind,
+    pub(crate) path: Option<String>,
+    pub(crate) manifest: Option<PathBuf>,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DoctorWarning {
+    pub(crate) path: PathBuf,
+    pub(crate) message: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct DoctorSelection {
+    pub(crate) tasks: Vec<DoctorTask>,
+    pub(crate) warnings: Vec<DoctorWarning>,
+}
+
+pub(crate) fn select_for_doctor(start: &Path, selector: Option<&str>) -> Result<DoctorSelection> {
+    // Doctor diagnoses a newer required CLI rather than refusing the audit.
+    let catalog = discover_with_cli_requirement(start, false)?;
+    let selected = match selector {
+        Some(selector) => vec![catalog.resolve(selector)?],
+        None => catalog.tasks.iter().collect(),
+    };
+    let warnings = catalog
+        .warnings
+        .iter()
+        .filter(|warning| {
+            selector.is_none()
+                || selected.iter().any(|task| {
+                    task.manifest.as_ref() == Some(&warning.path)
+                        || task
+                            .scopes
+                            .iter()
+                            .any(|scope| warning.path.starts_with(catalog.repo.join(scope)))
+                })
+        })
+        .map(|warning| DoctorWarning {
+            path: warning.path.clone(),
+            message: warning.message.clone(),
+        })
+        .collect();
+    let tasks = selected
+        .into_iter()
+        .map(|task| DoctorTask {
+            id: task.id.clone(),
+            name: task.name.clone(),
+            kind: task.kind,
+            path: task.path.clone(),
+            manifest: task.manifest.clone(),
+            scopes: task.scopes.clone(),
+            diagnostic: task.diagnostic.clone(),
+        })
+        .collect();
+    Ok(DoctorSelection { tasks, warnings })
+}
+
 pub(crate) fn list(args: &TaskListArgs, format: Format) -> Result<()> {
     let mut catalog = discover(&args.repo)?;
     let query = args.query.as_ref().map(|value| value.to_lowercase());
@@ -366,9 +431,17 @@ impl Catalog {
 }
 
 pub(crate) fn discover(start: &Path) -> Result<Catalog> {
+    discover_with_cli_requirement(start, true)
+}
+
+fn discover_with_cli_requirement(start: &Path, enforce_cli_requirement: bool) -> Result<Catalog> {
     let repo = GitRepo::discover(start)?;
     let config = if Config::path(&repo).exists() {
-        Config::load_compatible(&repo)?
+        if enforce_cli_requirement {
+            Config::load_compatible(&repo)?
+        } else {
+            Config::load_compatible_ignoring_cli_requirement(&repo)?
+        }
     } else {
         Config::default()
     };
