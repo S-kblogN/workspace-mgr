@@ -1398,9 +1398,20 @@ fn published_proof(repo: &GitRepo, remote: &Path, receipt: &Value) -> Value {
 
 #[test]
 fn published_archive_purge_deletes_only_mapped_versions_and_retains_new_writes() {
+    published_archive_purge(false);
+}
+
+#[test]
+fn published_archive_purge_replays_interrupted_reads_without_repeating_deletes() {
+    published_archive_purge(true);
+}
+
+fn published_archive_purge(interrupt: bool) {
+    use crate::native_s3::tests::{interrupt_response_once, routed_fixture};
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     };
     let (directory, repo) = repo();
     let mut receipt = copied_receipt();
@@ -1412,14 +1423,21 @@ fn published_archive_purge_deletes_only_mapped_versions_and_retains_new_writes()
     let payload_flag = deleted_payload.clone();
     let marker_flag = deleted_marker.clone();
     let stored_receipt = receipt.clone();
-    // Initial list + canonical/history checks before each of two DELETEs +
-    // final complete rescan. Every request targets this private loopback.
-    let (client, worker) = fixture_handler(19, move |request| {
+    let registry_target = format!(
+        "/fixture-bucket/{}?versionId=registry-version",
+        registry_object()
+    );
+    let interrupted_target = registry_target.clone();
+    let first_registry_read = AtomicBool::new(true);
+    let (request_sent, request_received) = mpsc::channel();
+    // Keep serving until the operation completes: an abandoned GET may replay,
+    // while each exact-version DELETE must still occur exactly once.
+    let (client, worker) = routed_fixture(move |request| {
         if request.method == "DELETE" {
-            if request.target.ends_with("versionId=v1") {
-                payload_flag.store(true, Ordering::SeqCst);
-            } else if request.target.ends_with("versionId=d1") {
-                marker_flag.store(true, Ordering::SeqCst);
+            if request.target == "/fixture-bucket/root/task/a?versionId=v1" {
+                assert!(!payload_flag.swap(true, Ordering::SeqCst));
+            } else if request.target == "/fixture-bucket/root/task/a?versionId=d1" {
+                assert!(!marker_flag.swap(true, Ordering::SeqCst));
             } else {
                 panic!("attempted unmapped version deletion: {}", request.target);
             }
@@ -1454,20 +1472,45 @@ fn published_archive_purge_deletes_only_mapped_versions_and_retains_new_writes()
             rows.push_str(&marker_row("root/task/b", "independent-new-marker"));
             return history(&rows);
         }
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, interrupted_target);
+        if interrupt && first_registry_read.swap(false, Ordering::SeqCst) {
+            request_sent.send(()).unwrap();
+        }
         registry_body(&stored_receipt)
     });
+    let (client, injected) = if interrupt {
+        interrupt_response_once(client, registry_target.clone(), request_received)
+    } else {
+        (client, Arc::new(AtomicUsize::new(0)))
+    };
     let payload = json!({"candidates":[{"pointer":"task/.workspace-mgr-archive.json","object":"task/a","version_id":"v1"},{"pointer":"task/.workspace-mgr-archive.json","object":"task/a","version_id":"d1"}],"prefixes":[receipt],"coordination":[{"receipt":receipt,"coordination":proof}]});
     let result = delete_candidates(&client, &repo, &payload).unwrap();
     assert!(deleted_payload.load(Ordering::SeqCst));
     assert!(deleted_marker.load(Ordering::SeqCst));
     assert_eq!(result["retained_unmapped"].as_array().unwrap().len(), 2);
     assert_eq!(result["cleaned_prefixes"], json!([]));
-    let requests = worker.join().unwrap();
+    let attempts = worker.finish();
+    let mut deletions = attempts
+        .iter()
+        .filter(|attempt| attempt.request.method == "DELETE")
+        .map(|attempt| {
+            assert!(attempt.response_sent);
+            attempt.request.target.as_str()
+        })
+        .collect::<Vec<_>>();
+    deletions.sort_unstable();
     assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == "DELETE")
-            .count(),
-        2
+        deletions,
+        [
+            "/fixture-bucket/root/task/a?versionId=d1",
+            "/fixture-bucket/root/task/a?versionId=v1"
+        ]
     );
+    assert_eq!(injected.load(Ordering::SeqCst), usize::from(interrupt));
+    let registry_reads = attempts
+        .iter()
+        .filter(|attempt| attempt.request.target == registry_target)
+        .count();
+    assert!(registry_reads >= 3 + usize::from(interrupt));
 }

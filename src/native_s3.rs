@@ -2152,19 +2152,19 @@ pub(crate) mod tests {
         pub response_sent: bool,
     }
 
-    pub(crate) struct ReplayableReadFixture {
+    pub(crate) struct RoutedFixture {
         stop: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<Vec<ReadAttempt>>>,
     }
 
-    impl ReplayableReadFixture {
+    impl RoutedFixture {
         pub fn finish(mut self) -> Vec<ReadAttempt> {
             self.stop.store(true, Ordering::SeqCst);
             self.worker.take().unwrap().join().unwrap()
         }
     }
 
-    impl Drop for ReplayableReadFixture {
+    impl Drop for RoutedFixture {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
             // Also stop on a client assertion failure, without double-panicking.
@@ -2178,7 +2178,24 @@ pub(crate) mod tests {
     /// Abandoned reads remain recorded and never consume another version's reply.
     pub(crate) fn replayable_read_fixture(
         handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + 'static,
-    ) -> (S3Client, ReplayableReadFixture) {
+    ) -> (S3Client, RoutedFixture) {
+        response_fixture(move |request| {
+            assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
+            handler(request)
+        })
+    }
+
+    /// Route every request until the caller finishes the logical operation.
+    /// Read retries never consume a fixed budget or another request's reply.
+    pub(crate) fn routed_fixture(
+        handler: impl Fn(&WireRequest) -> Reply + Send + 'static,
+    ) -> (S3Client, RoutedFixture) {
+        response_fixture(move |request| Arc::new(handler(request)))
+    }
+
+    fn response_fixture(
+        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + 'static,
+    ) -> (S3Client, RoutedFixture) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -2197,7 +2214,7 @@ pub(crate) mod tests {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             std::time::Instant::now() < deadline,
-                            "mock S3 read fixture timed out"
+                            "mock S3 routed fixture timed out"
                         );
                         thread::sleep(Duration::from_millis(5));
                         continue;
@@ -2224,36 +2241,9 @@ pub(crate) mod tests {
                     }
                     Err(error) => panic!("mock read: {error}"),
                 };
-                assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
                 let reply = handler(&request);
-                let mut headers =
-                    format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", reply.status);
-                if !reply
-                    .headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                {
-                    headers.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
-                }
-                for (name, value) in &reply.headers {
-                    headers.push_str(&format!("{name}: {value}\r\n"));
-                }
-                headers.push_str("\r\n");
-                let response_sent = match connection
-                    .write_all(headers.as_bytes())
-                    .and_then(|()| connection.write_all(&reply.body))
-                {
-                    Ok(()) => true,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        ) =>
-                    {
-                        false
-                    }
-                    Err(error) => panic!("mock response: {error}"),
-                };
+                let response_sent = write_fixture_response(&mut connection, &request, &reply)
+                    .unwrap_or_else(|error| panic!("mock response: {error}"));
                 attempts.push(ReadAttempt {
                     request,
                     response_sent,
@@ -2266,11 +2256,164 @@ pub(crate) mod tests {
         });
         (
             client(&endpoint),
-            ReplayableReadFixture {
+            RoutedFixture {
                 stop,
                 worker: Some(worker),
             },
         )
+    }
+
+    fn write_fixture_response(
+        output: &mut impl Write,
+        request: &WireRequest,
+        reply: &Reply,
+    ) -> std::io::Result<bool> {
+        let mut headers = format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", reply.status);
+        if !reply
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
+            headers.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+        }
+        for (name, value) in &reply.headers {
+            headers.push_str(&format!("{name}: {value}\r\n"));
+        }
+        headers.push_str("\r\n");
+        match output
+            .write_all(headers.as_bytes())
+            .and_then(|()| output.write_all(&reply.body))
+        {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(request.method.as_str(), "GET" | "HEAD")
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn fixture_response_tolerates_only_abandoned_read_connections() {
+        struct FailingWriter {
+            kind: std::io::ErrorKind,
+            successful_writes: usize,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.successful_writes == 0 {
+                    return Err(std::io::Error::from(self.kind));
+                }
+                self.successful_writes -= 1;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            for method in ["GET", "HEAD", "DELETE", "PUT"] {
+                for successful_writes in [0, 1] {
+                    let request = WireRequest {
+                        method: method.into(),
+                        target: "/fixture".into(),
+                        headers: BTreeMap::new(),
+                        body: Vec::new(),
+                    };
+                    let mut output = FailingWriter {
+                        kind,
+                        successful_writes,
+                    };
+                    let result = write_fixture_response(&mut output, &request, &Reply::xml("body"));
+                    if matches!(method, "GET" | "HEAD")
+                        && matches!(
+                            kind,
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        )
+                    {
+                        assert!(!result.unwrap());
+                    } else {
+                        assert_eq!(result.unwrap_err().kind(), kind);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routed_fixture_records_an_abandoned_get_retry_and_one_subsequent_delete() {
+        let (received, receiver) = mpsc::channel();
+        let (client, worker) = routed_fixture(move |request| {
+            if request.method == "GET" {
+                received.send(()).unwrap();
+                Reply {
+                    status: 200,
+                    headers: vec![
+                        ("x-amz-version-id", "v1".into()),
+                        ("ETag", "\"abc\"".into()),
+                    ],
+                    body: b"abc".to_vec(),
+                }
+            } else {
+                assert_eq!(request.method, "DELETE");
+                Reply {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }
+            }
+        });
+        let (client, injected) = interrupt_response_once(
+            client,
+            "/fixture-bucket/root/read?versionId=v1".into(),
+            receiver,
+        );
+        let result = client
+            .call_s3(
+                "get_object",
+                &json!({"Key":"root/read","VersionId":"v1"}),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.body, b"abc");
+        assert_eq!(result.value["VersionId"], "v1");
+        client
+            .call_s3(
+                "delete_object",
+                &json!({"Key":"root/read","VersionId":"v1"}),
+                None,
+            )
+            .unwrap();
+        assert_eq!(injected.load(Ordering::SeqCst), 1);
+        let attempts = worker.finish();
+        assert!(attempts.len() >= 3);
+        assert!(
+            attempts
+                .iter()
+                .filter(|attempt| attempt.request.method == "GET")
+                .count()
+                >= 2
+        );
+        let deletes = attempts
+            .iter()
+            .filter(|attempt| attempt.request.method == "DELETE")
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 1);
+        assert!(deletes[0].response_sent);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.request.target == "/fixture-bucket/root/read?versionId=v1")
+        );
     }
 
     fn test_credentials() -> Credentials {
