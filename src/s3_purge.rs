@@ -1761,7 +1761,7 @@ mod tests {
         queue(&repo, std::slice::from_ref(&old)).unwrap();
         let report = purge_pending(&repo, &config, "origin").unwrap();
         assert_eq!(report.status, "cleanup_pending");
-        assert_eq!(report.protected, [old.clone()]);
+        assert_eq!(report.protected.as_slice(), std::slice::from_ref(&old));
         assert_eq!(report.pending, [old]);
         assert!(report.deleted.is_empty());
         let requests = worker.join().unwrap();
