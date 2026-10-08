@@ -338,9 +338,10 @@ Git, place them with `workspace-mgr storage` or keep the bytes locally with
 `workspace-mgr untrack`; do not move them outside the repository to avoid the
 decision, and do not route bulk by-products to S3 to keep Git small.
 
-Nested Git repositories are always excluded from outer publication. Cover the
-whole nested directory with a shared repository or task-local `.gitignore`
-rule and remove any outer-tracked files or gitlinks. `plan` and `publish`
+Nested Git repositories, including external clones, stay local and are
+excluded from Git and S3 publication. Cover the whole nested directory with a
+shared repository or task-local `.gitignore` rule and remove any outer-tracked
+files or gitlinks. `plan` and `publish`
 check this boundary before storage placement. A new task-local ignore file
 can be published with the task; a global ignore or `.git/info/exclude` alone
 does not satisfy the rule.
