@@ -30,6 +30,10 @@ pub(crate) struct MigrationReport {
     pub remote_objects: Vec<crate::storage_import::RemoteObject>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub remote_transfer_bytes: u64,
+    /// Never-published pointers converted without a version binding. The
+    /// owning task's next publication uploads their verified local payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_upload: Vec<String>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -604,7 +608,7 @@ fn preflight(repo: &GitRepo) -> Result<Plan> {
         reject_pending_transactions(repo)?;
     }
     if !plan.report.converted.is_empty() {
-        verify_s3_bindings(repo, &plan)?;
+        plan.report.pending_upload = verify_s3_bindings(repo, &plan)?;
     }
     plan.report.removed = plan.removes.iter().cloned().collect();
     if plan.legacy_directory {
@@ -824,8 +828,12 @@ fn legacy_controls(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
         })?;
         plan.credentials.render()?;
     }
+    // Native commands run before migration may already own the cache root.
+    // The legacy layout stays readable below `legacy/`, as for CAS imports.
+    let native_cache = fs::symlink_metadata(repo.root.join(".workspace-mgr/local/cache"))
+        .is_ok_and(|metadata| metadata.is_dir());
     for item in &mut plan.moves {
-        if item.source == ".dvc/cache" && plan.legacy_cas_proven {
+        if item.source == ".dvc/cache" && (plan.legacy_cas_proven || native_cache) {
             item.destination = ".workspace-mgr/local/cache/legacy".to_owned();
         }
         reject_symlink_traversal(&repo.root, &item.destination, "retained local storage")?;
@@ -901,7 +909,7 @@ fn legacy_controls(repo: &GitRepo, plan: &mut Plan) -> Result<()> {
     Ok(())
 }
 
-fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
+fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<Vec<String>> {
     let url = match plan
         .expected_before
         .get(CONFIG_NAME)
@@ -919,9 +927,10 @@ fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
     let url = url.ok_or_else(|| {
         Error::message("legacy storage pointers require a selected storage URL before manage")
     })?;
+    let mut pending = Vec::new();
     if url.starts_with("s3://") {
         if plan.import.is_some() {
-            return Ok(());
+            return Ok(pending);
         }
         if !plan.legacy_version_aware {
             return Err(Error::message(
@@ -953,6 +962,10 @@ fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
                     }),
             };
             if !exact {
+                if unpublished_with_matching_payload(repo, conversion, &manifest)? {
+                    pending.push(conversion.source.clone());
+                    continue;
+                }
                 return Err(Error::message(format!(
                     "legacy pointer {:?} lacks exact S3 object versions; resolve its path-based bindings with the previous CLI before manage",
                     conversion.source
@@ -960,7 +973,50 @@ fn verify_s3_bindings(repo: &GitRepo, plan: &Plan) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(pending)
+}
+
+/// A pointer that no index entry or local or remote-tracking revision ever
+/// recorded was never published, so no history needs its missing versions.
+/// When it binds no version at all and its local payload is exactly what it
+/// records, it converts to a pending native placement that the owning task's
+/// next publication uploads.
+fn unpublished_with_matching_payload(
+    repo: &GitRepo,
+    conversion: &Conversion,
+    manifest: &crate::storage_format::Manifest,
+) -> Result<bool> {
+    let unbound = match manifest.kind {
+        crate::storage_format::Kind::File => manifest.version.is_none(),
+        crate::storage_format::Kind::Directory => manifest
+            .entries
+            .as_ref()
+            .is_some_and(|entries| entries.iter().all(|entry| entry.version.is_none())),
+    };
+    if !unbound {
+        return Ok(false);
+    }
+    let indexed = repo.run(["--literal-pathspecs", "ls-files", "--", &conversion.source])?;
+    let recorded = repo.run([
+        "--literal-pathspecs",
+        "log",
+        "--all",
+        "-1",
+        "--format=%H",
+        "--",
+        &conversion.source,
+    ])?;
+    if !indexed.stdout.trim().is_empty() || !recorded.stdout.trim().is_empty() {
+        return Ok(false);
+    }
+    let parent = Path::new(&conversion.source)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let object = repo_path(
+        &to_slash(&parent.join(&manifest.path)),
+        "legacy storage output",
+    )?;
+    crate::native_engine::payload_matches_manifest(repo, &object, manifest)
 }
 
 fn reject_pending_transactions(repo: &GitRepo) -> Result<()> {
@@ -1540,6 +1596,35 @@ mod tests {
         );
         assert!(repo.root.join(".dvc/cache").is_dir());
         assert!(!repo.root.join(".workspace-mgr/local/cache/legacy").exists());
+    }
+
+    #[test]
+    fn version_aware_cache_moves_below_an_existing_native_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-b", "main"]).unwrap();
+        let config = "[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = \"s3://offline.invalid/repository\"\n";
+        fs::write(repo.root.join(CONFIG_NAME), config).unwrap();
+        fs::create_dir_all(repo.root.join(".dvc/cache/files")).unwrap();
+        fs::write(
+            repo.root.join(".dvc/config"),
+            "[core]\nremote = workspace-mgr\n['remote \"workspace-mgr\"']\nurl = s3://offline.invalid/repository\nversion_aware = true\n",
+        )
+        .unwrap();
+        let mut plan = Plan::default();
+        legacy_controls(&repo, &mut plan).unwrap();
+        assert!(!plan.legacy_cas_proven);
+        assert_eq!(plan.moves[0].destination, ".workspace-mgr/local/cache");
+        // A native command such as refresh created the cache root first.
+        fs::create_dir_all(repo.root.join(".workspace-mgr/local/cache/objects")).unwrap();
+        let mut plan = Plan::default();
+        legacy_controls(&repo, &mut plan).unwrap();
+        assert_eq!(
+            plan.moves[0].destination,
+            ".workspace-mgr/local/cache/legacy"
+        );
     }
 
     #[test]

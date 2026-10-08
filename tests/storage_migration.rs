@@ -243,6 +243,10 @@ fn content_addressed_s3_or_missing_versions_refuse_before_migration() {
             original.split("  cloud:").next().unwrap().to_owned()
         };
         fs::write(fixture.shared.join(path), changed).unwrap();
+        // Published history needs the missing versions; only a pointer that no
+        // revision recorded may become a pending native placement.
+        git(&fixture.shared, ["add", "--", "data.bin.dvc"]);
+        git(&fixture.shared, ["commit", "-q", "-m", "published pointer"]);
         let output = workspace_unchecked(&fixture.shared, ["manage"]);
         assert!(
             !output.status.success(),
@@ -320,6 +324,93 @@ fn files_only_directory_manifest_migrates_without_its_omitted_aggregate() {
     );
     assert!(!fixture.shared.join("absent-directory.dvc").exists());
     assert!(!fixture.shared.join("absent-directory").exists());
+}
+
+#[test]
+fn manage_keeps_an_existing_native_cache_and_retains_the_legacy_cache_below_it() {
+    let fixture = legacy_repository();
+    // Native commands such as refresh populate the cache before migration.
+    let native = fixture
+        .shared
+        .join(".workspace-mgr/local/cache/objects/md5/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    fs::create_dir_all(native.parent().unwrap()).unwrap();
+    fs::write(&native, b"native").unwrap();
+    assert_eq!(
+        json(&workspace(&fixture.shared, ["manage", "--dry-run"]))["status"],
+        "dry_run"
+    );
+    assert!(fixture.shared.join(".dvc/cache").is_dir());
+    let report = json(&workspace(&fixture.shared, ["manage"]));
+    assert_eq!(report["status"], "managed");
+    assert_eq!(fs::read(&native).unwrap(), b"native");
+    assert_eq!(
+        fs::read(
+            fixture.shared.join(
+                ".workspace-mgr/local/cache/legacy/files/md5/90/0150983cd24fb0d6963f7d28e17f72"
+            )
+        )
+        .unwrap(),
+        b"abc"
+    );
+    assert!(!fixture.shared.join(".dvc").exists());
+    assert_eq!(fs::read(fixture.shared.join("data.bin")).unwrap(), b"abc");
+}
+
+#[test]
+fn unpublished_unbound_pointer_with_matching_payload_converts_pending_upload() {
+    use md5::{Digest, Md5};
+    let fixture = legacy_repository();
+    // A legacy S3 placement recorded locally but never published: an aggregate
+    // digest whose listing lives only in the local cache, and no version.
+    let rows = "[{\"md5\": \"900150983cd24fb0d6963f7d28e17f72\", \"relpath\": \"a.bin\"}]";
+    let digest = Md5::digest(rows.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let listing = fixture.shared.join(format!(
+        ".dvc/cache/files/md5/{}/{}.dir",
+        &digest[..2],
+        &digest[2..]
+    ));
+    fs::create_dir_all(listing.parent().unwrap()).unwrap();
+    fs::write(&listing, rows).unwrap();
+    fs::create_dir_all(fixture.shared.join("task/raw")).unwrap();
+    fs::write(fixture.shared.join("task/raw/a.bin"), b"abc").unwrap();
+    fs::write(fixture.shared.join("task/.gitignore"), "/raw\n").unwrap();
+    let raw =
+        format!("outs:\n- md5: {digest}.dir\n  size: 3\n  nfiles: 1\n  hash: md5\n  path: raw\n");
+    fs::write(fixture.shared.join("task/raw.dvc"), &raw).unwrap();
+
+    // A payload that differs from the record still refuses, leaving files intact.
+    fs::write(fixture.shared.join("task/raw/extra.bin"), b"x").unwrap();
+    let refused = workspace_unchecked(&fixture.shared, ["manage"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("lacks exact S3 object versions"));
+    assert_eq!(
+        fs::read_to_string(fixture.shared.join("task/raw.dvc")).unwrap(),
+        raw
+    );
+    fs::remove_file(fixture.shared.join("task/raw/extra.bin")).unwrap();
+
+    let preview = json(&workspace(&fixture.shared, ["manage", "--dry-run"]));
+    assert_eq!(preview["migration"]["pending_upload"][0], "task/raw.dvc");
+    let report = json(&workspace(&fixture.shared, ["manage"]));
+    assert_eq!(report["migration"]["pending_upload"][0], "task/raw.dvc");
+    let native: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.shared.join("task/raw.wm-storage.json")).unwrap())
+            .unwrap();
+    assert_eq!(native["kind"], "directory");
+    assert_eq!(native["entries"][0]["path"], "a.bin");
+    assert!(
+        native["entries"][0]
+            .get("version")
+            .is_none_or(|v| v.is_null())
+    );
+    assert!(!fixture.shared.join("task/raw.dvc").exists());
+    assert_eq!(
+        fs::read(fixture.shared.join("task/raw/a.bin")).unwrap(),
+        b"abc"
+    );
 }
 
 #[test]

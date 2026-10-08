@@ -1082,6 +1082,41 @@ fn select_pointers(repo: &GitRepo, targets: &[String]) -> Result<Vec<String>> {
     Ok(pointers.into_iter().collect())
 }
 
+/// Whether an output's current bytes are exactly the files a manifest records:
+/// the same paths, sizes and checksums, and nothing else.
+pub(crate) fn payload_matches_manifest(
+    repo: &GitRepo,
+    object: &str,
+    manifest: &Manifest,
+) -> Result<bool> {
+    let mut recorded = match manifest.kind {
+        crate::storage_format::Kind::File => vec![(
+            String::new(),
+            manifest.checksum.digest.clone(),
+            manifest.size,
+        )],
+        crate::storage_format::Kind::Directory => manifest
+            .entries
+            .as_ref()
+            .ok_or_else(|| Error::message("directory manifest has no entries"))?
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    entry.checksum.digest.clone(),
+                    entry.size,
+                )
+            })
+            .collect(),
+    };
+    recorded.sort();
+    let current = current_files_with_algorithm(repo, object, &manifest.checksum.algorithm)?
+        .into_iter()
+        .map(|file| (file.relpath, file.md5, file.size))
+        .collect::<Vec<_>>();
+    Ok(!current.is_empty() && current == recorded)
+}
+
 #[cfg(test)]
 fn current_files(repo: &GitRepo, object: &str) -> Result<Vec<FileState>> {
     current_files_with_algorithm(repo, object, "md5")

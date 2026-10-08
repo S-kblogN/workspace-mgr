@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-08
+
 ### Added
 
 - `doctor [<task>]` resolves one current task by ID, name, slug or path, including
@@ -14,6 +16,22 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   They report stale bindings, extra or misplaced objects, obsolete historical
   paths, and incomplete or changing audit evidence without hydrating or deleting
   data. Historical versions at valid current keys remain permitted.
+
+### Fixed
+
+- `manage` no longer refuses a version-aware repository whose native cache
+  root already exists, as it does after any native command such as `refresh`
+  ran before migration. The legacy DVC cache moves whole below
+  `.workspace-mgr/local/cache/legacy/`, the layout already used for
+  content-addressed imports and read by the legacy cache lookup, so existing
+  native objects and every legacy object stay in place and reusable.
+- `manage` converts a legacy S3 pointer that was never published, meaning no
+  index entry and no local or remote-tracking revision records it, binds no
+  version, and whose local payload is exactly what it records, into a pending
+  native placement instead of refusing for missing versions. The migration
+  report lists it under `pending_upload`, and the owning task's next
+  publication uploads it. Recorded pointers without exact versions, partly
+  bound pointers and mismatched payloads are still refused.
 
 ## [0.8.3] - 2026-10-07
 
