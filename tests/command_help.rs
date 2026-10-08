@@ -8,7 +8,7 @@ use common::binary_command;
 const PAGES: &[(&[&str], &[&str])] = &[
     (&["setup"], &["native storage", "Python", "user approval"]),
     (
-        &["init"],
+        &["manage"],
         &["product-owned", "infrastructure", "versioning"],
     ),
     (

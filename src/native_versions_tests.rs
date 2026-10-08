@@ -332,6 +332,71 @@ fn historical_directory_manifest_flattens_without_reading_payload() {
     assert!(!dir.path().join("task/data").exists());
 }
 
+#[test]
+fn shared_cas_history_is_retained_outside_path_version_retirement() {
+    let (dir, repo) = repo();
+    repo.run(["init"]).unwrap();
+    repo.run(["config", "user.name", "Fixture"]).unwrap();
+    repo.run(["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    fs::create_dir_all(dir.path().join(".dvc")).unwrap();
+    fs::create_dir_all(dir.path().join("task")).unwrap();
+    let remote = "[core]\nremote = source\n['remote \"source\"']\nurl = s3://fixture-bucket/root\n";
+    fs::write(dir.path().join(".dvc/config"), remote).unwrap();
+    fs::write(
+        dir.path().join("task/data.dvc"),
+        "outs:\n- md5: 900150983cd24fb0d6963f7d28e17f72.dir\n  hash: md5\n  size: 3\n  nfiles: 1\n  path: data\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("task/a.wm-storage.json"),
+        crate::storage_format::Manifest {
+            schema_version: 1,
+            path: "a".into(),
+            kind: crate::storage_format::Kind::File,
+            checksum: crate::storage_format::Checksum {
+                algorithm: "md5".into(),
+                digest: "900150983cd24fb0d6963f7d28e17f72".into(),
+            },
+            size: 3,
+            version: Some(crate::storage_format::Version {
+                id: "native-exact".into(),
+                etag: None,
+            }),
+            entries: None,
+        }
+        .serialize()
+        .unwrap(),
+    )
+    .unwrap();
+    repo.run(["add", ".dvc/config", "task"]).unwrap();
+    repo.run(["commit", "-m", "CAS and native history"])
+        .unwrap();
+    let request =
+        json!([{"revision":"HEAD","pointers":["task/data.dvc","task/a.wm-storage.json"]}]);
+    assert_eq!(
+        purge(&repo, "list", &request).unwrap(),
+        json!([{"pointer":"task/a.wm-storage.json","object":"task/a","version_id":"native-exact"}])
+    );
+    assert!(!dir.path().join(".dvc/cache").exists());
+
+    fs::write(
+        dir.path().join(".dvc/config"),
+        format!("{remote}version_aware = true\n"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("task/data.dvc"),
+        "outs:\n- md5: 900150983cd24fb0d6963f7d28e17f72\n  hash: md5\n  size: 3\n  path: data\n",
+    )
+    .unwrap();
+    repo.run(["add", ".dvc/config", "task/data.dvc"]).unwrap();
+    repo.run(["commit", "-m", "Invalid unbound path history"])
+        .unwrap();
+    let rejected = purge(&repo, "list", &request).unwrap_err().to_string();
+    assert!(rejected.contains("no exact version ID"), "{rejected}");
+}
+
 fn version_row(key: &str, id: &str) -> String {
     format!(
         "<Version><Key>{key}</Key><VersionId>{id}</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-07T00:00:00Z</LastModified><ETag>&quot;abc&quot;</ETag><Size>3</Size></Version>"
@@ -723,7 +788,7 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
         history(&rows)
     });
     configure_repo(&client, &repo);
-    let result = crate::dvc::version_purge_adapter(&repo, "delete", &payload).unwrap();
+    let result = crate::storage_metadata::version_purge_adapter(&repo, "delete", &payload).unwrap();
     assert_eq!(result["mode"], "permanent-version-deletion");
     assert_eq!(result["remote"], "workspace-mgr");
     assert_eq!(result["deleted"].as_array().unwrap().len(), 1);
@@ -779,7 +844,7 @@ fn large_purge_adapter_validates_last_candidate_before_any_deletion() {
     // precede validation. No object history or DELETE may be reached.
     let (client, worker) = fixture(vec![versioning(), history(""), history(""), versioning()]);
     configure_repo(&client, &repo);
-    let error = crate::dvc::version_purge_adapter(&repo, "delete", &payload)
+    let error = crate::storage_metadata::version_purge_adapter(&repo, "delete", &payload)
         .unwrap_err()
         .to_string();
     assert!(error.contains("missing or invalid version_id"), "{error}");
@@ -890,10 +955,12 @@ fn exact_fetch_preserves_legacy_binary_and_chunk_boundary_hash_semantics() {
         );
         let pointer = repo.root.join("task/data.dvc");
         fs::write(&pointer, &raw).unwrap();
+        let metadata = native_engine::metadata_entries(&repo, None, &["task/data.dvc".into()])
+            .unwrap()
+            .remove(0);
         for _ in 0..2 {
             read(&repo, &["task/data.dvc".into()], "--fetch", &[]).unwrap();
-            let cache =
-                native_engine::cache_path_with_algorithm(&repo, digest, "md5-dos2unix").unwrap();
+            let cache = native_engine::cache_path_for_entry(&repo, &metadata).unwrap();
             assert_eq!(fs::read(cache).unwrap(), body);
             assert_eq!(fs::read_to_string(&pointer).unwrap(), raw);
         }
@@ -989,7 +1056,10 @@ fn omitted_legacy_hash_preserves_cache_namespace_and_exact_payload_bytes() {
     fs::write(&pointer, &raw).unwrap();
     native_engine::install_cache(&repo, digest, b"a\nb\n").unwrap();
     let canonical = native_engine::cache_path(&repo, digest).unwrap();
-    let legacy = native_engine::cache_path_with_algorithm(&repo, digest, "md5-dos2unix").unwrap();
+    let metadata = native_engine::metadata_entries(&repo, None, &["task/data.dvc".into()])
+        .unwrap()
+        .remove(0);
+    let legacy = native_engine::cache_path_for_entry(&repo, &metadata).unwrap();
     for _ in 0..2 {
         read(&repo, &["task/data.dvc".into()], "--fetch", &[]).unwrap();
         assert_eq!(fs::read(&canonical).unwrap(), b"a\nb\n");
@@ -1000,6 +1070,133 @@ fn omitted_legacy_hash_preserves_cache_namespace_and_exact_payload_bytes() {
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[1].method, "GET");
     assert_eq!(requests[3].method, "HEAD");
+}
+
+fn normalized_file_pointer(repo: &GitRepo, version: &str, tag: &str) -> String {
+    let pointer = "task/data.wm-storage.json";
+    fs::create_dir_all(repo.root.join("task")).unwrap();
+    let raw = serde_json::to_string_pretty(&json!({
+        "schema_version": 1,
+        "path": "data",
+        "kind": "file",
+        "checksum": {
+            "algorithm": "md5-dos2unix",
+            "digest": "dd8c6a395b5dd36c56d23275028f526c"
+        },
+        "size": 5,
+        "version": { "id": version, "etag": tag }
+    }))
+    .unwrap();
+    fs::write(repo.root.join(pointer), raw).unwrap();
+    pointer.into()
+}
+
+#[test]
+fn exact_versions_with_same_normalized_hash_and_size_keep_distinct_raw_caches() {
+    let (_directory, repo) = repo();
+    let first = b"a\r\nb\n";
+    let second = b"a\nb\r\n";
+    let digest = "dd8c6a395b5dd36c56d23275028f526c";
+    let (client, worker) = fixture(vec![
+        versioning(),
+        downloaded(first, "version-a", "raw-a"),
+        versioning(),
+        downloaded(second, "version-b", "raw-b"),
+        versioning(),
+        head("version-a", "raw-a", 5),
+    ]);
+    configure_repo(&client, &repo);
+    // A normalized checksum and size cannot prove which raw S3 version a
+    // generic cache object contains, even when the normalized hash is valid.
+    let generic = native_engine::cache_path_with_algorithm(&repo, digest, "md5-dos2unix").unwrap();
+    fs::create_dir_all(generic.parent().unwrap()).unwrap();
+    fs::write(&generic, second).unwrap();
+
+    let pointer = normalized_file_pointer(&repo, "version-a", "raw-a");
+    read(&repo, std::slice::from_ref(&pointer), "--fetch", &[]).unwrap();
+    let first_entry = native_engine::metadata_entries(&repo, None, std::slice::from_ref(&pointer))
+        .unwrap()
+        .remove(0);
+    let first_cache = native_engine::cache_path_for_entry(&repo, &first_entry).unwrap();
+    assert_eq!(fs::read(&first_cache).unwrap(), first);
+
+    normalized_file_pointer(&repo, "version-b", "raw-b");
+    read(&repo, std::slice::from_ref(&pointer), "--fetch", &[]).unwrap();
+    let second_entry = native_engine::metadata_entries(&repo, None, std::slice::from_ref(&pointer))
+        .unwrap()
+        .remove(0);
+    let second_cache = native_engine::cache_path_for_entry(&repo, &second_entry).unwrap();
+    assert_ne!(first_cache, second_cache);
+    assert_eq!(fs::read(&first_cache).unwrap(), first);
+    assert_eq!(fs::read(&second_cache).unwrap(), second);
+
+    normalized_file_pointer(&repo, "version-a", "raw-a");
+    read(&repo, std::slice::from_ref(&pointer), "--fetch", &[]).unwrap();
+    assert_eq!(fs::read(&first_cache).unwrap(), first);
+    assert_eq!(fs::read(&second_cache).unwrap(), second);
+    assert_eq!(fs::read(&generic).unwrap(), second);
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[1].target,
+        "/fixture-bucket/root/task/data?versionId=version-a"
+    );
+    assert_eq!(requests[1].headers["if-match"], "\"raw-a\"");
+    assert_eq!(requests[3].method, "GET");
+    assert_eq!(
+        requests[3].target,
+        "/fixture-bucket/root/task/data?versionId=version-b"
+    );
+    assert_eq!(requests[3].headers["if-match"], "\"raw-b\"");
+    assert_eq!(requests[5].method, "HEAD");
+    assert_eq!(
+        requests[5].target,
+        "/fixture-bucket/root/task/data?versionId=version-a"
+    );
+}
+
+#[test]
+fn checkout_replaces_existing_normalized_raw_variant_with_incoming_exact_version() {
+    let (_directory, repo) = repo();
+    let first = b"a\r\nb\n";
+    let second = b"a\nb\r\n";
+    let (client, worker) = fixture(vec![
+        versioning(),
+        downloaded(first, "version-a", "raw-a"),
+        versioning(),
+        downloaded(second, "version-b", "raw-b"),
+    ]);
+    configure_repo(&client, &repo);
+    let pointer = normalized_file_pointer(&repo, "version-a", "raw-a");
+    for (version, tag, bytes) in [
+        ("version-a", "raw-a", first),
+        ("version-b", "raw-b", second),
+    ] {
+        normalized_file_pointer(&repo, version, tag);
+        read(&repo, std::slice::from_ref(&pointer), "--fetch", &[]).unwrap();
+        let raw = fs::read(repo.root.join(&pointer)).unwrap();
+        let result = native_engine::execute(
+            &repo.root,
+            &native_engine::Operation::Materialize {
+                pointers: vec![pointer.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(result.code, 0, "{}", result.stderr);
+        assert_eq!(fs::read(repo.root.join("task/data")).unwrap(), bytes);
+        assert_eq!(fs::read(repo.root.join(&pointer)).unwrap(), raw);
+    }
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[1].target,
+        "/fixture-bucket/root/task/data?versionId=version-a"
+    );
+    assert_eq!(
+        requests[3].target,
+        "/fixture-bucket/root/task/data?versionId=version-b"
+    );
 }
 
 fn published_proof(repo: &GitRepo, remote: &Path, receipt: &Value) -> Value {

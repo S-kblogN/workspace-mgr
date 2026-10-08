@@ -35,7 +35,7 @@ fn write_task(repo: &Path, id: &str, slug: &str, approval: bool) {
 
 fn managed_fixture(active: bool) -> (GitFixture, String) {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize managed workspace");
     git(&fixture.seed, ["switch", "-c", "codex/completed"]);
     write_task(&fixture.seed, DONE, "completed", true);
@@ -880,7 +880,16 @@ fn archive_rejects_changed_materialized_s3_payloads_without_touching_metadata() 
     let (fixture, merged) = managed_fixture(false);
     let original_head = oid(&fixture.remote, "refs/heads/codex/completed");
     let task = fixture.seed.join(DONE);
-    std::fs::write(task.join("model.bin.dvc"), "outs:\n- path: model.bin\n  md5: 9f9f90dbe3e5ee1218c86b8839db1995\n  size: 6\n  cloud:\n    workspace-mgr:\n      version_id: retained-version\n").unwrap();
+    std::fs::write(
+        task.join("model.bin.wm-storage.json"),
+        storage_file_manifest(
+            "model.bin",
+            "9f9f90dbe3e5ee1218c86b8839db1995",
+            6,
+            Some("retained-version"),
+        ),
+    )
+    .unwrap();
     std::fs::write(task.join(".gitignore"), "/model.bin\n").unwrap();
     fixture.commit_seed("Retain the task's S3 metadata");
     let metadata_merge = oid(&fixture.seed, "HEAD");
@@ -902,7 +911,8 @@ fn archive_rejects_changed_materialized_s3_payloads_without_touching_metadata() 
     );
     git(&fixture.shared, ["pull", "--ff-only", "origin", "main"]);
     std::fs::write(fixture.shared.join(DONE).join("model.bin"), "changed\n").unwrap();
-    let pointer = std::fs::read(fixture.shared.join(DONE).join("model.bin.dvc")).unwrap();
+    let pointer =
+        std::fs::read(fixture.shared.join(DONE).join("model.bin.wm-storage.json")).unwrap();
     rejected(
         &fixture.shared,
         &gh,
@@ -910,7 +920,7 @@ fn archive_rejects_changed_materialized_s3_payloads_without_touching_metadata() 
         "locally changed materialized S3 output",
     );
     assert_eq!(
-        std::fs::read(fixture.shared.join(DONE).join("model.bin.dvc")).unwrap(),
+        std::fs::read(fixture.shared.join(DONE).join("model.bin.wm-storage.json")).unwrap(),
         pointer
     );
     assert!(fixture.shared.join(DONE).is_dir());
@@ -982,7 +992,7 @@ fn archive_accepts_a_divergent_local_branch_when_the_associated_pr_is_closed() {
 
 fn migrated_fixture(reviewed: bool) -> (GitFixture, PathBuf) {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize managed workspace");
     git(&fixture.seed, ["switch", "-c", "historical/completed"]);
     write_task(&fixture.seed, DONE, "completed", false);
@@ -1272,7 +1282,7 @@ fn task_upgrade_preserves_current_metadata_without_generating_content_proofs() {
 #[test]
 fn adoption_accepts_dirty_payloads_without_comparing_reviewed_task_trees() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     let task = fixture.seed.join(DONE);
     std::fs::create_dir_all(&task).unwrap();
     std::fs::write(task.join("README.md"), "Original description\n").unwrap();
@@ -1486,7 +1496,7 @@ fn archive_accepts_current_completion_metadata_without_requiring_another_review(
 #[test]
 fn legacy_tasks_are_visible_and_require_explicit_reviewed_adoption() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize managed workspace");
     git(&fixture.seed, ["switch", "-c", "legacy/completed"]);
     std::fs::create_dir_all(fixture.seed.join(DONE)).unwrap();
@@ -1629,7 +1639,11 @@ fn legacy_tasks_are_visible_and_require_explicit_reviewed_adoption() {
         std::fs::read_to_string(workplace.join(&record_path)).unwrap(),
         record
     );
-    assert!(!workplace.join(format!("{record_path}.dvc")).exists());
+    assert!(
+        !workplace
+            .join(format!("{record_path}.wm-storage.json"))
+            .exists()
+    );
     let archive_preview = json(&archive(
         &workplace,
         &gh,
@@ -1698,7 +1712,7 @@ fn directly_imported_adoption_fixture(
     adoption_reviewed: bool,
 ) -> (CompletionFixture, PathBuf, PathBuf) {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize managed workspace");
     std::fs::create_dir_all(fixture.seed.join(DONE)).unwrap();
     std::fs::write(
@@ -2214,7 +2228,7 @@ fn archive_preserves_arbitrary_local_content_and_user_index_through_cancel() {
 #[test]
 fn archive_accepts_closed_unmerged_pr_and_publishes_a_task_absent_from_shared_history() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize managed workspace without the task");
     fixture.clone_shared();
     write_task(&fixture.shared, DONE, "completed", false);
@@ -2307,7 +2321,7 @@ fn archive_rejects_malformed_current_dvc_metadata_before_moving() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
     let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
-    let pointer = workplace.join(DONE).join("data.bin.dvc");
+    let pointer = workplace.join(DONE).join("data.bin.wm-storage.json");
     std::fs::write(&pointer, "invalid: [unclosed metadata\n").unwrap();
     let before = std::fs::read(&pointer).unwrap();
     let env = archive_environment(&gh);

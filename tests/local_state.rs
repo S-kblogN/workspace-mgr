@@ -10,7 +10,7 @@ const LEGACY_STATE: &str = ".git/workspace-mgr";
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();
     fixture
@@ -58,7 +58,7 @@ fn create_infrastructure_task(fixture: &GitFixture) -> PathBuf {
 
 fn separate_git_fixture() -> (GitFixture, PathBuf) {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Add workspace policy");
     let git_directory = fixture.root.join("git-metadata");
     command(
@@ -80,7 +80,7 @@ fn separate_git_fixture() -> (GitFixture, PathBuf) {
 fn local_state_is_ignored_while_shared_configuration_remains_trackable() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
 
     let lock = fixture.shared.join(LOCAL_STATE).join("repository.lock");
     assert!(lock.is_file());
@@ -115,7 +115,7 @@ fn local_state_is_ignored_while_shared_configuration_remains_trackable() {
 #[test]
 fn publication_excludes_private_state_before_the_legacy_ignore_rules_are_upgraded() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     let root_ignore = fixture.seed.join(".gitignore");
     let current_ignore = fs::read_to_string(&root_ignore).unwrap();
     let legacy_ignore = current_ignore.replace("/.workspace-mgr/local/\n", "");
@@ -229,7 +229,7 @@ fn publication_excludes_private_state_before_the_legacy_ignore_rules_are_upgrade
 fn ignored_private_state_does_not_break_task_or_repository_scoped_publication() {
     for infrastructure in [false, true] {
         let fixture = GitFixture::new();
-        workspace(&fixture.seed, ["init"]);
+        workspace(&fixture.seed, ["manage"]);
         let policy = ".workspace-mgr/shared-policy.md";
         let obsolete_policy = ".workspace-mgr/obsolete-policy.md";
         // The E2E failure requires tracked shared configuration underneath
@@ -467,7 +467,7 @@ fn migration_merges_distinct_state_without_overwriting_existing_files() {
     write(&local.join("archive/same.json"), b"same retained journal");
     write(&legacy.join("archive/same.json"), b"same retained journal");
 
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(
         fs::read(local.join("state/new/private.index")).unwrap(),
         b"new index"
@@ -499,7 +499,7 @@ fn conflicting_state_refuses_migration_and_preserves_both_versions() {
     );
     write(&legacy.join("archive/preserved.json"), b"legacy journal");
 
-    let rejected = workspace_unchecked(&fixture.shared, ["init"]);
+    let rejected = workspace_unchecked(&fixture.shared, ["manage"]);
     assert_eq!(rejected.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("conflicting workspace-mgr local state")
@@ -526,7 +526,7 @@ fn an_active_legacy_operation_blocks_migration_until_its_lock_is_released() {
     write(&legacy.join("state/task/private.index"), b"in-use index");
     let lock = hold_lock(&legacy.join("repository.lock"));
 
-    let rejected = workspace_unchecked(&fixture.shared, ["init"]);
+    let rejected = workspace_unchecked(&fixture.shared, ["manage"]);
     assert_eq!(rejected.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("repository operation"));
     assert_eq!(
@@ -542,7 +542,7 @@ fn an_active_legacy_operation_blocks_migration_until_its_lock_is_released() {
     );
 
     drop(lock);
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(
         fs::read(
             fixture
@@ -558,7 +558,7 @@ fn an_active_legacy_operation_blocks_migration_until_its_lock_is_released() {
 #[test]
 fn linked_worktrees_use_the_shared_checkout_repository_lock() {
     let fixture = managed_fixture();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let linked = fixture.root.join("linked");
     git(
         &fixture.shared,
@@ -599,7 +599,7 @@ fn repositories_with_a_separate_git_directory_keep_state_in_the_checkout() {
     let legacy_index = git_directory.join("workspace-mgr/state/task/private.index");
     write(&legacy_index, b"separate git private index");
 
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(
         fs::read(
             fixture
@@ -639,7 +639,7 @@ fn linked_worktrees_with_a_separate_git_directory_share_the_primary_lock() {
         &fixture.shared,
         ["config", "core.worktree", fixture.shared.to_str().unwrap()],
     );
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let linked = fixture.root.join("linked");
     git(
         &fixture.shared,
@@ -661,7 +661,7 @@ fn a_separate_git_directory_without_a_primary_worktree_pointer_refuses_migration
     let (fixture, git_directory) = separate_git_fixture();
     let legacy_index = git_directory.join("workspace-mgr/state/task/private.index");
     write(&legacy_index, b"unmigrated private index");
-    let rejected = workspace_unchecked(&fixture.shared, ["init"]);
+    let rejected = workspace_unchecked(&fixture.shared, ["manage"]);
     assert_eq!(rejected.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("core.worktree"));
     assert_eq!(

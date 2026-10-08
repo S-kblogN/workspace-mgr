@@ -19,6 +19,7 @@ use crate::path::{allowed, reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::relocation::RelocationPlan;
 use crate::s3_purge::{self, ObjectVersion};
+use crate::storage_metadata;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Metadata {
@@ -96,7 +97,7 @@ pub fn record_attempt(
             ));
         }
     }
-    let mut paths = crate::dvc::discover(repo, &[source.to_owned()])?
+    let mut paths = crate::storage_metadata::discover(repo, &[source.to_owned()])?
         .into_iter()
         .map(|p| p[source.len() + 1..].to_owned())
         .collect::<Vec<_>>();
@@ -294,7 +295,7 @@ pub fn record_pointer_rewrite(
     reject_symlink_traversal(&repo.root, &pointer, "archive rewritten pointer")?;
     let relative = pointer
         .strip_prefix(&format!("{destination}/"))
-        .filter(|path| path.ends_with(".dvc"))
+        .filter(|path| storage_metadata::is_pointer(path))
         .ok_or_else(|| Error::message("archive rewritten pointer escaped its destination"))?;
     let metadata = attempt
         .metadata
@@ -511,13 +512,16 @@ pub fn cancel(
         let mut canonical_to_release = None;
         let mut terminal_remote = attempt.remote_cleanup_complete;
         let remote = if config.s3_enabled() && journal.exists() {
-            crate::dvc::ensure_ready(&repo, &config)?;
+            crate::storage_metadata::ensure_ready(&repo, &config)?;
             let transport_request = json!({
                 "source":attempt.source,"destination":attempt.destination,"state_path":journal.to_string_lossy()
             });
             // Prove ownership/source preservation before withdrawing a mapping.
-            let preview =
-                crate::dvc::version_archive_adapter(&repo, "cancel-preview", &transport_request)?;
+            let preview = crate::storage_metadata::version_archive_adapter(
+                &repo,
+                "cancel-preview",
+                &transport_request,
+            )?;
             let mut receipt: Value = read(&journal)?;
             normalize_copy_schema(&mut receipt)?;
             terminal_remote |= receipt["status"] == "cancelled";
@@ -568,7 +572,7 @@ pub fn cancel(
             let registry = if terminal_remote {
                 json!({"status":"already_cancelled"})
             } else {
-                crate::dvc::archive_registry_adapter(
+                crate::storage_metadata::archive_registry_adapter(
                     &repo,
                     if dry_run { "cancel-preview" } else { "cancel" },
                     &json!({"receipt":receipt,"coordination":proof}),
@@ -577,8 +581,11 @@ pub fn cancel(
             let mut result = if dry_run {
                 preview
             } else {
-                let result =
-                    crate::dvc::version_archive_adapter(&repo, "cancel", &transport_request)?;
+                let result = crate::storage_metadata::version_archive_adapter(
+                    &repo,
+                    "cancel",
+                    &transport_request,
+                )?;
                 if !matches!(
                     result["status"].as_str(),
                     Some("cancelled" | "already_cancelled" | "no_remote_copy")

@@ -17,7 +17,7 @@ fn fixture() -> (GitFixture, PathBuf, PathBuf) {
 
 fn fixture_with_metadata(metadata: bool) -> (GitFixture, PathBuf, PathBuf) {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize");
     git(&fixture.seed, ["switch", "-c", "codex/completed"]);
     let task = fixture.seed.join(SOURCE);
@@ -29,7 +29,19 @@ fn fixture_with_metadata(metadata: bool) -> (GitFixture, PathBuf, PathBuf) {
     std::fs::write(task.join(".gitignore"), "cache/\nnested/\n").unwrap();
     if metadata {
         std::fs::create_dir(task.join("metadata")).unwrap();
-        std::fs::write(task.join("metadata/data.bin.dvc"), "# original pointer formatting\nouts:\n- md5: 00000000000000000000000000000000\n  size: 4\n  hash: md5\n  path: data.bin\n  cloud:\n    workspace-mgr:\n      version_id: original-v1\n      etag: original-etag\n    other:\n      version_id: preserved-other\n").unwrap();
+        let pointer = json!({
+            "schema_version": 1,
+            "path": "data.bin",
+            "kind": "file",
+            "checksum": {"algorithm": "md5", "digest": "00000000000000000000000000000000"},
+            "size": 4,
+            "version": {"id": "original-v1", "etag": "original-etag"}
+        });
+        std::fs::write(
+            task.join("metadata/data.bin.wm-storage.json"),
+            format!(" \n{}\n\n", serde_json::to_string_pretty(&pointer).unwrap()),
+        )
+        .unwrap();
         std::fs::write(task.join(RECEIPT), format!("{{\n \"schema_version\": 1, \"status\": \"copied\", \"task_id\": \"{SOURCE}\",\n \"source\": \"legacy/{SOURCE}\", \"destination\": \"{SOURCE}\", \"versions\": []\n}}\n")).unwrap();
     }
     git(&fixture.seed, ["add", SOURCE]);
@@ -303,7 +315,7 @@ fn cancel_after_rejected_push_restores_tree_and_only_its_retirement_queue() {
     let state = f.shared.join(".workspace-mgr/local/s3-purge.json");
     std::fs::write(&state, json!({"schema_version":1,"pending":[
         {"pointer":format!("{SOURCE}/{RECEIPT}"),"object":format!("{SOURCE}/remote.bin"),"version_id":"old-version"},
-        {"pointer":"other-task/data.dvc","object":"other-task/data","version_id":"other-version"}
+        {"pointer":"other-task/data.wm-storage.json","object":"other-task/data","version_id":"other-version"}
     ]}).to_string()).unwrap();
     invoke(&f.shared, &gh, &manifest, true, false);
     assert!(f.shared.join(SOURCE).is_dir());
@@ -361,10 +373,10 @@ fn cancel_after_rejected_push_restores_tree_and_only_its_retirement_queue() {
 }
 
 #[test]
-fn cancel_restores_exact_previous_receipt_and_rebound_dvc_pointer_bytes() {
+fn cancel_restores_exact_previous_receipt_and_rebound_native_manifest_bytes() {
     let (f, gh, manifest) = fixture_with_metadata(true);
     let source = f.shared.join(SOURCE);
-    let pointer = "metadata/data.bin.dvc";
+    let pointer = "metadata/data.bin.wm-storage.json";
     let before_pointer = std::fs::read(source.join(pointer)).unwrap();
     let before_receipt = std::fs::read(source.join(RECEIPT)).unwrap();
     std::fs::set_permissions(source.join(pointer), std::fs::Permissions::from_mode(0o640)).unwrap();

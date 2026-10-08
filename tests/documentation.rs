@@ -56,7 +56,7 @@ fn user_documentation_routes_global_and_operation_specific_information() {
     }
     for command in [
         "setup",
-        "init",
+        "manage",
         "instructions",
         "doctor",
         "config show",

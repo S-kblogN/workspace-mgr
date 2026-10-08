@@ -19,7 +19,7 @@ same directory in the primary checkout rather than each keeping an independent
 copy, so repository locks still exclude operations across worktrees.
 All mutating repository, placement, publication, hydration, and refresh
 operations share `.workspace-mgr/local/repository.lock`; task locks under
-`state/<hash>/` and storage-boundary locks under `dvc-locks/` add narrower
+`state/<hash>/` and storage-boundary locks under `storage-locks/` add narrower
 diagnostics.
 
 An infrastructure manifest is stored at
@@ -81,15 +81,16 @@ survives rename and is deleted by confirmed discard. A disposable
 objects and is recomputed when missing or unreadable.
 
 Scaffold ownership is structural. In a repository established by
-`.workspace-mgr.toml`, `AGENTS.md`, the root `.gitignore`, `.dvc/config`,
-`.dvc/.gitignore`, and `.dvcignore` have fixed roles: the TOML file is the
-user-editable source of Git/S3 facts, while the other five are whole-file
-generated paths owned by the product and reconciled by `init`. Ownership is
+`.workspace-mgr.toml`, `AGENTS.md`, and the root `.gitignore` have fixed roles:
+the TOML file is the user-editable source of Git/S3 facts; the other two are
+whole-file generated paths reconciled by `manage`. Native storage reads that
+TOML directly and creates no duplicate remote configuration. Ownership is
 structural for all but one: the root `.gitignore` exists in most repositories
 before the product does, so it is claimed by the generated header the product
-writes rather than by its path, and a file without that header is refused with
-the migration into `.workspace-mgr/repository.gitignore` rather than
-reconciled. Git has no include directive, so the root ignore file is generated
+writes rather than by its path. During adoption, `manage` preserves a file
+without that header in `.workspace-mgr/repository.gitignore` and creates the
+generated root file in the same transaction. An incompatible existing module
+refuses adoption. Git has no include directive, so the root ignore file is generated
 rather than merged: it carries the product's fixed rules, imports
 `.workspace-mgr/repository.gitignore` verbatim, and preserves any well-formed
 managed local-only block the file already holds.
@@ -146,8 +147,9 @@ release, a repository declares the oldest compatible release in
   `task discard` check the base tip, `task rename`, `plan`, and `publish` check
   the base tip and the task-branch tip, and `refresh` checks the incoming
   revision before it changes the ref, index, or files. A `task create --dry-run` fetches a missing
-  base commit without moving any ref. `init` round-trips an existing
-  declaration unchanged.
+  base commit without moving any ref. `manage` preserves higher existing
+  declarations and raises the requirement to at least 0.8.0 when adopting
+  native storage.
 - Declarations are plain release versions. An installed release meets one by
   semantic-version precedence, and a pre-release also meets a declaration of
   its own release, so a release candidate can operate on the repositories it
@@ -289,9 +291,9 @@ top level. No merge or synchronization hook invokes it automatically.
 
 Publication measures the full inventory before copying any S3 version. The
 transport copies all payload versions and recreates delete markers, including
-objects absent from current DVC pointers, with a durable private retry journal.
+objects absent from current storage manifests, with a durable private retry journal.
 It preserves literal S3 keys and records original timestamps plus the new exact
-VersionIds and ETags. DVC file and directory entries are rewritten without
+VersionIds and ETags. Storage file and directory entries are rewritten without
 changing their content hashes. The complete receipt remains in Git even when
 large; it is storage control metadata and may not be untracked or placed in S3.
 An identical canonical receipt under the remote's
@@ -369,8 +371,8 @@ history reports `cleanup_pending`; unmapped concurrent additions report
 completion, even when Git publication or synchronization succeeded. A typed
 copied-receipt prefix intent persists even when its original inventory is
 empty; only a published-receipt scan confirming no versions or markers clears
-that intent. Native DVC does not interpret the
-canonical archive mappings, so old revisions use workspace-mgr hydration after
+that intent. Historical revisions use workspace-mgr hydration to interpret the
+canonical archive mappings after
 their original versions have been retired.
 
 Private purge queues and copy journals use schema 2, fencing the released
@@ -384,8 +386,9 @@ workspace-mgr 0.7.0 independently of task schema or S3 inventory size, and the
 managed repository declaration rises before uploads.
 
 The executable, local storage engine, S3 transport, archive registry, and
-history copy/cancel adapters are Rust. DVC-compatible pointer and cache formats
-remain stable; no Python assets are embedded or executed. S3 requests use
+history copy/cancel adapters are Rust. Native storage uses versioned JSON
+manifests and typed Rust operations. Legacy DVC metadata is read only by the
+migration and historical compatibility layer; no Python assets are executed. S3 requests use
 native Signature Version 4 and explicit checksum/conditional headers. The
 production path does not install or invoke Python or DVC.
 
@@ -420,8 +423,8 @@ For a task publication, the CLI:
    holds. The preview's S3 metadata does not yet show output changes that step
    6 commits, so for a task that documents nothing the documentation refusal
    asks the storage engine whether a boundary in the task gained or changed
-   files, and reads metadata that only drops files, adding no line beyond the
-   entries it keeps, as retiring content;
+   files, and recognizes canonical native metadata that only drops unchanged
+   entries as retiring content; the legacy reader retains its line comparison;
 5. measures the task's cloud usage from the preview tree and refuses a
    publication that would exceed the task's limit, unless it only removes
    content apart from at most 1 MiB (1048576 bytes) of new control-file
@@ -520,18 +523,20 @@ records, storage metadata, `.gitignore` files, and the root
 `.workspace-mgr.toml`) with at most 1 MiB (1048576 bytes) of new control-file
 content. Each added or changed control
 file that the remote does not hold yet is charged its full new size, because a
-rewrite stores its new content whatever its size. Storage metadata whose
-entries are a subset of the entries it replaces, with the same object paths and
-versions (or digests where no version is recorded), is charged only the lines it
-does not share with that version, so metadata that only drops entries is free.
+rewrite stores its new content whatever its size. A canonical native directory
+manifest that only removes entries is free when every retained entry preserves
+its path, checksum, physical size and exact version binding. Legacy metadata
+whose object identities are a subset of the identities it replaces is charged
+only for the lines it does not share with that version.
 Each added control file is also charged its path plus 28 bytes, an upper bound
 on the Git tree entries it adds, so new directory names cannot carry content.
 
 Contributors are aggregated per path. Measurement reads Git objects, local
 storage metadata, and one local status pass from the storage engine; it does
 not list or read S3 objects. Parsed metadata is cached per immutable Git blob.
-Directory manifests are read from the local storage cache and, for the
-filesystem test remote, from the remote directory itself.
+Native directory entries are inline in their manifests. Legacy directory
+listings are read from the local storage cache and, for the filesystem test
+remote, from the remote directory itself.
 
 ## Private storage adapter
 

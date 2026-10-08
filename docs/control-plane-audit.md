@@ -99,7 +99,7 @@ repository, credentials, external commands or network state.
 | Current closed PR, scoped grouping, complete S3 copy and cancel | Archive help and archive/cancel reports | Archive command reference and architecture |
 | Manual link/path audit after an actual move | Successful relocation `notices` only | Output schema in command reference |
 | Shared overlays and verified branch-ref cleanup | Refresh help and report | Detailed shared-checkout topic; refresh architecture |
-| Product scaffold, client compatibility and update approval | Setup/init/config/doctor help and relevant diagnostics | Detailed core topic; configuration/reference docs |
+| Product scaffold, client compatibility and update approval | Setup/manage/config/doctor help and relevant diagnostics | Detailed core topic; configuration/reference docs |
 
 The user-owned `.workspace-mgr/instructions/repository.md` is indexed globally,
 with an explicit requirement to read it before task work. `instructions

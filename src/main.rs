@@ -13,12 +13,12 @@ mod command_guidance;
 mod config;
 mod discard;
 mod doctor;
-mod dvc;
 mod error;
 mod git;
 mod guidance;
 mod hex;
 mod instructions;
+mod legacy_dvc;
 mod local_state;
 mod lock;
 mod manifest;
@@ -37,6 +37,10 @@ mod runtime;
 mod s3_purge;
 mod scaffold;
 mod storage;
+mod storage_format;
+mod storage_import;
+mod storage_metadata;
+mod storage_migration;
 mod task_approval;
 mod task_catalog;
 mod task_rename;
@@ -59,7 +63,7 @@ use crate::output::{Format, print_human, print_json};
 use crate::path::repo_path;
 use crate::refresh::{RefreshOptions, execute as refresh};
 use crate::runtime::{SetupOptions, setup};
-use crate::scaffold::{InitOptions, TaskCreateOptions, create_task, init};
+use crate::scaffold::{ManageOptions, TaskCreateOptions, create_task};
 use crate::task_approval::{CloudUsageApprovalOptions, approve as approve_cloud_usage};
 use crate::task_rename::{TaskRenameOptions, rename as rename_task};
 use crate::transaction::{Operation, TransactionOptions, execute as transact, task_status};
@@ -100,13 +104,18 @@ fn run(cli: Cli) -> Result<()> {
             })?,
             cli.format,
         ),
-        Command::Init(args) => {
-            let report = init(&InitOptions {
+        Command::Manage(args) => {
+            let options = ManageOptions {
                 repo: args.repo,
                 s3_url: args.s3_url,
                 s3_endpoint_url: args.s3_endpoint_url,
                 dry_run: args.dry_run,
-            })?;
+            };
+            let report = if args.cancel_migration {
+                storage_migration::cancel(&options)?
+            } else {
+                storage_migration::manage(&options)?
+            };
             emit(&report, cli.format)
         }
         Command::Instructions(args) => {

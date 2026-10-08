@@ -31,7 +31,6 @@ jobs:
       AWS_SECRET_ACCESS_KEY: workspace-mgr-e2e-secret
       AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
-      DVC_NO_ANALYTICS: "true"
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
@@ -45,14 +44,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Install isolated S3 fixture and legacy oracle tools
-        run: python -m pip install --disable-pip-version-check "dvc[s3]==3.67.1"
+      - name: Install isolated S3 fixture client
+        run: python -m pip install --disable-pip-version-check "boto3>=1.40,<2"
       - name: Check external commands
         run: |
           git --version
-          dvc version
-      - name: Test legacy storage compatibility oracles
-        run: python -m unittest discover -s scripts/tests -p 'test_dvc_*.py'
       - name: Start versioned S3-compatible service
         run: |
           # The official container registry no longer serves this release.

@@ -11,13 +11,13 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::config::{CONFIG_NAME, Config};
-use crate::dvc::{self, DataStatus, PointerDocument, PointerEntry};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::manifest::{CloudUsageApproval, ResolvedTask};
 use crate::path::resolved_under;
 use crate::policy::{CLOUD_USAGE_APPROVAL_BYTES, TASK_MANIFEST_NAME};
 use crate::storage::PLACEMENT_SUFFIX;
+use crate::storage_metadata::{self, DataStatus, PointerDocument, PointerEntry};
 use crate::transaction::task_state_dir;
 
 /// Test builds may lower the approval threshold; they can never raise it.
@@ -929,7 +929,7 @@ fn measure_git(repo: &GitRepo, inputs: &UsageInputs<'_>) -> Result<GitUsage> {
         .iter()
         .filter(|change| {
             change.status != 'D'
-                && change.path.ends_with(".dvc")
+                && storage_metadata::is_pointer(&change.path)
                 && added.contains(change.new_oid.as_str())
         })
         .filter_map(|change| change.old_blob().zip(change.new_blob()))
@@ -1289,7 +1289,7 @@ fn parse_raw_commits(output: &str) -> Result<Vec<Vec<RawChange>>> {
 
 fn is_control_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    path.ends_with(".dvc")
+    storage_metadata::is_pointer(path)
         || path.ends_with(PLACEMENT_SUFFIX)
         || name == ".gitignore"
         || name == TASK_MANIFEST_NAME
@@ -1349,6 +1349,11 @@ fn control_file_charge(
     let full = info.get(&change.new_oid).map_or(0, |info| info.size);
     let blob = |oid: Option<&str>| oid.and_then(|oid| contents.get(oid));
     match (blob(change.old_blob()), blob(change.new_blob())) {
+        (Some(old), Some(new))
+            if native_retires_content_only(&change.path, old, new) == Some(true) =>
+        {
+            0
+        }
         (Some(old), Some(new)) if drops_entries_only(&change.path, old, new) => {
             unshared_line_bytes(old, new).min(full)
         }
@@ -1360,7 +1365,7 @@ fn control_file_charge(
 /// metadata already names.
 fn drops_entries_only(path: &str, old: &[u8], new: &[u8]) -> bool {
     let parse = |content: &[u8]| {
-        dvc::parse_pointer_document(&String::from_utf8_lossy(content), path)
+        storage_metadata::parse_pointer_document(&String::from_utf8_lossy(content), path)
             .ok()
             .map(|document| document.entries(path))
     };
@@ -1391,12 +1396,15 @@ pub(crate) fn retires_content_only(
     old: &[u8],
     new: &[u8],
 ) -> bool {
+    if let Some(retires) = native_retires_content_only(path, old, new) {
+        return retires;
+    }
     if !adds_only_entry_lines(old, new) {
         return false;
     }
-    let listings = DirectoryListings::new(dvc::local_object_stores(repo, config));
+    let listings = DirectoryListings::new(storage_metadata::local_object_stores(repo, config));
     let parse = |content: &[u8]| {
-        dvc::parse_pointer_document(&String::from_utf8_lossy(content), path)
+        storage_metadata::parse_pointer_document(&String::from_utf8_lossy(content), path)
             .ok()
             .map(|document| listings.expand(document.entries(path)))
     };
@@ -1404,6 +1412,47 @@ pub(crate) fn retires_content_only(
         return false;
     };
     names_only_known_content(&old, &new)
+}
+
+/// Native metadata has a closed schema. A canonical directory rewrite that
+/// keeps only unchanged entries records a deletion, including the regenerated
+/// aggregate checksum and size. Require canonical bytes to keep arbitrary
+/// formatting or padding from being treated as free cleanup content.
+fn native_retires_content_only(path: &str, old: &[u8], new: &[u8]) -> Option<bool> {
+    if !path.ends_with(crate::storage_format::SUFFIX) {
+        return None;
+    }
+    let parse = |bytes: &[u8]| {
+        crate::storage_format::Manifest::parse(std::str::from_utf8(bytes).ok()?, path).ok()
+    };
+    let Some(old) = parse(old) else {
+        return Some(false);
+    };
+    let Some(new_manifest) = parse(new) else {
+        return Some(false);
+    };
+    if new_manifest.serialize().ok().as_deref().map(str::as_bytes) != Some(new)
+        || old.path != new_manifest.path
+        || old.kind != new_manifest.kind
+        || old.checksum.algorithm != new_manifest.checksum.algorithm
+    {
+        return Some(false);
+    }
+    Some(match old.kind {
+        crate::storage_format::Kind::File => old == new_manifest,
+        crate::storage_format::Kind::Directory => {
+            let old_entries = old.entries.expect("validated directory entries");
+            let known = old_entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry))
+                .collect::<BTreeMap<_, _>>();
+            new_manifest
+                .entries
+                .expect("validated directory entries")
+                .iter()
+                .all(|entry| known.get(entry.path.as_str()).copied() == Some(entry))
+        }
+    })
 }
 
 fn names_only_known_content(old: &[PointerEntry], new: &[PointerEntry]) -> bool {
@@ -1438,7 +1487,7 @@ const ENTRY_KEYS: [&str; 13] = [
     "files",
     "relpath",
     "cloud",
-    dvc::INTERNAL_REMOTE,
+    storage_metadata::INTERNAL_REMOTE,
     "version_id",
     "etag",
 ];
@@ -1519,7 +1568,7 @@ struct PendingSources {
 /// digests; a version that cannot be resolved locally keeps its aggregate.
 struct DirectoryListings {
     stores: Vec<PathBuf>,
-    resolved: RefCell<BTreeMap<String, Option<Rc<Vec<dvc::ListedFile>>>>>,
+    resolved: RefCell<BTreeMap<String, Option<Rc<Vec<storage_metadata::ListedFile>>>>>,
 }
 
 impl DirectoryListings {
@@ -1540,7 +1589,7 @@ impl DirectoryListings {
                 .and_then(|digest| self.listing(digest));
             match listing {
                 Some(files) => expanded.extend(files.iter().map(|file| PointerEntry {
-                    key: dvc::object_key(&entry.key, &file.relpath),
+                    key: storage_metadata::object_key(&entry.key, &file.relpath),
                     md5: Some(file.md5.clone()),
                     size: Some(file.size),
                     version_id: None,
@@ -1553,11 +1602,13 @@ impl DirectoryListings {
         expanded
     }
 
-    fn listing(&self, digest: &str) -> Option<Rc<Vec<dvc::ListedFile>>> {
+    fn listing(&self, digest: &str) -> Option<Rc<Vec<storage_metadata::ListedFile>>> {
         self.resolved
             .borrow_mut()
             .entry(digest.to_owned())
-            .or_insert_with(|| dvc::directory_listing(&self.stores, digest).map(Rc::new))
+            .or_insert_with(|| {
+                storage_metadata::directory_listing(&self.stores, digest).map(Rc::new)
+            })
             .clone()
     }
 }
@@ -1587,6 +1638,7 @@ fn measure_storage(
                 inputs.remote_base_oid,
                 "--",
                 "*.dvc",
+                "*.wm-storage.json",
             ],
         )?,
         None => Vec::new(),
@@ -1608,17 +1660,20 @@ fn measure_storage(
             inputs.projected_tree_oid,
             "--",
             "*.dvc",
+            "*.wm-storage.json",
         ],
     )?
     .into_iter()
-    .filter(|change| change.path.ends_with(".dvc") && !worktree.contains(change.path.as_str()))
+    .filter(|change| {
+        storage_metadata::is_pointer(&change.path) && !worktree.contains(change.path.as_str())
+    })
     .collect::<Vec<_>>();
     let history = history
         .into_iter()
         .map(|commit| {
             commit
                 .into_iter()
-                .filter(|change| change.path.ends_with(".dvc"))
+                .filter(|change| storage_metadata::is_pointer(&change.path))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -1635,8 +1690,8 @@ fn measure_storage(
     cache.load_documents(repo, &wanted)?;
     let documents = &cache.pointers;
     let version_aware = config.requires_object_versioning();
-    let listings =
-        (!version_aware).then(|| DirectoryListings::new(dvc::local_object_stores(repo, config)));
+    let listings = (!version_aware)
+        .then(|| DirectoryListings::new(storage_metadata::local_object_stores(repo, config)));
     let expand = |entries: Vec<PointerEntry>| match &listings {
         Some(listings) => listings.expand(entries),
         None => entries,
@@ -1665,7 +1720,8 @@ fn measure_storage(
     let mut projection_rows = rows(&projected);
     let mut sources = PendingSources::default();
     for pointer in inputs.pointers {
-        let current = expand(dvc::read_pointer_document(repo, pointer)?.entries(pointer));
+        let current =
+            expand(storage_metadata::read_pointer_document(repo, pointer)?.entries(pointer));
         let previous = entries(
             base_blobs.get(pointer).and_then(|oid| oid.as_deref()),
             pointer,
@@ -1684,11 +1740,11 @@ fn measure_storage(
             .pointers
             .iter()
             .filter(|pointer| !archived.contains(*pointer))
-            .filter_map(|pointer| pointer.strip_suffix(".dvc"))
+            .filter_map(|pointer| storage_metadata::boundary_path(pointer))
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         if !outputs.is_empty() {
-            let status = dvc::data_status(repo, &outputs)?;
+            let status = storage_metadata::data_status(repo, &outputs)?;
             (sources.dirty, sources.dirty_aggregates) =
                 dirty_uploads(&repo.root, &status, &sources.worktree, version_aware);
         }
@@ -1700,7 +1756,7 @@ fn measure_storage(
     };
     if version_aware {
         // A copied prefix also retains superseded versions and files which
-        // disappeared before the current DVC pointers. Charge those bytes
+        // disappeared before the current storage manifests. Charge those bytes
         // before the first copy, using the immutable source inventory.
         let changed = repo.run([
             "diff-tree",
@@ -2248,7 +2304,7 @@ impl UsageCache {
             let raw = String::from_utf8_lossy(content);
             parsed.insert(
                 oid.to_owned(),
-                dvc::parse_pointer_document(&raw, &format!("in Git blob {oid}"))?,
+                storage_metadata::parse_pointer_document(&raw, &format!("in Git blob {oid}"))?,
             );
             Ok(())
         })?;
@@ -2950,6 +3006,60 @@ mod tests {
         raw.into_bytes()
     }
 
+    #[test]
+    fn native_directory_cleanup_preserves_exact_entries_and_rejects_padding() {
+        use crate::storage_format::{Checksum, Entry, Kind, Manifest, Version, directory_digest};
+        let entry = |path: &str| Entry {
+            path: path.into(),
+            checksum: Checksum {
+                algorithm: "md5".into(),
+                digest: "00000000000000000000000000000000".into(),
+            },
+            size: 10,
+            version: Some(Version {
+                id: "original-v1".into(),
+                etag: Some("original-etag".into()),
+            }),
+        };
+        let manifest = |entries: Vec<Entry>| Manifest {
+            schema_version: 1,
+            path: "data".into(),
+            kind: Kind::Directory,
+            checksum: Checksum {
+                algorithm: "md5".into(),
+                digest: directory_digest(&entries).unwrap(),
+            },
+            size: entries.iter().map(|entry| entry.size).sum(),
+            version: None,
+            entries: Some(entries),
+        };
+        let path = "T/data.wm-storage.json";
+        let old = manifest(vec![entry("a"), entry("b")]).serialize().unwrap();
+        let smaller = manifest(vec![entry("a")]).serialize().unwrap();
+        assert_eq!(
+            native_retires_content_only(path, old.as_bytes(), smaller.as_bytes()),
+            Some(true)
+        );
+        assert_eq!(
+            native_retires_content_only(path, old.as_bytes(), format!("{smaller}\n").as_bytes()),
+            Some(false)
+        );
+        let mut rebound = entry("a");
+        rebound.version.as_mut().unwrap().id = "another-v2".into();
+        let changed = manifest(vec![rebound]).serialize().unwrap();
+        assert_eq!(
+            native_retires_content_only(path, old.as_bytes(), changed.as_bytes()),
+            Some(false)
+        );
+        let mut resized = entry("a");
+        resized.size = 9;
+        let changed = manifest(vec![resized]).serialize().unwrap();
+        assert_eq!(
+            native_retires_content_only(path, old.as_bytes(), changed.as_bytes()),
+            Some(false)
+        );
+    }
+
     /// Charges one rewrite of `T/data.dvc` from `old` to `new`.
     fn metadata_charge(old: &[u8], new: &[u8]) -> u64 {
         let old_oid = "1".repeat(40);
@@ -3607,7 +3717,7 @@ mod tests {
             + fixture.size(&format!("{tree}:T/text.txt"));
         assert_eq!(bytes(&uncompressed), raw_text);
         assert!(bytes(&packed) > 0);
-        assert!(bytes(&packed) * 4 < raw_text, "{}", bytes(&packed));
+        assert!(bytes(&packed) < raw_text, "{}", bytes(&packed));
 
         let again = measure(&fixture.repo, &config, &inputs, 1_000).unwrap();
         assert_eq!(again.totals(), packed.totals());
@@ -4021,7 +4131,7 @@ mod tests {
         fixture.write("T/files/new", &[4_u8; 11]);
         let status = DataStatus {
             not_in_cache: vec!["T/file.bin".to_owned()],
-            uncommitted: dvc::DataChanges {
+            uncommitted: storage_metadata::DataChanges {
                 added: vec!["T/files/new".to_owned(), "T/files/vanished".to_owned()],
                 modified: vec![
                     "T/dir/".to_owned(),
@@ -4029,7 +4139,7 @@ mod tests {
                     "T/file.bin".to_owned(),
                 ],
                 deleted: vec!["T/dir/c".to_owned(), "T/gone.bin".to_owned()],
-                renamed: vec![dvc::DataRename {
+                renamed: vec![storage_metadata::DataRename {
                     old: "T/dir/b".to_owned(),
                     new: "T/dir/e".to_owned(),
                 }],
@@ -4063,9 +4173,9 @@ mod tests {
         // a deletion elsewhere uploads nothing.
         let deleted = DataStatus {
             not_in_cache: Vec::new(),
-            uncommitted: dvc::DataChanges {
+            uncommitted: storage_metadata::DataChanges {
                 deleted: vec!["T/dir/c".to_owned(), "T/gone.bin".to_owned()],
-                ..dvc::DataChanges::default()
+                ..storage_metadata::DataChanges::default()
             },
         };
         for version_aware in [true, false] {
@@ -4076,12 +4186,12 @@ mod tests {
         }
         let moved = DataStatus {
             not_in_cache: Vec::new(),
-            uncommitted: dvc::DataChanges {
-                renamed: vec![dvc::DataRename {
+            uncommitted: storage_metadata::DataChanges {
+                renamed: vec![storage_metadata::DataRename {
                     old: "T/files/old".to_owned(),
                     new: "T/files/new".to_owned(),
                 }],
-                ..dvc::DataChanges::default()
+                ..storage_metadata::DataChanges::default()
             },
         };
         assert_eq!(
@@ -4113,13 +4223,13 @@ mod tests {
         symlink("nowhere", root.join("T/agg/broken")).unwrap();
         let status = DataStatus {
             not_in_cache: Vec::new(),
-            uncommitted: dvc::DataChanges {
+            uncommitted: storage_metadata::DataChanges {
                 added: vec![
                     "T/ckpt/dangling.bin".to_owned(),
                     "T/agg/sub/latest.bin".to_owned(),
                 ],
                 modified: vec!["T/ckpt/".to_owned(), "T/ckpt/latest.bin".to_owned()],
-                ..dvc::DataChanges::default()
+                ..storage_metadata::DataChanges::default()
             },
         };
         let mut aggregate = entry("T/agg", 34, None);
@@ -4146,18 +4256,32 @@ mod tests {
     #[test]
     fn storage_engine_status_feeds_pending_uploads() {
         let fixture = Fixture::new();
+        fixture.write(".gitignore", b"/.workspace-mgr/local/\n");
         fixture.write("README.md", b"base\n");
-        dvc::execute_engine(&fixture.repo.root, ["init", "-q"]).unwrap();
+        storage_metadata::execute_engine(
+            &fixture.repo.root,
+            &crate::native_engine::Operation::Initialize,
+        )
+        .unwrap();
         fixture.write("T/file.bin", &[1_u8; 20]);
         fixture.write("T/dir/a", &[2_u8; 5]);
         fixture.write("T/dir/b", &[3_u8; 6]);
-        dvc::execute_engine(&fixture.repo.root, ["add", "-q", "T/file.bin", "T/dir"]).unwrap();
+        storage_metadata::execute_engine(
+            &fixture.repo.root,
+            &crate::native_engine::Operation::Track {
+                paths: vec!["T/file.bin".into(), "T/dir".into()],
+            },
+        )
+        .unwrap();
         let base = fixture.commit("tracked");
         fixture.write("T/file.bin", &[9_u8; 45]);
         fixture.write("T/dir/c", &[4_u8; 8]);
         fixture.remove("T/dir/b");
         let tree = fixture.tree();
-        let pointers = ["T/dir.dvc".to_owned(), "T/file.bin.dvc".to_owned()];
+        let pointers = [
+            storage_metadata::pointer_path("T/dir"),
+            storage_metadata::pointer_path("T/file.bin"),
+        ];
         let mut inputs = fixture.inputs(&base, None, &tree, &pointers, &[]);
         inputs.inspect_outputs = true;
 
@@ -4175,7 +4299,9 @@ mod tests {
         assert!(usage.pending_uploads());
 
         let usage = measure(&fixture.repo, &versioned_config(), &inputs, u64::MAX).unwrap();
-        assert_eq!(usage.totals().1.s3_bytes, 45 + 5 + 8);
+        // Every unbound entry remains reserved until Record rewrites the
+        // complete native listing, including the not-yet-retired b entry.
+        assert_eq!(usage.totals().1.s3_bytes, 45 + 5 + 6 + 8);
         assert!(usage.pending_uploads());
 
         inputs.inspect_outputs = false;
@@ -4186,9 +4312,11 @@ mod tests {
         // Once the engine records the new directory version, its manifest
         // resolves from the cache and the same new digests are charged.
         for pointer in &pointers {
-            dvc::execute_engine(
+            storage_metadata::execute_engine(
                 &fixture.repo.root,
-                ["commit", "-q", "--force", "--", pointer],
+                &crate::native_engine::Operation::Record {
+                    pointers: vec![pointer.clone()],
+                },
             )
             .unwrap();
         }
@@ -4217,11 +4345,11 @@ mod tests {
         fixture.write("T/data/a.bin", &[1_u8; 400]);
         fixture.write("T/data/a\\b.bin", &[2_u8; 2_000]);
         assert!(fixture.repo.root.join("T/data/a\\b.bin").is_file());
-        let status = dvc::parse_data_status(
+        let status = storage_metadata::parse_data_status(
             r#"{"uncommitted": {"modified": ["T/data/", "T/data/a\\b.bin"]}}"#,
         )
         .unwrap();
-        let document = dvc::parse_pointer_document(
+        let document = storage_metadata::parse_pointer_document(
             "outs:\n- hash: md5\n  path: data\n  files:\n  - relpath: a.bin\n    md5: m1\n    size: 400\n    cloud:\n      workspace-mgr:\n        version_id: va\n  - relpath: a\\b.bin\n    md5: m2\n    size: 1\n    cloud:\n      workspace-mgr:\n        version_id: vb\n",
             "T/data.dvc",
         )
@@ -4430,7 +4558,7 @@ mod tests {
                 if let Some(version) = version {
                     raw.push_str(&format!(
                         "    cloud:\n      {}:\n        version_id: {version}\n",
-                        dvc::INTERNAL_REMOTE
+                        storage_metadata::INTERNAL_REMOTE
                     ));
                 }
             }

@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::config::{Config, StorageTarget};
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::manifest::{ResolvedTask, one_line, published_history_path, published_task_paths};
 use crate::path::{allowed, reject_symlink_traversal, relative_to, repo_path, resolved_under};
 use crate::policy::{AUTO_S3_ABOVE_BYTES, RECOMMENDED_S3_MINIMUM_BYTES, TASK_MANIFEST_NAME};
+use crate::storage_metadata;
 
 pub const PLACEMENT_SUFFIX: &str = ".workspace-mgr-storage.toml";
 /// The markers around the ignore rule `untrack` writes for a local-only path.
@@ -164,7 +164,11 @@ pub fn set(
     if target == StorageTarget::S3 {
         for path in &paths {
             reject_symlink_traversal(&repo.root, path, "S3 storage path")?;
-            dvc::require_addressable(path, "S3 storage path", "rename it before placing it in S3")?;
+            storage_metadata::require_addressable(
+                path,
+                "S3 storage path",
+                "rename it before placing it in S3",
+            )?;
         }
     }
     if !dry_run {
@@ -174,7 +178,7 @@ pub fn set(
                 if local.contains(path) {
                     update_local_ignore(repo, path, false)?;
                     // A restored old pointer must not bypass creation of fresh
-                    // storage metadata and DVC ignore rules when re-tracking.
+                    // storage metadata and payload ignore rules when re-tracking.
                     apply_target(repo, config, path, StorageTarget::Git)?;
                 }
                 apply_target(repo, config, path, target)?;
@@ -292,7 +296,7 @@ pub fn untrack(
                 };
                 apply_target(repo, config, path, StorageTarget::Local)?;
                 if let Some((ignore, contents)) = retained_ignore {
-                    // DVC remove may strip its former output pattern from our
+                    // Storage untracking may strip its former output pattern from our
                     // managed block. Once local, these rules belong to us.
                     atomic_write_bytes(&resolved_under(&repo.root, &ignore), &contents)?;
                 }
@@ -473,7 +477,7 @@ pub fn move_path(
         let snapshot = MetadataSnapshot::capture(repo, &[old_path.clone(), new_path.clone()])?;
         let result = (|| {
             if pointer_path(repo, &old_path).is_file() {
-                dvc::management(
+                storage_metadata::management(
                     repo,
                     config,
                     "move",
@@ -573,7 +577,7 @@ pub fn remove_paths(
             }
             let pointer = pointer_path(repo, path);
             if pointer.is_file() {
-                dvc::management(
+                storage_metadata::management(
                     repo,
                     config,
                     "untrack",
@@ -610,13 +614,13 @@ pub fn hydrate(
     scopes: &[String],
     paths: &[String],
     dry_run: bool,
-) -> Result<dvc::HydrateReport> {
+) -> Result<storage_metadata::HydrateReport> {
     let pointers = if paths.is_empty() {
         Vec::new()
     } else {
         let paths = validate_targets(repo, scopes, paths, false)?;
-        let discovered = dvc::discover(repo, scopes)?;
-        let outputs = dvc::output_paths(repo, &discovered)?;
+        let discovered = storage_metadata::discover(repo, scopes)?;
+        let outputs = storage_metadata::output_paths(repo, &discovered)?;
         let mut selected = BTreeSet::new();
         for path in paths {
             for (pointer, values) in &outputs {
@@ -637,7 +641,7 @@ pub fn hydrate(
         }
         selected.into_iter().collect()
     };
-    dvc::hydrate(repo, config, scopes, &pointers, dry_run)
+    storage_metadata::hydrate(repo, config, scopes, &pointers, dry_run)
 }
 
 pub fn apply_automatic(
@@ -659,7 +663,7 @@ pub fn apply_automatic(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        if path.ends_with(".dvc")
+        if storage_metadata::is_pointer(&path)
             || path.ends_with(PLACEMENT_SUFFIX)
             || path.ends_with(&format!("/{}", crate::archive_migration::RECEIPT_NAME))
             || path.ends_with(&format!("/{}", crate::archive_adoption::LEGACY_RECORD))
@@ -694,7 +698,7 @@ pub fn apply_automatic(
                     "automatic policy selected S3 for {path:?}, but [s3] is not configured; configure S3 or run `workspace-mgr storage set {path} --to git --reason <reason>`"
                 )));
             }
-            dvc::require_addressable(
+            storage_metadata::require_addressable(
                 &path,
                 "automatic S3 placement path",
                 &format!(
@@ -708,7 +712,8 @@ pub fn apply_automatic(
     candidates.dedup();
     if !dry_run && !candidates.is_empty() {
         let snapshot = MetadataSnapshot::capture(repo, &candidates)?;
-        if let Err(error) = dvc::management(repo, config, "track", &candidates, false) {
+        if let Err(error) = storage_metadata::management(repo, config, "track", &candidates, false)
+        {
             return Err(rollback_error(error, snapshot.restore()));
         }
     }
@@ -808,7 +813,7 @@ fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarg
     let pointer = pointer_path(repo, path);
     match target {
         StorageTarget::Git | StorageTarget::Local if pointer.is_file() => {
-            dvc::management(
+            storage_metadata::management(
                 repo,
                 config,
                 "untrack",
@@ -817,7 +822,7 @@ fn apply_target(repo: &GitRepo, config: &Config, path: &str, target: StorageTarg
             )?;
         }
         StorageTarget::S3 if !pointer.is_file() => {
-            dvc::management(repo, config, "track", &[path.to_owned()], false)?;
+            storage_metadata::management(repo, config, "track", &[path.to_owned()], false)?;
         }
         _ => {}
     }
@@ -858,13 +863,17 @@ fn automatic_target_after_reset(
 ) -> Result<(StorageTarget, PlacementBasis)> {
     if let Some(history) = history {
         let history_path = history.object_path(path);
-        if repo
-            .run_unchecked([
-                "cat-file",
-                "-e",
-                &format!("{}:{history_path}.dvc", history.oid),
-            ])?
-            .success()
+        if [
+            storage_metadata::pointer_path(&history_path),
+            format!("{history_path}.dvc"),
+        ]
+        .iter()
+        .map(|pointer| {
+            repo.run_unchecked(["cat-file", "-e", &format!("{}:{pointer}", history.oid)])
+        })
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|output| output.success())
         {
             return Ok((StorageTarget::S3, PlacementBasis::PublishedHistory));
         }
@@ -899,13 +908,17 @@ fn placement_status(
     }
     if let Some(history) = history {
         let history_path = history.object_path(path);
-        if repo
-            .run_unchecked([
-                "cat-file",
-                "-e",
-                &format!("{}:{history_path}.dvc", history.oid),
-            ])?
-            .success()
+        if [
+            storage_metadata::pointer_path(&history_path),
+            format!("{history_path}.dvc"),
+        ]
+        .iter()
+        .map(|pointer| {
+            repo.run_unchecked(["cat-file", "-e", &format!("{}:{pointer}", history.oid)])
+        })
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|output| output.success())
         {
             return placement_report(
                 repo,
@@ -1277,8 +1290,8 @@ fn resolve_status_paths(
     }
     let mut found = BTreeSet::new();
     let mut boundaries = BTreeSet::new();
-    for pointer in dvc::discover(repo, scopes)? {
-        for output in dvc::output_paths(repo, std::slice::from_ref(&pointer))?
+    for pointer in storage_metadata::discover(repo, scopes)? {
+        for output in storage_metadata::output_paths(repo, std::slice::from_ref(&pointer))?
             .remove(&pointer)
             .unwrap_or_default()
         {
@@ -1302,7 +1315,7 @@ fn resolve_status_paths(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        if path.ends_with(".dvc") || path.ends_with(PLACEMENT_SUFFIX) {
+        if storage_metadata::is_pointer(&path) || path.ends_with(PLACEMENT_SUFFIX) {
             continue;
         }
         if boundaries
@@ -1391,9 +1404,9 @@ fn validate_boundary_targets(repo: &GitRepo, scopes: &[String], paths: &[String]
 
 fn known_boundaries(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String>> {
     let mut boundaries = BTreeSet::new();
-    for pointer in dvc::discover(repo, scopes)? {
+    for pointer in storage_metadata::discover(repo, scopes)? {
         boundaries.extend(
-            dvc::output_paths(repo, std::slice::from_ref(&pointer))?
+            storage_metadata::output_paths(repo, std::slice::from_ref(&pointer))?
                 .remove(&pointer)
                 .unwrap_or_default(),
         );
@@ -1416,7 +1429,15 @@ fn is_descendant(path: &str, ancestor: &str) -> bool {
 }
 
 fn pointer_path(repo: &GitRepo, path: &str) -> std::path::PathBuf {
-    resolved_under(&repo.root, &format!("{path}.dvc"))
+    {
+        let native = resolved_under(&repo.root, &storage_metadata::pointer_path(path));
+        let legacy = resolved_under(&repo.root, &format!("{path}.dvc"));
+        if !native.exists() && legacy.is_file() {
+            legacy
+        } else {
+            native
+        }
+    }
 }
 
 fn sidecar_path(repo: &GitRepo, path: &str) -> std::path::PathBuf {
@@ -1463,7 +1484,7 @@ fn reject_control_path(repo: &GitRepo, path: &str) -> Result<()> {
         || name == crate::archive_adoption::LEGACY_RECORD
         || name == crate::config::CONFIG_NAME
         || name.ends_with(PLACEMENT_SUFFIX)
-        || name.ends_with(".dvc")
+        || storage_metadata::is_pointer(name)
         || path.split('/').any(|part| part == ".git" || part == ".dvc")
     {
         return Err(Error::message(format!(
@@ -1493,7 +1514,7 @@ fn validate_local_metadata_scope(
         }
         for metadata in [
             format!("{path}{PLACEMENT_SUFFIX}"),
-            format!("{path}.dvc"),
+            storage_metadata::pointer_path(path),
             local_ignore_path(path)?,
         ] {
             if !allowed(&metadata, scopes) {
@@ -1799,8 +1820,8 @@ impl MetadataSnapshot {
 /// Brings the payload of a boundary whose metadata is present but whose
 /// payload is not into the local cache, through that metadata.
 fn fetch_unmaterialized_source(repo: &GitRepo, config: &Config, boundary: &str) -> Result<()> {
-    dvc::ensure_ready(repo, config)?;
-    dvc::fetch(repo, config, &[format!("{boundary}.dvc")]).map_err(
+    storage_metadata::ensure_ready(repo, config)?;
+    storage_metadata::fetch(repo, config, &[storage_metadata::pointer_path(boundary)]).map_err(
         |error| {
             Error::message(format!(
                 "move could not fetch the payload of {boundary}, which is not materialized here, so it left the boundary unchanged: {error}"
@@ -1814,9 +1835,14 @@ fn fetch_unmaterialized_source(repo: &GitRepo, config: &Config, boundary: &str) 
 /// `fetch_unmaterialized_source` placed its payload, and confirms the result
 /// matches the renamed metadata.
 fn materialize_moved_destination(repo: &GitRepo, boundary: &str) -> Result<()> {
-    let pointer = format!("{boundary}.dvc");
-    dvc::execute_engine(&repo.root, ["checkout", "--", &pointer])?;
-    let clean = dvc::status(repo, &pointer)?
+    let pointer = storage_metadata::pointer_path(boundary);
+    storage_metadata::execute_engine(
+        &repo.root,
+        &crate::native_engine::Operation::Materialize {
+            pointers: vec![pointer.clone()],
+        },
+    )?;
+    let clean = storage_metadata::status(repo, &pointer)?
         .as_object()
         .is_some_and(serde_json::Map::is_empty);
     if !clean {

@@ -12,10 +12,12 @@ use std::time::Duration;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use md5::Md5;
 use quick_xml::{Reader, events::Event};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
@@ -24,6 +26,111 @@ const MAX_LIST_PAGES: usize = 100_000;
 const XML_LIMIT: u64 = 64 * 1024 * 1024;
 const MEMORY_GET_LIMIT: u64 = 64 * 1024 * 1024;
 const INTERRUPTED_READ_RETRIES: usize = 2;
+
+pub(crate) const CREDENTIALS_NAME: &str = ".workspace-mgr/local/credentials.toml";
+
+/// Machine-local authentication settings. Repository location and endpoint
+/// are deliberately absent: the tracked repository config owns routing.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CredentialsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_process: Option<String>,
+}
+
+impl CredentialsConfig {
+    pub(crate) fn from_legacy_settings(settings: &BTreeMap<String, String>) -> Result<Self> {
+        let value = Self {
+            access_key_id: settings.get("access_key_id").cloned(),
+            secret_access_key: settings.get("secret_access_key").cloned(),
+            session_token: settings.get("session_token").cloned(),
+            profile: settings.get("profile").cloned(),
+            region: settings.get("region").cloned(),
+            credential_process: settings.get("credential_process").cloned(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn render(&self) -> Result<String> {
+        self.validate()?;
+        toml::to_string_pretty(self)
+            .map_err(|_| Error::message("cannot render local S3 credentials configuration"))
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("access_key_id", &self.access_key_id),
+            ("secret_access_key", &self.secret_access_key),
+            ("session_token", &self.session_token),
+            ("profile", &self.profile),
+            ("region", &self.region),
+            ("credential_process", &self.credential_process),
+        ] {
+            if value
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.contains(['\n', '\r']))
+            {
+                return Err(Error::message(format!(
+                    "local S3 credentials field {field} must be a non-empty single-line string"
+                )));
+            }
+        }
+        if self.access_key_id.is_some() != self.secret_access_key.is_some() {
+            return Err(Error::message(
+                "local S3 credentials are incomplete: access_key_id and secret_access_key must be configured together",
+            ));
+        }
+        if self.session_token.is_some() && self.access_key_id.is_none() {
+            return Err(Error::message(
+                "local S3 session_token requires access_key_id and secret_access_key",
+            ));
+        }
+        Ok(())
+    }
+
+    fn settings(&self) -> BTreeMap<String, String> {
+        [
+            ("access_key_id", &self.access_key_id),
+            ("secret_access_key", &self.secret_access_key),
+            ("session_token", &self.session_token),
+            ("profile", &self.profile),
+            ("region", &self.region),
+            ("credential_process", &self.credential_process),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.clone().map(|value| (key.to_owned(), value)))
+        .collect()
+    }
+}
+
+pub(crate) fn credentials_path(repo: &GitRepo) -> Result<PathBuf> {
+    let directory = crate::local_state::directory_unmigrated(repo)?;
+    crate::path::reject_symlink_traversal(&directory, "credentials.toml", "local S3 credentials")?;
+    Ok(directory.join("credentials.toml"))
+}
+
+pub(crate) fn load_credentials_config(repo: &GitRepo) -> Result<CredentialsConfig> {
+    let path = credentials_path(repo)?;
+    let raw = read_optional(&path)?;
+    let config: CredentialsConfig = toml::from_str(&raw).map_err(|_| {
+        Error::message(format!(
+            "invalid local S3 credentials configuration: {CREDENTIALS_NAME}; use flat TOML string fields access_key_id, secret_access_key, session_token, profile, region or credential_process"
+        ))
+    })?;
+    config.validate()?;
+    Ok(config)
+}
 
 #[derive(Clone)]
 struct Credentials {
@@ -133,11 +240,114 @@ struct RequestPlan {
 type S3Result<T> = std::result::Result<T, S3Error>;
 
 impl S3Client {
+    pub(crate) fn cache_route(repo: &GitRepo) -> Result<Option<(String, Option<String>)>> {
+        match fs::symlink_metadata(Config::path(repo)) {
+            Ok(_) => Ok(Config::load_compatible(repo)?
+                .s3
+                .map(|s3| (s3.url, s3.endpoint_url))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(legacy_s3_configuration(&repo.root)?.map(|(url, endpoint, _)| (url, endpoint)))
+            }
+            Err(source) => Err(Error::Io {
+                path: Config::path(repo),
+                source,
+            }),
+        }
+    }
+
+    pub(crate) fn historical_cas_from_repo(repo: &GitRepo) -> Result<Option<Self>> {
+        crate::path::reject_symlink_traversal(
+            &repo.root,
+            ".dvc/config",
+            "legacy CAS configuration",
+        )?;
+        let raw = read_optional(&repo.root.join(".dvc/config"))?;
+        if !crate::legacy_dvc::is_content_addressed_checkout(repo)? {
+            return Ok(None);
+        }
+        let remote = ini_section(&raw, "core")["remote"].clone();
+        let settings = legacy_remote_settings(&repo.root, &remote)?;
+        let legacy_credentials = CredentialsConfig::from_legacy_settings(&settings)?;
+        let (url, endpoint) = match fs::symlink_metadata(Config::path(repo)) {
+            Ok(_) => {
+                let s3 = Config::load_compatible(repo)?.s3.ok_or_else(|| {
+                    Error::message("historical repository configuration does not enable S3")
+                })?;
+                (s3.url, s3.endpoint_url)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                settings.get("url").cloned().ok_or_else(|| {
+                    Error::message("historical CAS remote has no public or legacy route")
+                })?,
+                settings.get("endpointurl").cloned(),
+            ),
+            Err(source) => {
+                return Err(Error::Io {
+                    path: Config::path(repo),
+                    source,
+                });
+            }
+        };
+        let path = credentials_path(repo)?;
+        let credentials = match fs::symlink_metadata(&path) {
+            Ok(_) => load_credentials_config(repo)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_credentials,
+            Err(source) => return Err(Error::Io { path, source }),
+        };
+        Self::from_location(&url, endpoint.as_deref(), &credentials).map(Some)
+    }
+
     pub fn from_repo(repo: &GitRepo) -> Result<Self> {
-        let (location, configured_endpoint) = crate::dvc::internal_location(repo)?
-            .ok_or_else(|| Error::message("managed storage has no internal S3 configuration"))?;
-        let (bucket, prefix) = storage_location(&location)?;
-        let remote = remote_settings(&repo.root)?;
+        let (location, configured_endpoint, credentials_config) =
+            match fs::symlink_metadata(Config::path(repo)) {
+                Ok(_) => {
+                    let config = Config::load_compatible(repo)?;
+                    let s3 = config.s3.ok_or_else(|| {
+                        Error::message("managed S3 is not configured in .workspace-mgr.toml")
+                    })?;
+                    (s3.url, s3.endpoint_url, load_credentials_config(repo)?)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Historical checkouts predating native repository metadata
+                    // retain their original remote definition for exact reads.
+                    let (location, endpoint, legacy_credentials) =
+                        legacy_s3_configuration(&repo.root)?.ok_or_else(|| {
+                            Error::message("managed S3 has no repository configuration")
+                        })?;
+                    // Authentication is machine-local state. A migrated
+                    // primary checkout owns it for all historical worktrees.
+                    let path = credentials_path(repo)?;
+                    let credentials = match fs::symlink_metadata(&path) {
+                        Ok(_) => load_credentials_config(repo)?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            legacy_credentials
+                        }
+                        Err(source) => return Err(Error::Io { path, source }),
+                    };
+                    (location, endpoint, credentials)
+                }
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: Config::path(repo),
+                        source,
+                    });
+                }
+            };
+        Self::from_location(
+            &location,
+            configured_endpoint.as_deref(),
+            &credentials_config,
+        )
+    }
+
+    pub(crate) fn from_location(
+        location: &str,
+        configured_endpoint: Option<&str>,
+        credentials_config: &CredentialsConfig,
+    ) -> Result<Self> {
+        credentials_config.validate()?;
+        let (bucket, prefix) = storage_location(location)?;
+        let remote = credentials_config.settings();
         let profile = remote
             .get("profile")
             .cloned()
@@ -145,10 +355,7 @@ impl S3Client {
             .or_else(|| env_nonempty("AWS_DEFAULT_PROFILE"))
             .unwrap_or_else(|| "default".to_owned());
         let (config, saved) = profile_settings(&profile)?;
-        let endpoint = configured_endpoint
-            .or_else(|| env_nonempty("AWS_ENDPOINT_URL_S3"))
-            .or_else(|| env_nonempty("AWS_ENDPOINT_URL"))
-            .or_else(|| remote.get("endpointurl").cloned());
+        let endpoint = configured_endpoint.map(str::to_owned);
         let inferred_region = endpoint.as_deref().and_then(b2_region);
         let region = env_nonempty("AWS_REGION")
             .or_else(|| env_nonempty("AWS_DEFAULT_REGION"))
@@ -1346,8 +1553,8 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 fn storage_location(location: &str) -> Result<(String, String)> {
-    // DVC/fsspec keeps percent escapes and Unicode literally. HTTP URL
-    // parsing would decode or rewrite its logical object prefix.
+    // S3 object keys keep percent escapes and Unicode literally. HTTP URL
+    // parsing would decode or rewrite the logical object prefix.
     let raw = location
         .strip_prefix("s3://")
         .ok_or_else(|| Error::message("managed storage must use s3://bucket/prefix"))?;
@@ -1397,6 +1604,74 @@ fn ini_section(raw: &str, section: &str) -> BTreeMap<String, String> {
     found
 }
 
+#[cfg(test)]
+fn is_legacy_cas_configuration(raw: &str) -> bool {
+    is_legacy_cas_configuration_with_public_route(raw, false)
+}
+
+pub(crate) fn is_legacy_cas_configuration_with_public_route(raw: &str, public_route: bool) -> bool {
+    let strict_section = |section: &str| -> Option<BTreeMap<String, String>> {
+        let mut fields = BTreeMap::new();
+        let mut active = false;
+        let mut seen = false;
+        for line in raw.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with(['#', ';']) {
+                continue;
+            }
+            if line.starts_with('[') {
+                let name = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+                let name = if name.len() >= 2
+                    && ((name.starts_with('\'') && name.ends_with('\''))
+                        || (name.starts_with('"') && name.ends_with('"')))
+                {
+                    &name[1..name.len() - 1]
+                } else {
+                    name
+                };
+                active = name == section;
+                if active {
+                    if seen {
+                        return None;
+                    }
+                    seen = true;
+                }
+            } else if active {
+                let (key, value) = line.split_once('=')?;
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if key.is_empty()
+                    || (value.starts_with('"') != value.ends_with('"'))
+                    || fields
+                        .insert(key, value.trim_matches('"').to_owned())
+                        .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        seen.then_some(fields)
+    };
+    let Some(core) = strict_section("core") else {
+        return false;
+    };
+    let Some(remote) = core
+        .get("remote")
+        .filter(|remote| !remote.trim().is_empty())
+    else {
+        return false;
+    };
+    let Some(settings) = strict_section(&format!("remote \"{remote}\"")) else {
+        return false;
+    };
+    (public_route
+        || settings
+            .get("url")
+            .is_some_and(|url| storage_location(url).is_ok()))
+        && settings
+            .get("version_aware")
+            .is_none_or(|value| value.eq_ignore_ascii_case("false"))
+}
+
 fn read_optional(path: &Path) -> Result<String> {
     match fs::read_to_string(path) {
         Ok(raw) => Ok(raw),
@@ -1408,16 +1683,42 @@ fn read_optional(path: &Path) -> Result<String> {
     }
 }
 
-fn remote_settings(root: &Path) -> Result<BTreeMap<String, String>> {
+/// Legacy source reader used only by repository import and old historical
+/// checkouts. Native repositories never consult these files.
+pub(crate) fn legacy_remote_settings(
+    root: &Path,
+    remote_name: &str,
+) -> Result<BTreeMap<String, String>> {
     let mut settings = BTreeMap::new();
     for file in [".dvc/config", ".dvc/config.local"] {
-        crate::path::reject_symlink_traversal(root, file, "managed-storage configuration")?;
+        crate::path::reject_symlink_traversal(root, file, "legacy storage configuration")?;
         settings.extend(ini_section(
             &read_optional(&root.join(file))?,
-            "remote \"workspace-mgr\"",
+            &format!("remote \"{remote_name}\""),
         ));
     }
     Ok(settings)
+}
+
+pub(crate) fn legacy_s3_configuration(
+    root: &Path,
+) -> Result<Option<(String, Option<String>, CredentialsConfig)>> {
+    let mut core = BTreeMap::new();
+    for file in [".dvc/config", ".dvc/config.local"] {
+        crate::path::reject_symlink_traversal(root, file, "legacy storage configuration")?;
+        core.extend(ini_section(&read_optional(&root.join(file))?, "core"));
+    }
+    let remote_name = core
+        .get("remote")
+        .map(String::as_str)
+        .unwrap_or("workspace-mgr");
+    let settings = legacy_remote_settings(root, remote_name)?;
+    let Some(location) = settings.get("url").cloned() else {
+        return Ok(None);
+    };
+    let endpoint = settings.get("endpointurl").cloned();
+    let credentials = CredentialsConfig::from_legacy_settings(&settings)?;
+    Ok(Some((location, endpoint, credentials)))
 }
 
 fn profile_settings(profile: &str) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
@@ -1453,7 +1754,7 @@ fn resolve_credentials(
             remote.get("access_key_id").cloned(),
             remote.get("secret_access_key").cloned(),
             remote.get("session_token").cloned(),
-            "managed-storage remote",
+            "local S3 credentials",
         );
     }
     if env_nonempty("AWS_ACCESS_KEY_ID").is_some()
@@ -1465,6 +1766,9 @@ fn resolve_credentials(
             env_nonempty("AWS_SESSION_TOKEN").or_else(|| env_nonempty("AWS_SECURITY_TOKEN")),
             "AWS environment",
         );
+    }
+    if let Some(command) = remote.get("credential_process") {
+        return process_credentials(command);
     }
     let mut profile = config.clone();
     profile.extend(saved.clone());
@@ -1494,7 +1798,7 @@ fn resolve_credentials(
         return process_credentials(command);
     }
     Err(Error::message(
-        "S3 credentials are unavailable; configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN for temporary credentials), an AWS_PROFILE with shared credentials, or the managed-storage remote's local credentials",
+        "S3 credentials are unavailable; configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN for temporary credentials), an AWS_PROFILE with shared credentials, or .workspace-mgr/local/credentials.toml",
     ))
 }
 
@@ -1617,6 +1921,37 @@ fn credentials_from(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn historical_cas_layout_requires_unambiguous_valid_remote_configuration() {
+        let raw = "[core]\nremote = archive\n['remote \"archive\"']\nurl = s3://fixture/cas\nversion_aware = false\n";
+        assert!(is_legacy_cas_configuration(raw));
+        assert!(is_legacy_cas_configuration(
+            &raw.replace("version_aware = false\n", "")
+        ));
+        let layout_only = raw.replace("url = s3://fixture/cas\n", "");
+        assert!(!is_legacy_cas_configuration(&layout_only));
+        assert!(is_legacy_cas_configuration_with_public_route(
+            &layout_only,
+            true
+        ));
+        assert!(!is_legacy_cas_configuration_with_public_route(
+            "[core]\nremote = archive\n",
+            true
+        ));
+        for malformed in [
+            raw.replace("false", "true"),
+            raw.replace("false", "perhaps"),
+            raw.replace("remote = archive", "remote = archive\nremote = other"),
+            format!("{raw}version_aware = true\n"),
+            format!("{raw}url = s3://other/cas\n"),
+            format!("{raw}['remote \"archive\"']\nversion_aware = false\n"),
+            raw.replace("s3://fixture/cas", "../filesystem"),
+            raw.replace("[core]\nremote = archive\n", ""),
+        ] {
+            assert!(!is_legacy_cas_configuration(&malformed));
+        }
+    }
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
@@ -1851,7 +2186,11 @@ pub(crate) mod tests {
         let server_stop = stop.clone();
         let worker = thread::spawn(move || {
             let mut attempts = Vec::new();
-            let mut deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // Clients can parse large JSON bodies between requests while other
+            // tests occupy the runner. Keep a bounded idle deadline without
+            // counting that CPU work as a failed request.
+            let idle_timeout = Duration::from_secs(60);
+            let mut deadline = std::time::Instant::now() + idle_timeout;
             while !server_stop.load(Ordering::SeqCst) {
                 let (mut connection, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -1865,7 +2204,7 @@ pub(crate) mod tests {
                     }
                     Err(error) => panic!("mock accept: {error}"),
                 };
-                deadline = std::time::Instant::now() + Duration::from_secs(10);
+                deadline = std::time::Instant::now() + idle_timeout;
                 connection.set_nonblocking(false).unwrap();
                 connection
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1921,7 +2260,7 @@ pub(crate) mod tests {
                 });
                 // The idle-request deadline must not include a large response's
                 // transmission time on a slower CI runner.
-                deadline = std::time::Instant::now() + Duration::from_secs(10);
+                deadline = std::time::Instant::now() + idle_timeout;
             }
             attempts
         });
@@ -1952,9 +2291,21 @@ pub(crate) mod tests {
         .unwrap()
     }
     pub(crate) fn configure_repo(client: &S3Client, repo: &GitRepo) {
-        fs::create_dir_all(repo.root.join(".dvc")).unwrap();
-        fs::write(repo.root.join(".dvc/config"),format!("[core]\nremote = workspace-mgr\n['remote \"workspace-mgr\"']\nurl = s3://{}/{}\nendpointurl = {}\nversion_aware = true\nregion = us-east-1\n",client.bucket,client.prefix,client.endpoint)).unwrap();
-        fs::write(repo.root.join(".dvc/config.local"),"['remote \"workspace-mgr\"']\naccess_key_id = fixture-test-only\nsecret_access_key = fixture-test-only-secret\n").unwrap();
+        if !repo.root.join(".git").exists() {
+            repo.run(["init", "-q", "-b", "main"]).unwrap();
+        }
+        let mut config = if Config::path(repo).exists() {
+            Config::load(repo).unwrap()
+        } else {
+            Config::default()
+        };
+        config.s3 = Some(crate::config::S3Config {
+            url: format!("s3://{}/{}", client.bucket, client.prefix),
+            endpoint_url: Some(client.endpoint.clone()),
+        });
+        fs::write(Config::path(repo), config.render().unwrap()).unwrap();
+        fs::create_dir_all(repo.root.join(".workspace-mgr/local")).unwrap();
+        fs::write(repo.root.join(CREDENTIALS_NAME), "access_key_id = \"fixture-test-only\"\nsecret_access_key = \"fixture-test-only-secret\"\nregion = \"us-east-1\"\n").unwrap();
     }
     pub(crate) fn fixture(replies: Vec<Reply>) -> (S3Client, thread::JoinHandle<Vec<WireRequest>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2835,6 +3186,190 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn native_repository_uses_tracked_routing_and_ignores_legacy_remote_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: directory.path().to_owned(),
+        };
+        configure_repo(&client("http://127.0.0.1:1"), &repo);
+        fs::create_dir(repo.root.join(".dvc")).unwrap();
+        fs::write(repo.root.join(".dvc/config"), "[core]\nremote = other\n['remote \"other\"']\nurl = s3://wrong/wrong\nendpointurl = https://wrong.invalid\n").unwrap();
+        fs::write(
+            repo.root.join(".dvc/config.local"),
+            "this is not valid configuration\n",
+        )
+        .unwrap();
+        let resolved = S3Client::from_repo(&repo).unwrap();
+        assert_eq!(resolved.bucket, "fixture-bucket");
+        assert_eq!(resolved.prefix, "root");
+        assert_eq!(resolved.endpoint, "http://127.0.0.1:1");
+        assert_eq!(resolved.credentials.access, "fixture-test-only");
+    }
+
+    #[test]
+    fn malformed_root_configuration_never_falls_back_to_a_legacy_remote() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: directory.path().to_owned(),
+        };
+        repo.run(["init", "-q"]).unwrap();
+        fs::create_dir(repo.root.join(".dvc")).unwrap();
+        fs::write(repo.root.join(".dvc/config"), "[core]\nremote = old\n['remote \"old\"']\nurl = s3://legacy/root\naccess_key_id = fixture\nsecret_access_key = fixture-secret\n").unwrap();
+        fs::write(Config::path(&repo), "not valid TOML [").unwrap();
+        assert!(
+            S3Client::from_repo(&repo)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(".workspace-mgr.toml")
+        );
+        fs::remove_file(Config::path(&repo)).unwrap();
+        let resolved = S3Client::from_repo(&repo).unwrap();
+        assert_eq!(resolved.bucket, "legacy");
+        assert_eq!(resolved.credentials.access, "fixture");
+    }
+
+    #[test]
+    fn local_credentials_reject_routing_overrides_and_redact_parse_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: directory.path().to_owned(),
+        };
+        repo.run(["init", "-q"]).unwrap();
+        fs::create_dir_all(repo.root.join(".workspace-mgr/local")).unwrap();
+        for raw in [
+            "endpoint_url = \"https://routing-secret-should-not-print.invalid\"\n",
+            "access_key_id = \"credential-secret-should-not-print\"\nsecret_access_key = 123\n",
+            "secret_access_key = \"syntax-secret-should-not-print\n",
+        ] {
+            fs::write(repo.root.join(CREDENTIALS_NAME), raw).unwrap();
+            let message = load_credentials_config(&repo).err().unwrap().to_string();
+            assert!(message.contains("invalid local S3 credentials configuration"));
+            assert!(!message.contains("secret-should-not-print"));
+        }
+    }
+
+    #[test]
+    fn linked_worktrees_share_credentials_from_the_primary_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary_root = directory.path().join("primary");
+        fs::create_dir(&primary_root).unwrap();
+        let primary = GitRepo { root: primary_root };
+        configure_repo(&client("http://127.0.0.1:1"), &primary);
+        primary.run(["add", ".workspace-mgr.toml"]).unwrap();
+        primary
+            .run([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "Native configuration",
+            ])
+            .unwrap();
+        let linked_root = directory.path().join("linked");
+        primary
+            .run(["worktree", "add", "--detach", linked_root.to_str().unwrap()])
+            .unwrap();
+        let linked = GitRepo { root: linked_root };
+        fs::create_dir_all(linked.root.join(".workspace-mgr/local")).unwrap();
+        fs::write(
+            linked.root.join(CREDENTIALS_NAME),
+            "access_key_id = \"wrong-worktree\"\nsecret_access_key = \"wrong-worktree-secret\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credentials_path(&linked).unwrap().canonicalize().unwrap(),
+            primary.root.join(CREDENTIALS_NAME).canonicalize().unwrap()
+        );
+        assert_eq!(
+            load_credentials_config(&linked).unwrap().access_key_id,
+            Some("fixture-test-only".to_owned())
+        );
+        assert_eq!(
+            S3Client::from_repo(&linked).unwrap().credentials.access,
+            "fixture-test-only"
+        );
+    }
+
+    #[test]
+    fn historical_worktrees_keep_legacy_routing_and_use_migrated_primary_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary_root = directory.path().join("primary");
+        fs::create_dir(&primary_root).unwrap();
+        let primary = GitRepo { root: primary_root };
+        primary.run(["init", "-q"]).unwrap();
+        fs::create_dir(primary.root.join(".dvc")).unwrap();
+        fs::write(
+            primary.root.join(".dvc/config"),
+            "[core]\nremote = old\n['remote \"old\"']\nurl = s3://historical-bucket/old-prefix\nendpointurl = http://127.0.0.1:2\naccess_key_id = historical-credential\nsecret_access_key = historical-secret\n",
+        )
+        .unwrap();
+        primary.run(["add", ".dvc/config"]).unwrap();
+        primary
+            .run([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "Historical remote configuration",
+            ])
+            .unwrap();
+        configure_repo(&client("http://127.0.0.1:1"), &primary);
+        let historical_root = directory.path().join("historical");
+        primary
+            .run([
+                "worktree",
+                "add",
+                "--detach",
+                historical_root.to_str().unwrap(),
+            ])
+            .unwrap();
+        let historical = GitRepo {
+            root: historical_root,
+        };
+        assert!(!Config::path(&historical).exists());
+        let resolved = S3Client::from_repo(&historical).unwrap();
+        assert_eq!(resolved.bucket, "historical-bucket");
+        assert_eq!(resolved.prefix, "old-prefix");
+        assert_eq!(resolved.endpoint, "http://127.0.0.1:2");
+        assert_eq!(resolved.credentials.access, "fixture-test-only");
+
+        fs::remove_file(primary.root.join(CREDENTIALS_NAME)).unwrap();
+        let fallback = S3Client::from_repo(&historical).unwrap();
+        assert_eq!(fallback.bucket, "historical-bucket");
+        assert_eq!(fallback.credentials.access, "historical-credential");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_credentials_cannot_traverse_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: directory.path().to_owned(),
+        };
+        repo.run(["init", "-q"]).unwrap();
+        fs::create_dir_all(repo.root.join(".workspace-mgr/local")).unwrap();
+        let outside = directory.path().join("private-source");
+        fs::write(
+            &outside,
+            "access_key_id = \"fixture\"\nsecret_access_key = \"fixture-secret\"\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, repo.root.join(CREDENTIALS_NAME)).unwrap();
+        assert!(
+            load_credentials_config(&repo)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("may not traverse a symlink")
+        );
+    }
+
+    #[test]
     fn partial_explicit_credentials_do_not_fall_back() {
         let remote = BTreeMap::from([("access_key_id".to_owned(), "fixture".to_owned())]);
         let saved = BTreeMap::from([
@@ -2871,7 +3406,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn storage_prefix_keeps_dvc_literal_percent_unicode_and_slashes() {
+    fn storage_prefix_keeps_literal_percent_unicode_and_slashes() {
         assert_eq!(
             storage_location("s3://bucket/prefix%20literal/é data//").unwrap(),
             ("bucket".to_owned(), "prefix%20literal/é data".to_owned())

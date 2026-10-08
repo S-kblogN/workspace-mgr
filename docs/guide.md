@@ -52,7 +52,7 @@ workspace-mgr setup
 ```
 
 If the release changes managed repository scaffolding, create an infrastructure
-task covering the affected product-owned paths and run `workspace-mgr init`
+task covering the affected product-owned paths and run `workspace-mgr manage`
 in the shared checkout. Review and publish that generated diff using the private
 manifest path returned by `task create`.
 
@@ -69,38 +69,34 @@ error. In both cases the agent tells the user the installed version and the
 required one and asks before updating, exactly as for an update notice; nobody
 removes or edits the key to make an older release work.
 
-### 2. Initialize a repository
+### 2. Manage a repository
 
-Run `init` once from the Git repository:
+Run `manage` from the Git repository to adopt it or update its scaffolding and storage metadata:
 
 ```sh
-workspace-mgr init \
+workspace-mgr manage \
   --s3-url s3://example-bucket/workspace \
   --s3-endpoint-url https://s3.example.invalid
 ```
 
-Initialization creates:
+Management creates:
 
 - `.workspace-mgr.toml`, the public Git and optional S3 facts;
 - a thin `AGENTS.md` bootstrap;
 - the root `.gitignore`, generated from the product's fixed rules for
   regenerated output and private product state, and from this repository's own
-  rules in `.workspace-mgr/repository.gitignore`;
-- internal storage scaffolding when S3 is configured.
+  rules in `.workspace-mgr/repository.gitignore`.
 
-On first initialization, `AGENTS.md`, the root `.gitignore`, and the private
-internal-storage scaffold paths are reserved. If any already exists, `init`
-reports the complete collision before writing anything; it does not inspect
-content to guess whether the path is managed. A repository that already keeps
-its own root `.gitignore` moves those rules into
-`.workspace-mgr/repository.gitignore`, removes the root file, and runs `init`
-again; that file is never migrated silently or discarded. After
-`.workspace-mgr.toml` establishes the repository as initialized, `AGENTS.md`,
-the root `.gitignore`, generated internal storage configuration, and the
-private engine's ignore files are product-owned. Every `init` deterministically
-creates, replaces, or removes them according to the installed CLI and current
-Git/S3 facts. This is also the scaffold-upgrade operation after installing a
-newer CLI. In an initialized repository, an agent performs this reconciliation
+An existing repository-owned root `.gitignore` is preserved verbatim in
+`.workspace-mgr/repository.gitignore` before the generated root file replaces
+it. A conflicting existing module or an unowned `AGENTS.md` blocks adoption
+before files change. After `.workspace-mgr.toml` establishes the repository as
+managed, `AGENTS.md` and the generated root `.gitignore` are product-owned.
+Every `manage` deterministically reconciles them with the installed CLI and
+current Git/S3 facts. It also converts supported legacy DVC storage metadata
+through the same recoverable transaction; see [native storage](storage.md).
+Use `--dry-run` to inspect all planned changes first. In a managed repository,
+an agent performs this reconciliation
 inside an infrastructure task so the generated repository-wide diff is
 reviewed like any other shared change.
 
@@ -145,47 +141,42 @@ running the new version. Migration refuses a lock held by an older process or
 a conflicting destination path; resolve the reported conflict before retrying.
 Older binaries keep using the previous directory and cannot participate in the
 new repository lock. Running old and new CLIs in parallel is unsupported.
-Run `workspace-mgr init` in an infrastructure task to
+Run `workspace-mgr manage` in an infrastructure task to
 regenerate the root `.gitignore`, then publish that scaffold change so other
 clones receive the new rule.
 
-### Upgrading a repository that predates the generated root `.gitignore`
+### Preserving repository ignore rules
 
-The root `.gitignore` became product-owned after the 0.3.0 release, so every
-repository initialized before it performs one migration. Unlike the other
-owned paths, this one is claimed by content rather than by name alone: the
-product regenerates a root `.gitignore` only when it wrote the file that is
-there, which the generated first line records. Until the migration runs, `init`
-and `doctor` both refuse the file and say the same thing, so nothing is
-overwritten by following either of them:
+The generated first line identifies a product-owned root `.gitignore`.
+When adopting a repository with its own root ignore file, `manage` automatically
+preserves its rules in the repository module and regenerates the root file:
 
 ```sh
-mkdir -p .workspace-mgr
-git mv .gitignore .workspace-mgr/repository.gitignore
-workspace-mgr init
+workspace-mgr manage --dry-run
+workspace-mgr manage
 ```
 
-`init` then regenerates the root file from the product's fixed rules followed
-by that module, so every rule the repository had keeps working, negations
-included, and repository rules still win over the product's because they come
-last. Do this inside an infrastructure task like any other repository-wide
+The generated file contains the product's fixed rules followed by that module,
+so repository rules and negations retain their order and take precedence.
+Resolve a conflicting existing module explicitly before retrying. Do this
+inside an infrastructure task like any other repository-wide
 change, and publish the result: an ignore rule reaches other clones only once
 the regenerated root file is on the shared branch.
 
 Repository-specific additions belong in
-`.workspace-mgr/instructions/repository.md`, which `init` preserves, and this
+`.workspace-mgr/instructions/repository.md`, which `manage` preserves, and this
 repository's own ignore rules belong in `.workspace-mgr/repository.gitignore`,
-which `init` imports verbatim into the generated root `.gitignore` under its
+which `manage` imports verbatim into the generated root `.gitignore` under its
 own comment header. Both modules are repository-owned and limited to 64 KiB of
 UTF-8; the product validates nothing else about the ignore patterns, except
 that the ignore module may not contain the `# workspace-mgr local begin` and
 `# workspace-mgr local end` markers, which belong to `untrack`. Hand edits
 to the generated root file, below its generated header, are drift, which
-`doctor` reports and `init` repairs; a well-formed `# workspace-mgr local
+`doctor` reports and `manage` repairs; a well-formed `# workspace-mgr local
 begin` block in the root file survives regeneration unchanged, while a marker
 left without its partner is dropped and named in the reported action. Shared
-files such as `.gitattributes` retain repository-owned content while `init`
-ensures the product-required rules. `--dry-run` reports every planned action
+files such as `.gitattributes` retain repository-owned content; migration removes
+only recognized obsolete storage rules. `--dry-run` reports every planned action
 without writing files.
 
 Every initialized repository uses the same shared-checkout, task, storage, and
@@ -364,7 +355,7 @@ that matches its audience:
 | Rule | Where it belongs | Who sees it |
 | --- | --- | --- |
 | Specific to one task | `<task>/.gitignore`, the narrowest rule that covers it | Every clone, and the task's own review |
-| This repository's own, for every task | `.workspace-mgr/repository.gitignore`, imported into the generated root `.gitignore` by `init` | Every clone, once that change is published |
+| This repository's own, for every task | `.workspace-mgr/repository.gitignore`, imported into the generated root `.gitignore` by `manage` | Every clone, once that change is published |
 | Only this machine | Nowhere the product accepts: a rule in your global excludes or `.git/info/exclude` makes `plan` and `publish` refuse | Only you |
 
 The first layer is the cheap one, and it is the one a deliverable task can
@@ -952,7 +943,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | Command | Local effect | Remote reads | Remote writes |
 | --- | --- | --- | --- |
 | `setup` | Verifies Git and the built-in engine | None | None |
-| `init` | Creates or repairs scaffolding | None | None |
+| `manage` | Creates or repairs scaffolding | None | None |
 | `instructions`, `config show` | Read-only checks/output | None | None |
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task list`, `task path`, `task show` | Read-only local discovery; no cache writes or state migration | None, including no update check | None |

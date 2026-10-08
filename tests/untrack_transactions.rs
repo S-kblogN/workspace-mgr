@@ -12,13 +12,13 @@ fn managed_fixture(storage: bool) -> GitFixture {
         workspace(
             &fixture.seed,
             [
-                "init",
+                "manage",
                 "--s3-url",
                 fixture.root.join("storage-remote").to_str().unwrap(),
             ],
         );
     } else {
-        workspace(&fixture.seed, ["init"]);
+        workspace(&fixture.seed, ["manage"]);
     }
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
@@ -243,7 +243,7 @@ fn untrack_complete_git_directory_excludes_existing_and_future_descendants() {
     );
     std::fs::write(directory.join("future.bin"), vec![8_u8; 10_485_761]).unwrap();
     std::fs::write(
-        directory.join("future.dvc"),
+        directory.join("future.wm-storage.json"),
         "local payload, not storage metadata\n",
     )
     .unwrap();
@@ -254,7 +254,7 @@ fn untrack_complete_git_directory_excludes_existing_and_future_descendants() {
     assert_eq!(status["placements"][0]["target"], "local");
     assert_eq!(status["placements"][0]["boundary"], path);
     assert_eq!(json(&workspace(&task, ["plan"]))["status"], "no_changes");
-    assert!(!directory.join("future.bin.dvc").exists());
+    assert!(!directory.join("future.bin.wm-storage.json").exists());
 }
 
 #[cfg(feature = "test-storage")]
@@ -286,7 +286,7 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
         ],
     );
     workspace(&task, ["publish", "-m", "Publish stored content"]);
-    let published_pointer = std::fs::read(task.join("data.bin.dvc")).unwrap();
+    let published_pointer = std::fs::read(task.join("data.bin.wm-storage.json")).unwrap();
     let index_path = fixture.shared.join(".git/index");
     let index_before = std::fs::read(&index_path).unwrap();
     let remote = fixture.root.join("storage-remote");
@@ -298,8 +298,8 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
         ["untrack", &path, &format!("{bundle_path}/part.bin")],
     );
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(task.join("data.bin.dvc").is_file());
-    assert!(task.join("bundle.dvc").is_file());
+    assert!(task.join("data.bin.wm-storage.json").is_file());
+    assert!(task.join("bundle.wm-storage.json").is_file());
     assert_eq!(
         json(&workspace(&task, ["storage", "status", &path]))["placements"][0]["target"],
         "s3"
@@ -311,11 +311,11 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
         ["untrack", &path, &bundle_path, "--dry-run"],
     ));
     assert_eq!(dry["status"], "dry_run");
-    assert!(task.join("data.bin.dvc").is_file());
-    assert!(task.join("bundle.dvc").is_file());
+    assert!(task.join("data.bin.wm-storage.json").is_file());
+    assert!(task.join("bundle.wm-storage.json").is_file());
     workspace(&task, ["untrack", &path, &bundle_path]);
-    assert!(!task.join("data.bin.dvc").exists());
-    assert!(!task.join("bundle.dvc").exists());
+    assert!(!task.join("data.bin.wm-storage.json").exists());
+    assert!(!task.join("bundle.wm-storage.json").exists());
     assert_eq!(std::fs::read(task.join("data.bin")).unwrap(), payload);
     assert_eq!(
         std::fs::read(task.join("bundle/part.bin")).unwrap(),
@@ -331,7 +331,11 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
     let oid = published["commit_oid"].as_str().unwrap();
     for output in [&path, &bundle_path] {
         assert!(!tree_contains(&fixture, oid, output));
-        assert!(!tree_contains(&fixture, oid, &format!("{output}.dvc")));
+        assert!(!tree_contains(
+            &fixture,
+            oid,
+            &format!("{output}.wm-storage.json")
+        ));
         assert!(tree_contains(
             &fixture,
             oid,
@@ -365,7 +369,7 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
     // A restored old pointer must not publish newer local-only bytes under
     // conflicting metadata. Both previews and publication refuse it first.
     let retained_ignores = std::fs::read(task.join(".gitignore")).unwrap();
-    std::fs::write(task.join("data.bin.dvc"), &published_pointer).unwrap();
+    std::fs::write(task.join("data.bin.wm-storage.json"), &published_pointer).unwrap();
     for args in [
         vec!["plan"],
         vec!["publish", "-m", "Reject a restored stale S3 pointer"],
@@ -379,13 +383,13 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
             b"new local-only content\n"
         );
         assert_eq!(
-            std::fs::read(task.join("data.bin.dvc")).unwrap(),
+            std::fs::read(task.join("data.bin.wm-storage.json")).unwrap(),
             published_pointer
         );
         assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
     }
     workspace(&task, ["untrack", &path]);
-    assert!(!task.join("data.bin.dvc").exists());
+    assert!(!task.join("data.bin.wm-storage.json").exists());
     assert_eq!(
         std::fs::read(task.join(".gitignore")).unwrap(),
         retained_ignores
@@ -406,7 +410,7 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
 
     // The alternative recovery API must rebuild both metadata and the DVC
     // ignore rule from the current local payload before publication.
-    std::fs::write(task.join("data.bin.dvc"), &published_pointer).unwrap();
+    std::fs::write(task.join("data.bin.wm-storage.json"), &published_pointer).unwrap();
     let retracked = json(&workspace(
         &task,
         [
@@ -422,7 +426,7 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
     assert_eq!(retracked["remote_writes"], false);
     assert_eq!(remote_snapshot(&remote), remote_before);
     assert_ne!(
-        std::fs::read(task.join("data.bin.dvc")).unwrap(),
+        std::fs::read(task.join("data.bin.wm-storage.json")).unwrap(),
         published_pointer
     );
     git(&fixture.shared, ["check-ignore", "--no-index", "--", &path]);
@@ -431,13 +435,13 @@ fn untrack_s3_file_and_complete_directory_preserves_bytes_without_repeat_uploads
     assert!(tree_contains(
         &fixture,
         restored_oid,
-        &format!("{path}.dvc")
+        &format!("{path}.wm-storage.json")
     ));
     assert!(!tree_contains(&fixture, restored_oid, &path));
     assert!(!tree_contains(
         &fixture,
         restored_oid,
-        &format!("{bundle_path}.dvc")
+        &format!("{bundle_path}.wm-storage.json")
     ));
     assert_eq!(
         std::fs::read(task.join("data.bin")).unwrap(),

@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
+use crate::storage_metadata;
 
 // 0.6.0 checks this field before invoking its destructive adapter, but ignores
 // additional fields. An extra protection field in schema 1 cannot fence it.
@@ -102,7 +102,7 @@ pub fn candidates_between(
         .collect::<Vec<_>>();
     // A fresh clone has no private copy journal or retirement queue. The
     // merged receipt supplies the complete original history, including retired
-    // keys and markers that current DVC pointers cannot enumerate.
+    // keys and markers that current storage manifests cannot enumerate.
     candidates.extend(archive_candidates_at(repo, new_revision, scopes)?);
     candidates.sort();
     candidates.dedup();
@@ -134,7 +134,12 @@ pub fn candidates_for_worktree(
     if !config.requires_object_versioning() {
         return Ok(Vec::new());
     }
-    objects_at(repo, config, None, &dvc::discover(repo, scopes)?)
+    objects_at(
+        repo,
+        config,
+        None,
+        &storage_metadata::discover(repo, scopes)?,
+    )
 }
 
 pub fn queue(repo: &GitRepo, candidates: &[ObjectVersion]) -> Result<()> {
@@ -232,9 +237,48 @@ pub fn preview(repo: &GitRepo) -> Result<PurgeReport> {
     })
 }
 
+#[cfg(test)]
 pub fn has_pending(repo: &GitRepo) -> Result<bool> {
     let state = read_state(repo)?;
     Ok(!state.pending.is_empty() || !state.pending_prefixes.is_empty())
+}
+
+/// Inspects pending retirement state without adopting old private directories.
+/// Repository management uses this during its read-only preflight.
+pub(crate) fn has_pending_read_only(repo: &GitRepo) -> Result<bool> {
+    let mut directories = vec![crate::local_state::directory_unmigrated(repo)?];
+    let common = repo.common_dir()?.canonicalize().at(&repo.root)?;
+    directories.extend(crate::local_state::legacy_directories(repo)?);
+    for directory in directories {
+        if let Ok(relative) = directory.strip_prefix(&common) {
+            crate::path::reject_symlink_traversal(
+                &common,
+                &crate::path::to_slash(relative),
+                "legacy private state",
+            )?;
+        }
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(Error::message(
+                    "private S3 purge state requires a regular state directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        }
+        let path = directory.join(STATE_NAME);
+        let state = read_state_at(&path)?;
+        if !state.pending.is_empty() || !state.pending_prefixes.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<PurgeReport> {
@@ -248,8 +292,8 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
     // A legacy queue may be read for preview, but any retry must first fence
     // old clients durably, even when no prefix promotion is necessary.
     write_state(repo, &state)?;
-    dvc::ensure_ready(repo, config)?;
-    dvc::verify_object_versioning(repo, config)?;
+    storage_metadata::ensure_ready(repo, config)?;
+    storage_metadata::verify_object_versioning(repo, config)?;
     let base = repo.fetch_branch(remote, &config.git.branch)?;
     let published = archive_receipts_at(repo, &base, &[])?;
     if promote_archive_prefixes(&mut state, &published)? {
@@ -281,7 +325,7 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
     let mut cleaned_prefixes = Vec::new();
     if !deleted.is_empty() || !prefixes.is_empty() {
         let payload = serde_json::json!({"candidates":deleted,"prefixes":prefixes});
-        let response = dvc::version_purge_adapter(repo, "delete", &payload)?;
+        let response = storage_metadata::version_purge_adapter(repo, "delete", &payload)?;
         if let Some(retained) = response.get("retained_unmapped") {
             retained_unmapped = serde_json::from_value(retained.clone()).map_err(|error| {
                 Error::message(format!("invalid unmapped archive version report: {error}"))
@@ -484,12 +528,12 @@ fn objects_at(
     if pointers.is_empty() {
         return Ok(Vec::new());
     }
-    dvc::ensure_ready(repo, config)?;
+    storage_metadata::ensure_ready(repo, config)?;
     let payload = serde_json::json!([{
         "revision": revision,
         "pointers": pointers,
     }]);
-    let value = dvc::version_purge_adapter(repo, "list", &payload)?;
+    let value = storage_metadata::version_purge_adapter(repo, "list", &payload)?;
     let mut objects: Vec<ObjectVersion> = serde_json::from_value(value).map_err(|error| {
         Error::message(format!(
             "managed-storage purge adapter returned invalid objects: {error}"
@@ -532,7 +576,7 @@ fn pointers_at(repo: &GitRepo, revision: &str, scopes: &[String]) -> Result<Vec<
         // Keep literal backslashes: native metadata reads each pointer through
         // Git at this revision. Dropping such a path would leave retired object
         // versions in the bucket after a rename or deletion.
-        .filter(|path| path.ends_with(".dvc"))
+        .filter(|path| storage_metadata::is_pointer(path))
         .collect())
 }
 
@@ -643,7 +687,11 @@ fn referenced_objects(
     let referenced = if requests.is_empty() {
         Vec::new()
     } else {
-        let value = dvc::version_purge_adapter(repo, "list", &serde_json::Value::Array(requests))?;
+        let value = storage_metadata::version_purge_adapter(
+            repo,
+            "list",
+            &serde_json::Value::Array(requests),
+        )?;
         serde_json::from_value::<Vec<ObjectVersion>>(value).map_err(|error| {
             Error::message(format!(
                 "managed-storage purge adapter returned invalid references: {error}"
@@ -727,15 +775,32 @@ fn state_path(repo: &GitRepo) -> Result<PathBuf> {
 }
 
 fn read_state(repo: &GitRepo) -> Result<PurgeState> {
-    let path = state_path(repo)?;
-    if !path.is_file() {
-        return Ok(PurgeState {
-            schema_version: STATE_SCHEMA,
-            pending: Vec::new(),
-            pending_prefixes: BTreeMap::new(),
-        });
+    read_state_at(&state_path(repo)?)
+}
+
+fn read_state_at(path: &Path) -> Result<PurgeState> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(Error::message(
+                "private S3 purge state must be a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PurgeState {
+                schema_version: STATE_SCHEMA,
+                pending: Vec::new(),
+                pending_prefixes: BTreeMap::new(),
+            });
+        }
+        Err(source) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     }
-    let raw = fs::read_to_string(&path).at(&path)?;
+    let raw = fs::read_to_string(path).at(path)?;
     let mut state: PurgeState = serde_json::from_str(&raw)
         .map_err(|error| Error::message(format!("invalid private S3 purge state: {error}")))?;
     if !matches!(state.schema_version, 1 | STATE_SCHEMA) {
@@ -803,6 +868,30 @@ mod tests {
             "destination":format!("2026/07/{source}"),"status":"copied",
             "bucket":"isolated-fixture","remote_prefix":"dvc","versions":[]
         })
+    }
+
+    #[test]
+    fn read_only_pending_inspection_does_not_adopt_legacy_private_state() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: fixture.path().canonicalize().unwrap(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        let legacy = repo.common_dir().unwrap().join("workspace-mgr");
+        fs::create_dir_all(&legacy).unwrap();
+        let raw = br#"{"schema_version":2,"pending":[{"pointer":"task/data.wm-storage.json","object":"task/data","version_id":"v1"}],"pending_prefixes":{}}"#;
+        fs::write(legacy.join(STATE_NAME), raw).unwrap();
+        fs::write(legacy.join("keep-state"), b"preserve").unwrap();
+        assert!(has_pending_read_only(&repo).unwrap());
+        assert_eq!(fs::read(legacy.join(STATE_NAME)).unwrap(), raw);
+        assert_eq!(fs::read(legacy.join("keep-state")).unwrap(), b"preserve");
+        assert!(
+            !repo
+                .root
+                .join(crate::local_state::LOCAL_STATE_PATH)
+                .exists()
+        );
+        assert!(!legacy.join("repository.lock").exists());
     }
 
     #[test]
@@ -1276,7 +1365,7 @@ mod tests {
 
         // A generic retirement queue can predate the archive receipt. Expand
         // it from the verified published tree, including keys and markers that
-        // no current DVC pointer names, and keep the expanded state on disk.
+        // no current storage manifest names, and keep the expanded state on disk.
         let generic = ObjectVersion {
             pointer: format!("{source}/retired.dvc"),
             object: format!("{source}/retired"),
@@ -1520,14 +1609,14 @@ mod tests {
         relpath: &str,
         version: &str,
     ) {
-        let files = [dvc::PointerFileVersion {
+        let files = [storage_metadata::PointerFileVersion {
             relpath: relpath.to_owned(),
             md5: Some("900150983cd24fb0d6963f7d28e17f72".to_owned()),
             size: Some(3),
             version_id: Some(version.to_owned()),
             etag: Some("abc".to_owned()),
         }];
-        let digest = crate::native_engine::directory_digest(&files).unwrap();
+        let digest = crate::legacy_dvc::directory_digest(&files).unwrap();
         let path = repo.root.join(pointer);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
@@ -1749,7 +1838,7 @@ mod tests {
             "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
         )]);
         configure_repo(&client, &repo);
-        let (_, endpoint_url) = dvc::internal_location(&repo).unwrap().unwrap();
+        let endpoint_url = Config::load(&repo).unwrap().s3.unwrap().endpoint_url;
         let config = Config {
             s3: Some(crate::config::S3Config {
                 url: "s3://fixture-bucket/root".to_owned(),
@@ -1757,7 +1846,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        dvc::write_internal_config(&repo, &config).unwrap();
+        fs::write(Config::path(&repo), config.render().unwrap()).unwrap();
         queue(&repo, std::slice::from_ref(&old)).unwrap();
         let report = purge_pending(&repo, &config, "origin").unwrap();
         assert_eq!(report.status, "cleanup_pending");

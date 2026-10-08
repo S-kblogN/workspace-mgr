@@ -19,13 +19,13 @@ fn managed_fixture(storage: bool) -> GitFixture {
         workspace(
             &fixture.seed,
             [
-                "init",
+                "manage",
                 "--s3-url",
                 fixture.root.join("storage-remote").to_str().unwrap(),
             ],
         );
     } else {
-        workspace(&fixture.seed, ["init"]);
+        workspace(&fixture.seed, ["manage"]);
     }
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
@@ -1129,11 +1129,11 @@ mod test_storage {
     // schema 3, so these tests stand in for one explicitly.
     pub const LIMIT_10MB: [(&str, &str); 2] = [
         (CLOUD_USAGE_THRESHOLD_ENV, "10000000"),
-        (CLI_VERSION_ENV, "0.4.0"),
+        (CLI_VERSION_ENV, "0.8.0"),
     ];
     pub const LIMIT_300KB: [(&str, &str); 2] = [
         (CLOUD_USAGE_THRESHOLD_ENV, "300000"),
-        (CLI_VERSION_ENV, "0.4.0"),
+        (CLI_VERSION_ENV, "0.8.0"),
     ];
     pub const LARGE: usize = 10_485_761;
 
@@ -1149,10 +1149,6 @@ mod test_storage {
         git_unchecked(repo, ["cat-file", "-e", &format!("{oid}:{path}")])
             .status
             .success()
-    }
-
-    pub fn dvc_available() -> bool {
-        true
     }
 
     pub fn remote_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -1175,7 +1171,7 @@ mod test_storage {
     }
 
     pub fn cached_files(repo: &Path) -> usize {
-        let cache = repo.join(".dvc/cache");
+        let cache = repo.join(".workspace-mgr/local/cache");
         if !cache.exists() {
             return 0;
         }
@@ -1213,15 +1209,43 @@ mod test_storage {
         rules
     }
 
-    /// A 400 KB incompressible Git file, reported by its compressed size
-    /// because the totals are packed.
-    pub fn assert_git_contributor(contributor: &Value, path: &str, state: &str) {
+    /// Packed contributors report the on-disk size Git measures for the blob.
+    /// Its compression format and overhead vary with the installed Git.
+    pub fn assert_git_contributor(
+        contributor: &Value,
+        path: &str,
+        state: &str,
+        repo: &Path,
+        object: &str,
+    ) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
         assert_eq!(contributor["path"], path, "{contributor}");
         assert_eq!(contributor["store"], "git");
         assert_eq!(contributor["versions"], 1);
         assert_eq!(contributor["state"], state);
-        let bytes = contributor["bytes"].as_u64().unwrap();
-        assert!((399_000..402_000).contains(&bytes), "{contributor}");
+        let mut child = Command::new("git")
+            .args(["cat-file", "--batch-check=%(objectsize:disk)"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{object}\n").as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let disk_bytes: u64 = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(contributor["bytes"], disk_bytes, "{contributor}");
+        assert!(disk_bytes > 0);
     }
 
     pub fn reminder(task_id: &str, projected: &str, limit: &str) -> String {
@@ -1288,9 +1312,6 @@ use test_storage::*;
 #[cfg(feature = "test-storage")]
 #[test]
 fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-gate", "20260918-120000");
     document_task(&task);
@@ -1341,7 +1362,7 @@ fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
             .unwrap()
             .contains("exceeds the limit 9.53 MiB (10000000 bytes)")
     );
-    assert!(!task.join("large.bin.dvc").exists());
+    assert!(!task.join("large.bin.wm-storage.json").exists());
 
     let status = workspace_env(&task, ["task", "status"], env);
     assert!(stderr(&status).is_empty());
@@ -1376,7 +1397,7 @@ fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
         let refused = workspace_env_unchecked(&task, args, env);
         assert_refused(&refused, &refusal);
         assert!(!stderr(&refused).contains("approve-cloud-usage"));
-        assert!(!task.join("large.bin.dvc").exists());
+        assert!(!task.join("large.bin.wm-storage.json").exists());
         assert!(!task.join(".gitignore").exists());
         assert_eq!(cached_files(&fixture.shared), 0);
         assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
@@ -1510,13 +1531,13 @@ fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
     ));
     assert_eq!(published["status"], "pushed");
     assert_eq!(published["cloud_usage"]["status"], "within_limit");
-    assert!(task.join("large.bin.dvc").is_file());
+    assert!(task.join("large.bin.wm-storage.json").is_file());
     assert_ne!(remote_snapshot(&storage_remote), storage_before);
     let tip = published["remote_oid"].as_str().unwrap().to_owned();
     assert!(tree_contains(
         &fixture.remote,
         &tip,
-        &format!("{large}.dvc")
+        &format!("{large}.wm-storage.json")
     ));
     assert_eq!(
         last_line(&commit_message(&fixture.remote, &tip)),
@@ -1556,7 +1577,7 @@ fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
             "limit 19.07 MiB (20000000 bytes).",
         ],
     );
-    assert!(!task.join("more.bin.dvc").exists());
+    assert!(!task.join("more.bin.wm-storage.json").exists());
     assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
     assert_eq!(remote_snapshot(&storage_remote), storage_published);
 }
@@ -1566,9 +1587,6 @@ fn growth_past_the_limit_is_refused_before_tracking_until_the_user_approves() {
 #[cfg(all(unix, feature = "test-storage"))]
 #[test]
 fn an_unaddressable_boundary_is_refused_before_the_cloud_usage_gate() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "gate-order", "20260918-130000");
     document_task(&task);
@@ -1605,7 +1623,7 @@ fn an_unaddressable_boundary_is_refused_before_the_cloud_usage_gate() {
         assert!(!message.contains("needs the user's approval"), "{message}");
         assert!(!message.contains(REMINDER), "{message}");
         assert!(cloud_usage_state(&fixture.shared).is_empty(), "{args:?}");
-        assert!(!task.join("top\\level.bin.dvc").exists());
+        assert!(!task.join("top\\level.bin.wm-storage.json").exists());
         assert_eq!(cached_files(&fixture.shared), 0);
         assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
         assert_eq!(remote_snapshot(&storage_remote), storage_before);
@@ -1634,7 +1652,7 @@ fn an_unaddressable_boundary_is_refused_before_the_cloud_usage_gate() {
         )],
     );
     assert!(!stderr(&refused).contains("backslash"));
-    assert!(!task.join("top-level.bin.dvc").exists());
+    assert!(!task.join("top-level.bin.wm-storage.json").exists());
     assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
     assert_eq!(remote_snapshot(&storage_remote), storage_before);
 
@@ -1642,7 +1660,8 @@ fn an_unaddressable_boundary_is_refused_before_the_cloud_usage_gate() {
     // exactly the path Git holds.
     let in_git = format!("{task_id}/keep\\me.bin");
     std::fs::write(task.join("keep\\me.bin"), noise(400_000, 11)).unwrap();
-    let usage = json(&workspace_env(&task, ["plan"], env))["cloud_usage"].clone();
+    let git_plan = json(&workspace_env(&task, ["plan"], env));
+    let usage = git_plan["cloud_usage"].clone();
     assert_eq!(usage["git_measure"], "packed");
     let contributor = usage["contributors"]
         .as_array()
@@ -1650,15 +1669,18 @@ fn an_unaddressable_boundary_is_refused_before_the_cloud_usage_gate() {
         .iter()
         .find(|contributor| contributor["path"] == in_git.as_str())
         .unwrap_or_else(|| panic!("{usage}"));
-    assert_git_contributor(contributor, &in_git, "pending");
+    assert_git_contributor(
+        contributor,
+        &in_git,
+        "pending",
+        &fixture.shared,
+        &format!("{}:{in_git}", git_plan["tree_oid"].as_str().unwrap()),
+    );
 }
 
 #[cfg(feature = "test-storage")]
 #[test]
 fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-cleanup", "20260918-130000");
     document_task(&task);
@@ -1716,7 +1738,11 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
     assert_eq!(kept["status"], "pushed");
     let tip = kept["remote_oid"].as_str().unwrap();
     assert!(!tree_contains(&fixture.remote, tip, &more));
-    assert!(!tree_contains(&fixture.remote, tip, &format!("{more}.dvc")));
+    assert!(!tree_contains(
+        &fixture.remote,
+        tip,
+        &format!("{more}.wm-storage.json")
+    ));
     assert!(tree_contains(
         &fixture.remote,
         tip,
@@ -1740,14 +1766,14 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
     assert_eq!(reset["blocked"], false);
     let plan = json(&workspace_env(&task, ["plan"], env));
     let usage = &plan["cloud_usage"];
-    // Removing the approval changes the task manifest and withdraws the
-    // requirement raise that only the approval needed.
+    // Removing the approval changes only the task manifest. Native storage
+    // keeps the repository compatibility floor at 0.8.0.
     assert_eq!(plan["status"], "dry_run");
     assert_eq!(
         plan["changed_paths"],
-        json!([CONFIG, format!("{task_id}/.workspace-mgr-task.toml")])
+        json!([format!("{task_id}/.workspace-mgr-task.toml")])
     );
-    assert_eq!(plan["repository_requirement"], withdrawn_requirement());
+    assert!(plan.get("repository_requirement").is_none());
     assert_eq!(usage["status"], "approval_required");
     assert_eq!(usage["cleanup_only"], true);
     assert_eq!(usage["publish_allowed"], true);
@@ -1786,7 +1812,7 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
     assert!(!tree_contains(
         &fixture.remote,
         tip,
-        &format!("{large}.dvc")
+        &format!("{large}.wm-storage.json")
     ));
     assert!(!commit_message(&fixture.remote, tip).contains(TRAILER));
     assert_ne!(
@@ -1822,7 +1848,13 @@ fn git_history_counts_toward_the_limit_and_cleanup_cannot_shrink_it() {
         usage["projected"]["git_uncompressed_bytes"],
         object_bytes(&fixture.shared, &[tree, "--not", base, &base_tree])
     );
-    assert_git_contributor(&usage["contributors"][0], &weights, "pending");
+    assert_git_contributor(
+        &usage["contributors"][0],
+        &weights,
+        "pending",
+        &fixture.shared,
+        &format!("{tree}:{weights}"),
+    );
     assert_refused(
         &workspace_env_unchecked(&task, ["publish", "-m", "Publish weights"], env),
         &["S3 0 bytes", "limit 292.96 KiB (300000 bytes)."],
@@ -1874,7 +1906,13 @@ fn git_history_counts_toward_the_limit_and_cleanup_cannot_shrink_it() {
         .iter()
         .find(|contributor| contributor["path"] == weights.as_str())
         .unwrap();
-    assert_git_contributor(published_weights, &weights, "published");
+    assert_git_contributor(
+        published_weights,
+        &weights,
+        "published",
+        &fixture.shared,
+        &format!("{tip}:{weights}"),
+    );
     let cleaned = json(&workspace_env(
         &task,
         ["publish", "-m", "Remove weights"],
@@ -1948,7 +1986,21 @@ fn packed_git_contributors_report_compressed_bytes() {
             .unwrap()
             > 2_400_000
     );
-    assert!(usage["projected"]["git_bytes"].as_u64().unwrap() < 450_000);
+    let projected = &usage["projected"];
+    assert!(
+        projected["git_bytes"].as_u64().unwrap()
+            < projected["git_uncompressed_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(projected["total_bytes"], projected["git_bytes"]);
+    let base = plan["remote_base_oid"].as_str().unwrap();
+    let tree = plan["tree_oid"].as_str().unwrap();
+    assert_eq!(
+        projected["git_uncompressed_bytes"],
+        object_bytes(
+            &fixture.shared,
+            &[tree, "--not", base, &format!("{base}^{{tree}}")]
+        )
+    );
     // Removing the compressible file would barely change the gated total, so
     // it must not look like the largest contributor.
     let contributors = usage["contributors"].as_array().unwrap();
@@ -1956,12 +2008,19 @@ fn packed_git_contributors_report_compressed_bytes() {
         &contributors[0],
         &format!("{task_id}/weights.bin"),
         "pending",
+        &fixture.shared,
+        &format!(
+            "{}:{task_id}/weights.bin",
+            plan["tree_oid"].as_str().unwrap()
+        ),
     );
     let zeros = contributors
         .iter()
         .find(|contributor| contributor["path"] == format!("{task_id}/zeros.log").as_str())
         .unwrap();
-    assert!(zeros["bytes"].as_u64().unwrap() < 20_000, "{zeros}");
+    let raw_zero_bytes = std::fs::metadata(task.join("zeros.log")).unwrap().len();
+    assert!(zeros["bytes"].as_u64().unwrap() < raw_zero_bytes, "{zeros}");
+    assert!(zeros["bytes"].as_u64().unwrap() < projected["git_bytes"].as_u64().unwrap());
 }
 
 #[cfg(feature = "test-storage")]
@@ -2214,9 +2273,6 @@ fn another_clone_continues_with_the_approval_in_the_published_manifest() {
 fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
     use std::os::unix::fs::PermissionsExt;
 
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-late", "20260918-160000");
     document_task(&task);
@@ -2341,9 +2397,6 @@ fn late_rechecks_refuse_growth_that_appears_after_the_gate() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn content_addressed_directories_are_charged_per_file_at_every_check() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-directory", "20260918-163000");
     document_task(&task);
@@ -2484,15 +2537,8 @@ fn content_addressed_directories_are_charged_per_file_at_every_check() {
     assert_eq!(cleaned["cloud_usage"]["cleanup_only"], true);
     assert_eq!(cleaned["cloud_usage"]["projected"]["s3_bytes"], 11_000_006);
     assert_ne!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
-    // Only the new directory manifest was uploaded.
-    let after = remote_snapshot(&storage);
-    assert_eq!(after.len(), before.len() + 1);
-    assert!(
-        after
-            .iter()
-            .filter(|(path, _)| !before.iter().any(|(old, _)| old == path))
-            .all(|(path, _)| path.to_string_lossy().ends_with(".dir"))
-    );
+    // Directory entries live in Git metadata, so a deletion uploads no object.
+    assert_eq!(remote_snapshot(&storage), before);
     let settled = json(&workspace_env(&task, ["plan"], env));
     assert_eq!(settled["status"], "no_changes");
     assert_eq!(settled["cloud_usage"]["published"]["s3_bytes"], 11_000_006);
@@ -2503,9 +2549,6 @@ fn content_addressed_directories_are_charged_per_file_at_every_check() {
 fn symlinks_in_a_published_s3_directory_are_measured_by_their_targets() {
     use std::os::unix::fs::symlink;
 
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "usage-links", "20260918-164500");
     document_task(&task);
@@ -2569,10 +2612,9 @@ fn symlinks_in_a_published_s3_directory_are_measured_by_their_targets() {
     assert_eq!(settled["status"], "no_changes");
     assert_eq!(settled["cloud_usage"]["published"]["s3_bytes"], 8_000);
     assert_eq!(settled["cloud_usage"]["projected"]["s3_bytes"], 8_000);
-    // The remote holds exactly the two checkpoints plus manifests.
+    // The remote holds exactly the two content-addressed checkpoints.
     let stored = remote_snapshot(&fixture.root.join("storage-remote"))
         .iter()
-        .filter(|(path, _)| !path.to_string_lossy().ends_with(".dir"))
         .map(|(_, content)| content.len() as u64)
         .sum::<u64>();
     assert_eq!(stored, 8_000);
@@ -2581,9 +2623,6 @@ fn symlinks_in_a_published_s3_directory_are_measured_by_their_targets() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn the_real_threshold_refuses_a_sparse_upload_before_tracking() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "sparse-gate", "20260918-170000");
     document_task(&task);
@@ -2608,7 +2647,7 @@ fn the_real_threshold_refuses_a_sparse_upload_before_tracking() {
             "limit 1 GiB (1073741824 bytes).",
         ],
     );
-    assert!(!task.join("sparse.bin.dvc").exists());
+    assert!(!task.join("sparse.bin.wm-storage.json").exists());
     assert!(!task.join(".gitignore").exists());
     assert_eq!(cached_files(&fixture.shared), 0);
     assert_eq!(rev(&fixture.remote, branch), tip);
@@ -2668,6 +2707,8 @@ fn infrastructure_tasks_wait_for_approval_and_publish_the_trailer() {
         &plan["cloud_usage"]["contributors"][0],
         "assets/model.bin",
         "pending",
+        &fixture.shared,
+        &format!("{}:assets/model.bin", plan["tree_oid"].as_str().unwrap()),
     );
     assert_refused(
         &workspace_env_unchecked(

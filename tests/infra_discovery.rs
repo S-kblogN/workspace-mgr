@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 fn infrastructure_fixture() -> (GitFixture, PathBuf) {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     std::fs::write(fixture.seed.join("shared-policy.md"), "original policy\n").unwrap();
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();

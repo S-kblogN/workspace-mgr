@@ -13,6 +13,20 @@ pub const CLOUD_USAGE_THRESHOLD_ENV: &str = "WORKSPACE_MGR_TEST_CLOUD_USAGE_THRE
 /// variable. Every helper clears it unless a test passes it explicitly.
 pub const CLI_VERSION_ENV: &str = "WORKSPACE_MGR_TEST_CLI_VERSION";
 
+pub fn storage_file_manifest(path: &str, digest: &str, size: u64, version: Option<&str>) -> String {
+    let mut manifest = serde_json::json!({
+        "schema_version": 1,
+        "path": path,
+        "kind": "file",
+        "checksum": {"algorithm": "md5", "digest": digest},
+        "size": size
+    });
+    if let Some(id) = version {
+        manifest["version"] = serde_json::json!({"id": id});
+    }
+    format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap())
+}
+
 pub struct GitFixture {
     pub temp: TempDir,
     pub root: PathBuf,

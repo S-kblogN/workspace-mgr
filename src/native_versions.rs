@@ -452,11 +452,7 @@ pub(crate) fn read(
         let mut cached = Vec::new();
         let mut missing = Vec::new();
         for entry in &entries {
-            let path = native_engine::existing_cache_with_algorithm(
-                repo,
-                entry.metadata.md5.as_deref().unwrap(),
-                &entry.metadata.hash_name,
-            )?;
+            let path = native_engine::cache_path_for_entry(repo, &entry.metadata)?;
             if content_matches(entry, &path)? {
                 cached.push(entry.clone());
             } else {
@@ -497,11 +493,7 @@ pub(crate) fn read(
                                 entry.metadata.object
                             )));
                         }
-                        return Ok((
-                            entry.metadata.md5.clone().unwrap(),
-                            entry.metadata.hash_name.clone(),
-                            destination,
-                        ));
+                        return Ok((entry.metadata.clone(), destination));
                     }
                     Err(error) if error.is_missing() => {
                         current = mapped_entry(&client, repo, &current, &mut seen)?
@@ -510,8 +502,8 @@ pub(crate) fn read(
                 }
             }
         })?;
-        for (digest, algorithm, path) in downloaded {
-            native_engine::install_cache_file_with_algorithm(repo, &digest, &path, &algorithm)?;
+        for (metadata, path) in downloaded {
+            native_engine::install_cache_for_entry(repo, &metadata, &path)?;
         }
         native_engine::install_directory_manifests(repo, pointers)?;
     } else {
@@ -524,6 +516,67 @@ pub(crate) fn read(
     Ok(json!({"mode":"version-aware","remote":"workspace-mgr","checked_objects":checked}))
 }
 
+fn path_version_pointers(
+    repo: &GitRepo,
+    revision: Option<&str>,
+    pointers: Vec<String>,
+) -> Result<Vec<String>> {
+    let Some(revision) = revision else {
+        return Ok(pointers);
+    };
+    if !crate::legacy_dvc::is_content_addressed_revision(repo, revision)? {
+        return Ok(pointers);
+    }
+    let mut retained = Vec::new();
+    for pointer in pointers {
+        if !pointer.ends_with(".dvc") {
+            retained.push(pointer);
+            continue;
+        }
+        let mode = repo.run(["ls-tree", "-z", revision, "--", &pointer])?;
+        if !mode.stdout.starts_with("100644 blob ") && !mode.stdout.starts_with("100755 blob ") {
+            return Err(Error::message(format!(
+                "historical storage metadata is not a regular file: {pointer}"
+            )));
+        }
+        let raw = repo.run(["show", &format!("{revision}:{pointer}")])?.stdout;
+        let document = crate::legacy_dvc::parse_document(&raw, &pointer)?;
+        let [output] = document.outs.as_slice() else {
+            return Err(Error::message(format!(
+                "historical storage metadata must define one output: {pointer}"
+            )));
+        };
+        crate::legacy_dvc::hash_algorithm(&raw, &pointer)?;
+        let identity = output.md5.as_deref().unwrap_or_default();
+        let digest = identity.strip_suffix(".dir").unwrap_or(identity);
+        if digest.len() != 32
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::message(format!(
+                "historical storage metadata has no supported checksum: {pointer}"
+            )));
+        }
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|_| {
+            Error::message(format!("invalid historical storage metadata: {pointer}"))
+        })?;
+        let row = &yaml["outs"][0];
+        let bound = row.get("cloud").is_some()
+            || row["files"]
+                .as_sequence()
+                .is_some_and(|files| files.iter().any(|entry| entry.get("cloud").is_some()));
+        if bound {
+            retained.push(pointer);
+        }
+        // Unbound CAS history names shared hash objects outside the logical
+        // task prefix. Keep those sources; only exact path versions belong in
+        // archive copying and permanent prefix retirement. No .dir cache is
+        // needed to establish that distinction.
+    }
+    Ok(retained)
+}
+
 pub(crate) fn purge(repo: &GitRepo, operation: &str, payload: &Value) -> Result<Value> {
     if operation == "list" {
         let mut result = Vec::new();
@@ -534,6 +587,7 @@ pub(crate) fn purge(repo: &GitRepo, operation: &str, payload: &Value) -> Result<
             let revision = request["revision"].as_str();
             let pointers: Vec<String> = serde_json::from_value(request["pointers"].clone())
                 .map_err(|e| Error::message(e.to_string()))?;
+            let pointers = path_version_pointers(repo, revision, pointers)?;
             for entry in native_engine::metadata_entries(repo, revision, &pointers)? {
                 match entry
                     .version_id

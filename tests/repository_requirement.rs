@@ -11,7 +11,7 @@ const MANIFEST: &str = ".workspace-mgr-task.toml";
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
     fixture
@@ -47,6 +47,11 @@ fn read(path: &Path) -> String {
 
 /// The canonical rendering of a configuration that declares `version`.
 fn declaring(version: &str, config: &str) -> String {
+    let config = if config.starts_with("minimum_cli_version = ") {
+        config.split_once("\n\n").unwrap().1
+    } else {
+        config
+    };
     format!("minimum_cli_version = \"{version}\"\n\n{config}")
 }
 
@@ -151,8 +156,8 @@ fn a_repository_requiring_a_newer_cli_refuses_every_command_but_doctor() {
         (shared, vec!["instructions"]),
         (shared, vec!["instructions", "core"]),
         (shared, vec!["config", "show"]),
-        (shared, vec!["init", "--dry-run"]),
-        (shared, vec!["init"]),
+        (shared, vec!["manage", "--dry-run"]),
+        (shared, vec!["manage"]),
         (shared, vec!["refresh", "--dry-run"]),
         (shared, vec!["refresh"]),
         (
@@ -571,7 +576,7 @@ fn refresh_refuses_an_incoming_requirement_before_changing_the_checkout() {
     assert_eq!(refreshed["new_oid"], seed_head.as_str());
     assert_eq!(read(&config_path), met);
     assert!(fixture.shared.join("incoming.md").is_file());
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(read(&config_path), met);
     assert_eq!(porcelain(&fixture.shared), "");
 }
@@ -579,19 +584,19 @@ fn refresh_refuses_an_incoming_requirement_before_changing_the_checkout() {
 #[test]
 fn init_preserves_the_declaration_and_publication_raises_it_from_there() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     let seed_config = fixture.seed.join(CONFIG);
     let plain = read(&seed_config);
     let declared = declaring("0.2.0", &plain);
     std::fs::write(&seed_config, &declared).unwrap();
-    for args in [&["init", "--dry-run"][..], &["init"][..]] {
+    for args in [&["manage", "--dry-run"][..], &["manage"][..]] {
         workspace(&fixture.seed, args);
         assert_eq!(read(&seed_config), declared, "{args:?}");
     }
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
     let config_path = fixture.shared.join(CONFIG);
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(read(&config_path), declared);
     assert_eq!(porcelain(&fixture.shared), "");
     assert_eq!(
@@ -668,7 +673,7 @@ fn init_preserves_the_declaration_and_publication_raises_it_from_there() {
 #[test]
 fn init_reconciles_the_root_ignore_file_and_keeps_the_declaration() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     let config_path = fixture.seed.join(CONFIG);
     let ignore_path = fixture.seed.join(".gitignore");
     let plain = read(&config_path);
@@ -691,7 +696,7 @@ fn init_reconciles_the_root_ignore_file_and_keeps_the_declaration() {
         format!("installed {}, repository requires 0.2.0", installed())
     );
 
-    let repaired = json(&workspace(&fixture.seed, ["init"]));
+    let repaired = json(&workspace(&fixture.seed, ["manage"]));
     let actions = repaired["actions"]
         .as_array()
         .unwrap()
@@ -714,7 +719,7 @@ fn init_reconciles_the_root_ignore_file_and_keeps_the_declaration() {
     std::fs::write(&config_path, &required).unwrap();
     std::fs::write(&ignore_path, &drifted).unwrap();
     assert_refused_with(
-        &workspace_unchecked(&fixture.seed, ["init"]),
+        &workspace_unchecked(&fixture.seed, ["manage"]),
         &refusal("99.0.0", &installed().to_string(), CONFIG),
     );
     assert_eq!(read(&ignore_path), drifted);
@@ -802,20 +807,24 @@ fn a_raise_applies_on_top_of_an_authorized_configuration_change() {
 
 #[cfg(feature = "test-storage")]
 #[test]
-fn init_with_storage_keeps_the_declaration_first() {
+fn manage_with_storage_raises_the_native_format_requirement() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     let config_path = fixture.seed.join(CONFIG);
     let declared = declaring("0.2.0", &read(&config_path));
     std::fs::write(&config_path, &declared).unwrap();
     let storage = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage.to_str().unwrap()],
+        ["manage", "--s3-url", storage.to_str().unwrap()],
     );
     assert_eq!(
         read(&config_path),
-        format!("{declared}\n[s3]\nurl = \"{}\"\n", storage.display())
+        format!(
+            "{}\n[s3]\nurl = \"{}\"\n",
+            declaring("0.8.0", &declared),
+            storage.display()
+        )
     );
 }
 
@@ -1557,7 +1566,7 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
     workspace(
         &fixture.seed,
         [
-            "init",
+            "manage",
             "--s3-url",
             fixture.root.join("storage-remote").to_str().unwrap(),
         ],
@@ -1566,7 +1575,7 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
     fixture.clone_shared();
     let config_path = fixture.shared.join(CONFIG);
     let original = read(&config_path);
-    let current = [(CLI_VERSION_ENV, "0.4.0")];
+    let current = [(CLI_VERSION_ENV, "0.8.0")];
     let (task_id, task) = create_task(&fixture, "relocation", "20260918-202000");
     approve(
         &task,
@@ -1578,7 +1587,7 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
     workspace(
         &fixture.shared,
         [
-            "init",
+            "manage",
             "--s3-url",
             fixture.root.join("relocated-storage").to_str().unwrap(),
         ],
@@ -1598,27 +1607,27 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
         ],
         &current,
     ));
-    assert_eq!(authorized["repository_requirement"]["change"], "raise");
+    assert!(authorized.get("repository_requirement").is_none());
     let tip = authorized["remote_oid"].as_str().unwrap();
     assert_eq!(
         show(&fixture.remote, &format!("{tip}:{CONFIG}")),
-        declaring("0.4.0", &relocated)
+        declaring("0.8.0", &relocated)
     );
 
     // A later release raises the shared branch further for its own schema.
-    std::fs::write(fixture.seed.join(CONFIG), declaring("0.5.0", &original)).unwrap();
+    std::fs::write(fixture.seed.join(CONFIG), declaring("0.9.0", &original)).unwrap();
     fixture.commit_seed("Adopt a newer task manifest schema");
 
     // The next publication leaves the configuration outside its scopes and
     // follows main's declaration while keeping the relocation.
     git(&fixture.shared, ["checkout", "--", "."]);
     std::fs::write(task.join("notes.md"), "notes\n").unwrap();
-    let later = [(CLI_VERSION_ENV, "0.5.0")];
+    let later = [(CLI_VERSION_ENV, "0.9.0")];
     let follow = json!({
         "path": CONFIG,
         "change": "follow",
-        "minimum_cli_version": "0.5.0",
-        "previous_minimum_cli_version": "0.4.0",
+        "minimum_cli_version": "0.9.0",
+        "previous_minimum_cli_version": "0.8.0",
         "task_manifest_schema": 3,
     });
     let published = json(&workspace_env(
@@ -1634,16 +1643,82 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
     let tip = published["remote_oid"].as_str().unwrap();
     assert_eq!(
         show(&fixture.remote, &format!("{tip}:{CONFIG}")),
-        declaring("0.5.0", &relocated)
+        declaring("0.9.0", &relocated)
     );
     assert!(commit_message(&fixture.remote, tip).contains(
-        "\nWorkspace-Requirement: minimum_cli_version=0.5.0 (task manifest schema 3; follows origin/main)\n"
+        "\nWorkspace-Requirement: minimum_cli_version=0.9.0 (task manifest schema 3; follows origin/main)\n"
     ));
 
-    // The user's merge is clean and keeps both the relocation and 0.5.0.
+    // The user's merge is clean and keeps both the relocation and 0.9.0.
     merge_into_main(&fixture, "codex/relocation");
     assert_eq!(
         read(&fixture.seed.join(CONFIG)),
-        declaring("0.5.0", &relocated)
+        declaring("0.9.0", &relocated)
+    );
+}
+
+#[cfg(feature = "test-storage")]
+#[test]
+fn native_storage_metadata_requires_a_compatible_writer_before_publication() {
+    let fixture = GitFixture::new();
+    let remote = fixture.root.join("native-storage");
+    workspace(
+        &fixture.seed,
+        ["manage", "--s3-url", remote.to_str().unwrap()],
+    );
+    let config_path = fixture.seed.join(CONFIG);
+    std::fs::write(&config_path, declaring("0.7.2", &read(&config_path))).unwrap();
+    fixture.commit_seed("Manage storage with an older declaration");
+    fixture.clone_shared();
+    let (task_id, task) = create_task(&fixture, "native-format", "20261007-190000");
+    document_task(&task);
+    std::fs::write(task.join("artifact.bin"), b"abc").unwrap();
+    std::fs::write(
+        task.join("artifact.bin.wm-storage.json"),
+        storage_file_manifest("artifact.bin", "900150983cd24fb0d6963f7d28e17f72", 3, None),
+    )
+    .unwrap();
+    let index = git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout;
+    let head = rev(&fixture.shared, "HEAD").unwrap();
+    for args in [
+        &["plan"][..],
+        &["publish", "--dry-run", "-m", "Native metadata"][..],
+        &["publish", "-m", "Native metadata"][..],
+    ] {
+        let rejected = workspace_env_unchecked(&task, args, &[(CLI_VERSION_ENV, "0.7.2")]);
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(
+            stderr(&rejected).contains("native storage manifest"),
+            "{}",
+            stderr(&rejected)
+        );
+        assert!(stderr(&rejected).contains("0.8.0"), "{}", stderr(&rejected));
+        assert_eq!(
+            git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
+            index
+        );
+        assert_eq!(rev(&fixture.shared, "HEAD").unwrap(), head);
+        assert!(rev(&fixture.remote, "refs/heads/codex/native-format").is_none());
+    }
+    let plan = json(&workspace(&task, ["plan"]));
+    assert_eq!(
+        plan["repository_requirement"]["minimum_cli_version"],
+        "0.8.0"
+    );
+    let published = json(&workspace(
+        &task,
+        ["publish", "-m", "Retain native metadata"],
+    ));
+    let tip = published["remote_oid"].as_str().unwrap();
+    assert!(
+        show(&fixture.remote, &format!("{tip}:{CONFIG}"))
+            .starts_with("minimum_cli_version = \"0.8.0\"")
+    );
+    assert!(commit_message(&fixture.remote, tip).contains("storage metadata compatibility"));
+    assert!(
+        published["changed_paths"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("{task_id}/artifact.bin.wm-storage.json")))
     );
 }

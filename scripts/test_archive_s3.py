@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real CLI archive/publication/history E2E against a CI-owned MinIO service.
 
-Requires a --features test-storage binary, boto3/PyYAML for this test oracle, and
+Requires a --features test-storage binary, boto3 for isolated S3 verification, and
 the same WORKSPACE_MGR_BIN / WORKSPACE_MGR_E2E_ROOT / MINIO_* variables as the
 ordinary E2E harness. This scenario uses its own bucket and temporary home; it
 never reads user credentials or connects to an AWS endpoint.
@@ -38,13 +38,13 @@ class ArchiveHarness(e2e.Harness):
             raise e2e.E2EFailure("archive E2E requires a local CI-owned MinIO endpoint")
         self.bucket = os.environ.get("MINIO_ARCHIVE_BUCKET", self.bucket + "-archive")
         # The obsolete Python override deliberately selects a missing program.
-        # The test-only DVC fault injector remains unset for these real flows.
+        # The test-only storage fault injector remains unset for these real flows.
         self.env["WORKSPACE_MGR_STORAGE_PYTHON"] = str(self.root / "python-must-not-run")
-        self.env.pop("WORKSPACE_MGR_STORAGE_DVC", None)
+        self.env.pop("WORKSPACE_MGR_TEST_STORAGE_HOOK", None)
         self.unmapped_source_versions = []
 
     def namespace_versions(self, task):
-        prefix = f"dvc/{task}/"
+        prefix = f"objects/{task}/"
         entries = self.versions_under(prefix)
         self.record("archive-s3-state", {"task": task, "versions": entries})
         return entries
@@ -65,7 +65,7 @@ class ArchiveHarness(e2e.Harness):
         return entries
 
     def registry_versions(self):
-        key = f"dvc/.workspace-mgr/archive/{hashlib.sha256(TASK.encode()).hexdigest()}.json"
+        key = f"objects/.workspace-mgr/archive/{hashlib.sha256(TASK.encode()).hexdigest()}.json"
         return [row for row in self.versions_under(key) if row["key"] == key]
 
     def registry_binding(self, receipt, kind="archive-registry"):
@@ -135,12 +135,12 @@ class ArchiveHarness(e2e.Harness):
         self.section("isolated versioned S3 and Git fixture")
         self.setup_s3()
         self.setup_repository()
-        self.wm(self.shared, "init", "--s3-url", f"s3://{self.bucket}/dvc", "--s3-endpoint-url", self.endpoint)
+        self.wm(self.shared, "manage", "--s3-url", f"s3://{self.bucket}/objects", "--s3-endpoint-url", self.endpoint)
         self.git(self.shared, "add", "-A")
         self.git(self.shared, "commit", "-m", "Initialize archive fixture")
         self.git(self.shared, "push", "origin", "main")
         self.check(not Path(self.env["WORKSPACE_MGR_STORAGE_PYTHON"]).exists()
-                   and "WORKSPACE_MGR_STORAGE_DVC" not in self.env,
+                   and "WORKSPACE_MGR_TEST_STORAGE_HOOK" not in self.env,
                    "native storage initialization ignores a missing legacy Python runtime override")
 
     def publish_original(self):
@@ -168,8 +168,8 @@ class ArchiveHarness(e2e.Harness):
         merged = self.merge_branch_to_main(BRANCH)
         self.wm(self.shared, "refresh")
         # The archived namespace also owns versions absent from the current
-        # DVC pointer inventory. These must move with all payload generations.
-        retired_key = f"dvc/{TASK}/retired.bin"
+        # native manifest inventory. These must move with all payload generations.
+        retired_key = f"objects/{TASK}/retired.bin"
         for body in (b"retired generation one\n", b"retired generation two\n"):
             response = self.s3.put_object(Bucket=self.bucket, Key=retired_key, Body=body,
                                           Metadata={"purpose": "original historical metadata"}, ContentType="binary/archive-test")
@@ -178,7 +178,7 @@ class ArchiveHarness(e2e.Harness):
         self.s3.delete_object(Bucket=self.bucket, Key=retired_key)
         # A published pointer remains readable through its exact payload even
         # when S3's current state is a delete marker above it.
-        self.s3.delete_object(Bucket=self.bucket, Key=f"dvc/{TASK}/single.txt")
+        self.s3.delete_object(Bucket=self.bucket, Key=f"objects/{TASK}/single.txt")
         self.fake_gh(merged, second["remote_oid"])
         original = self.namespace_versions(TASK)
         self.check(sum(not row["delete_marker"] for row in original) == 7
@@ -192,10 +192,10 @@ class ArchiveHarness(e2e.Harness):
         self.run(["git", "clone", self.remote_url, organizer])
         self.configure_git(organizer)
         self.check(not (organizer / TASK / "single.txt").exists() and not (organizer / TASK / "bundle").exists(),
-                   "a fresh clone has only DVC pointers")
+                   "a fresh clone has only native manifests")
         self.original_metadata = {
             name: (organizer / TASK / name).read_bytes()
-            for name in (".workspace-mgr-task.toml", "single.txt.dvc", "bundle.dvc")
+            for name in (".workspace-mgr-task.toml", "single.txt.wm-storage.json", "bundle.wm-storage.json")
         }
         ignored = organizer / TASK / "__pycache__" / "retained-local.bin"
         ignored.parent.mkdir()
@@ -216,7 +216,7 @@ class ArchiveHarness(e2e.Harness):
         archived = self.wm(worktree, "archive", TASK, "--manifest", manifest)
         self.check(archived["status"] == "archived" and archived["remote_writes"] is False,
                    "archive is a local operation in the infrastructure task")
-        self.check(not (worktree / TASK).exists() and (worktree / DESTINATION / "single.txt.dvc").is_file(),
+        self.check(not (worktree / TASK).exists() and (worktree / DESTINATION / "single.txt.wm-storage.json").is_file(),
                    "archive moves Git metadata to the selected date folder")
         self.check(not (worktree / DESTINATION / "single.txt").exists() and not (worktree / DESTINATION / "bundle").exists(),
                    "archive does not materialize absent S3 outputs")
@@ -300,9 +300,9 @@ class ArchiveHarness(e2e.Harness):
         self.check(len(mapped) == len(original) == len(copied), "every source payload and marker has one copied destination version")
         actual = {(row["key"], row["version_id"]): row for row in copied}
         for old in original:
-            object_name = old["key"].removeprefix("dvc/")
+            object_name = old["key"].removeprefix("objects/")
             row = mapped[(object_name, old["version_id"])]
-            destination_key = "dvc/" + row["destination_object"]
+            destination_key = "objects/" + row["destination_object"]
             new = actual[(destination_key, row["destination_version_id"])]
             self.check(row["source_last_modified"] == old["last_modified"], "receipt preserves the original timestamp", object=object_name)
             self.check(row["delete_marker"] == old["delete_marker"] == new["delete_marker"]
@@ -337,30 +337,29 @@ class ArchiveHarness(e2e.Harness):
         self.check(self.namespace_versions(TASK) == original, "a failed Git publication leaves every source version untouched")
         self.check(not (worktree / DESTINATION / "single.txt").exists() and not (worktree / DESTINATION / "bundle").exists(),
                    "archive publication can copy without downloading task outputs")
-        import yaml
-        single = yaml.safe_load((worktree / DESTINATION / "single.txt.dvc").read_text())["outs"][0]
-        version = single["cloud"]["workspace-mgr"]["version_id"]
+        single = json.loads((worktree / DESTINATION / "single.txt.wm-storage.json").read_text())
+        version = single["version"]["id"]
         self.check(any(row["destination_object"] == DESTINATION + "/single.txt" and row["destination_version_id"] == version
-                       for row in receipt["versions"]), "the standalone DVC pointer automatically binds the copied exact version")
-        bundle = yaml.safe_load((worktree / DESTINATION / "bundle.dvc").read_text())["outs"][0]
-        self.check(all(any(row["destination_object"] == DESTINATION + "/bundle/" + item["relpath"]
-                              and row["destination_version_id"] == item["cloud"]["workspace-mgr"]["version_id"]
-                          for row in receipt["versions"]) for item in bundle["files"]),
+                       for row in receipt["versions"]), "the standalone native manifest automatically binds the copied exact version")
+        bundle = json.loads((worktree / DESTINATION / "bundle.wm-storage.json").read_text())
+        self.check(all(any(row["destination_object"] == DESTINATION + "/bundle/" + item["path"]
+                              and row["destination_version_id"] == item["version"]["id"]
+                          for row in receipt["versions"]) for item in bundle["entries"]),
                    "every directory manifest entry automatically binds its copied version")
         # Model interruption after copying but before every local metadata
         # rewrite became durable. A copied receipt must repair an old binding
         # on retry, rather than treating its status as permission to skip it.
         base = self.remote_ref("main")
-        old_pointer = self.remote_file(base, f"{TASK}/single.txt.dvc")
-        (worktree / DESTINATION / "single.txt.dvc").write_text(old_pointer)
+        old_pointer = self.remote_file(base, f"{TASK}/single.txt.wm-storage.json")
+        (worktree / DESTINATION / "single.txt.wm-storage.json").write_text(old_pointer)
         # A concurrent writer can append history after this complete copy.
         # It must block completed retirement, and cannot become a latest-version
         # fallback for an older Git pointer whose exact version was retired.
         for name, body in (("single.txt", b"unmapped standalone written after copying\n"),
                            ("late-unmapped.txt", b"unmapped brand-new source key\n")):
-            response = self.s3.put_object(Bucket=self.bucket, Key=f"dvc/{TASK}/{name}", Body=body)
+            response = self.s3.put_object(Bucket=self.bucket, Key=f"objects/{TASK}/{name}", Body=body)
             self.unmapped_source_versions.append((f"{TASK}/{name}", response["VersionId"]))
-        marker = self.s3.delete_object(Bucket=self.bucket, Key=f"dvc/{TASK}/late-unmapped.txt")
+        marker = self.s3.delete_object(Bucket=self.bucket, Key=f"objects/{TASK}/late-unmapped.txt")
         self.unmapped_source_versions.append((f"{TASK}/late-unmapped.txt", marker["VersionId"]))
         source_after_late_writes = self.namespace_versions(TASK)
         reject_flag.unlink()
@@ -374,8 +373,8 @@ class ArchiveHarness(e2e.Harness):
         self.check(self.namespace_versions(DESTINATION) == copied, "retry creates no duplicate destination history")
         self.check(self.namespace_versions(TASK) == source_after_late_writes,
                    "all original and later source history remains protected while main uses the old task path")
-        repaired = yaml.safe_load((worktree / DESTINATION / "single.txt.dvc").read_text())["outs"][0]
-        self.check(repaired["cloud"]["workspace-mgr"]["version_id"] == version,
+        repaired = json.loads((worktree / DESTINATION / "single.txt.wm-storage.json").read_text())
+        self.check(repaired["version"]["id"] == version,
                    "retry repairs old path-bound metadata even when the private copy journal is complete")
         repeated = self.wm(worktree, "publish", "--manifest", manifest, "-m", "Verify completed archive is idempotent")
         self.check(repeated["status"] == "no_changes" and self.namespace_versions(DESTINATION) == copied,
@@ -399,7 +398,7 @@ class ArchiveHarness(e2e.Harness):
         self.check(self.remote_ref(BRANCH) is None,
                    "automatic branch cleanup removes the old source's last remote branch protection")
         remaining = self.namespace_versions(TASK)
-        self.check({(row["key"].removeprefix("dvc/"), row["version_id"]) for row in remaining}
+        self.check({(row["key"].removeprefix("objects/"), row["version_id"]) for row in remaining}
                    == set(self.unmapped_source_versions),
                    "mapped retirement preserves every unreviewed concurrent generation")
         retained = refreshed["storage"]["purge"]["retained_unmapped"]
@@ -413,7 +412,7 @@ class ArchiveHarness(e2e.Harness):
         # Model the user's explicit reconciliation of these fixture-owned
         # competing writes. The product itself must never erase unknown bytes.
         for object_name, version in self.unmapped_source_versions:
-            self.s3.delete_object(Bucket=self.bucket, Key="dvc/" + object_name, VersionId=version)
+            self.s3.delete_object(Bucket=self.bucket, Key="objects/" + object_name, VersionId=version)
         completed = self.wm(cleaner, "refresh")
         self.check(completed["storage"]["purge"]["status"] == "complete"
                    and completed["storage"]["purge"]["pending"] == []
