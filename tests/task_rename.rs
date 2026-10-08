@@ -2,11 +2,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{GitFixture, document_task, git, git_unchecked, json, workspace, workspace_unchecked};
+use common::{
+    GitFixture, document_task, git, git_unchecked, json, storage_file_manifest, workspace,
+    workspace_unchecked,
+};
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize managed workspace");
     fixture.clone_shared();
     fixture
@@ -359,8 +362,13 @@ fn rename_clears_path_bound_s3_versions_for_republication_at_the_new_path() {
     let fixture = managed_fixture();
     let (_, old_task, _) = create_task(&fixture, "versioned-path", "20260830-120250");
     std::fs::write(
-        old_task.join("artifact.bin.dvc"),
-        "outs:\n- md5: abc\n  size: 3\n  path: artifact.bin\n  cloud:\n    storage:\n      version_id: old-path-version\n",
+        old_task.join("artifact.bin.wm-storage.json"),
+        storage_file_manifest(
+            "artifact.bin",
+            "900150983cd24fb0d6963f7d28e17f72",
+            3,
+            Some("old-path-version"),
+        ),
     )
     .unwrap();
 
@@ -368,12 +376,15 @@ fn rename_clears_path_bound_s3_versions_for_republication_at_the_new_path() {
 
     let pointer = fixture
         .shared
-        .join("20260830-120250-new-versioned-path/artifact.bin.dvc");
-    let contents = std::fs::read_to_string(pointer).unwrap();
-    assert!(contents.contains("md5: abc"));
-    assert!(contents.contains("path: artifact.bin"));
-    assert!(!contents.contains("cloud:"));
-    assert!(!contents.contains("version_id:"));
+        .join("20260830-120250-new-versioned-path/artifact.bin.wm-storage.json");
+    let contents: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(pointer).unwrap()).unwrap();
+    assert_eq!(
+        contents["checksum"]["digest"],
+        "900150983cd24fb0d6963f7d28e17f72"
+    );
+    assert_eq!(contents["path"], "artifact.bin");
+    assert!(contents.get("version").is_none());
 }
 
 #[test]

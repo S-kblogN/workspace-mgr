@@ -9,7 +9,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize automatic storage policy");
     fixture.clone_shared();
@@ -89,12 +89,21 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
         json(&plan)["storage"]["placement"]["automatic_s3_above_bytes"],
         10_485_760
     );
-    assert!(!task.join("large.bin.dvc").exists());
+    assert!(!task.join("large.bin.wm-storage.json").exists());
     assert!(!storage_remote.exists());
 
     let published = workspace(&task, ["publish", "-m", "Publish automatic placement"]);
     assert_eq!(json(&published)["status"], "pushed");
-    assert!(task.join("large.bin.dvc").is_file());
+    assert!(task.join("large.bin.wm-storage.json").is_file());
+    let native: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(task.join("large.bin.wm-storage.json")).unwrap())
+            .unwrap();
+    assert_eq!(native["schema_version"], 1);
+    assert_eq!(native["kind"], "file");
+    assert_eq!(native["checksum"]["algorithm"], "md5");
+    assert!(native.get("outs").is_none());
+    assert!(native.get("cloud").is_none());
+    assert!(!task.join("large.bin.dvc").exists());
     assert!(storage_remote.exists());
 
     std::fs::write(task.join("second-large.bin"), vec![8_u8; 10_485_761]).unwrap();
@@ -117,7 +126,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
             .iter()
             .any(|path| path == &format!("{task_id}/second-large.bin"))
     );
-    assert!(!task.join("second-large.bin.dvc").exists());
+    assert!(!task.join("second-large.bin.wm-storage.json").exists());
 }
 
 #[cfg(unix)]
@@ -127,7 +136,7 @@ fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize automatic storage policy");
     fixture.clone_shared();
@@ -171,7 +180,7 @@ fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
             stderr.contains(&format!("{top_level:?} contains a backslash")),
             "{stderr}"
         );
-        assert!(!task.join("top\\level.bin.dvc").exists());
+        assert!(!task.join("top\\level.bin.wm-storage.json").exists());
         assert!(!task.join(".gitignore").exists());
         assert!(!storage_remote.exists());
     }
@@ -209,7 +218,7 @@ fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
         String::from_utf8_lossy(&refused.stderr)
             .contains(&format!("{nested:?} contains a backslash"))
     );
-    assert!(!task.join("d\\x").join("big.bin.dvc").exists());
+    assert!(!task.join("d\\x").join("big.bin.wm-storage.json").exists());
     assert!(!storage_remote.exists());
 
     let renamed = format!("{task_id}/dx/big.bin");
@@ -220,7 +229,7 @@ fn automatic_s3_placement_refuses_backslash_paths_before_engine_writes() {
         json(&in_s3)["storage"]["placement"]["placed_in_s3"],
         serde_json::json!([renamed])
     );
-    assert!(task.join("dx").join("big.bin.dvc").is_file());
+    assert!(task.join("dx").join("big.bin.wm-storage.json").is_file());
     assert!(storage_remote.exists());
 }
 
@@ -231,7 +240,7 @@ fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize automatic storage policy");
     fixture.clone_shared();
@@ -254,31 +263,32 @@ fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
     document_task(&task);
     let top_level = format!("{task_id}/top\\level.bin");
     std::fs::write(task.join("top\\level.bin"), vec![7_u8; 10_485_761]).unwrap();
-    // Earlier releases let automatic placement create this metadata before
-    // publication failed, leaving every later transaction broken.
+    // Imported metadata can preserve a historical boundary spelling. It must
+    // remain visible and recoverable through an explicit move.
     let payload = std::fs::read(task.join("top\\level.bin")).unwrap();
     let digest = md5::Md5::digest(&payload)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     std::fs::write(
-        task.join("top\\level.bin.dvc"),
-        format!(
-            "outs:\n- md5: {digest}\n  size: {}\n  hash: md5\n  path: top\\level.bin\n",
-            payload.len()
-        ),
+        task.join("top\\level.bin.wm-storage.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1, "path": "top\\level.bin", "kind": "file",
+            "checksum": { "algorithm": "md5", "digest": digest }, "size": payload.len()
+        }))
+        .unwrap(),
     )
     .unwrap();
     std::fs::write(task.join(".gitignore"), "/top\\\\level.bin\n").unwrap();
     let cache = fixture
         .shared
-        .join(".dvc/cache/files/md5")
+        .join(".workspace-mgr/local/cache/objects/md5")
         .join(&digest[..2])
         .join(&digest[2..]);
     std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
     std::fs::write(cache, payload).unwrap();
-    assert!(task.join("top\\level.bin.dvc").is_file());
-    let stale_pointer = format!("{top_level}.dvc");
+    assert!(task.join("top\\level.bin.wm-storage.json").is_file());
+    let stale_pointer = format!("{top_level}.wm-storage.json");
 
     for args in [
         vec!["plan"],
@@ -302,19 +312,19 @@ fn engine_metadata_at_a_backslash_path_is_reported_and_recoverable() {
             "{stderr}"
         );
         assert!(stderr.contains("workspace-mgr move"), "{stderr}");
-        assert!(task.join("top\\level.bin.dvc").is_file());
+        assert!(task.join("top\\level.bin.wm-storage.json").is_file());
     }
 
     let renamed = format!("{task_id}/top-level.bin");
     workspace(&task, ["move", &top_level, &renamed]);
     let published = workspace(&task, ["publish", "-m", "Publish recovered data"]);
     assert_eq!(json(&published)["status"], "pushed");
-    let pointer = format!("{renamed}.dvc");
+    let pointer = format!("{renamed}.wm-storage.json");
     assert_eq!(
         json(&published)["storage"]["s3"]["pushed"],
         serde_json::json!([pointer])
     );
-    assert!(!task.join("top\\level.bin.dvc").exists());
+    assert!(!task.join("top\\level.bin.wm-storage.json").exists());
     assert!(storage_remote.exists());
 }
 
@@ -324,13 +334,13 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", dvc_remote.to_str().unwrap()],
+        ["manage", "--s3-url", dvc_remote.to_str().unwrap()],
     );
     let config = std::fs::read_to_string(fixture.seed.join(".workspace-mgr.toml")).unwrap();
     assert!(config.contains("[s3]"));
     assert!(config.contains(&format!("url = {:?}", dvc_remote.to_str().unwrap())));
-    let internal = std::fs::read_to_string(fixture.seed.join(".dvc/config")).unwrap();
-    assert!(internal.contains("remote = workspace-mgr"));
+    assert!(!fixture.seed.join(".dvc").exists());
+    assert!(!fixture.seed.join(".dvcignore").exists());
     fixture.commit_seed("Initialize managed DVC repository");
     fixture.clone_shared();
     workspace(
@@ -391,14 +401,14 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     assert!(aggregate.get("warnings").is_none());
     let tracked = workspace(&task, ["publish", "-m", "Publish S3 data"]);
     assert_eq!(json(&tracked)["status"], "pushed");
-    assert!(task.join("data.bin.dvc").is_file());
+    assert!(task.join("data.bin.wm-storage.json").is_file());
 
     let reset = workspace(
         &task,
         ["storage", "reset", &format!("{task_name}/data.bin")],
     );
     assert_eq!(json(&reset)["placements"][0]["target"], "s3");
-    assert!(task.join("data.bin.dvc").is_file());
+    assert!(task.join("data.bin.wm-storage.json").is_file());
     assert!(!task.join("data.bin.workspace-mgr-storage.toml").exists());
 
     let inherited = workspace(
@@ -445,10 +455,10 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     assert_eq!(json(&published)["status"], "pushed");
     assert_eq!(
         json(&published)["storage"]["s3"]["dirty_files"][0],
-        format!("{task_name}/data.bin.dvc")
+        format!("{task_name}/data.bin.wm-storage.json")
     );
 
-    let cache = fixture.shared.join(".dvc/cache");
+    let cache = fixture.shared.join(".workspace-mgr/local/cache");
     std::fs::remove_dir_all(&cache).unwrap();
     let exact_without_cache = workspace(&task, ["storage", "hydrate"]);
     assert_eq!(json(&exact_without_cache)["status"], "hydrated");
@@ -481,7 +491,7 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let moved_publish = workspace(&task, ["publish", "-m", "Publish moved S3 data"]);
     assert_eq!(json(&moved_publish)["status"], "pushed");
     assert!(moved.is_file());
-    assert!(task.join("moved.bin.dvc").is_file());
+    assert!(task.join("moved.bin.wm-storage.json").is_file());
 
     let git_placement = workspace(
         &task,
@@ -499,7 +509,7 @@ fn placement_publish_and_hydrate_use_an_isolated_local_remote() {
     let git_publish = workspace(&task, ["publish", "-m", "Publish Git placement"]);
     assert_eq!(json(&git_publish)["status"], "pushed");
     assert!(moved.is_file());
-    assert!(!task.join("moved.bin.dvc").exists());
+    assert!(!task.join("moved.bin.wm-storage.json").exists());
 }
 
 #[test]
@@ -508,7 +518,7 @@ fn a_published_git_file_can_move_to_s3_without_remaining_in_git() {
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", dvc_remote.to_str().unwrap()],
+        ["manage", "--s3-url", dvc_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize managed storage");
     fixture.clone_shared();
@@ -564,7 +574,7 @@ fn a_published_git_file_can_move_to_s3_without_remaining_in_git() {
         [
             "cat-file",
             "-e",
-            &format!("{commit}:{task_id}/data.txt.dvc"),
+            &format!("{commit}:{task_id}/data.txt.wm-storage.json"),
         ],
     );
     assert!(pointer.status.success());
@@ -579,7 +589,7 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize managed storage");
     fixture.clone_shared();
@@ -602,16 +612,16 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
     std::fs::write(task.join("first.bin"), b"first\n").unwrap();
     std::fs::write(task.join("second.bin"), b"second\n").unwrap();
 
-    let fake_dvc = fixture.root.join("fake-dvc");
-    let counter = fixture.root.join("fake-dvc-counter");
+    let failure_hook = fixture.root.join("storage-failure-hook");
+    let counter = fixture.root.join("storage-failure-hook-counter");
     std::fs::write(
-        &fake_dvc,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"add\" ]; then\n  count=0\n  if [ -f \"$FAKE_DVC_COUNTER\" ]; then count=$(cat \"$FAKE_DVC_COUNTER\"); fi\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > \"$FAKE_DVC_COUNTER\"\n  if [ \"$count\" -gt 1 ]; then exit 23; fi\n  path=$3\n  name=${path##*/}\n  dir=${path%/*}\n  printf 'outs:\\n- path: %s\\n' \"$name\" > \"$path.dvc\"\n  printf '/%s\\n' \"$name\" > \"$dir/.gitignore\"\n  exit 0\nfi\nexit 23\n",
+        &failure_hook,
+        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"add\" ]; then\n  count=0\n  if [ -f \"$STORAGE_FAILURE_COUNTER\" ]; then count=$(cat \"$STORAGE_FAILURE_COUNTER\"); fi\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > \"$STORAGE_FAILURE_COUNTER\"\n  if [ \"$count\" -gt 1 ]; then exit 23; fi\n  exit 0\nfi\nexit 0\n",
     )
     .unwrap();
-    let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
+    let mut permissions = std::fs::metadata(&failure_hook).unwrap().permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_dvc, permissions).unwrap();
+    std::fs::set_permissions(&failure_hook, permissions).unwrap();
 
     let output = binary_command()
         .args([
@@ -626,15 +636,15 @@ fn failed_multi_path_storage_set_rolls_back_all_local_metadata() {
         ])
         .current_dir(&task)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
-        .env("FAKE_DVC_COUNTER", &counter)
+        .env("WORKSPACE_MGR_TEST_STORAGE_HOOK", &failure_hook)
+        .env("STORAGE_FAILURE_COUNTER", &counter)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("was rolled back"));
     for name in ["first.bin", "second.bin"] {
         assert!(task.join(name).is_file());
-        assert!(!task.join(format!("{name}.dvc")).exists());
+        assert!(!task.join(format!("{name}.wm-storage.json")).exists());
         assert!(
             !task
                 .join(format!("{name}.workspace-mgr-storage.toml"))
@@ -653,7 +663,7 @@ fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize automatic storage rollback");
     fixture.clone_shared();
@@ -676,27 +686,27 @@ fn automatic_storage_failure_rolls_back_partial_engine_metadata() {
     document_task(&task);
     std::fs::write(task.join("large.bin"), vec![9_u8; 10_485_761]).unwrap();
 
-    let fake_dvc = fixture.root.join("partial-automatic-dvc");
+    let failure_hook = fixture.root.join("partial-automatic-storage");
     std::fs::write(
-        &fake_dvc,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"add\" ]; then\n  path=$3\n  name=${path##*/}\n  dir=${path%/*}\n  printf 'outs:\\n- path: %s\\n' \"$name\" > \"$path.dvc\"\n  printf '/%s\\n' \"$name\" > \"$dir/.gitignore\"\n  exit 23\nfi\nexit 23\n",
+        &failure_hook,
+        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"add\" ]; then\n  path=$3\n  name=${path##*/}\n  dir=${path%/*}\n  printf 'partial metadata\\n' > \"$path.wm-storage.json\"\n  printf '/%s\\n' \"$name\" > \"$dir/.gitignore\"\n  exit 23\nfi\nexit 0\n",
     )
     .unwrap();
-    let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
+    let mut permissions = std::fs::metadata(&failure_hook).unwrap().permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_dvc, permissions).unwrap();
+    std::fs::set_permissions(&failure_hook, permissions).unwrap();
 
     let output = binary_command()
         .args(["publish", "-m", "This automatic placement must fail"])
         .current_dir(&task)
         .env("WORKSPACE_MGR_FORMAT", "json")
-        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
+        .env("WORKSPACE_MGR_TEST_STORAGE_HOOK", &failure_hook)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("was rolled back"));
     assert!(task.join("large.bin").is_file());
-    assert!(!task.join("large.bin.dvc").exists());
+    assert!(!task.join("large.bin.wm-storage.json").exists());
     assert!(!task.join(".gitignore").exists());
 }
 
@@ -706,7 +716,7 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
     let dvc_remote = fixture.root.join("dvc-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", dvc_remote.to_str().unwrap()],
+        ["manage", "--s3-url", dvc_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize managed DVC repository");
     fixture.clone_shared();
@@ -750,11 +760,11 @@ fn publish_refuses_a_missing_dirty_dvc_output() {
 
 #[cfg(unix)]
 #[test]
-fn object_version_adapter_and_engine_config_are_internal() {
+fn native_storage_has_one_routing_authority_and_no_external_engine_files() {
     let fixture = GitFixture::new();
     let output = binary_command()
         .args([
-            "init",
+            "manage",
             "--s3-url",
             "s3://example.invalid/workspace",
             "--s3-endpoint-url",
@@ -771,9 +781,9 @@ fn object_version_adapter_and_engine_config_are_internal() {
     assert!(!public.contains("[dvc]"));
     assert!(!public.contains("require_version_aware"));
     assert!(!public.contains("python"));
-    let internal = std::fs::read_to_string(fixture.seed.join(".dvc/config")).unwrap();
-    assert!(internal.contains("remote = workspace-mgr"));
-    assert!(internal.contains("version_aware = true"));
+    assert!(!fixture.seed.join(".dvc").exists());
+    assert!(!fixture.seed.join(".dvcignore").exists());
+    assert!(!fixture.seed.join(".dvc/config").exists());
 }
 
 #[test]
@@ -782,7 +792,7 @@ fn content_routed_to_s3_still_needs_a_task_record() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize automatic storage policy");
     fixture.clone_shared();
@@ -819,7 +829,7 @@ fn content_routed_to_s3_still_needs_a_task_record() {
     );
     let refused_publish = workspace_unchecked(&task, ["publish", "-m", "Publish the dataset"]);
     assert_eq!(refused_publish.status.code(), Some(2));
-    assert!(!task.join("expensive.bin.dvc").exists());
+    assert!(!task.join("expensive.bin.wm-storage.json").exists());
 
     document_task(&task);
     let published = workspace(
@@ -830,7 +840,9 @@ fn content_routed_to_s3_still_needs_a_task_record() {
     assert_eq!(published["status"], "pushed");
     let changed = published["changed_paths"].as_array().unwrap();
     assert!(
-        changed.contains(&serde_json::json!(format!("{task_id}/expensive.bin.dvc"))),
+        changed.contains(&serde_json::json!(format!(
+            "{task_id}/expensive.bin.wm-storage.json"
+        ))),
         "{changed:?}"
     );
     assert!(
@@ -856,7 +868,7 @@ fn bulk_publication_counts_an_automatic_boundary_the_same_at_plan_and_publish() 
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize automatic storage policy");
     fixture.clone_shared();

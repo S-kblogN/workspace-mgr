@@ -1,6 +1,6 @@
 [package]
 name = "workspace-mgr"
-version = "0.7.4"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Fixed-policy repository workspace manager for coding agents"
@@ -11,7 +11,7 @@ readme = "README.md"
 publish = ["crates-io"]
 keywords = ["agents", "storage", "workspace", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/", "scripts/", "tests/e2e/", "tests/oracles/"]
+exclude = [".github/", "scripts/", "tests/e2e/"]
 
 [features]
 default = []

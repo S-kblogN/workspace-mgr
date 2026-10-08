@@ -5,7 +5,7 @@ use fs2::FileExt;
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();
     fixture
@@ -108,7 +108,7 @@ fn published_git_placement_stays_stable_when_a_file_grows() {
         ["storage", "reset", &format!("{task_id}/retained.bin")],
     );
     assert_eq!(json(&reset)["placements"][0]["target"], "git");
-    assert!(!task.join("retained.bin.dvc").exists());
+    assert!(!task.join("retained.bin.wm-storage.json").exists());
     let plan = workspace(&task, ["plan"]);
     assert_eq!(json(&plan)["status"], "dry_run");
     assert!(
@@ -582,8 +582,8 @@ fn refresh_rejects_new_storage_metadata_below_a_symlink() {
 
     std::fs::create_dir(fixture.seed.join("linked")).unwrap();
     std::fs::write(
-        fixture.seed.join("linked/payload.dvc"),
-        "outs:\n- path: payload\n  md5: d41d8cd98f00b204e9800998ecf8427e\n  size: 0\n",
+        fixture.seed.join("linked/payload.wm-storage.json"),
+        storage_file_manifest("payload", "d41d8cd98f00b204e9800998ecf8427e", 0, None),
     )
     .unwrap();
     fixture.commit_seed("Add incoming storage metadata");
@@ -1561,7 +1561,7 @@ fn the_products_own_rules_never_refuse_the_first_publication_of_a_repository() {
     // installation regardless, so they must never be read as machine-local.
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     assert!(
         git_unchecked(&fixture.shared, ["ls-files", "--", ".gitignore"])
             .stdout
@@ -1865,7 +1865,11 @@ fn public_plan_and_publish_require_bare_nested_repositories_to_be_ignored_before
         );
         assert_eq!(git(&fixture.remote, ["show-ref"]).stdout, remote);
         assert_eq!(std::fs::metadata(&payload).unwrap().len(), 10_485_761);
-        assert!(!bare.join("objects/large-local-object.dvc").exists());
+        assert!(
+            !bare
+                .join("objects/large-local-object.wm-storage.json")
+                .exists()
+        );
         assert!(!fixture.shared.join(".workspace-mgr/local/uploads").exists());
     }
     std::fs::write(task.join(".gitignore"), "/cache.git/\n").unwrap();
@@ -1886,6 +1890,10 @@ fn public_plan_and_publish_require_bare_nested_repositories_to_be_ignored_before
         index
     );
     assert_eq!(git(&fixture.remote, ["show-ref"]).stdout, remote);
-    assert!(!bare.join("objects/large-local-object.dvc").exists());
+    assert!(
+        !bare
+            .join("objects/large-local-object.wm-storage.json")
+            .exists()
+    );
     assert!(!fixture.shared.join(".workspace-mgr/local/uploads").exists());
 }

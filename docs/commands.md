@@ -41,7 +41,7 @@ The [user guide](guide.md) explains how the commands form one workflow.
   line on stderr; stdout, structured output, and command exit status are
   unchanged. The CLI never updates itself. Agents report the versions and ask
   the user before updating, then run `workspace-mgr setup`; scaffold changes are
-  reconciled with `workspace-mgr init` in an infrastructure task.
+  reconciled with `workspace-mgr manage` in an infrastructure task.
 - A repository whose `.workspace-mgr.toml` declares a `minimum_cli_version`
   that the installed CLI does not meet is refused, with status 2, by every
   command that reads the repository configuration, including `instructions`;
@@ -80,41 +80,68 @@ No separate runtime or package download is needed. `--runtime-dir` remains an
 accepted compatibility option and has no filesystem effect, including when it
 names an existing user directory. Setup leaves former runtimes unchanged.
 
-## `workspace-mgr init`
+## `workspace-mgr manage`
 
-Initialize a repository or reconcile its managed scaffolding.
+Adopt a repository, update its scaffolding and migrate supported legacy storage.
 
 ```text
-workspace-mgr init [--repo <path>]
+workspace-mgr manage [--repo <path>]
   [--s3-url <url> [--s3-endpoint-url <url>]]
+  [--cancel-migration]
   [--dry-run]
 ```
 
 `--s3-url` must use `s3://` and is a tracked, non-secret storage location; userinfo,
 queries, fragments, and other credential-bearing URL forms are rejected.
-Re-running `init` validates public configuration and deterministically repairs
-or upgrades product-owned scaffolding. Ownership is established by the
-initialized repository and reserved path, not inferred from file content, so
-old, edited, or damaged `AGENTS.md` and internal storage configuration are
-replaced with their current deterministic forms, as are the private engine's
-ignore files. Before the first successful initialization, an existing
-`AGENTS.md`, root `.gitignore`, or private internal-storage scaffold is instead
-an atomic collision that the caller must move or remove explicitly; for the
-root `.gitignore` the message says where its rules belong.
+Re-running `manage` validates public configuration and deterministically repairs
+or upgrades product-owned `AGENTS.md` and the generated root `.gitignore`.
+`.workspace-mgr.toml` directly configures the native storage engine. Management
+does not generate a second remote configuration or engine-specific ignore file.
+An unowned existing `AGENTS.md` blocks first adoption before files change.
 
 The root `.gitignore` is the one reserved path a repository is likely to have
 arranged for itself long before workspace-mgr existed, so the product owns it
 only once it wrote it, which the generated first line records. A root
-`.gitignore` that the product did not generate is never reconciled over: `init`
-and `doctor` both refuse it and say to move this repository's own rules into
-`.workspace-mgr/repository.gitignore`, remove the root file, and run `init`
-again. Every repository initialized by an earlier release performs that
-migration once; see the upgrade note in the guide. Below the generated header
-the file is product-owned like the others, so a hand edit there is drift that
-`init` repairs.
+`.gitignore` that the product did not generate has its repository rules preserved in
+`.workspace-mgr/repository.gitignore` as part of the same transaction. An
+incompatible existing module blocks adoption. Below the generated header the
+file is product-owned, so a hand edit there is drift that `manage` repairs.
+Managed local-retention blocks stay in the root file separately. Migration drops
+only the recognized obsolete DVC control rules and normalizes trailing newlines.
+
+The command scans the whole checkout, including archived tasks, for legacy
+`.dvc` manifests. It converts supported metadata to `.wm-storage.json`, carries
+reusable caches and private credentials into `.workspace-mgr/local/`, and removes
+recognized obsolete DVC controls. Nested Git repositories are excluded. Both
+migration and scaffold changes are preflighted before the recoverable transaction
+writes files. Path-based exact-version imports need no object transfer. Ordinary
+DVC 2 and DVC 3 S3 content-addressed imports verify source identities and copy
+opaque payloads to native object paths, including remote-only directory listings.
+Each destination binds a verified exact version in a bucket with versioning
+enabled and conditional writes supported; original CAS objects remain available
+to old Git snapshots. A durable import journal resumes partial transfers and
+reconciles lost upload responses.
+`--dry-run` reports conversions, removals, scaffold actions and remote transfer
+bytes without writes; it may read S3 metadata and directory listings. Legacy
+adoption requires the primary shared checkout;
+native scaffold reconciliation can also run in a linked worktree. See
+[native storage](storage.md) for import restrictions.
+The former `init` spelling remains a hidden compatibility alias.
+
+Publish all converted manifests, their legacy sidecar deletions, obsolete
+control deletions and updated configuration together, with all paths included in
+the infrastructure task's scopes. Publication refuses to remove routing
+controls still needed by legacy pointers in its proposed Git tree.
+
+After a failed CAS transfer, re-run `manage` to resume its verified source
+inventory and owned uploads. If a source or planned control file needs repair,
+`manage --cancel-migration` abandons the pending import plan so the next `manage`
+can build a fresh one. Preview cancellation with `--dry-run`. Cancellation keeps
+legacy controls, payloads, cache, upload receipts and every remote version; it
+performs no remote deletion. It cannot be combined with S3 routing options.
 
 The generated root `.gitignore` is the product's fixed rules, followed by this
-repository's own rules imported verbatim from
+repository's own rules imported from
 `.workspace-mgr/repository.gitignore`, followed by any
 `# workspace-mgr local begin` blocks the root file already holds. The fixed
 rules are written in these groups:
@@ -164,19 +191,22 @@ own directory, which today is always inside a task, so a block in the root file
 is a state this format supports rather than one a command produces; a marker
 without its partner has no readable extent, so regeneration drops it and the
 reported action names the marker it dropped. `doctor` reports a hand-edited
-root file through its `repository-scaffold` check. `init` refuses to change the S3
-location while retained S3 boundaries exist. It keeps an existing
-`minimum_cli_version` exactly and never adds one. It never contacts or writes a
-remote. The generated `AGENTS.md` includes an approval-gated command that
+root file through its `repository-scaffold` check. `manage` refuses to change the S3
+location while retained S3 boundaries exist. It preserves higher existing
+`minimum_cli_version` declarations and raises the requirement to at least
+0.8.1 when adopting native storage. It does not push Git refs. Ordinary CAS
+adoption reads S3 sources and creates verified native object versions;
+`--dry-run` reads only the remote metadata and listings needed for its inventory.
+The generated `AGENTS.md` includes an approval-gated command that
 installs the latest stable release from crates.io, followed by `setup` and an
 instructions retry, so a new machine can bootstrap without inventing a
 lower-level workflow.
 
 ```sh
-workspace-mgr init
-workspace-mgr init \
+workspace-mgr manage
+workspace-mgr manage \
   --s3-url s3://example-bucket/workspace
-workspace-mgr init --dry-run
+workspace-mgr manage --dry-run
 ```
 
 ## `workspace-mgr instructions`
@@ -1028,6 +1058,9 @@ the deletion authoritative in Git, then permanently deletes every S3 version
 at object paths removed by the operation. Current remote branches and tags are
 reference guards, so protected objects remain in private pending state until a
 later `publish`, `refresh`, or discard can delete them safely.
+Shared legacy CAS sources retained during migration are outside this native
+path retirement and are not automatically garbage-collected; see
+[legacy import retention](storage.md#migrating-legacy-dvc-repositories).
 
 ## `workspace-mgr untrack`
 
@@ -1064,6 +1097,7 @@ permanently cleans obsolete S3 object versions. Current remote branches and
 tags can defer cleanup; for example, `main` protects the previous S3 content
 until the deletion is merged. A later `publish` or `refresh` retries pending
 cleanup. Git history is not rewritten.
+Retained legacy CAS source hashes are not deleted by this native path cleanup.
 
 After merge, `refresh` retains existing local-only bytes. Automatic placement,
 publication, and hydration do not upload or recreate them. Resume tracking with
@@ -1343,10 +1377,11 @@ files, and the root `.workspace-mgr.toml`); every other change is a deletion.
 It may carry at most 1 MiB (1048576 bytes) of new workspace-mgr control-file
 content per publication, where metadata that only drops entries is free: each
 added or changed control file that the remote does not hold yet is charged its
-full new size, whether it grew, kept its size, or shrank. The exception is S3
-metadata in which every entry names an object path and version (or, where no
-version is recorded, content) that the metadata it replaces already names: it
-is charged only for the lines it does not share with that version. Each added
+full new size, whether it grew, kept its size, or shrank. A canonical native
+directory manifest that only removes entries, preserving every retained entry's
+path, checksum, physical size and exact version binding, is free. Legacy
+metadata that only removes existing object identities is charged only for
+the lines it does not share with the replaced version. Each added
 control file is also charged its path plus 28 bytes for the entry it adds to
 the Git trees above it. More new control-file content counts as added content.
 A cleanup-only publication remains allowed while the task is over its limit.

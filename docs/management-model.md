@@ -73,7 +73,7 @@ only become relevant once the operation runs.
 | Group closed-PR tasks or cancel an unpublished attempt | `workspace-mgr archive --help` |
 | Explicitly abandon an unmerged task | `workspace-mgr task discard --help` |
 | Synchronize the shared checkout after merge | `workspace-mgr refresh --help` |
-| Install dependencies, initialize or diagnose control state | `workspace-mgr setup --help`, `init --help`, `doctor --help`, `config show --help` |
+| Install dependencies, adopt or update a repository, diagnose control state | `workspace-mgr setup --help`, `manage --help`, `doctor --help`, `config show --help` |
 
 Default `instructions` and explicit `instructions all` return this mental model,
 operation directory and session-wide constraints. `instructions model` returns

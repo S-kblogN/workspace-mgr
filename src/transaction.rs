@@ -17,7 +17,6 @@ use crate::config::{
     CONFIG_NAME, Config, cli_version_satisfies, declared_minimum_cli_version,
     installed_cli_version, require_supported_cli_at,
 };
-use crate::dvc::{self, DataStatus};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
@@ -36,6 +35,7 @@ use crate::policy::{
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
 use crate::storage::{self, PLACEMENT_SUFFIX};
+use crate::storage_metadata::{self, DataStatus};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
@@ -146,7 +146,8 @@ impl RepositoryRequirement {
             (RequirementChange::Follow, Some(schema)) => {
                 format!("task manifest schema {schema}; follows {base}")
             }
-            (RequirementChange::Raise | RequirementChange::Follow, None) => {
+            (RequirementChange::Raise, None) => "storage metadata compatibility".to_owned(),
+            (RequirementChange::Follow, None) => {
                 format!("follows {base}")
             }
             (RequirementChange::Withdraw, _) => format!(
@@ -328,16 +329,16 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     }
     let local_only = storage::local_boundaries(&repo, &scopes)?;
     for boundary in &local_only {
-        let pointer = format!("{boundary}.dvc");
+        let pointer = storage_metadata::pointer_path(boundary);
         if local_path_exists(&resolved_under(&repo.root, &pointer))? {
             return Err(Error::message(format!(
                 "managed-storage metadata {pointer:?} conflicts with local-only content {boundary:?}; run `workspace-mgr untrack {boundary}` again to reconcile local retention, or run `workspace-mgr storage set {boundary} --to git|s3 --reason <reason>` to restore tracking explicitly"
             )));
         }
     }
-    let initial_dvc = dvc::discover(&repo, &scopes)?;
-    dvc::require_addressable_metadata(&initial_dvc)?;
-    let initial_outputs = dvc::output_paths(&repo, &initial_dvc)?;
+    let initial_pointers = storage_metadata::discover(&repo, &scopes)?;
+    storage_metadata::require_addressable_metadata(&initial_pointers)?;
+    let initial_outputs = storage_metadata::output_paths(&repo, &initial_pointers)?;
     let placement_preview = storage::apply_automatic(&repo, &config, &scopes, &base_oid, true)?;
     let preview_automatic_s3 = placement_preview.automatic_s3().to_vec();
     let preview_index = state_dir.join("preview-index");
@@ -361,7 +362,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         automatic_s3: &preview_automatic_s3,
         local_only: &local_only,
         config: &config,
-        uncommitted: &initial_dvc,
+        uncommitted: &initial_pointers,
         // Decided once the gate has measured, below.
         withheld_records_are_content: false,
     };
@@ -376,7 +377,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     // Decided on the preview, before any placement change or upload, so `plan`
     // and `publish` refuse the same machine-local ignore rule at the same point.
     let preview_ignored = check_untracked_ignore_sources(&repo, &preview_index, &scopes, &task)?;
-    let mut lock_names = initial_dvc
+    let mut lock_names = initial_pointers
         .iter()
         .map(|path| format!("pointer:{path}"))
         .chain(
@@ -387,14 +388,14 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .collect::<Vec<_>>();
     lock_names.sort();
     lock_names.dedup();
-    let _dvc_locks = acquire_dvc_locks(&local_state_dir, &lock_names)?;
+    let _storage_locks = acquire_storage_locks(&local_state_dir, &lock_names)?;
     if config.requires_object_versioning()
-        && (!initial_dvc.is_empty() || !preview_automatic_s3.is_empty())
+        && (!initial_pointers.is_empty() || !preview_automatic_s3.is_empty())
     {
-        dvc::verify_object_versioning(&repo, &config)?;
-    } else if config.s3_enabled() && !initial_dvc.is_empty() {
+        storage_metadata::verify_object_versioning(&repo, &config)?;
+    } else if config.s3_enabled() && !initial_pointers.is_empty() {
         // The usage gate trusts the storage engine's report of changed outputs.
-        dvc::ensure_ready(&repo, &config)?;
+        storage_metadata::ensure_ready(&repo, &config)?;
     }
     // Nothing has been placed, committed, or uploaded yet: this is the last
     // point where a publication can be refused without leaving local changes.
@@ -408,7 +409,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         remote_base_oid: &remote_base_oid,
         remote_target_oid: has_remote_target.then_some(base_oid.as_str()),
         projected_tree_oid: &projected_tree_oid,
-        pointers: &initial_dvc,
+        pointers: &initial_pointers,
         automatic_s3: &preview_automatic_s3,
         inspect_outputs: true,
     };
@@ -461,7 +462,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         withheld_records_are_content,
         ..preview_policy
     };
-    let pointers = dvc::discover(&repo, &scopes)?;
+    let pointers = storage_metadata::discover(&repo, &scopes)?;
     let archived_pointers = archive_migration::pointer_set(&repo, &scopes)?;
     let ordinary_pointers = pointers
         .iter()
@@ -469,7 +470,7 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         .cloned()
         .collect::<Vec<_>>();
     if !dry_run {
-        let preflight_outputs = dvc::output_paths(&repo, &pointers)?;
+        let preflight_outputs = storage_metadata::output_paths(&repo, &pointers)?;
         let preflight_index = state_dir.join("preflight-index");
         if preflight_index.exists() {
             fs::remove_file(&preflight_index).at(&preflight_index)?;
@@ -505,13 +506,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     } else {
         read_metadata(&repo, &pointers)?
     };
-    let mut s3 = dvc::reconcile(&repo, &config, &ordinary_pointers, dry_run)?;
+    let mut s3 = storage_metadata::reconcile(&repo, &config, &ordinary_pointers, dry_run)?;
     if !dry_run {
         stage_scopes(&repo, &preview_index, &scopes)?;
         remove_stored_outputs_from_index(
             &repo,
             &preview_index,
-            &dvc::output_paths(&repo, &pointers)?,
+            &storage_metadata::output_paths(&repo, &pointers)?,
         )?;
         remove_output_paths_from_index(&repo, &preview_index, local_only.iter())?;
         let committed_tree = repo
@@ -556,12 +557,13 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
                 },
             );
         }
-        dvc::push_outputs(&repo, &config, &mut s3)?;
+        storage_metadata::push_outputs(&repo, &config, &mut s3)?;
     }
     // Copied archive versions already exist remotely and may be deliberately
-    // unmaterialized. Never let native DVC push manufacture replacement versions.
+    // unmaterialized. Never let native storage upload manufacture replacement versions.
     let archived = archived_pointers.into_iter().collect::<Vec<_>>();
-    s3.outputs.extend(dvc::output_paths(&repo, &archived)?);
+    s3.outputs
+        .extend(storage_metadata::output_paths(&repo, &archived)?);
     s3.files.extend(archived.iter().cloned());
     if !dry_run {
         s3.pushed.extend(archived);
@@ -571,14 +573,11 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         let retired_pointers = local_only
             .iter()
             .map(|path| {
-                format!(
-                    "{}.dvc",
-                    published_history_path(
-                        path,
-                        task.task_path.as_deref(),
-                        published_task_path.as_deref(),
-                    )
-                )
+                storage_metadata::pointer_path(&published_history_path(
+                    path,
+                    task.task_path.as_deref(),
+                    published_task_path.as_deref(),
+                ))
             })
             .collect::<Vec<_>>();
         purge_preview.queued =
@@ -869,6 +868,7 @@ fn validate_private_index(
         )));
     }
     check_staged_entry_modes(repo, index, paths, policy)?;
+    check_storage_import_projection(repo, index, base_oid)?;
     check_large_files(repo, scopes, base_oid, policy)?;
     repo.run_with_index(
         index,
@@ -877,6 +877,70 @@ fn validate_private_index(
         true,
     )?;
     check_task_documentation(repo, index, base_oid, paths, policy)?;
+    Ok(())
+}
+
+fn check_storage_import_projection(repo: &GitRepo, index: &Path, base_oid: &str) -> Result<()> {
+    if !crate::legacy_dvc::is_content_addressed_revision(repo, base_oid)? {
+        return Ok(());
+    }
+    let public_route = staged_config(repo, index)?
+        .filter(IndexEntry::is_regular_file)
+        .map(|entry| blob_text(repo, &entry.oid))
+        .transpose()?
+        .is_some_and(|raw| {
+            Config::parse(&raw, &repo.root.join(CONFIG_NAME))
+                .ok()
+                .is_some_and(|config| config.requires_object_versioning())
+        });
+    let legacy = index_entries(repo, index, ":(literal).dvc/config")?
+        .into_iter()
+        .find(IndexEntry::is_regular_file);
+    if legacy
+        .map(|entry| blob_text(repo, &entry.oid))
+        .transpose()?
+        .is_some_and(|raw| {
+            crate::native_s3::is_legacy_cas_configuration_with_public_route(&raw, public_route)
+        })
+    {
+        return Ok(());
+    }
+    for entry in index_entries(repo, index, ":(glob)**/*.dvc")? {
+        if !entry.is_regular_file() {
+            continue;
+        }
+        let mut ancestor = Path::new(&entry.path).parent();
+        let mut nested = false;
+        while let Some(path) = ancestor.filter(|path| !path.as_os_str().is_empty()) {
+            if fs::symlink_metadata(repo.root.join(path).join(".git")).is_ok() {
+                nested = true;
+                break;
+            }
+            ancestor = path.parent();
+        }
+        if nested {
+            continue;
+        }
+        let raw = blob_text(repo, &entry.oid)?;
+        let document: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|_| {
+            Error::message(format!("invalid legacy storage metadata: {}", entry.path))
+        })?;
+        let unbound = document["outs"].as_sequence().is_some_and(|outputs| {
+            !outputs.is_empty()
+                && outputs.iter().all(|output| {
+                    output.get("cloud").is_none()
+                        && output["files"].as_sequence().is_none_or(|files| {
+                            files.iter().all(|file| file.get("cloud").is_none())
+                        })
+                })
+        });
+        if unbound {
+            return Err(Error::message(format!(
+                "the publication removes the content-addressed storage configuration but retains legacy manifest {}; publish every converted manifest and obsolete control removal together in the authorized infrastructure scope",
+                entry.path
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1061,11 +1125,11 @@ impl LockGuard {
     }
 }
 
-fn acquire_dvc_locks(local_state_dir: &Path, names: &[String]) -> Result<Vec<LockGuard>> {
+fn acquire_storage_locks(local_state_dir: &Path, names: &[String]) -> Result<Vec<LockGuard>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let lock_dir = local_state_dir.join("dvc-locks");
+    let lock_dir = local_state_dir.join("storage-locks");
     let mut guards = vec![LockGuard::acquire(
         &lock_dir.join("transaction.lock"),
         "another repository transaction is running",
@@ -1274,7 +1338,7 @@ fn is_task_content(task_path: &str, path: &str) -> bool {
     }
     let boundary = path
         .strip_suffix(PLACEMENT_SUFFIX)
-        .or_else(|| path.strip_suffix(".dvc"))
+        .or_else(|| storage_metadata::boundary_path(path))
         .unwrap_or(path);
     let name = boundary.rsplit('/').next().unwrap_or(boundary);
     !name.is_empty() && !is_housekeeping_name(name)
@@ -1314,7 +1378,7 @@ impl TaskProjection {
             let metadata_blob = attributes
                 .split_whitespace()
                 .nth(1)
-                .filter(|_| path.ends_with(".dvc"));
+                .filter(|_| storage_metadata::is_pointer(path));
             if let Some(oid) = metadata_blob {
                 projection
                     .metadata_blobs
@@ -1478,7 +1542,7 @@ fn retires_published_payload(boundary: &str, published: &str, removed: &[&str]) 
         [boundary, published].into_iter().any(|candidate| {
             *path == candidate
                 || inside(candidate, path)
-                || path.strip_suffix(".dvc") == Some(candidate)
+                || storage_metadata::boundary_path(path) == Some(candidate)
         })
     })
 }
@@ -1502,7 +1566,7 @@ fn check_committed_documentation(
     state_dir: &Path,
     base_oid: &str,
     scopes: &[String],
-    s3: &dvc::DvcReport,
+    s3: &storage_metadata::StorageReport,
     policy: &PrivateIndexPolicy<'_>,
 ) -> Result<()> {
     let Some(task_path) = deliverable_task_path(policy.task) else {
@@ -1565,7 +1629,7 @@ fn restore_metadata(
 /// because its directory's manifest is missing changes nothing on its own.
 fn pending_metadata_rewrites(
     repo: &GitRepo,
-    s3: &dvc::DvcReport,
+    s3: &storage_metadata::StorageReport,
     task_path: &str,
 ) -> Result<Vec<String>> {
     let dirty = s3
@@ -1581,7 +1645,7 @@ fn pending_metadata_rewrites(
         .flat_map(|pointer| s3.outputs.get(pointer.as_str()).into_iter().flatten())
         .cloned()
         .collect::<Vec<_>>();
-    let status = dvc::data_status(repo, &outputs)?;
+    let status = storage_metadata::data_status(repo, &outputs)?;
     let changes = &status.uncommitted;
     let rows = changes
         .added
@@ -1620,13 +1684,15 @@ fn uncommitted_content(repo: &GitRepo, config: &Config, pointers: &[String]) -> 
     if pointers.is_empty() {
         return Ok(false);
     }
-    dvc::ensure_ready(repo, config)?;
+    storage_metadata::ensure_ready(repo, config)?;
     let outputs = pointers
         .iter()
-        .filter_map(|pointer| pointer.strip_suffix(".dvc"))
+        .filter_map(|pointer| storage_metadata::boundary_path(pointer))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    Ok(adds_uncommitted_content(&dvc::data_status(repo, &outputs)?))
+    Ok(adds_uncommitted_content(&storage_metadata::data_status(
+        repo, &outputs,
+    )?))
 }
 
 /// Directory rows are skipped: the engine reports a directory boundary as
@@ -1791,7 +1857,12 @@ fn bulk_publication_volume(
     let added = added_paths(repo, index, base_oid)?;
     let automatic_metadata: BTreeSet<String> = automatic_s3
         .iter()
-        .flat_map(|path| [format!("{path}.dvc"), format!("{path}{PLACEMENT_SUFFIX}")])
+        .flat_map(|path| {
+            [
+                storage_metadata::pointer_path(path),
+                format!("{path}{PLACEMENT_SUFFIX}"),
+            ]
+        })
         .collect();
     let mut files = 0;
     let mut bytes = 0;
@@ -1999,9 +2070,9 @@ fn machine_local_ignores<'a, 'b>(
         .collect()
 }
 
-/// A rule the product itself writes into the root ignore file. `init`
+/// A rule the product itself writes into the root ignore file. `manage`
 /// regenerates that file in every clone from the installed CLI, so such a rule
-/// is carried wherever the product is, including in the window between `init`
+/// is carried wherever the product is, including in the window between `manage`
 /// and the publication of the generated file. Without this, the first plan of
 /// every freshly initialized repository would be refused over a stray
 /// `.DS_Store` hidden by the product's own wildcard, and the remedies the
@@ -2031,7 +2102,7 @@ fn untracked_ignore_message(rules: &[&IgnoreRule<'_>], destination: &str) -> Str
         format!(", and {remaining} more")
     };
     format!(
-        "this task's scopes hold content that only an ignore rule this publication does not carry hides, so the rule keeps it out of every other clone and out of review: {listed}{more}; put the rule in {destination}, which stays inside this task's write boundary and reaches review with the task, or let the content be published when the task retains it; a rule the whole repository needs belongs in `{REPOSITORY_IGNORE_MODULE}`, which `workspace-mgr init` imports into the root `{ROOT_IGNORE_NAME}`, but both are shared root paths whose change needs the user's explicit authorization and counts only once it is published on the shared branch"
+        "this task's scopes hold content that only an ignore rule this publication does not carry hides, so the rule keeps it out of every other clone and out of review: {listed}{more}; put the rule in {destination}, which stays inside this task's write boundary and reaches review with the task, or let the content be published when the task retains it; a rule the whole repository needs belongs in `{REPOSITORY_IGNORE_MODULE}`, which `workspace-mgr manage` imports into the root `{ROOT_IGNORE_NAME}`, but both are shared root paths whose change needs the user's explicit authorization and counts only once it is published on the shared branch"
     )
 }
 
@@ -2521,6 +2592,14 @@ fn require_publishable(
     needs: &ManifestNeeds,
     declaration: &Version,
 ) -> Result<()> {
+    if let Some(path) = &needs.native_storage {
+        let required = crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION;
+        if !cli_version_satisfies(installed, &required) {
+            return Err(Error::message(format!(
+                "this build (workspace-mgr {installed}) cannot publish native storage manifest {path}; workspace-mgr {required} or newer is required"
+            )));
+        }
+    }
     if let Some(path) = &needs.archive_protocol {
         if !cli_version_satisfies(installed, &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION) {
             return Err(Error::message(format!(
@@ -2572,6 +2651,11 @@ fn require_publishable(
 
 fn missing_configuration(required: &Version, schema: Option<u32>, needs: &ManifestNeeds) -> Error {
     let Some(schema) = schema else {
+        if let Some(path) = &needs.native_storage {
+            return Error::message(format!(
+                "native storage manifest {path} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; run `workspace-mgr manage` first"
+            ));
+        }
         return Error::message(format!(
             "archive storage protocol for {} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME} to record that in; publish the repository configuration first",
             needs
@@ -2612,6 +2696,7 @@ struct ManifestNeeds {
     /// Archive receipts use a storage protocol newer than their task manifest
     /// and public data schemas. This floor must not depend on schema 4.
     archive_protocol: Option<String>,
+    native_storage: Option<String>,
 }
 
 impl ManifestNeeds {
@@ -2619,6 +2704,15 @@ impl ManifestNeeds {
     /// instance's schema.
     fn highest(&self) -> Option<(Version, Option<u32>)> {
         let manifest = self.highest_need();
+        if self.native_storage.is_some()
+            && manifest.is_none_or(|need| {
+                crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION
+                    .cmp_precedence(&need.version)
+                    .is_ge()
+            })
+        {
+            return Some((crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION, None));
+        }
         if self.archive_protocol.is_some()
             && manifest.is_none_or(|need| {
                 ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION
@@ -2673,6 +2767,10 @@ fn manifest_requirement(
         Ok(())
     })?;
     let mut needs = ManifestNeeds {
+        native_storage: index_entries(repo, index, ":(glob)**/*.wm-storage.json")?
+            .into_iter()
+            .find(IndexEntry::is_regular_file)
+            .map(|entry| entry.path),
         archive_protocol: index_entries(
             repo,
             index,
@@ -3223,6 +3321,50 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.oid)
         }
+    }
+
+    #[test]
+    fn partial_import_publication_cannot_retire_configuration_needed_by_remaining_manifests() {
+        let fixture = Fixture::new(None);
+        let control =
+            "[core]\nremote = source\n['remote \"source\"']\nurl = s3://fixture-bucket/root\n";
+        let pointer = |path: &str| {
+            format!(
+                "outs:\n- md5: 900150983cd24fb0d6963f7d28e17f72\n  hash: md5\n  size: 3\n  path: {path}\n"
+            )
+        };
+        fixture.write(".dvc/config", control);
+        fixture.write("first.dvc", &pointer("first"));
+        fixture.write("second.dvc", &pointer("second"));
+        let base = fixture.commit();
+        fs::remove_file(fixture.repo.root.join(".dvc/config")).unwrap();
+        fs::remove_file(fixture.repo.root.join("first.dvc")).unwrap();
+        fs::remove_file(fixture.repo.root.join("second.dvc")).unwrap();
+        fixture.write(
+            "first.wm-storage.json",
+            r#"{"schema_version":1,"path":"first","kind":"file","checksum":{"algorithm":"md5","digest":"900150983cd24fb0d6963f7d28e17f72"},"size":3,"version":{"id":"native-exact"}}"#,
+        );
+        fixture.stage(&base, &[".dvc", "first.dvc", "first.wm-storage.json"]);
+        let before = fs::read(&fixture.index).unwrap();
+        let rejected = check_storage_import_projection(&fixture.repo, &fixture.index, &base)
+            .unwrap_err()
+            .to_string();
+        assert!(rejected.contains("second.dvc"), "{rejected}");
+        assert!(
+            rejected.contains("publish every converted manifest"),
+            "{rejected}"
+        );
+        assert_eq!(fs::read(&fixture.index).unwrap(), before);
+
+        fixture.stage(
+            &base,
+            &[".dvc", "first.dvc", "second.dvc", "first.wm-storage.json"],
+        );
+        check_storage_import_projection(&fixture.repo, &fixture.index, &base).unwrap();
+
+        fixture.write(".dvc/config", control);
+        fixture.stage(&base, &["first.dvc", "first.wm-storage.json"]);
+        check_storage_import_projection(&fixture.repo, &fixture.index, &base).unwrap();
     }
 
     #[test]
@@ -4352,7 +4494,7 @@ mod curation_tests {
 
     #[test]
     fn only_added_or_changed_files_are_uncommitted_content() {
-        let status = |raw: &str| dvc::parse_data_status(raw).unwrap();
+        let status = |raw: &str| storage_metadata::parse_data_status(raw).unwrap();
         // Removing a file from a directory boundary also reports the directory.
         let removed = status(
             r#"{"committed": {"added": ["out/", "out/a.bin"]}, "uncommitted": {"modified": ["out/"], "deleted": ["out/b.bin"]}}"#,
@@ -4553,7 +4695,7 @@ mod curation_tests {
 
     #[test]
     fn a_rule_the_product_itself_ships_is_never_machine_local() {
-        // The generated root file is unpublished between `init` and the first
+        // The generated root file is unpublished between `manage` and the first
         // scaffold publication, and on macOS a `.DS_Store` appears in a browsed
         // directory on its own. Refusing there would block the bootstrap the
         // guide prescribes, with no remedy the task could apply.

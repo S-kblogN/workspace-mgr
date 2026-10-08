@@ -6,7 +6,7 @@ use common::*;
 
 fn managed_fixture() -> GitFixture {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
     fixture
@@ -107,7 +107,7 @@ fn incoming_local_choice_preserves_an_unchanged_git_file() {
         "/payload.bin\n",
     )
     .unwrap();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     git(&fixture.seed, ["rm", "--cached", "--", "payload.bin"]);
     fixture.commit_seed("Keep payload local");
     workspace(&fixture.shared, ["refresh"]);
@@ -163,7 +163,7 @@ fn s3_untrack_refresh_preserves_dirty_bytes_without_the_old_remote_or_cache() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize isolated storage");
     fixture.clone_shared();
@@ -209,14 +209,14 @@ fn s3_untrack_refresh_preserves_dirty_bytes_without_the_old_remote_or_cache() {
     std::fs::write(task.join("trigger.txt"), "force rollback in one consumer\n").unwrap();
     publish_to_main(&fixture, &task);
     std::fs::remove_dir_all(&storage_remote).unwrap();
-    let cache = fixture.shared.join(".dvc/cache");
+    let cache = fixture.shared.join(".workspace-mgr/local/cache");
     if cache.exists() {
         std::fs::remove_dir_all(&cache).unwrap();
     }
     let refresh = workspace(&fixture.shared, ["refresh"]);
     assert_eq!(json(&refresh)["status"], "updated");
     assert_eq!(std::fs::read(task.join("data.txt")).unwrap(), payload);
-    assert!(!task.join("data.txt.dvc").exists());
+    assert!(!task.join("data.txt.wm-storage.json").exists());
     assert_eq!(
         json(&workspace(&task, ["storage", "hydrate"]))["status"],
         "no_changes"
@@ -228,7 +228,11 @@ fn s3_untrack_refresh_preserves_dirty_bytes_without_the_old_remote_or_cache() {
     // payload. Neither the remote content nor a comparison cache remains.
     workspace(&consumers[0], ["refresh"]);
     assert_eq!(std::fs::read(consumers[0].join(&path)).unwrap(), payload);
-    assert!(!consumers[0].join(format!("{path}.dvc")).exists());
+    assert!(
+        !consumers[0]
+            .join(format!("{path}.wm-storage.json"))
+            .exists()
+    );
 
     // A later checkout failure must roll back metadata without trying to
     // restore retired S3 bytes over the locally retained payload.
@@ -244,7 +248,11 @@ fn s3_untrack_refresh_preserves_dirty_bytes_without_the_old_remote_or_cache() {
         before_failure
     );
     assert_eq!(std::fs::read(consumers[1].join(&path)).unwrap(), payload);
-    assert!(consumers[1].join(format!("{path}.dvc")).exists());
+    assert!(
+        consumers[1]
+            .join(format!("{path}.wm-storage.json"))
+            .exists()
+    );
     assert!(!consumers[1].join(&id).join("trigger.txt").exists());
 }
 
@@ -255,7 +263,7 @@ fn incoming_s3_updates_cannot_replace_a_pending_local_choice() {
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize isolated storage");
     fixture.clone_shared();
@@ -302,5 +310,5 @@ fn incoming_s3_updates_cannot_replace_a_pending_local_choice() {
     );
     assert_eq!(git(&consumer, ["rev-parse", "HEAD"]).stdout, old_head);
     assert_eq!(std::fs::read(consumer.join(&path)).unwrap(), payload);
-    assert!(!consumer.join(format!("{path}.dvc")).exists());
+    assert!(!consumer.join(format!("{path}.wm-storage.json")).exists());
 }

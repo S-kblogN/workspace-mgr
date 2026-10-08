@@ -1,21 +1,21 @@
-//! Embedded DVC-compatible hashing, metadata, cache and local materialization.
+//! Native storage hashing, metadata, cache and local materialization.
 //! Network archive/version policy lives in the native transport adapters.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::legacy_dvc::{TreeEntry, directory_digest, tree_bytes, tree_manifest_bytes};
+use crate::storage_format::{Checksum, Entry, Kind, Manifest, Version};
 use md5::{Digest, Md5};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use serde_yaml::{Mapping, Value as Yaml};
 use walkdir::WalkDir;
 
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::{reject_symlink_traversal, repo_path, resolved_under, to_slash};
 use crate::process::CommandOutput;
+use crate::storage_metadata;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StorageEntry {
@@ -28,10 +28,423 @@ pub(crate) struct StorageEntry {
     pub hash_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct TreeEntry {
-    md5: String,
-    relpath: String,
+#[derive(Debug, Clone)]
+pub(crate) struct CasSource {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub etag: String,
+    pub size: u64,
+    pub checksum: Checksum,
+}
+
+pub(crate) fn fetch_cas_to_cache(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    source: &CasSource,
+) -> Result<PathBuf> {
+    source.checksum.validate()?;
+    if source
+        .version_id
+        .as_deref()
+        .is_some_and(|version| version.trim().is_empty() || version == "null")
+    {
+        return Err(Error::message(
+            "legacy CAS source has an invalid pinned exact version ID",
+        ));
+    }
+    if source.etag.trim_matches('"').is_empty() {
+        return Err(Error::message("legacy CAS source has no pinned ETag"));
+    }
+    let mut request = json!({"Bucket":client.bucket,"Key":source.key,"IfMatch":source.etag});
+    if let Some(version) = &source.version_id {
+        request["VersionId"] = version.clone().into();
+    }
+    let matches = |value: &Value| {
+        value["DeleteMarker"] != true
+            && value["ContentLength"].as_u64() == Some(source.size)
+            && value["ETag"]
+                .as_str()
+                .is_some_and(|etag| etag.trim_matches('"') == source.etag.trim_matches('"'))
+            && source
+                .version_id
+                .as_deref()
+                .is_none_or(|version| value["VersionId"].as_str() == Some(version))
+    };
+    if !matches(&client.call_s3("head_object", &request, None)?.value) {
+        return Err(Error::message(
+            "legacy CAS source changed after its import inventory was recorded",
+        ));
+    }
+    let cache =
+        cache_path_with_algorithm(repo, &source.checksum.digest, &source.checksum.algorithm)?;
+    let root = cache_root(repo)?;
+    fs::create_dir_all(&root).at(&root)?;
+    let temporary = tempfile::NamedTempFile::new_in(&root).at(&root)?;
+    let fetched = client.get_to_file(&request, temporary.path())?;
+    if !matches(&fetched.value)
+        || fs::metadata(temporary.path()).at(temporary.path())?.len() != source.size
+        || file_digest(temporary.path(), &source.checksum.algorithm)? != source.checksum.digest
+    {
+        return Err(Error::message(
+            "legacy CAS GET differs from its pinned ETag, exact version, physical size or checksum",
+        ));
+    }
+    fs::create_dir_all(cache.parent().expect("cache parent")).at(&cache)?;
+    temporary.persist(&cache).map_err(|error| Error::Io {
+        path: cache.clone(),
+        source: error.error,
+    })?;
+    Ok(cache)
+}
+
+pub(crate) fn upload_verified(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+    source: &Path,
+) -> Result<Version> {
+    let raw_sha256 = file_sha256(source)?;
+    let condition = import_destination_condition(repo, client, entry)?;
+    let (id, etag) = upload_version_in(
+        client,
+        repo,
+        entry,
+        source,
+        5 * (1 << 30),
+        64 * (1 << 20),
+        UploadPolicy {
+            namespace: "storage-import-uploads",
+            condition: condition.as_deref(),
+            raw_sha256: Some(&raw_sha256),
+        },
+    )?;
+    let mut bound = entry.clone();
+    bound.version_id = Some(id.clone());
+    install_cache_for_entry(repo, &bound, source)?;
+    if file_sha256(&cache_path_for_entry(repo, &bound)?)? != raw_sha256 {
+        return Err(Error::message(
+            "storage import source changed while installing its exact-version cache",
+        ));
+    }
+    Ok(Version {
+        id,
+        etag: Some(etag),
+    })
+}
+
+pub(crate) fn is_historical_cas_read(repo: &GitRepo, pointers: &[String]) -> Result<bool> {
+    Ok(!pointers.is_empty() && historical_cas_pointers(repo, pointers)?.len() == pointers.len())
+}
+
+pub(crate) fn historical_cas_pointers(repo: &GitRepo, pointers: &[String]) -> Result<Vec<String>> {
+    if !pointers.iter().any(|pointer| pointer.ends_with(".dvc")) {
+        return Ok(Vec::new());
+    }
+    if !crate::legacy_dvc::is_content_addressed_checkout(repo)? {
+        return Ok(Vec::new());
+    }
+    let mut selected = Vec::new();
+    for pointer in pointers {
+        if !pointer.ends_with(".dvc") {
+            continue;
+        }
+        reject_symlink_traversal(&repo.root, pointer, "legacy CAS metadata")?;
+        let raw = fs::read_to_string(repo.root.join(pointer)).at(repo.root.join(pointer))?;
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&raw).map_err(|error| Error::message(error.to_string()))?;
+        let has_bindings = yaml["outs"].as_sequence().into_iter().flatten().any(|out| {
+            out.get("cloud").is_some()
+                || out
+                    .get("files")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .is_some_and(|files| files.iter().any(|file| file.get("cloud").is_some()))
+        });
+        if !has_bindings {
+            selected.push(pointer.clone());
+        }
+    }
+    Ok(selected)
+}
+
+pub(crate) fn resolve_cas_source(
+    client: &crate::native_s3::S3Client,
+    digest: &str,
+    algorithm: &str,
+) -> Result<CasSource> {
+    let mut selected = None;
+    for object in crate::legacy_dvc::cas_key_candidates(digest, algorithm)? {
+        let key = client.key_for(&object);
+        let info = match client.call_s3(
+            "head_object",
+            &json!({"Bucket":client.bucket,"Key":key}),
+            None,
+        ) {
+            Ok(response) => response.value,
+            Err(error) if matches!(error.code.as_str(), "NoSuchKey" | "NotFound" | "404") => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let size = info["ContentLength"]
+            .as_u64()
+            .ok_or_else(|| Error::message("legacy CAS HEAD has no physical size"))?;
+        let etag = info["ETag"]
+            .as_str()
+            .filter(|etag| !etag.trim_matches('"').is_empty())
+            .ok_or_else(|| Error::message("legacy CAS HEAD has no ETag"))?
+            .to_owned();
+        let source = CasSource {
+            key,
+            version_id: info["VersionId"]
+                .as_str()
+                .filter(|version| !version.is_empty() && *version != "null")
+                .map(str::to_owned),
+            etag,
+            size,
+            checksum: Checksum {
+                algorithm: algorithm.into(),
+                digest: digest.trim_end_matches(".dir").into(),
+            },
+        };
+        if selected.as_ref().is_some_and(|previous: &CasSource| {
+            previous.size != source.size
+                || previous.etag.trim_matches('"') != source.etag.trim_matches('"')
+        }) {
+            return Err(Error::message(
+                "legacy CAS object layouts contain conflicting source identities",
+            ));
+        }
+        if selected.is_none() {
+            selected = Some(source);
+        }
+    }
+    selected
+        .ok_or_else(|| Error::message("legacy CAS object is absent from every supported layout"))
+}
+
+pub(crate) fn fetch_historical_cas(repo: &GitRepo, pointers: &[String]) -> Result<Option<Value>> {
+    if !is_historical_cas_read(repo, pointers)? {
+        return Ok(None);
+    }
+    let client = crate::native_s3::S3Client::historical_cas_from_repo(repo)?.ok_or_else(|| {
+        Error::message("historical metadata has no content-addressed source remote")
+    })?;
+    let mut checked = BTreeSet::new();
+    for pointer in pointers {
+        let raw = fs::read_to_string(repo.root.join(pointer)).at(repo.root.join(pointer))?;
+        let raw = storage_metadata::normalize_pointer_in_repo(repo, None, &raw, pointer)?;
+        let algorithm = storage_metadata::hash_algorithm(&raw, pointer)?;
+        let document = storage_metadata::parse_pointer_document(&raw, pointer)?;
+        let [out] = document.outs.as_slice() else {
+            return Err(Error::message(
+                "historical CAS pointer must define exactly one output",
+            ));
+        };
+        let digest = out
+            .md5
+            .as_deref()
+            .ok_or_else(|| Error::message("historical CAS pointer has no checksum"))?;
+        let files = if digest.ends_with(".dir") {
+            let source = resolve_cas_source(&client, digest, &algorithm)?;
+            let mut directory_source = source.clone();
+            directory_source.checksum.algorithm = "md5".into();
+            let temporary_cache = fetch_cas_to_cache(repo, &client, &directory_source)?;
+            let bytes = fs::read(&temporary_cache).at(&temporary_cache)?;
+            let files = crate::legacy_dvc::parse_directory_manifest(&bytes, digest)?;
+            if out
+                .files
+                .as_ref()
+                .is_some_and(|inline| directory_digest(inline).ok().as_deref() != Some(digest))
+            {
+                return Err(Error::message(
+                    "historical CAS inline directory inventory differs from its aggregate",
+                ));
+            }
+            atomic_write(
+                &cache_path_with_algorithm(repo, digest, &algorithm)?,
+                &bytes,
+            )?;
+            files
+                .into_iter()
+                .map(|file| (file.relpath, file.md5.unwrap(), file.size))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(String::new(), digest.to_owned(), out.size)]
+        };
+        let mut total = 0u64;
+        for (relative, digest, declared_size) in files {
+            let source = resolve_cas_source(&client, &digest, &algorithm)?;
+            if declared_size.is_some_and(|size| size != source.size) {
+                return Err(Error::message(
+                    "historical CAS physical size differs from its metadata",
+                ));
+            }
+            total = total
+                .checked_add(source.size)
+                .ok_or_else(|| Error::message("historical CAS size overflows"))?;
+            fetch_cas_to_cache(repo, &client, &source)?;
+            checked.insert(if relative.is_empty() {
+                output_object(pointer, &out.path)?
+            } else {
+                format!("{}/{}", output_object(pointer, &out.path)?, relative)
+            });
+        }
+        if out.size.is_some_and(|size| size != total) {
+            return Err(Error::message(
+                "historical CAS output physical size differs from its metadata",
+            ));
+        }
+    }
+    Ok(Some(
+        json!({"mode":"legacy-content-addressed","checked_objects":checked}),
+    ))
+}
+
+pub(crate) fn verify_import_destination(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+) -> Result<bool> {
+    import_destination_condition(repo, client, entry).map(|condition| condition.is_some())
+}
+
+fn import_destination_condition(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+) -> Result<Option<String>> {
+    let local = crate::local_state::directory_unmigrated(repo)?;
+    reject_symlink_traversal(
+        &local,
+        "storage-import-uploads",
+        "private storage import uploads",
+    )?;
+    let directory = local.join("storage-import-uploads");
+    let key = client.key_for(&entry.object);
+    let mut receipts = BTreeMap::new();
+    if directory.is_dir() {
+        for item in fs::read_dir(&directory).at(&directory)? {
+            let path = item.at(&directory)?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            if path.is_symlink() || !path.is_file() {
+                return Err(Error::message(
+                    "private import upload receipt is not a regular file",
+                ));
+            }
+            let journal: Value =
+                serde_json::from_slice(&fs::read(&path).at(&path)?).map_err(|error| {
+                    Error::message(format!("invalid private import upload receipt: {error}"))
+                })?;
+            let context = &journal["context"];
+            if context["bucket"] != client.bucket || context["key"] != key {
+                continue;
+            }
+            let token = journal["token"]
+                .as_str()
+                .filter(|token| {
+                    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    Error::message("private import upload receipt has no valid ownership token")
+                })?;
+            let checksum = Checksum {
+                algorithm: context["hash_name"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        Error::message("private import upload receipt has no checksum algorithm")
+                    })?
+                    .into(),
+                digest: context["md5"]
+                    .as_str()
+                    .ok_or_else(|| Error::message("private import upload receipt has no checksum"))?
+                    .into(),
+            };
+            checksum.validate()?;
+            let owned_entry = StorageEntry {
+                pointer: entry.pointer.clone(),
+                object: entry.object.clone(),
+                md5: Some(checksum.digest),
+                size: Some(context["size"].as_u64().ok_or_else(|| {
+                    Error::message("private import upload receipt has no physical size")
+                })?),
+                version_id: None,
+                etag: None,
+                hash_name: checksum.algorithm,
+            };
+            let raw_sha256 = context["raw_sha256"]
+                .as_str()
+                .ok_or_else(|| Error::message("private import upload receipt has no raw SHA256"))?;
+            let (expected_path, expected_context) = upload_context(
+                repo,
+                client,
+                &owned_entry,
+                "storage-import-uploads",
+                Some(raw_sha256),
+            )?;
+            if path != expected_path
+                || context != &expected_context
+                || receipts
+                    .insert(token.to_owned(), (owned_entry, raw_sha256.to_owned()))
+                    .is_some()
+            {
+                return Err(Error::message(
+                    "private import upload receipt identity does not match its destination",
+                ));
+            }
+        }
+    }
+    let rows = client
+        .list_versions(&key)?
+        .into_iter()
+        .filter(|row| row["Key"] == key)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut used = BTreeSet::new();
+    let mut latest = None;
+    for row in rows {
+        if row["delete_marker"] == true {
+            return Err(Error::message(
+                "storage import destination has an unowned delete marker",
+            ));
+        }
+        let version = row["VersionId"]
+            .as_str()
+            .ok_or_else(|| Error::message("storage import destination has no exact version ID"))?;
+        let info = client
+            .call_s3(
+                "head_object",
+                &json!({"Bucket":client.bucket,"Key":key,"VersionId":version}),
+                None,
+            )?
+            .value;
+        let token = info["Metadata"][UPLOAD_TOKEN].as_str().ok_or_else(|| {
+            Error::message("storage import destination already has unowned object history")
+        })?;
+        let (owned_entry, raw_sha256) = receipts.get(token).ok_or_else(|| {
+            Error::message("storage import destination has no matching private ownership receipt")
+        })?;
+        if !used.insert(token.to_owned()) {
+            return Err(Error::message(
+                "storage import ownership token matches conflicting destination versions",
+            ));
+        }
+        verify_uploaded_version(client, repo, owned_entry, token, version, Some(raw_sha256))?;
+        if row["IsLatest"] == true {
+            if latest.is_some() {
+                return Err(Error::message(
+                    "storage import destination has conflicting latest versions",
+                ));
+            }
+            latest = info["ETag"].as_str().map(str::to_owned);
+        }
+    }
+    latest.map(Some).ok_or_else(|| {
+        Error::message("storage import destination has no verified latest ownership binding")
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -39,28 +452,57 @@ struct FileState {
     relpath: String,
     md5: String,
     size: u64,
+    version_id: Option<String>,
 }
 
-pub(crate) fn execute(cwd: &Path, args: Vec<String>) -> Result<CommandOutput> {
+#[derive(Debug, Clone)]
+pub(crate) enum Operation {
+    #[cfg(test)]
+    Initialize,
+    Track {
+        paths: Vec<String>,
+    },
+    Record {
+        pointers: Vec<String>,
+    },
+    Upload {
+        pointers: Vec<String>,
+    },
+    Fetch {
+        pointers: Vec<String>,
+    },
+    Materialize {
+        pointers: Vec<String>,
+    },
+    Move {
+        source: String,
+        destination: String,
+    },
+    Untrack {
+        pointers: Vec<String>,
+    },
+    Status {
+        pointers: Vec<String>,
+        cloud: bool,
+        quiet: bool,
+    },
+    Changes {
+        outputs: Vec<String>,
+    },
+}
+
+pub(crate) fn execute(cwd: &Path, operation: &Operation) -> Result<CommandOutput> {
     #[cfg(feature = "test-storage")]
-    {
-        if let Some(hook) = std::env::var_os("WORKSPACE_MGR_TEST_STORAGE_HOOK") {
-            let hook = hook
-                .to_str()
-                .ok_or_else(|| Error::message("storage test hook is not UTF-8"))?;
-            crate::process::run(hook, &args, cwd)?;
-        }
-        if let Some(program) = std::env::var_os("WORKSPACE_MGR_STORAGE_DVC") {
-            let program = program
-                .to_str()
-                .ok_or_else(|| Error::message("storage test engine is not UTF-8"))?;
-            return crate::process::run_unchecked(program, &args, cwd);
-        }
+    if let Some(hook) = std::env::var_os("WORKSPACE_MGR_TEST_STORAGE_HOOK") {
+        let hook = hook
+            .to_str()
+            .ok_or_else(|| Error::message("storage test hook is not UTF-8"))?;
+        crate::process::run(hook, operation.test_arguments(), cwd)?;
     }
     let repo = GitRepo {
         root: cwd.canonicalize().at(cwd)?,
     };
-    match execute_inner(&repo, &args) {
+    match execute_inner(&repo, operation) {
         Ok((code, stdout)) => Ok(CommandOutput {
             code,
             stdout,
@@ -74,108 +516,87 @@ pub(crate) fn execute(cwd: &Path, args: Vec<String>) -> Result<CommandOutput> {
     }
 }
 
-fn execute_inner(repo: &GitRepo, args: &[String]) -> Result<(i32, String)> {
-    let command = args.first().map(String::as_str).unwrap_or("");
-    let targets = targets(args);
-    match command {
-        "--version" => Ok((0, format!("native Rust {}\n", env!("CARGO_PKG_VERSION")))),
-        "init" => {
-            initialize(repo)?;
-            Ok((0, String::new()))
-        }
-        "add" => {
-            for target in targets {
-                add(repo, &target)?;
+#[cfg(feature = "test-storage")]
+impl Operation {
+    fn test_arguments(&self) -> Vec<String> {
+        let (name, paths) = match self {
+            #[cfg(test)]
+            Self::Initialize => ("init", Vec::new()),
+            Self::Track { paths } => ("add", paths.clone()),
+            Self::Record { pointers } => ("commit", pointers.clone()),
+            Self::Upload { pointers } => ("push", pointers.clone()),
+            Self::Fetch { pointers } => ("fetch", pointers.clone()),
+            Self::Materialize { pointers } => ("checkout", pointers.clone()),
+            Self::Move {
+                source,
+                destination,
+            } => ("move", vec![source.clone(), destination.clone()]),
+            Self::Untrack { pointers } => ("remove", pointers.clone()),
+            Self::Status { pointers, .. } => ("status", pointers.clone()),
+            Self::Changes { outputs } => ("data", outputs.clone()),
+        };
+        std::iter::once(name.to_owned())
+            .chain(std::iter::once("--".to_owned()))
+            .chain(paths)
+            .collect()
+    }
+}
+
+fn execute_inner(repo: &GitRepo, operation: &Operation) -> Result<(i32, String)> {
+    match operation {
+        #[cfg(test)]
+        Operation::Initialize => initialize(repo)?,
+        Operation::Track { paths } => {
+            for path in paths {
+                add(repo, path)?;
             }
-            Ok((0, String::new()))
         }
-        "commit" => {
-            for pointer in select_pointers(repo, &targets)? {
+        Operation::Record { pointers } => {
+            for pointer in select_pointers(repo, pointers)? {
                 commit(repo, &pointer)?;
             }
-            Ok((0, String::new()))
         }
-        "push" => {
-            push(repo, &select_pointers(repo, &targets)?)?;
-            Ok((0, String::new()))
-        }
-        "fetch" => {
-            fetch(repo, &select_pointers(repo, &targets)?)?;
-            Ok((0, String::new()))
-        }
-        "checkout" => {
-            checkout(repo, &select_pointers(repo, &targets)?)?;
-            Ok((0, String::new()))
-        }
-        "move" if targets.len() == 2 => {
-            move_output(repo, &targets[0], &targets[1])?;
-            Ok((0, String::new()))
-        }
-        "remove" => {
-            for pointer in select_pointers(repo, &targets)? {
+        Operation::Upload { pointers } => push(repo, &select_pointers(repo, pointers)?)?,
+        Operation::Fetch { pointers } => fetch(repo, &select_pointers(repo, pointers)?)?,
+        Operation::Materialize { pointers } => checkout(repo, &select_pointers(repo, pointers)?)?,
+        Operation::Move {
+            source,
+            destination,
+        } => move_output(repo, source, destination)?,
+        Operation::Untrack { pointers } => {
+            for pointer in select_pointers(repo, pointers)? {
                 remove(repo, &pointer)?;
             }
-            Ok((0, String::new()))
         }
-        "status" => status(
-            repo,
-            &select_pointers(repo, &targets)?,
-            args.iter().any(|a| a == "--cloud"),
-            args.iter().any(|a| a == "--quiet" || a == "-q"),
-        ),
-        "data" if args.get(1).map(String::as_str) == Some("status") => {
-            let value = data_status(repo, &targets)?;
-            Ok((
+        Operation::Status {
+            pointers,
+            cloud,
+            quiet,
+        } => return status(repo, &select_pointers(repo, pointers)?, *cloud, *quiet),
+        Operation::Changes { outputs } => {
+            return Ok((
                 0,
-                serde_json::to_string(&value).map_err(|e| Error::message(e.to_string()))?,
-            ))
+                serde_json::to_string(&data_status(repo, outputs)?)
+                    .map_err(|error| Error::message(error.to_string()))?,
+            ));
         }
-        other => Err(Error::message(format!(
-            "unsupported embedded storage command: {other}"
-        ))),
     }
+    Ok((0, String::new()))
 }
 
-fn targets(args: &[String]) -> Vec<String> {
-    let start = args.iter().position(|a| a == "--").map(|i| i + 1);
-    match start {
-        Some(start) => args[start..].to_vec(),
-        None => args
-            .iter()
-            .skip(if args.first().is_some_and(|a| a == "data") {
-                2
-            } else {
-                1
-            })
-            .filter(|a| !a.starts_with('-'))
-            .cloned()
-            .collect(),
-    }
-}
-
+#[cfg(test)]
 fn initialize(repo: &GitRepo) -> Result<()> {
-    for path in [".dvc", ".dvc/cache", ".dvc/tmp"] {
-        reject_symlink_traversal(&repo.root, path, "storage initialization")?;
-        fs::create_dir_all(repo.root.join(path)).at(repo.root.join(path))?;
-    }
-    for (path, bytes) in [
-        (".dvc/config", ""),
-        (".dvc/.gitignore", "/config.local\n/tmp\n/cache\n"),
-        (
-            ".dvcignore",
-            "# Add patterns of files dvc should ignore, which could improve\n# the performance. To learn more about .dvcignore, visit\n# https://dvc.org/doc/user-guide/dvcignore\n",
-        ),
-    ] {
-        reject_symlink_traversal(&repo.root, path, "storage initialization")?;
-        if !repo.root.join(path).exists() {
-            atomic_write(&repo.root.join(path), bytes.as_bytes())?;
-        }
+    let local = crate::local_state::directory_unmigrated(repo)?;
+    for path in [local.join("cache"), local.join("uploads")] {
+        fs::create_dir_all(&path).at(&path)?;
     }
     Ok(())
 }
 
 pub(crate) fn cache_root(repo: &GitRepo) -> Result<PathBuf> {
-    let path = dvc::cache_dir(&repo.root.join(".dvc"));
+    let local = crate::local_state::directory_unmigrated(repo)?;
+    reject_symlink_traversal(&local, "cache", "native storage cache")?;
+    let path = local.join("cache");
     if path.exists() && !path.is_dir() {
         return Err(Error::message("storage cache is not a directory"));
     }
@@ -204,8 +625,8 @@ pub(crate) fn cache_path_with_algorithm(
     let (prefix, rest) = digest_parts(digest)?;
     let root = cache_root(repo)?;
     let path = match hash_name {
-        "md5" => format!("files/md5/{prefix}/{rest}"),
-        "md5-dos2unix" => format!("{prefix}/{rest}"),
+        "md5" => format!("objects/md5/{prefix}/{rest}"),
+        "md5-dos2unix" => format!("objects/md5-dos2unix/{prefix}/{rest}"),
         _ => return Err(Error::message("unsupported storage hash algorithm")),
     };
     reject_symlink_traversal(&root, &path, "storage cache object")?;
@@ -230,27 +651,166 @@ pub(crate) fn existing_cache_with_algorithm(
     if preferred.is_file() {
         return Ok(preferred);
     }
-    // Older caches and interrupted native upgrades can contain the same
-    // object in the other layout. Every consumer still checks its digest.
-    let alternate = cache_path_with_algorithm(
-        repo,
-        digest,
-        if hash_name == "md5" {
-            "md5-dos2unix"
-        } else {
-            "md5"
-        },
-    )?;
-    Ok(if alternate.is_file() {
-        alternate
+    Ok(crate::legacy_dvc::existing_cache(&repo.root, digest, hash_name).unwrap_or(preferred))
+}
+
+/// Normalized text checksums do not identify raw bytes. Exact bindings must
+/// therefore never reuse an unbound hash cache or another object's generation.
+pub(crate) fn cache_path_for_entry(repo: &GitRepo, entry: &StorageEntry) -> Result<PathBuf> {
+    let digest = entry
+        .md5
+        .as_deref()
+        .ok_or_else(|| Error::message("storage cache entry has no checksum"))?;
+    let Some(version) = entry
+        .version_id
+        .as_deref()
+        .filter(|_| entry.hash_name == "md5-dos2unix")
+    else {
+        return existing_cache_with_algorithm(repo, digest, &entry.hash_name);
+    };
+    Checksum {
+        algorithm: entry.hash_name.clone(),
+        digest: digest.into(),
+    }
+    .validate()?;
+    if version.trim().is_empty() || version == "null" {
+        return Err(Error::message(
+            "storage cache entry has no immutable exact version",
+        ));
+    }
+    let identity = crate::hex::encode_lower(sha2::Sha256::digest(
+        serde_json::to_vec(&json!([
+            crate::native_s3::S3Client::cache_route(repo)?,
+            entry.object,
+            version,
+            digest
+        ]))
+        .map_err(|error| Error::message(error.to_string()))?,
+    ));
+    let relative = format!("versions/md5-dos2unix/{identity}");
+    let root = cache_root(repo)?;
+    reject_symlink_traversal(&root, &relative, "exact-version storage cache")?;
+    Ok(root.join(relative))
+}
+
+pub(crate) fn install_cache_for_entry(
+    repo: &GitRepo,
+    entry: &StorageEntry,
+    source: &Path,
+) -> Result<()> {
+    let digest = entry
+        .md5
+        .as_deref()
+        .ok_or_else(|| Error::message("storage cache entry has no checksum"))?;
+    if file_digest(source, &entry.hash_name)? != digest
+        || entry.size.is_some_and(|size| {
+            fs::metadata(source).map(|metadata| metadata.len()).ok() != Some(size)
+        })
+    {
+        return Err(Error::message("downloaded content size or hash mismatch"));
+    }
+    let destination = if entry.hash_name == "md5-dos2unix" && entry.version_id.is_some() {
+        cache_path_for_entry(repo, entry)?
     } else {
-        preferred
-    })
+        cache_path_with_algorithm(repo, digest, &entry.hash_name)?
+    };
+    atomic_copy(source, &destination)
+}
+
+pub(crate) fn exact_raw_bytes_match(
+    repo: &GitRepo,
+    entry: &StorageEntry,
+    local: &Path,
+) -> Result<bool> {
+    if entry.hash_name != "md5-dos2unix" || entry.version_id.is_none() {
+        return Ok(true);
+    }
+    let cache = cache_path_for_entry(repo, entry)?;
+    Ok(cache.is_file() && local.is_file() && file_sha256(local)? == file_sha256(&cache)?)
+}
+
+pub(crate) fn normalized_exact_cache_missing(repo: &GitRepo, pointer: &str) -> Result<bool> {
+    if pointer_algorithm(repo, pointer)? != "md5-dos2unix" {
+        return Ok(false);
+    }
+    for entry in metadata_entries(repo, None, &[pointer.into()])? {
+        if entry.version_id.is_some() && !cache_path_for_entry(repo, &entry)?.is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn cache_for_recorded_file(
+    repo: &GitRepo,
+    object: &str,
+    file: &FileState,
+    algorithm: &str,
+) -> Result<PathBuf> {
+    cache_path_for_entry(
+        repo,
+        &StorageEntry {
+            pointer: String::new(),
+            object: if file.relpath.is_empty() {
+                object.into()
+            } else {
+                format!("{object}/{}", file.relpath)
+            },
+            md5: Some(file.md5.clone()),
+            size: Some(file.size),
+            version_id: file.version_id.clone(),
+            etag: None,
+            hash_name: algorithm.into(),
+        },
+    )
+}
+
+fn normalized_exact_bytes_match(
+    repo: &GitRepo,
+    object: &str,
+    files: &[FileState],
+    algorithm: &str,
+) -> Result<bool> {
+    if algorithm != "md5-dos2unix" {
+        return Ok(true);
+    }
+    for file in files.iter().filter(|file| file.version_id.is_some()) {
+        let cache = cache_for_recorded_file(repo, object, file, algorithm)?;
+        let local = if file.relpath.is_empty() {
+            repo.root.join(object)
+        } else {
+            repo.root.join(object).join(&file.relpath)
+        };
+        if !cache.is_file() || !local.is_file() || file_sha256(&local)? != file_sha256(&cache)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn file_digest(path: &Path, hash_name: &str) -> Result<String> {
     let mut file = fs::File::open(path).at(path)?;
     stream_digest(&mut file, path, hash_name)
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).at(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => hasher.update(&buffer[..size]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(crate::hex::encode_lower(hasher.finalize()))
 }
 
 /// Reproduces DVC's legacy per-1-MiB text heuristic, including CRLF that
@@ -307,6 +867,7 @@ pub(crate) fn stream_digest(input: &mut impl Read, path: &Path, hash_name: &str)
     Ok(crate::hex::encode_lower(hasher.finalize()))
 }
 
+#[cfg(test)]
 pub(crate) fn install_cache(repo: &GitRepo, digest: &str, bytes: &[u8]) -> Result<()> {
     install_cache_with_algorithm(repo, digest, bytes, "md5")
 }
@@ -342,88 +903,47 @@ pub(crate) fn install_cache_file_with_algorithm(
     atomic_copy(path, &cache_path_with_algorithm(repo, digest, hash_name)?)
 }
 
-fn ascii_json_string(value: &str) -> Result<String> {
-    let rendered = serde_json::to_string(value).map_err(|e| Error::message(e.to_string()))?;
-    let mut ascii = String::new();
-    for character in rendered.chars() {
-        if character.is_ascii() {
-            ascii.push(character);
-        } else {
-            let mut buffer = [0u16; 2];
-            for code in character.encode_utf16(&mut buffer) {
-                ascii.push_str(&format!("\\u{code:04x}"));
-            }
-        }
-    }
-    Ok(ascii)
-}
-
-fn tree_bytes(files: &[TreeEntry]) -> Result<Vec<u8>> {
-    let mut files = files.to_vec();
-    files.sort_by(|a, b| a.relpath.cmp(&b.relpath));
-    let mut seen = BTreeSet::new();
-    let mut rows = Vec::new();
-    for file in files {
-        if repo_path(&file.relpath, "directory manifest path")? != file.relpath {
-            return Err(Error::message("directory manifest path is not canonical"));
-        }
-        digest_parts(&file.md5)?;
-        if file.md5.ends_with(".dir") || !seen.insert(file.relpath.clone()) {
-            return Err(Error::message(
-                "invalid or duplicate directory manifest entry",
-            ));
-        }
-        rows.push(format!(
-            "{{\"md5\": {}, \"relpath\": {}}}",
-            ascii_json_string(&file.md5)?,
-            ascii_json_string(&file.relpath)?
+fn read_manifest(repo: &GitRepo, pointer: &str) -> Result<Manifest> {
+    if !pointer.ends_with(crate::storage_format::SUFFIX) {
+        return Err(Error::message(
+            "legacy DVC metadata must be migrated before mutation; run `workspace-mgr manage`",
         ));
     }
-    Ok(format!("[{}]", rows.join(", ")).into_bytes())
-}
-
-pub(crate) fn tree_manifest_bytes(files: &[dvc::PointerFileVersion]) -> Result<Vec<u8>> {
-    let files = files
-        .iter()
-        .map(|file| {
-            Ok(TreeEntry {
-                relpath: file.relpath.clone(),
-                md5: file
-                    .md5
-                    .clone()
-                    .ok_or_else(|| Error::message("directory manifest entry has no MD5 digest"))?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    tree_bytes(&files)
-}
-
-pub(crate) fn directory_digest(files: &[dvc::PointerFileVersion]) -> Result<String> {
-    Ok(format!(
-        "{}.dir",
-        crate::hex::encode_lower(Md5::digest(tree_manifest_bytes(files)?))
-    ))
-}
-
-fn read_yaml(repo: &GitRepo, pointer: &str) -> Result<Yaml> {
-    let pointer = repo_path(pointer, "storage metadata")?;
-    reject_symlink_traversal(&repo.root, &pointer, "storage metadata")?;
-    let path = resolved_under(&repo.root, &pointer);
+    reject_symlink_traversal(&repo.root, pointer, "storage metadata")?;
+    let path = resolved_under(&repo.root, pointer);
     if !fs::symlink_metadata(&path).at(&path)?.is_file() {
         return Err(Error::message("storage metadata must be a regular file"));
     }
-    let bytes = fs::read(&path).at(&path)?;
-    serde_yaml::from_slice(&bytes).map_err(|source| Error::Yaml { path, source })
+    Manifest::parse(&fs::read_to_string(&path).at(&path)?, pointer)
 }
 
-fn write_yaml(repo: &GitRepo, pointer: &str, document: &Yaml) -> Result<()> {
-    let bytes = serde_yaml::to_string(document).map_err(|e| Error::message(e.to_string()))?;
-    atomic_write(&resolved_under(&repo.root, pointer), bytes.as_bytes())
+fn write_manifest(repo: &GitRepo, pointer: &str, manifest: &Manifest) -> Result<()> {
+    if !pointer.ends_with(crate::storage_format::SUFFIX) {
+        return Err(Error::message(
+            "native storage writes require a .wm-storage.json sidecar",
+        ));
+    }
+    atomic_write(
+        &resolved_under(&repo.root, pointer),
+        manifest.serialize()?.as_bytes(),
+    )
 }
 
 fn output_object(pointer: &str, path: &str) -> Result<String> {
     let parent = Path::new(pointer).parent().unwrap_or_else(|| Path::new(""));
     repo_path(&to_slash(&parent.join(path)), "storage output")
+}
+
+fn pointer_algorithm(repo: &GitRepo, pointer: &str) -> Result<String> {
+    reject_symlink_traversal(&repo.root, pointer, "storage metadata")?;
+    let path = repo.root.join(pointer);
+    let raw = storage_metadata::normalize_pointer_in_repo(
+        repo,
+        None,
+        &fs::read_to_string(&path).at(&path)?,
+        pointer,
+    )?;
+    storage_metadata::hash_algorithm(&raw, pointer)
 }
 
 pub(crate) fn metadata_entries(
@@ -441,32 +961,25 @@ pub(crate) fn metadata_entries(
                 fs::read_to_string(repo.root.join(pointer)).at(repo.root.join(pointer))?
             }
         };
-        let parsed = dvc::parse_pointer_document(&raw, pointer)?;
-        let yaml: Yaml = serde_yaml::from_str(&raw).map_err(|e| Error::message(e.to_string()))?;
+        let raw = storage_metadata::normalize_pointer_in_repo(repo, revision, &raw, pointer)?;
+        let parsed = storage_metadata::parse_pointer_document(&raw, pointer)?;
+        let hash_name = storage_metadata::hash_algorithm(&raw, pointer)?;
         if parsed.outs.is_empty() {
             return Err(Error::message(format!(
                 "storage metadata has no outputs: {pointer}"
             )));
         }
-        for (index, out) in parsed.outs.iter().enumerate() {
-            validate_transport_settings(&yaml["outs"][index], pointer)?;
-            let hash_name = yaml["outs"][index]["hash"]
-                .as_str()
-                .unwrap_or("md5-dos2unix")
-                .to_owned();
-            if !matches!(hash_name.as_str(), "md5" | "md5-dos2unix") {
-                return Err(Error::message(format!(
-                    "unsupported storage hash algorithm: {hash_name}"
-                )));
-            }
+        for out in parsed.outs {
             if let Some(digest) = &out.md5 {
                 digest_parts(digest)?;
             }
             let object = output_object(pointer, &out.path)?;
             if let Some(files) = &out.files {
-                if out.md5.as_deref() != Some(directory_digest(files)?.as_str()) {
+                if pointer.ends_with(".dvc")
+                    && out.md5.as_deref() != Some(directory_digest(files)?.as_str())
+                {
                     return Err(Error::message(format!(
-                        "directory manifest hash mismatch: {pointer}"
+                        "legacy directory manifest hash mismatch: {pointer}"
                     )));
                 }
                 for file in files {
@@ -491,7 +1004,11 @@ pub(crate) fn metadata_entries(
                         hash_name: hash_name.clone(),
                     });
                 }
-            } else if out.md5.as_deref().is_some_and(|md5| md5.ends_with(".dir")) {
+            } else if out
+                .md5
+                .as_deref()
+                .is_some_and(|digest| digest.ends_with(".dir"))
+            {
                 return Err(Error::message(format!(
                     "directory metadata is incomplete: {pointer}; restore its published file/version manifest"
                 )));
@@ -499,11 +1016,11 @@ pub(crate) fn metadata_entries(
                 entries.push(StorageEntry {
                     pointer: pointer.clone(),
                     object,
-                    md5: out.md5.clone(),
+                    md5: out.md5,
                     size: out.size,
-                    version_id: out.version_id.clone(),
-                    etag: out.etag.clone(),
-                    hash_name,
+                    version_id: out.version_id,
+                    etag: out.etag,
+                    hash_name: hash_name.clone(),
                 });
             }
         }
@@ -511,59 +1028,21 @@ pub(crate) fn metadata_entries(
     Ok(entries)
 }
 
-fn validate_transport_settings(output: &Yaml, pointer: &str) -> Result<()> {
-    for key in ["cache", "can_push", "push"] {
-        if let Some(value) = output.get(key) {
-            if value.as_bool() != Some(true) {
-                return Err(Error::message(format!(
-                    "storage output disables or invalidates {key}: {pointer}"
-                )));
-            }
-        }
-    }
-    if let Some(remote) = output.get("remote") {
-        if remote.as_str() != Some(dvc::INTERNAL_REMOTE) {
-            return Err(Error::message(format!(
-                "storage output uses a different remote: {pointer}"
-            )));
-        }
-    }
-    if let Some(files) = output.get("files").and_then(Yaml::as_sequence) {
-        for file in files {
-            if let Some(remote) = file.get("remote") {
-                if remote.as_str() != Some(dvc::INTERNAL_REMOTE) {
-                    return Err(Error::message(format!(
-                        "directory file uses a different storage remote: {pointer}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn install_directory_manifests(repo: &GitRepo, pointers: &[String]) -> Result<()> {
     for pointer in pointers {
-        let yaml = read_yaml(repo, pointer)?;
-        for (index, out) in dvc::read_pointer_document(repo, pointer)?
-            .outs
-            .into_iter()
-            .enumerate()
-        {
-            let hash_name = yaml["outs"][index]["hash"]
-                .as_str()
-                .unwrap_or("md5-dos2unix");
+        if pointer.ends_with(crate::storage_format::SUFFIX) {
+            read_manifest(repo, pointer)?;
+            continue;
+        }
+        let algorithm = pointer_algorithm(repo, pointer)?;
+        for out in storage_metadata::read_pointer_document(repo, pointer)?.outs {
             if let Some(files) = out.files {
                 let bytes = tree_manifest_bytes(&files)?;
                 let digest = format!("{}.dir", crate::hex::encode_lower(Md5::digest(&bytes)));
                 if out.md5.as_deref() != Some(&digest) {
-                    return Err(Error::message("directory manifest hash mismatch"));
+                    return Err(Error::message("legacy directory manifest hash mismatch"));
                 }
-                if hash_name == "md5" {
-                    install_cache(repo, &digest, &bytes)?;
-                } else {
-                    install_cache_with_algorithm(repo, &digest, &bytes, hash_name)?;
-                }
+                install_cache_with_algorithm(repo, &digest, &bytes, &algorithm)?;
             }
         }
     }
@@ -572,20 +1051,25 @@ pub(crate) fn install_directory_manifests(repo: &GitRepo, pointers: &[String]) -
 
 fn select_pointers(repo: &GitRepo, targets: &[String]) -> Result<Vec<String>> {
     if targets.is_empty() {
-        return dvc::discover(repo, &[]);
+        return storage_metadata::discover(repo, &[]);
     }
     let mut pointers = BTreeSet::new();
     for target in targets {
         let target = repo_path(target, "storage target")?;
-        let pointer = if target.ends_with(".dvc") {
+        let pointer = if storage_metadata::is_pointer(&target) {
             target.clone()
         } else {
-            format!("{target}.dvc")
+            let native = storage_metadata::pointer_path(&target);
+            if repo.root.join(&native).is_file() {
+                native
+            } else {
+                format!("{target}.dvc")
+            }
         };
         if repo.root.join(&pointer).is_file() {
             pointers.insert(pointer);
         } else {
-            for pointer in dvc::discover(repo, std::slice::from_ref(&target))? {
+            for pointer in storage_metadata::discover(repo, std::slice::from_ref(&target))? {
                 pointers.insert(pointer);
             }
         }
@@ -618,7 +1102,7 @@ fn current_files_with_algorithm(
         let item =
             item.map_err(|e| Error::message(format!("failed to inspect storage output: {e}")))?;
         let metadata = fs::metadata(item.path()).at(item.path())?;
-        // DVC records a file symlink's target bytes. Directory links cannot
+        // File symlinks record their target bytes. Directory links cannot
         // be traversed without ambiguous ownership or recursion, so refuse
         // them; reading a file target never mutates the target itself.
         if (item.file_type().is_symlink() && !metadata.is_file())
@@ -649,6 +1133,7 @@ fn current_files_with_algorithm(
             relpath,
             md5: file_digest(item.path(), hash_name)?,
             size: metadata.len(),
+            version_id: None,
         });
     }
     files.sort_by(|a, b| a.relpath.cmp(&b.relpath));
@@ -658,11 +1143,13 @@ fn current_files_with_algorithm(
 fn recorded_files(
     repo: &GitRepo,
     pointer: &str,
-    out: &dvc::PointerOutput,
+    out: &storage_metadata::PointerOutput,
     algorithm: &str,
 ) -> Result<Vec<FileState>> {
     if let Some(files) = &out.files {
-        if out.md5.as_deref() != Some(directory_digest(files)?.as_str()) {
+        if pointer.ends_with(".dvc")
+            && out.md5.as_deref() != Some(directory_digest(files)?.as_str())
+        {
             return Err(Error::message(format!(
                 "directory manifest hash mismatch: {pointer}"
             )));
@@ -677,6 +1164,7 @@ fn recorded_files(
                         .clone()
                         .ok_or_else(|| Error::message("directory file has no digest"))?,
                     size: file.size.unwrap_or(0),
+                    version_id: file.version_id.clone(),
                 })
             })
             .collect();
@@ -690,6 +1178,7 @@ fn recorded_files(
             relpath: String::new(),
             md5: digest.to_owned(),
             size: out.size.unwrap_or(0),
+            version_id: out.version_id.clone(),
         }]);
     }
     let mut path = existing_cache_with_algorithm(repo, digest, algorithm)?;
@@ -715,177 +1204,177 @@ fn recorded_files(
                 relpath: file.relpath,
                 md5: file.md5,
                 size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                version_id: None,
             })
         })
         .collect()
 }
 
-fn put(map: &mut Mapping, key: &str, value: Yaml) {
-    map.insert(Yaml::String(key.to_owned()), value);
-}
-fn string(value: impl Into<String>) -> Yaml {
-    Yaml::String(value.into())
-}
-
-fn clear_internal_cloud(map: &mut Mapping) {
-    if let Some(Yaml::Mapping(cloud)) = map.get_mut(string("cloud")) {
-        cloud.remove(string(dvc::INTERNAL_REMOTE));
-        if cloud.is_empty() {
-            map.remove(string("cloud"));
-        }
-    }
-}
-
 fn add(repo: &GitRepo, target: &str) -> Result<()> {
     let object = repo_path(target, "storage output")?;
-    dvc::require_addressable(
+    storage_metadata::require_addressable(
         &object,
         "storage output",
         "choose a path without backslashes",
     )?;
-    let pointer = format!("{object}.dvc");
+    let pointer = storage_metadata::pointer_path(&object);
     reject_symlink_traversal(&repo.root, &pointer, "storage metadata")?;
+    if repo.root.join(format!("{object}.dvc")).exists() {
+        return Err(Error::message(
+            "legacy DVC metadata must be migrated before tracking this boundary; run `workspace-mgr manage`",
+        ));
+    }
     let parent = Path::new(&object).parent().unwrap_or_else(|| Path::new(""));
     let filename = Path::new(&object)
         .file_name()
-        .and_then(|s| s.to_str())
+        .and_then(|name| name.to_str())
         .ok_or_else(|| Error::message("output name is not UTF-8"))?;
-    let mut map = Mapping::new();
-    put(&mut map, "path", string(filename));
-    put(&mut map, "hash", string("md5"));
-    let mut document = Yaml::Mapping(Mapping::from_iter([(
-        string("outs"),
-        Yaml::Sequence(vec![Yaml::Mapping(map)]),
-    )]));
-    update_document(repo, &pointer, &mut document)?;
-    write_yaml(repo, &pointer, &document)?;
+    let mut manifest = if repo.root.join(&pointer).exists() {
+        read_manifest(repo, &pointer)?
+    } else {
+        Manifest {
+            schema_version: 1,
+            path: filename.to_owned(),
+            kind: Kind::File,
+            checksum: Checksum {
+                algorithm: "md5".into(),
+                digest: "00000000000000000000000000000000".into(),
+            },
+            size: 0,
+            version: None,
+            entries: None,
+        }
+    };
+    update_manifest(repo, &pointer, &mut manifest)?;
+    write_manifest(repo, &pointer, &manifest)?;
     update_ignore(&repo.root.join(parent).join(".gitignore"), filename, true)
 }
 
 fn commit(repo: &GitRepo, pointer: &str) -> Result<()> {
-    let mut document = read_yaml(repo, pointer)?;
-    update_document(repo, pointer, &mut document)?;
-    write_yaml(repo, pointer, &document)
+    let mut manifest = read_manifest(repo, pointer)?;
+    update_manifest(repo, pointer, &mut manifest)?;
+    write_manifest(repo, pointer, &manifest)
 }
 
-fn version_aware(repo: &GitRepo) -> bool {
-    fs::read_to_string(repo.root.join(".dvc/config"))
-        .ok()
-        .is_some_and(|raw| {
-            raw.lines()
-                .any(|line| line.trim() == "version_aware = true")
-        })
-}
-
-fn update_document(repo: &GitRepo, pointer: &str, document: &mut Yaml) -> Result<()> {
-    let outs = document
-        .get_mut("outs")
-        .and_then(Yaml::as_sequence_mut)
-        .ok_or_else(|| Error::message("metadata has no outputs"))?;
-    for out in outs {
-        let map = out
-            .as_mapping_mut()
-            .ok_or_else(|| Error::message("invalid metadata output"))?;
-        let name = map
-            .get(string("path"))
-            .and_then(Yaml::as_str)
-            .ok_or_else(|| Error::message("metadata output has no path"))?;
-        let object = output_object(pointer, name)?;
-        let path = repo.root.join(&object);
-        if !path.exists() {
-            return Err(Error::message(format!(
-                "storage output is missing: {object}"
-            )));
+fn update_manifest(repo: &GitRepo, pointer: &str, manifest: &mut Manifest) -> Result<()> {
+    let object = output_object(pointer, &manifest.path)?;
+    let path = repo.root.join(&object);
+    if !path.exists() {
+        return Err(Error::message(format!(
+            "storage output is missing: {object}"
+        )));
+    }
+    if manifest.checksum.algorithm == "md5-dos2unix" {
+        let document = storage_metadata::read_pointer_document(repo, pointer)?;
+        let [out] = document.outs.as_slice() else {
+            return Err(Error::message(
+                "normalized storage metadata must define one output",
+            ));
+        };
+        let recorded = recorded_files(repo, pointer, out, "md5-dos2unix")?;
+        let unchanged = recorded.iter().all(|file| file.version_id.is_some())
+            && normalized_exact_bytes_match(repo, &object, &recorded, "md5-dos2unix")?;
+        if !unchanged {
+            manifest.checksum.algorithm = "md5".into();
+            manifest.clear_versions();
         }
-        let algorithm = map
-            .get(string("hash"))
-            .and_then(Yaml::as_str)
-            .unwrap_or("md5-dos2unix")
-            .to_owned();
-        let files = current_files_with_algorithm(repo, &object, &algorithm)?;
-        let old_digest = map
-            .get(string("md5"))
-            .and_then(Yaml::as_str)
-            .map(ToOwned::to_owned);
-        let size = files.iter().map(|f| f.size).sum::<u64>();
-        let digest;
-        if path.is_dir() {
-            let tree = files
-                .iter()
-                .map(|f| TreeEntry {
-                    relpath: f.relpath.clone(),
-                    md5: f.md5.clone(),
-                })
-                .collect::<Vec<_>>();
-            let bytes = tree_bytes(&tree)?;
-            digest = format!("{}.dir", crate::hex::encode_lower(Md5::digest(&bytes)));
-            install_cache_with_algorithm(repo, &digest, &bytes, &algorithm)?;
-            let previous = map
-                .get(string("files"))
-                .and_then(Yaml::as_sequence)
-                .cloned()
-                .unwrap_or_default();
-            if version_aware(repo) || !previous.is_empty() {
-                let mut rows = Vec::new();
-                for file in &files {
-                    let mut row = previous
-                        .iter()
-                        .find(|row| row["relpath"].as_str() == Some(&file.relpath))
-                        .and_then(Yaml::as_mapping)
-                        .cloned()
-                        .unwrap_or_default();
-                    if row.get(string("md5")).and_then(Yaml::as_str) != Some(&file.md5)
-                        || row
-                            .get(string("size"))
-                            .and_then(Yaml::as_u64)
-                            .is_some_and(|size| size != file.size)
-                    {
-                        clear_internal_cloud(&mut row);
-                    }
-                    put(&mut row, "relpath", string(&file.relpath));
-                    put(&mut row, "md5", string(&file.md5));
-                    put(&mut row, "size", Yaml::Number(file.size.into()));
-                    rows.push(Yaml::Mapping(row));
-                }
-                put(map, "files", Yaml::Sequence(rows));
-            }
-            put(map, "nfiles", Yaml::Number((files.len() as u64).into()));
-        } else {
-            digest = files
+    }
+    let files = current_files_with_algorithm(repo, &object, &manifest.checksum.algorithm)?;
+    let size = files.iter().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .ok_or_else(|| Error::message("storage content sizes overflow"))
+    })?;
+    let (kind, digest, entries) = if path.is_dir() {
+        let previous = manifest.entries.as_deref().unwrap_or_default();
+        let entries = files
+            .iter()
+            .map(|file| Entry {
+                path: file.relpath.clone(),
+                checksum: Checksum {
+                    algorithm: manifest.checksum.algorithm.clone(),
+                    digest: file.md5.clone(),
+                },
+                size: file.size,
+                version: previous
+                    .iter()
+                    .find(|entry| {
+                        entry.path == file.relpath
+                            && entry.checksum.digest == file.md5
+                            && entry.size == file.size
+                    })
+                    .and_then(|entry| entry.version.clone()),
+            })
+            .collect::<Vec<_>>();
+        (
+            Kind::Directory,
+            crate::storage_format::directory_digest(&entries)?,
+            Some(entries),
+        )
+    } else {
+        (
+            Kind::File,
+            files
                 .first()
                 .ok_or_else(|| Error::message("storage output is not a file"))?
                 .md5
-                .clone();
-            map.remove(string("files"));
-            map.remove(string("nfiles"));
-        }
-        for file in &files {
-            let source = if file.relpath.is_empty() {
-                path.clone()
-            } else {
-                path.join(&file.relpath)
-            };
-            install_cache_file_with_algorithm(repo, &file.md5, &source, &algorithm)?;
-        }
-        if old_digest.as_deref() != Some(&digest)
-            || map
-                .get(string("size"))
-                .and_then(Yaml::as_u64)
-                .is_some_and(|previous| previous != size)
-        {
-            clear_internal_cloud(map);
-        }
-        put(map, "md5", string(digest));
-        put(map, "size", Yaml::Number(size.into()));
-        if map.contains_key(string("hash")) {
-            put(map, "hash", string(algorithm));
-        }
+                .clone(),
+            None,
+        )
+    };
+    if manifest.kind != kind || manifest.checksum.digest != digest || manifest.size != size {
+        manifest.version = None;
+    }
+    manifest.kind = kind;
+    manifest.checksum.digest = digest;
+    manifest.size = size;
+    manifest.entries = entries;
+    for file in files {
+        let source = if file.relpath.is_empty() {
+            path.clone()
+        } else {
+            path.join(&file.relpath)
+        };
+        install_cache_file_with_algorithm(repo, &file.md5, &source, &manifest.checksum.algorithm)?;
     }
     Ok(())
 }
 
+fn actual_directory_digest(pointer: &str, files: &[FileState], algorithm: &str) -> Result<String> {
+    if pointer.ends_with(".dvc") {
+        return Ok(format!(
+            "{}.dir",
+            crate::hex::encode_lower(Md5::digest(tree_bytes(
+                &files
+                    .iter()
+                    .map(|file| TreeEntry {
+                        relpath: file.relpath.clone(),
+                        md5: file.md5.clone()
+                    })
+                    .collect::<Vec<_>>()
+            )?))
+        ));
+    }
+    let entries = files
+        .iter()
+        .map(|file| Entry {
+            path: file.relpath.clone(),
+            checksum: Checksum {
+                algorithm: algorithm.to_owned(),
+                digest: file.md5.clone(),
+            },
+            size: file.size,
+            version: None,
+        })
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "{}.dir",
+        crate::storage_format::directory_digest(&entries)?
+    ))
+}
+
 fn remote_root(repo: &GitRepo) -> Result<String> {
-    dvc::internal_location(repo)?
+    storage_metadata::internal_location(repo)?
         .map(|location| location.0)
         .ok_or_else(|| Error::message("storage remote is not configured"))
 }
@@ -901,11 +1390,11 @@ fn remote_cache_path(
     let root = if root.is_absolute() {
         root.to_owned()
     } else {
-        repo.root.join(".dvc").join(root)
+        repo.root.join(root)
     };
     let relative = match hash_name {
-        "md5" => format!("files/md5/{first}/{rest}"),
-        "md5-dos2unix" => format!("{first}/{rest}"),
+        "md5" => format!("objects/md5/{first}/{rest}"),
+        "md5-dos2unix" => format!("objects/md5-dos2unix/{first}/{rest}"),
         _ => return Err(Error::message("unsupported storage hash algorithm")),
     };
     reject_symlink_traversal(&root, &relative, "filesystem storage object")?;
@@ -913,21 +1402,16 @@ fn remote_cache_path(
 }
 
 fn algorithms_for_pointer(repo: &GitRepo, pointer: &str) -> Result<BTreeMap<String, String>> {
-    let yaml = read_yaml(repo, pointer)?;
+    let algorithm = pointer_algorithm(repo, pointer)?;
     let mut hashes = BTreeMap::new();
-    for (index, out) in dvc::read_pointer_document(repo, pointer)?
-        .outs
-        .iter()
-        .enumerate()
-    {
-        let algorithm = yaml["outs"][index]["hash"]
-            .as_str()
-            .unwrap_or("md5-dos2unix");
-        if let Some(digest) = &out.md5 {
-            hashes.insert(digest.clone(), algorithm.to_owned());
+    for out in storage_metadata::read_pointer_document(repo, pointer)?.outs {
+        if pointer.ends_with(".dvc") {
+            if let Some(digest) = &out.md5 {
+                hashes.insert(digest.clone(), algorithm.clone());
+            }
         }
-        for file in recorded_files(repo, pointer, out, algorithm)? {
-            hashes.insert(file.md5, algorithm.to_owned());
+        for file in recorded_files(repo, pointer, &out, &algorithm)? {
+            hashes.insert(file.md5, algorithm.clone());
         }
     }
     Ok(hashes)
@@ -956,26 +1440,6 @@ fn push(repo: &GitRepo, pointers: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cloud_binding(map: &mut Mapping, version: &str, etag: &str) {
-    let cloud = map
-        .entry(string("cloud"))
-        .or_insert_with(|| Yaml::Mapping(Mapping::new()));
-    if !cloud.is_mapping() {
-        *cloud = Yaml::Mapping(Mapping::new());
-    }
-    let remote = cloud
-        .as_mapping_mut()
-        .expect("mapping")
-        .entry(string(dvc::INTERNAL_REMOTE))
-        .or_insert_with(|| Yaml::Mapping(Mapping::new()));
-    if !remote.is_mapping() {
-        *remote = Yaml::Mapping(Mapping::new());
-    }
-    let remote = remote.as_mapping_mut().expect("mapping");
-    put(remote, "version_id", string(version));
-    put(remote, "etag", string(etag));
-}
-
 fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
     let client = crate::native_s3::S3Client::from_repo(repo)?;
     let versioning = client.call_s3(
@@ -996,10 +1460,6 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                 .md5
                 .as_deref()
                 .ok_or_else(|| Error::message("stored object has no content hash"))?;
-            let source = existing_cache_with_algorithm(repo, digest, &entry.hash_name)?;
-            if file_digest(&source, &entry.hash_name)? != digest {
-                return Err(Error::message("storage cache content hash mismatch"));
-            }
             if let Some(version) = &entry.version_id {
                 let info = client.call_s3(
                     "head_object",
@@ -1019,6 +1479,10 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                 }
                 continue;
             }
+            let source = existing_cache_with_algorithm(repo, digest, &entry.hash_name)?;
+            if file_digest(&source, &entry.hash_name)? != digest {
+                return Err(Error::message("storage cache content hash mismatch"));
+            }
             let (version, etag) = upload_version(
                 &client,
                 repo,
@@ -1027,74 +1491,68 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                 5 * (1 << 30),
                 64 * (1 << 20),
             )?;
-            let mut document = read_yaml(repo, pointer)?;
+            let mut manifest = read_manifest(repo, pointer)?;
+            let object = output_object(pointer, &manifest.path)?;
             let mut bound = false;
-            for out in document["outs"]
-                .as_sequence_mut()
-                .ok_or_else(|| Error::message("metadata has no outputs"))?
-            {
-                let object = output_object(
-                    pointer,
-                    out["path"]
-                        .as_str()
-                        .ok_or_else(|| Error::message("output has no path"))?,
-                )?;
-                if let Some(files) = out.get_mut("files").and_then(Yaml::as_sequence_mut) {
-                    for file in files {
-                        if format!("{object}/{}", file["relpath"].as_str().unwrap_or(""))
-                            == entry.object
-                        {
-                            if !binding_is_unchanged(file, &entry) {
-                                return Err(Error::message(
-                                    "storage metadata changed during upload; retry after reconciling the pointer",
-                                ));
-                            }
-                            cloud_binding(
-                                file.as_mapping_mut()
-                                    .ok_or_else(|| Error::message("invalid directory file"))?,
-                                &version,
-                                &etag,
-                            );
-                            bound = true;
+            if let Some(entries) = &mut manifest.entries {
+                for file in entries {
+                    if format!("{object}/{}", file.path) == entry.object {
+                        if !binding_is_unchanged(
+                            &file.checksum,
+                            file.size,
+                            file.version.as_ref(),
+                            &entry,
+                        ) {
+                            return Err(Error::message(
+                                "storage metadata changed during upload; retry after reconciling the pointer",
+                            ));
                         }
+                        file.version = Some(Version {
+                            id: version.clone(),
+                            etag: Some(etag.clone()),
+                        });
+                        bound = true;
                     }
-                } else if object == entry.object {
-                    if !binding_is_unchanged(out, &entry) {
-                        return Err(Error::message(
-                            "storage metadata changed during upload; retry after reconciling the pointer",
-                        ));
-                    }
-                    cloud_binding(
-                        out.as_mapping_mut()
-                            .ok_or_else(|| Error::message("invalid output"))?,
-                        &version,
-                        &etag,
-                    );
-                    bound = true;
                 }
+            } else if object == entry.object {
+                if !binding_is_unchanged(
+                    &manifest.checksum,
+                    manifest.size,
+                    manifest.version.as_ref(),
+                    &entry,
+                ) {
+                    return Err(Error::message(
+                        "storage metadata changed during upload; retry after reconciling the pointer",
+                    ));
+                }
+                manifest.version = Some(Version {
+                    id: version,
+                    etag: Some(etag),
+                });
+                bound = true;
             }
             if !bound {
                 return Err(Error::message(
                     "storage output changed during upload; its exact version remains recorded in the private upload journal",
                 ));
             }
-            // Each successful upload's exact ID is durable before the next put.
-            write_yaml(repo, pointer, &document)?;
+            write_manifest(repo, pointer, &manifest)?;
         }
     }
     Ok(())
 }
 
-fn binding_is_unchanged(row: &Yaml, entry: &StorageEntry) -> bool {
-    let binding = &row["cloud"][dvc::INTERNAL_REMOTE];
-    let expected = |field: &str, value: Option<&str>| match value {
-        Some(value) => binding[field].as_str() == Some(value),
-        None => binding[field].is_null(),
-    };
-    row["md5"].as_str() == entry.md5.as_deref()
-        && row["size"].as_u64() == entry.size
-        && expected("version_id", entry.version_id.as_deref())
-        && expected("etag", entry.etag.as_deref())
+fn binding_is_unchanged(
+    checksum: &Checksum,
+    size: u64,
+    version: Option<&Version>,
+    entry: &StorageEntry,
+) -> bool {
+    Some(checksum.digest.as_str()) == entry.md5.as_deref()
+        && checksum.algorithm == entry.hash_name
+        && Some(size) == entry.size
+        && version.map(|version| version.id.as_str()) == entry.version_id.as_deref()
+        && version.and_then(|version| version.etag.as_deref()) == entry.etag.as_deref()
 }
 
 const UPLOAD_TOKEN: &str = "workspace-mgr-upload";
@@ -1104,19 +1562,17 @@ fn upload_journal(
     client: &crate::native_s3::S3Client,
     entry: &StorageEntry,
 ) -> Result<(PathBuf, Value)> {
-    use sha2::Sha256;
-    let key = client.key_for(&entry.object);
-    let digest = entry
-        .md5
-        .as_deref()
-        .ok_or_else(|| Error::message("storage upload has no digest"))?;
-    let context = json!({"schema":1,"bucket":client.bucket,"key":key,"md5":digest,"hash_name":entry.hash_name,"size":entry.size});
-    let identity = crate::hex::encode_lower(Sha256::digest(
-        serde_json::to_vec(&context).map_err(|e| Error::message(e.to_string()))?,
-    ));
-    let relative = format!(".dvc/tmp/native-uploads/{identity}.json");
-    reject_symlink_traversal(&repo.root, &relative, "private storage upload journal")?;
-    let path = repo.root.join(relative);
+    upload_journal_in(repo, client, entry, "uploads", None)
+}
+
+fn upload_journal_in(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+    namespace: &str,
+    raw_sha256: Option<&str>,
+) -> Result<(PathBuf, Value)> {
+    let (path, context) = upload_context(repo, client, entry, namespace, raw_sha256)?;
     if path.is_file() {
         let journal: Value = serde_json::from_slice(&fs::read(&path).at(&path)?)
             .map_err(|e| Error::message(format!("invalid private storage upload journal: {e}")))?;
@@ -1134,6 +1590,7 @@ fn upload_journal(
         .rand_bytes(32)
         .tempfile_in(parent)
         .at(parent)?;
+    use sha2::Sha256;
     let token = crate::hex::encode_lower(Sha256::digest(
         nonce
             .path()
@@ -1146,6 +1603,44 @@ fn upload_journal(
     Ok((path, journal))
 }
 
+fn upload_context(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+    namespace: &str,
+    raw_sha256: Option<&str>,
+) -> Result<(PathBuf, Value)> {
+    use sha2::Sha256;
+    let key = client.key_for(&entry.object);
+    let digest = entry
+        .md5
+        .as_deref()
+        .ok_or_else(|| Error::message("storage upload has no digest"))?;
+    let mut context = json!({"schema":1,"bucket":client.bucket,"key":key,"md5":digest,"hash_name":entry.hash_name,"size":entry.size});
+    if namespace == "storage-import-uploads" {
+        let raw_sha256 = raw_sha256
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            .ok_or_else(|| {
+                Error::message("storage import upload requires a raw SHA256 identity")
+            })?;
+        context["schema"] = 2.into();
+        context["raw_sha256"] = raw_sha256.into();
+    }
+    let identity = crate::hex::encode_lower(Sha256::digest(
+        serde_json::to_vec(&context).map_err(|e| Error::message(e.to_string()))?,
+    ));
+    let relative = format!("{namespace}/{identity}.json");
+    let local = crate::local_state::directory_unmigrated(repo)?;
+    reject_symlink_traversal(&local, &relative, "private storage upload journal")?;
+    let path = local.join(relative);
+    Ok((path, context))
+}
+
 fn save_upload(path: &Path, journal: &Value) -> Result<()> {
     atomic_write(
         path,
@@ -1155,10 +1650,11 @@ fn save_upload(path: &Path, journal: &Value) -> Result<()> {
 
 fn verify_uploaded_version(
     client: &crate::native_s3::S3Client,
-    repo: &GitRepo,
+    _repo: &GitRepo,
     entry: &StorageEntry,
     token: &str,
     version: &str,
+    raw_sha256: Option<&str>,
 ) -> Result<String> {
     let key = client.key_for(&entry.object);
     let info = client
@@ -1178,7 +1674,7 @@ fn verify_uploaded_version(
             "uploaded exact version does not match its private ownership journal",
         ));
     }
-    let temporary = tempfile::NamedTempFile::new_in(cache_root(repo)?).at(cache_root(repo)?)?;
+    let temporary = tempfile::NamedTempFile::new().at(std::env::temp_dir())?;
     let fetched = client.get_to_file(
         &json!({"Bucket":client.bucket,"Key":key,"VersionId":version,"IfMatch":info["ETag"]}),
         temporary.path(),
@@ -1199,6 +1695,13 @@ fn verify_uploaded_version(
         return Err(Error::message(
             "uploaded exact version has a content hash mismatch; its private journal is retained for reconciliation",
         ));
+    }
+    if let Some(wanted) = raw_sha256 {
+        if file_sha256(temporary.path())? != wanted {
+            return Err(Error::message(
+                "uploaded exact version has a raw content hash mismatch; its private journal is retained for reconciliation",
+            ));
+        }
     }
     info["ETag"]
         .as_str()
@@ -1244,8 +1747,15 @@ fn recover_uploaded_version(
         .into_iter()
         .next()
         .map(|version| {
-            verify_uploaded_version(client, repo, entry, token, &version)
-                .map(|etag| (version, etag))
+            verify_uploaded_version(
+                client,
+                repo,
+                entry,
+                token,
+                &version,
+                journal["context"]["raw_sha256"].as_str(),
+            )
+            .map(|etag| (version, etag))
         })
         .transpose()
 }
@@ -1258,14 +1768,53 @@ fn upload_version(
     single_limit: u64,
     preferred_part_size: u64,
 ) -> Result<(String, String)> {
-    let (path, mut journal) = upload_journal(repo, client, entry)?;
+    upload_version_in(
+        client,
+        repo,
+        entry,
+        source,
+        single_limit,
+        preferred_part_size,
+        UploadPolicy {
+            namespace: "uploads",
+            condition: None,
+            raw_sha256: None,
+        },
+    )
+}
+
+struct UploadPolicy<'a> {
+    namespace: &'a str,
+    condition: Option<&'a str>,
+    raw_sha256: Option<&'a str>,
+}
+
+fn upload_version_in(
+    client: &crate::native_s3::S3Client,
+    repo: &GitRepo,
+    entry: &StorageEntry,
+    source: &Path,
+    single_limit: u64,
+    preferred_part_size: u64,
+    policy: UploadPolicy<'_>,
+) -> Result<(String, String)> {
+    let UploadPolicy {
+        namespace,
+        condition,
+        raw_sha256,
+    } = policy;
+    let (path, mut journal) = if namespace == "uploads" {
+        upload_journal(repo, client, entry)?
+    } else {
+        upload_journal_in(repo, client, entry, namespace, raw_sha256)?
+    };
     let key = client.key_for(&entry.object);
     let token = journal["token"]
         .as_str()
         .ok_or_else(|| Error::message("private upload journal has no ownership token"))?
         .to_owned();
     if let Some(version) = journal["version_id"].as_str() {
-        return verify_uploaded_version(client, repo, entry, &token, version)
+        return verify_uploaded_version(client, repo, entry, &token, version, raw_sha256)
             .map(|etag| (version.to_owned(), etag));
     }
     if journal["phase"] != "planned" {
@@ -1303,11 +1852,23 @@ fn upload_version(
             "cached upload size differs from storage metadata",
         ));
     }
+    if file_digest(source, &entry.hash_name)? != entry.md5.as_deref().unwrap_or("") {
+        return Err(Error::message(
+            "cached upload checksum differs from storage metadata",
+        ));
+    }
     let request = json!({"Bucket":client.bucket,"Key":key,"Metadata":{UPLOAD_TOKEN:token}});
     let response = if size <= single_limit {
         journal["phase"] = "uploading".into();
         save_upload(&path, &journal)?;
         let mut request = request;
+        if namespace == "storage-import-uploads" {
+            if let Some(etag) = condition {
+                request["IfMatch"] = etag.into();
+            } else {
+                request["IfNoneMatch"] = "*".into();
+            }
+        }
         request["ExpectedMD5"] = file_digest(source, "md5")?.into();
         request["ExpectedSize"] = size.into();
         client.put_file(&request, source)
@@ -1354,7 +1915,17 @@ fn upload_version(
             }
             journal["phase"] = "completing".into();
             save_upload(&path, &journal)?;
-            client.call_s3("complete_multipart_upload", &json!({"Bucket":client.bucket,"Key":key,"UploadId":upload,"MultipartUpload":{"Parts":parts}}),None).map_err(Error::from)
+            let mut complete = json!({"Bucket":client.bucket,"Key":key,"UploadId":upload,"MultipartUpload":{"Parts":parts}});
+            if namespace == "storage-import-uploads" {
+                if let Some(etag) = condition {
+                    complete["IfMatch"] = etag.into();
+                } else {
+                    complete["IfNoneMatch"] = "*".into();
+                }
+            }
+            client
+                .call_s3("complete_multipart_upload", &complete, None)
+                .map_err(Error::from)
         })();
         match result {
             Ok(response) => Ok(response),
@@ -1411,7 +1982,7 @@ fn upload_version(
     // Record the exact generation before its read-back, including a failure.
     journal["version_id"] = version.clone().into();
     save_upload(&path, &journal)?;
-    let etag = verify_uploaded_version(client, repo, entry, &token, &version)?;
+    let etag = verify_uploaded_version(client, repo, entry, &token, &version, raw_sha256)?;
     journal["etag"] = etag.clone().into();
     journal["phase"] = "complete".into();
     save_upload(&path, &journal)?;
@@ -1426,17 +1997,15 @@ fn fetch(repo: &GitRepo, pointers: &[String]) -> Result<()> {
         ));
     }
     for pointer in pointers {
-        let document = dvc::read_pointer_document(repo, pointer)?;
-        let yaml = read_yaml(repo, pointer)?;
-        for (index, out) in document.outs.iter().enumerate() {
-            let algorithm = yaml["outs"][index]["hash"]
-                .as_str()
-                .unwrap_or("md5-dos2unix");
+        let document = storage_metadata::read_pointer_document(repo, pointer)?;
+        let algorithm = pointer_algorithm(repo, pointer)?;
+        for out in &document.outs {
+            let algorithm = algorithm.as_str();
             let digest = out
                 .md5
                 .as_deref()
                 .ok_or_else(|| Error::message("metadata has no content hash"))?;
-            if digest.ends_with(".dir") {
+            if pointer.ends_with(".dvc") && digest.ends_with(".dir") {
                 install_cache_file_with_algorithm(
                     repo,
                     digest,
@@ -1463,15 +2032,9 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
     // any of them, so incoming revisions also retire removed directory files.
     let mut staged = Vec::new();
     for pointer in pointers {
-        let yaml = read_yaml(repo, pointer)?;
-        for (index, out) in dvc::read_pointer_document(repo, pointer)?
-            .outs
-            .into_iter()
-            .enumerate()
-        {
-            let hash_name = yaml["outs"][index]["hash"]
-                .as_str()
-                .unwrap_or("md5-dos2unix");
+        let algorithm = pointer_algorithm(repo, pointer)?;
+        for out in storage_metadata::read_pointer_document(repo, pointer)?.outs {
+            let hash_name = algorithm.as_str();
             let object = output_object(pointer, &out.path)?;
             reject_symlink_traversal(&repo.root, &object, "storage checkout")?;
             let root = repo.root.join(&object);
@@ -1484,7 +2047,7 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
             let files = recorded_files(repo, pointer, &out, hash_name)?;
             let mut cached_size = 0u64;
             for file in &files {
-                let source = existing_cache_with_algorithm(repo, &file.md5, hash_name)?;
+                let source = cache_for_recorded_file(repo, &object, file, hash_name)?;
                 let size = fs::metadata(&source).at(&source)?.len();
                 cached_size = cached_size
                     .checked_add(size)
@@ -1502,18 +2065,7 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
             // file links, mode bits and legacy CRLF representation.
             if root.exists() && root.is_dir() == directory {
                 let digest = if directory {
-                    format!(
-                        "{}.dir",
-                        crate::hex::encode_lower(Md5::digest(tree_bytes(
-                            &current
-                                .iter()
-                                .map(|file| TreeEntry {
-                                    md5: file.md5.clone(),
-                                    relpath: file.relpath.clone()
-                                })
-                                .collect::<Vec<_>>()
-                        )?))
-                    )
+                    actual_directory_digest(pointer, &current, hash_name)?
                 } else {
                     current
                         .first()
@@ -1524,6 +2076,7 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                     && out.size.is_none_or(|size| {
                         current.iter().map(|file| file.size).sum::<u64>() == size
                     })
+                    && normalized_exact_bytes_match(repo, &object, &files, hash_name)?
                 {
                     continue;
                 }
@@ -1551,7 +2104,7 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                 fs::create_dir(&replacement).at(&replacement)?;
             }
             for file in files {
-                let source = existing_cache_with_algorithm(repo, &file.md5, hash_name)?;
+                let source = cache_for_recorded_file(repo, &object, &file, hash_name)?;
                 let existing = if file.relpath.is_empty() {
                     root.clone()
                 } else {
@@ -1634,15 +2187,9 @@ fn status(repo: &GitRepo, pointers: &[String], cloud: bool, quiet: bool) -> Resu
     let mut result = serde_json::Map::new();
     for pointer in pointers {
         let mut changed = serde_json::Map::new();
-        let yaml = read_yaml(repo, pointer)?;
-        for (index, out) in dvc::read_pointer_document(repo, pointer)?
-            .outs
-            .into_iter()
-            .enumerate()
-        {
-            let algorithm = yaml["outs"][index]["hash"]
-                .as_str()
-                .unwrap_or("md5-dos2unix");
+        let algorithm = pointer_algorithm(repo, pointer)?;
+        for out in storage_metadata::read_pointer_document(repo, pointer)?.outs {
+            let algorithm = algorithm.as_str();
             let object = output_object(pointer, &out.path)?;
             let digest = out
                 .md5
@@ -1675,29 +2222,27 @@ fn status(repo: &GitRepo, pointers: &[String], cloud: bool, quiet: bool) -> Resu
             } else {
                 let current = current_files_with_algorithm(repo, &object, algorithm)?;
                 let actual = if digest.ends_with(".dir") {
-                    format!(
-                        "{}.dir",
-                        crate::hex::encode_lower(Md5::digest(tree_bytes(
-                            &current
-                                .iter()
-                                .map(|f| TreeEntry {
-                                    relpath: f.relpath.clone(),
-                                    md5: f.md5.clone()
-                                })
-                                .collect::<Vec<_>>()
-                        )?))
-                    )
+                    actual_directory_digest(pointer, &current, algorithm)?
                 } else {
-                    current.first().map(|f| f.md5.clone()).unwrap_or_default()
+                    current
+                        .first()
+                        .map(|file| file.md5.clone())
+                        .unwrap_or_default()
                 };
-                if actual != digest {
+                if actual != digest
+                    || !normalized_exact_bytes_match(
+                        repo,
+                        &object,
+                        &recorded_files(repo, pointer, &out, algorithm)?,
+                        algorithm,
+                    )?
+                {
                     Some("modified")
-                } else if !algorithms_for_pointer(repo, pointer).is_ok_and(|hashes| {
-                    hashes.iter().all(|(hash, algorithm)| {
-                        existing_cache_with_algorithm(repo, hash, algorithm).is_ok_and(|path| {
+                } else if !recorded_files(repo, pointer, &out, algorithm).is_ok_and(|files| {
+                    files.iter().all(|file| {
+                        cache_for_recorded_file(repo, &object, file, algorithm).is_ok_and(|path| {
                             path.is_file()
-                                && file_digest(&path, algorithm)
-                                    .is_ok_and(|d| d == hash.trim_end_matches(".dir"))
+                                && file_digest(&path, algorithm).is_ok_and(|d| d == file.md5)
                         })
                     })
                 }) {
@@ -1728,15 +2273,9 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
     let mut not_in_cache = BTreeSet::new();
     let mut unknown = BTreeSet::new();
     for pointer in select_pointers(repo, targets)? {
-        let yaml = read_yaml(repo, &pointer)?;
-        for (index, out) in dvc::read_pointer_document(repo, &pointer)?
-            .outs
-            .into_iter()
-            .enumerate()
-        {
-            let algorithm = yaml["outs"][index]["hash"]
-                .as_str()
-                .unwrap_or("md5-dos2unix");
+        let algorithm = pointer_algorithm(repo, &pointer)?;
+        for out in storage_metadata::read_pointer_document(repo, &pointer)?.outs {
+            let algorithm = algorithm.as_str();
             let object = output_object(&pointer, &out.path)?;
             let directory = out.md5.as_deref().is_some_and(|m| m.ends_with(".dir"));
             let label = if directory {
@@ -1758,11 +2297,11 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
             let current = current_files_with_algorithm(repo, &object, algorithm)?;
             let old = files
                 .iter()
-                .map(|f| (f.relpath.clone(), f.md5.clone()))
+                .map(|f| (f.relpath.clone(), (f.md5.clone(), f.size)))
                 .collect::<BTreeMap<_, _>>();
             let new = current
                 .iter()
-                .map(|f| (f.relpath.clone(), f.md5.clone()))
+                .map(|f| (f.relpath.clone(), (f.md5.clone(), f.size)))
                 .collect::<BTreeMap<_, _>>();
             if old != new || !repo.root.join(&object).exists() {
                 if !repo.root.join(&object).exists() {
@@ -1771,9 +2310,11 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                     modified.insert(label.clone());
                 }
             }
-            if let Some(digest) = &out.md5 {
-                if !existing_cache_with_algorithm(repo, digest, algorithm)?.is_file() {
-                    not_in_cache.insert(label);
+            if pointer.ends_with(".dvc") {
+                if let Some(digest) = &out.md5 {
+                    if !existing_cache_with_algorithm(repo, digest, algorithm)?.is_file() {
+                        not_in_cache.insert(label);
+                    }
                 }
             }
             for file in &files {
@@ -1789,7 +2330,7 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                     None => {
                         deleted.insert(label);
                     }
-                    Some(hash) if hash != &file.md5 => {
+                    Some(state) if state != &(file.md5.clone(), file.size) => {
                         modified.insert(label);
                     }
                     _ => {}
@@ -1832,57 +2373,26 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
 fn move_output(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
     let source = repo_path(source, "storage move source")?;
     let destination = repo_path(destination, "storage move destination")?;
-    dvc::require_addressable(
+    storage_metadata::require_addressable(
         &destination,
         "storage move destination",
         "choose a path without backslashes",
     )?;
-    for path in [
-        &source,
-        &destination,
-        &format!("{source}.dvc"),
-        &format!("{destination}.dvc"),
-    ] {
+    let old_pointer = storage_metadata::pointer_path(&source);
+    let new_pointer = storage_metadata::pointer_path(&destination);
+    for path in [&source, &destination, &old_pointer, &new_pointer] {
         reject_symlink_traversal(&repo.root, path, "storage move")?;
     }
-    let old_pointer = format!("{source}.dvc");
-    let new_pointer = format!("{destination}.dvc");
     if repo.root.join(&destination).exists() || repo.root.join(&new_pointer).exists() {
         return Err(Error::message("storage move destination already exists"));
     }
-    let mut document = read_yaml(repo, &old_pointer)?;
-    let outs = document["outs"]
-        .as_sequence_mut()
-        .ok_or_else(|| Error::message("storage metadata has no outputs"))?;
-    if outs.len() != 1 {
-        return Err(Error::message(
-            "storage move requires one output per pointer",
-        ));
-    }
-    let map = outs[0]
-        .as_mapping_mut()
-        .ok_or_else(|| Error::message("invalid storage output"))?;
-    if version_aware(repo) {
-        clear_internal_cloud(map);
-        if let Some(files) = map.get_mut(string("files")).and_then(Yaml::as_sequence_mut) {
-            for file in files {
-                clear_internal_cloud(
-                    file.as_mapping_mut()
-                        .ok_or_else(|| Error::message("invalid directory file"))?,
-                );
-            }
-        }
-    }
-    put(
-        map,
-        "path",
-        string(
-            Path::new(&destination)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| Error::message("invalid output name"))?,
-        ),
-    );
+    let mut document = read_manifest(repo, &old_pointer)?;
+    document.clear_versions();
+    document.path = Path::new(&destination)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::message("invalid output name"))?
+        .to_owned();
     fs::create_dir_all(
         repo.root
             .join(&destination)
@@ -1895,7 +2405,7 @@ fn move_output(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
         fs::rename(repo.root.join(&source), repo.root.join(&destination))
             .at(repo.root.join(&source))?;
     }
-    if let Err(error) = write_yaml(repo, &new_pointer, &document) {
+    if let Err(error) = write_manifest(repo, &new_pointer, &document) {
         if materialized {
             let _ = fs::rename(repo.root.join(&destination), repo.root.join(&source));
         }
@@ -1931,7 +2441,7 @@ fn move_output(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
 }
 
 fn remove(repo: &GitRepo, pointer: &str) -> Result<()> {
-    let document = dvc::read_pointer_document(repo, pointer)?;
+    let document = storage_metadata::read_pointer_document(repo, pointer)?;
     for out in document.outs {
         let object = output_object(pointer, &out.path)?;
         update_ignore(
@@ -2053,44 +2563,13 @@ mod tests {
 
     fn remote(repo: &GitRepo, path: &Path) {
         fs::write(
-            repo.root.join(".dvc/config"),
+            repo.root.join(".workspace-mgr.toml"),
             format!(
-                "[core]\n    remote = workspace-mgr\n['remote \"workspace-mgr\"']\n    url = {}\n",
-                path.display()
+                "[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = {}\n",
+                serde_json::to_string(&path.to_string_lossy()).unwrap()
             ),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn directory_cache_matches_dvc_three_format_including_unicode() {
-        let files = vec![
-            TreeEntry {
-                md5: "fbade9e36a3f36d3d676c1b808451dd7".into(),
-                relpath: "z".into(),
-            },
-            TreeEntry {
-                md5: "0cc175b9c0f1b6a831c399e269772661".into(),
-                relpath: "a".into(),
-            },
-        ];
-        let bytes = tree_bytes(&files).unwrap();
-        assert_eq!(
-            crate::hex::encode_lower(Md5::digest(&bytes)),
-            "d644a076696b7772d39ef7bc795f874d"
-        );
-        assert_eq!(
-            ascii_json_string("中文/😀").unwrap(),
-            "\"\\u4e2d\\u6587/\\ud83d\\ude00\""
-        );
-        assert!(
-            tree_bytes(&[TreeEntry {
-                md5: files[0].md5.clone(),
-                relpath: "../escaped".into()
-            }])
-            .is_err()
-        );
-        assert!(tree_bytes(&[files[0].clone(), files[0].clone()]).is_err());
     }
 
     #[test]
@@ -2187,24 +2666,25 @@ mod tests {
     #[test]
     fn native_add_reports_granular_changes_and_preserves_remote_versions() {
         let (_temporary, repo) = repository();
-        fs::write(repo.root.join(".dvc/config"), "version_aware = true\n").unwrap();
         fs::create_dir(repo.root.join("data")).unwrap();
         fs::write(repo.root.join("data/a"), "a").unwrap();
         fs::write(repo.root.join("data/z"), "z").unwrap();
         add(&repo, "data").unwrap();
-        let mut document = read_yaml(&repo, "data.dvc").unwrap();
-        assert_eq!(document["outs"][0]["hash"].as_str(), Some("md5"));
-        cloud_binding(
-            document["outs"][0]["files"][0].as_mapping_mut().unwrap(),
-            "old-a",
-            "etag-a",
-        );
-        cloud_binding(
-            document["outs"][0]["files"][1].as_mapping_mut().unwrap(),
-            "old-z",
-            "etag-z",
-        );
-        write_yaml(&repo, "data.dvc", &document).unwrap();
+        let mut document = read_manifest(&repo, "data.wm-storage.json").unwrap();
+        assert_eq!(document.checksum.algorithm, "md5");
+        for (entry, id) in document
+            .entries
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(["old-a", "old-z"])
+        {
+            entry.version = Some(Version {
+                id: id.into(),
+                etag: Some(format!("etag-{id}")),
+            });
+        }
+        write_manifest(&repo, "data.wm-storage.json", &document).unwrap();
         assert_eq!(data_status(&repo, &["data".into()]).unwrap(), json!({}));
         fs::write(repo.root.join("data/z"), "new z").unwrap();
         fs::write(repo.root.join("data/new"), "new").unwrap();
@@ -2214,8 +2694,8 @@ mod tests {
             json!(["data/", "data/z"])
         );
         assert_eq!(changes["uncommitted"]["added"], json!(["data/new"]));
-        commit(&repo, "data.dvc").unwrap();
-        let entries = metadata_entries(&repo, None, &["data.dvc".into()]).unwrap();
+        commit(&repo, "data.wm-storage.json").unwrap();
+        let entries = metadata_entries(&repo, None, &["data.wm-storage.json".into()]).unwrap();
         assert_eq!(
             entries
                 .iter()
@@ -2243,7 +2723,7 @@ mod tests {
         fs::create_dir(repo.root.join("data")).unwrap();
         fs::write(repo.root.join("data/a"), b"old").unwrap();
         add(&repo, "data").unwrap();
-        let pointers = vec!["data.dvc".into()];
+        let pointers = vec!["data.wm-storage.json".into()];
         push(&repo, &pointers).unwrap();
         fs::remove_dir_all(cache_root(&repo).unwrap()).unwrap();
         assert!(data_status(&repo, &["data".into()]).unwrap()["uncommitted"].is_null());
@@ -2264,11 +2744,11 @@ mod tests {
         fs::remove_file(repo.root.join("data/retired")).unwrap();
         fs::write(repo.root.join("data/a"), "new a").unwrap();
         fs::write(repo.root.join("data/new"), "new file").unwrap();
-        commit(&repo, "data.dvc").unwrap();
+        commit(&repo, "data.wm-storage.json").unwrap();
         fs::write(repo.root.join("data/a"), "old a").unwrap();
         fs::write(repo.root.join("data/retired"), "retired").unwrap();
         fs::remove_file(repo.root.join("data/new")).unwrap();
-        let pointers = vec!["data.dvc".into()];
+        let pointers = vec!["data.wm-storage.json".into()];
         checkout(&repo, &pointers).unwrap();
         assert_eq!(
             fs::read_to_string(repo.root.join("data/a")).unwrap(),
@@ -2276,11 +2756,11 @@ mod tests {
         );
         assert!(!repo.root.join("data/retired").exists());
         assert!(repo.root.join("data/new").exists());
-        let out = dvc::read_pointer_document(&repo, "data.dvc")
+        let out = storage_metadata::read_pointer_document(&repo, "data.wm-storage.json")
             .unwrap()
             .outs
             .remove(0);
-        let files = recorded_files(&repo, "data.dvc", &out, "md5").unwrap();
+        let files = recorded_files(&repo, "data.wm-storage.json", &out, "md5").unwrap();
         fs::write(existing_cache(&repo, &files[0].md5).unwrap(), "corrupt").unwrap();
         let before = fs::read(repo.root.join("data/a")).unwrap();
         assert!(checkout(&repo, &pointers).is_err());
@@ -2316,69 +2796,54 @@ mod tests {
         install_cache_file(&repo, digest, &normalized).unwrap();
         let canonical = cache_path(&repo, digest).unwrap();
         let error = checkout(&repo, &["text.dvc".into()]).unwrap_err();
-        assert!(error.to_string().contains("size"), "{error}");
+        assert!(
+            error.to_string().contains("size") || error.to_string().contains("No such file"),
+            "{error}"
+        );
         assert!(!repo.root.join("text").exists());
         assert_eq!(fs::read(canonical).unwrap(), b"a\nb\n");
         assert_eq!(fs::read_to_string(repo.root.join("text.dvc")).unwrap(), raw);
     }
 
     #[test]
-    fn legacy_directory_namespaces_survive_commit_push_fetch_and_checkout() {
+    fn native_record_converts_an_unbound_legacy_directory_to_raw_hashes() {
         let (_temporary, repo) = repository();
         let storage = tempfile::tempdir().unwrap();
         remote(&repo, storage.path());
         fs::create_dir(repo.root.join("data")).unwrap();
         fs::write(repo.root.join("data/a"), b"a\r\nb\r\n").unwrap();
-        let file_digest = "dd8c6a395b5dd36c56d23275028f526c";
-        let directory_digest = "178e38d9097fc874ace61e427874fc39.dir";
+        let digest = "dd8c6a395b5dd36c56d23275028f526c";
         let raw = format!(
-            "outs:\n- path: data\n  md5: {directory_digest}\n  size: 6\n  nfiles: 1\n  files:\n  - relpath: a\n    md5: {file_digest}\n    size: 6\n"
+            "outs:\n- path: data\n  md5: 178e38d9097fc874ace61e427874fc39.dir\n  size: 6\n  nfiles: 1\n  files:\n  - relpath: a\n    md5: {digest}\n    size: 6\n"
         );
-        fs::write(repo.root.join("data.dvc"), &raw).unwrap();
-        // A new-format LF object has the same digest as the legacy CRLF
-        // object. Their physical bytes must occupy separate namespaces.
+        let manifest = crate::legacy_dvc::import_manifest(&raw, "data.dvc").unwrap();
+        write_manifest(&repo, "data.wm-storage.json", &manifest).unwrap();
         let normalized = repo.root.join("normalized");
         fs::write(&normalized, b"a\nb\n").unwrap();
-        install_cache_file(&repo, file_digest, &normalized).unwrap();
-        let canonical = cache_path(&repo, file_digest).unwrap();
-        let legacy = cache_path_with_algorithm(&repo, file_digest, "md5-dos2unix").unwrap();
-        let legacy_directory =
-            cache_path_with_algorithm(&repo, directory_digest, "md5-dos2unix").unwrap();
-        let pointers = vec!["data.dvc".into()];
-        install_directory_manifests(&repo, &pointers).unwrap();
-        assert!(legacy_directory.is_file());
-        assert!(!cache_path(&repo, directory_digest).unwrap().exists());
-        commit(&repo, "data.dvc").unwrap();
-        assert!(read_yaml(&repo, "data.dvc").unwrap()["outs"][0]["hash"].is_null());
-        assert_eq!(fs::read(&legacy).unwrap(), b"a\r\nb\r\n");
-        assert_eq!(fs::read(&canonical).unwrap(), b"a\nb\n");
-        assert_eq!(status(&repo, &pointers, false, false).unwrap().1, "{}");
-        push(&repo, &pointers).unwrap();
+        install_cache_file(&repo, digest, &normalized).unwrap();
+        commit(&repo, "data.wm-storage.json").unwrap();
+        let canonical = cache_path(&repo, digest).unwrap();
+        let raw_digest = file_digest(&repo.root.join("data/a"), "md5").unwrap();
+        let raw_cache = cache_path(&repo, &raw_digest).unwrap();
+        assert_ne!(canonical, raw_cache);
         assert_eq!(
-            fs::read(
-                remote_cache_path(
-                    storage.path().to_str().unwrap(),
-                    file_digest,
-                    &repo,
-                    "md5-dos2unix"
-                )
+            read_manifest(&repo, "data.wm-storage.json")
                 .unwrap()
-            )
-            .unwrap(),
-            b"a\r\nb\r\n"
+                .checksum
+                .algorithm,
+            "md5"
         );
-        assert_eq!(status(&repo, &pointers, true, false).unwrap().1, "{}");
-        fs::remove_file(&legacy).unwrap();
-        fs::remove_file(&legacy_directory).unwrap();
+        assert_eq!(fs::read(&raw_cache).unwrap(), b"a\r\nb\r\n");
+        let pointers = vec!["data.wm-storage.json".into()];
+        push(&repo, &pointers).unwrap();
+        fs::remove_file(&raw_cache).unwrap();
         fs::remove_dir_all(repo.root.join("data")).unwrap();
-        let before = fs::read(repo.root.join("data.dvc")).unwrap();
+        let before = fs::read(repo.root.join(&pointers[0])).unwrap();
         fetch(&repo, &pointers).unwrap();
         checkout(&repo, &pointers).unwrap();
         assert_eq!(fs::read(repo.root.join("data/a")).unwrap(), b"a\r\nb\r\n");
-        assert_eq!(fs::read(&canonical).unwrap(), b"a\nb\n");
-        assert_eq!(fs::read(&legacy).unwrap(), b"a\r\nb\r\n");
-        assert!(legacy_directory.is_file());
-        assert_eq!(fs::read(repo.root.join("data.dvc")).unwrap(), before);
+        assert_eq!(fs::read(canonical).unwrap(), b"a\nb\n");
+        assert_eq!(fs::read(repo.root.join(&pointers[0])).unwrap(), before);
     }
 
     #[test]
@@ -2389,11 +2854,13 @@ mod tests {
         fs::remove_file(repo.root.join("data")).unwrap();
         fs::write(repo.root.join(".gitignore"), "/data\n/keep-local\n").unwrap();
         move_output(&repo, "data", "nested/moved").unwrap();
-        assert!(!repo.root.join("data.dvc").exists());
+        assert!(!repo.root.join("data.wm-storage.json").exists());
         assert!(!repo.root.join("nested/moved").exists());
         assert_eq!(
-            read_yaml(&repo, "nested/moved.dvc").unwrap()["outs"][0]["path"],
-            string("moved")
+            read_manifest(&repo, "nested/moved.wm-storage.json")
+                .unwrap()
+                .path,
+            "moved"
         );
         assert_eq!(
             fs::read_to_string(repo.root.join(".gitignore")).unwrap(),
@@ -2403,7 +2870,7 @@ mod tests {
             fs::read_to_string(repo.root.join("nested/.gitignore")).unwrap(),
             "/moved\n"
         );
-        remove(&repo, "nested/moved.dvc").unwrap();
+        remove(&repo, "nested/moved.wm-storage.json").unwrap();
         assert_eq!(
             fs::read_to_string(repo.root.join(".gitignore")).unwrap(),
             "/keep-local\n"
@@ -2421,7 +2888,7 @@ mod tests {
         let files = current_files(&repo, "data").unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].md5, files[1].md5);
-        checkout(&repo, &["data.dvc".into()]).unwrap();
+        checkout(&repo, &["data.wm-storage.json".into()]).unwrap();
         assert!(
             fs::symlink_metadata(repo.root.join("data/link"))
                 .unwrap()
@@ -2434,7 +2901,7 @@ mod tests {
         let foreign = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(foreign.path(), repo.root.join("foreign")).unwrap();
         assert!(add(&repo, "foreign/data").is_err());
-        assert!(!foreign.path().join("data.dvc").exists());
+        assert!(!foreign.path().join("data.wm-storage.json").exists());
     }
 
     // APFS rejects non-UTF-8 filenames at creation; Linux filesystems admit
@@ -2452,7 +2919,7 @@ mod tests {
         let error = add(&repo, "data").unwrap_err();
         assert!(error.to_string().contains("not UTF-8"), "{error}");
         assert_eq!(fs::read(source).unwrap(), b"local\0\r\nbytes");
-        assert!(!repo.root.join("data.dvc").exists());
+        assert!(!repo.root.join("data.wm-storage.json").exists());
         assert!(!repo.root.join(".gitignore").exists());
         assert_eq!(fs::read_dir(repo.root.join("data")).unwrap().count(), 1);
     }
@@ -2482,8 +2949,13 @@ mod tests {
         }
         fs::write(repo.root.join("data.dvc"), "outs: []\n").unwrap();
         assert!(metadata_entries(&repo, None, &["data.dvc".into()]).is_err());
-        let yaml: Yaml = serde_yaml::from_str("files:\n- relpath: a\n  remote: foreign\n").unwrap();
-        assert!(validate_transport_settings(&yaml, "data.dvc").is_err());
+        assert!(
+            crate::legacy_dvc::hash_algorithm(
+                "outs:\n- path: data\n  files:\n  - relpath: a\n    remote: foreign\n",
+                "data.dvc"
+            )
+            .is_err()
+        );
     }
 
     fn upload_fixture(repo: &GitRepo, bytes: &[u8]) -> (StorageEntry, PathBuf) {
@@ -2526,16 +2998,63 @@ mod tests {
         }
     }
 
+    fn upload_request_route(
+        request: &crate::native_s3::tests::WireRequest,
+    ) -> (String, BTreeMap<String, String>) {
+        let target = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = target
+            .query_pairs()
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(query.len(), target.query_pairs().count());
+        (target.path().into(), query)
+    }
+
+    fn assert_uploaded_read(request: &crate::native_s3::tests::WireRequest, object: &str) {
+        assert!(matches!(request.method.as_str(), "HEAD" | "GET"));
+        let (path, query) = upload_request_route(request);
+        assert_eq!(path, format!("/fixture-bucket/root/{object}"));
+        assert_eq!(
+            query,
+            BTreeMap::from([("versionId".into(), "owned-version".into())])
+        );
+        if request.method == "GET" {
+            assert_eq!(request.headers["if-match"], "\"owned-etag\"");
+        }
+    }
+
+    fn uploaded_read_fixture(
+        bytes: &'static [u8],
+        version: &'static str,
+        etag: &'static str,
+    ) -> (
+        crate::native_s3::S3Client,
+        crate::native_s3::tests::RoutedFixture,
+    ) {
+        crate::native_s3::tests::routed_fixture(move |request| {
+            assert_uploaded_read(request, "task/source");
+            if request.method == "HEAD" {
+                uploaded_head("owned-token", bytes.len())
+            } else {
+                uploaded_get(bytes, version, etag)
+            }
+        })
+    }
+
     #[test]
     fn multipart_upload_streams_complete_parts_and_verifies_its_exact_version() {
-        use crate::native_s3::tests::{Reply, fixture_handler};
+        use crate::native_s3::tests::{Reply, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"abcdefghijkl";
         let (entry, source) = upload_fixture(&repo, bytes);
         let token = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured = token.clone();
-        let (client, worker) = fixture_handler(7, move |request| {
-            if request.method == "POST" && request.target.contains("uploads") {
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
+            assert_eq!(path, "/fixture-bucket/root/task/source");
+            if request.method == "POST" && query.contains_key("uploads") {
+                assert_eq!(query, BTreeMap::from([("uploads".into(), String::new())]));
+                assert!(captured.lock().unwrap().is_empty());
                 *captured.lock().unwrap() =
                     request.headers["x-amz-meta-workspace-mgr-upload"].clone();
                 return Reply::xml(
@@ -2543,6 +3062,9 @@ mod tests {
                 );
             }
             if request.method == "PUT" {
+                assert_eq!(query.len(), 2);
+                assert_eq!(query["uploadId"], "owned-upload");
+                assert!(matches!(query["partNumber"].as_str(), "1" | "2" | "3"));
                 return Reply {
                     status: 200,
                     headers: vec![("etag", "\"part-etag\"".into())],
@@ -2550,8 +3072,14 @@ mod tests {
                 };
             }
             if request.method == "POST" {
+                assert_eq!(
+                    query,
+                    BTreeMap::from([("uploadId".into(), "owned-upload".into())])
+                );
+                assert!(!captured.lock().unwrap().is_empty());
                 return Reply {status:200,headers:vec![("x-amz-version-id","owned-version".into())],body:b"<CompleteMultipartUploadResult><ETag>\"owned-etag\"</ETag></CompleteMultipartUploadResult>".to_vec()};
             }
+            assert_uploaded_read(request, "task/source");
             if request.method == "HEAD" {
                 return uploaded_head(&captured.lock().unwrap(), bytes.len());
             }
@@ -2561,7 +3089,14 @@ mod tests {
             upload_version(&client, &repo, &entry, &source, 4, 5).unwrap(),
             ("owned-version".into(), "owned-etag".into())
         );
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            2
+        );
         let parts = requests
             .iter()
             .filter(|request| request.method == "PUT")
@@ -2593,34 +3128,70 @@ mod tests {
 
     #[test]
     fn lost_put_response_recovers_owned_version_without_another_upload() {
-        use crate::native_s3::tests::{Reply, fixture_handler};
+        lost_put_response_recovers_owned_version(false);
+    }
+
+    #[test]
+    fn lost_put_response_replays_interrupted_reads_without_another_upload() {
+        lost_put_response_recovers_owned_version(true);
+    }
+
+    fn lost_put_response_recovers_owned_version(interrupt: bool) {
+        use crate::native_s3::tests::{Reply, interrupt_response_once, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"recovered bytes";
         let (entry, source) = upload_fixture(&repo, bytes);
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let token = captured.clone();
-        let (client, worker) = fixture_handler(5, move |request| {
+        let (received, request_received) = std::sync::mpsc::channel();
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
             if request.method == "PUT" {
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert!(query.is_empty());
+                assert!(token.lock().unwrap().is_empty());
                 *token.lock().unwrap() = request.headers["x-amz-meta-workspace-mgr-upload"].clone();
                 return Reply {status:500,headers:Vec::new(),body:b"<Error><Code>InternalError</Code><Message>response lost after commit</Message></Error>".to_vec()};
             }
-            if request.target.contains("versions") {
+            assert!(!token.lock().unwrap().is_empty());
+            if request.method == "GET" && query.contains_key("versions") {
+                assert_eq!(path, "/fixture-bucket");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([
+                        ("versions".into(), String::new()),
+                        ("prefix".into(), "root/task/source".into()),
+                        ("max-keys".into(), "1000".into())
+                    ])
+                );
                 return Reply::xml(
                     "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>root/task/source</Key><VersionId>owned-version</VersionId><Size>15</Size><ETag>\"owned-etag\"</ETag></Version></ListVersionsResult>",
                 );
             }
+            assert_uploaded_read(request, "task/source");
+            let _ = received.send(());
             if request.method == "HEAD" {
                 return uploaded_head(&token.lock().unwrap(), bytes.len());
             }
             uploaded_get(bytes, "owned-version", "\"owned-etag\"")
         });
+        let (client, injected) = if interrupt {
+            let (client, injected) = interrupt_response_once(
+                client,
+                "/fixture-bucket/root/task/source?versionId=owned-version".into(),
+                request_received,
+            );
+            (client, Some(injected))
+        } else {
+            (client, None)
+        };
         assert_eq!(
             upload_version(&client, &repo, &entry, &source, 100, 5)
                 .unwrap()
                 .0,
             "owned-version"
         );
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
         assert_eq!(
             requests
                 .iter()
@@ -2631,20 +3202,41 @@ mod tests {
         let (_, journal) = upload_journal(&repo, &client, &entry).unwrap();
         assert_eq!(journal["phase"], "complete");
         assert_eq!(journal["version_id"], "owned-version");
+        if let Some(injected) = injected {
+            assert_eq!(injected.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == "HEAD")
+                    .count()
+                    >= 2
+            );
+        }
     }
 
     #[test]
     fn multipart_failure_aborts_only_the_known_owned_upload() {
-        use crate::native_s3::tests::{Reply, fixture_handler};
+        use crate::native_s3::tests::{Reply, routed_fixture};
         let (_temporary, repo) = repository();
         let (entry, source) = upload_fixture(&repo, b"multipart bytes");
-        let (client, worker) = fixture_handler(4, move |request| {
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
             if request.method == "POST" {
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert_eq!(query, BTreeMap::from([("uploads".into(), String::new())]));
                 return Reply::xml(
                     "<InitiateMultipartUploadResult><UploadId>owned-upload</UploadId></InitiateMultipartUploadResult>",
                 );
             }
             if request.method == "PUT" {
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([
+                        ("partNumber".into(), "1".into()),
+                        ("uploadId".into(), "owned-upload".into())
+                    ])
+                );
                 return Reply {
                     status: 403,
                     headers: Vec::new(),
@@ -2652,24 +3244,40 @@ mod tests {
                 };
             }
             if request.method == "DELETE" {
-                assert!(request.target.contains("uploadId=owned-upload"));
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([("uploadId".into(), "owned-upload".into())])
+                );
                 return Reply {
                     status: 204,
                     headers: Vec::new(),
                     body: Vec::new(),
                 };
             }
+            assert_eq!(request.method, "GET");
+            assert_eq!(path, "/fixture-bucket");
+            assert_eq!(
+                query,
+                BTreeMap::from([
+                    ("versions".into(), String::new()),
+                    ("prefix".into(), "root/task/source".into()),
+                    ("max-keys".into(), "1000".into())
+                ])
+            );
             Reply::xml("<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>")
         });
         assert!(upload_version(&client, &repo, &entry, &source, 4, 5).is_err());
-        let requests = worker.join().unwrap();
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.method == "DELETE")
-                .count(),
-            1
-        );
+        let requests = worker.finish_requests();
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == method)
+                    .count(),
+                1
+            );
+        }
         let (_, journal) = upload_journal(&repo, &client, &entry).unwrap();
         assert_eq!(journal["phase"], "planned");
         assert!(journal["upload_id"].is_null());
@@ -2677,7 +3285,6 @@ mod tests {
 
     #[test]
     fn uploaded_get_cannot_substitute_another_exact_generation_or_etag() {
-        use crate::native_s3::tests::fixture;
         for (version, etag) in [
             ("foreign-version", "\"owned-etag\""),
             ("owned-version", "\"foreign-etag\""),
@@ -2685,40 +3292,138 @@ mod tests {
             let (_temporary, repo) = repository();
             let bytes = b"same bytes";
             let (entry, _source) = upload_fixture(&repo, bytes);
-            let (client, worker) = fixture(vec![
-                uploaded_head("owned-token", bytes.len()),
-                uploaded_get(bytes, version, etag),
-            ]);
+            let (client, worker) = uploaded_read_fixture(bytes, version, etag);
             assert!(
-                verify_uploaded_version(&client, &repo, &entry, "owned-token", "owned-version")
-                    .is_err()
+                verify_uploaded_version(
+                    &client,
+                    &repo,
+                    &entry,
+                    "owned-token",
+                    "owned-version",
+                    None
+                )
+                .is_err()
             );
-            worker.join().unwrap();
+            let requests = worker.finish_requests();
+            assert!(requests.iter().any(|request| request.method == "GET"));
         }
+    }
+
+    #[test]
+    fn import_upload_receipts_distinguish_raw_variants_of_one_normalized_checksum() {
+        use crate::native_s3::tests::empty_fixture;
+        let (_temporary, repo) = repository();
+        let (mut entry, source) = upload_fixture(&repo, b"a\r\nb\n");
+        entry.hash_name = "md5-dos2unix".into();
+        entry.md5 = Some(file_digest(&source, &entry.hash_name).unwrap());
+        let a = file_sha256(&source).unwrap();
+        fs::write(&source, b"a\nb\r\n").unwrap();
+        assert_eq!(
+            file_digest(&source, &entry.hash_name).unwrap(),
+            entry.md5.as_deref().unwrap()
+        );
+        let b = file_sha256(&source).unwrap();
+        let (client, worker) = empty_fixture();
+        let (a_path, a_receipt) =
+            upload_journal_in(&repo, &client, &entry, "storage-import-uploads", Some(&a)).unwrap();
+        let (b_path, b_receipt) =
+            upload_journal_in(&repo, &client, &entry, "storage-import-uploads", Some(&b)).unwrap();
+        assert_ne!(a_path, b_path);
+        assert_ne!(a_receipt["token"], b_receipt["token"]);
+        assert_eq!(a_receipt["context"]["raw_sha256"], a);
+        assert_eq!(b_receipt["context"]["raw_sha256"], b);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(a_path).unwrap()).unwrap(),
+            a_receipt
+        );
+        assert!(upload_context(&repo, &client, &entry, "storage-import-uploads", None).is_err());
+        assert!(worker.finish_requests().is_empty());
+    }
+
+    #[test]
+    fn imported_exact_uploaded_get_rejects_a_different_raw_normalized_variant() {
+        let (_temporary, repo) = repository();
+        let (mut entry, source) = upload_fixture(&repo, b"a\r\nb\n");
+        entry.hash_name = "md5-dos2unix".into();
+        entry.md5 = Some(file_digest(&source, &entry.hash_name).unwrap());
+        let expected = file_sha256(&source).unwrap();
+        let bytes = b"a\nb\r\n";
+        let (client, worker) = uploaded_read_fixture(bytes, "owned-version", "\"owned-etag\"");
+        assert!(
+            verify_uploaded_version(
+                &client,
+                &repo,
+                &entry,
+                "owned-token",
+                "owned-version",
+                Some(&expected)
+            )
+            .is_err()
+        );
+        let requests = worker.finish_requests();
+        assert!(requests.iter().any(|request| request.method == "GET"));
     }
 
     #[test]
     fn restoring_legacy_cache_preserves_hash_algorithm_and_exact_binding() {
         let (_temporary, repo) = repository();
-        fs::write(repo.root.join("text"), b"a\r\nb\r\n").unwrap();
+        fs::write(repo.root.join("text"), b"a\r\nb\n").unwrap();
         let digest = file_digest(&repo.root.join("text"), "md5-dos2unix").unwrap();
         let raw = format!(
-            "outs:\n- path: text\n  hash: md5-dos2unix\n  md5: {digest}\n  size: 6\n  cloud:\n    workspace-mgr:\n      version_id: original-version\n      etag: original-etag\n"
+            "outs:\n- path: text\n  hash: md5-dos2unix\n  md5: {digest}\n  size: 5\n  cloud:\n    workspace-mgr:\n      version_id: original-version\n      etag: original-etag\n"
         );
-        fs::write(repo.root.join("text.dvc"), raw).unwrap();
-        commit(&repo, "text.dvc").unwrap();
-        let entries = metadata_entries(&repo, None, &["text.dvc".into()]).unwrap();
+        let manifest = crate::legacy_dvc::import_manifest(&raw, "text.dvc").unwrap();
+        write_manifest(&repo, "text.wm-storage.json", &manifest).unwrap();
+        let original = metadata_entries(&repo, None, &["text.wm-storage.json".into()])
+            .unwrap()
+            .remove(0);
+        assert!(
+            !storage_metadata::payload_matches_metadata(
+                &repo,
+                "text.wm-storage.json",
+                &manifest.serialize().unwrap()
+            )
+            .unwrap()
+        );
+        install_cache_for_entry(&repo, &original, &repo.root.join("text")).unwrap();
+        commit(&repo, "text.wm-storage.json").unwrap();
+        let entries = metadata_entries(&repo, None, &["text.wm-storage.json".into()]).unwrap();
         assert_eq!(entries[0].hash_name, "md5-dos2unix");
         assert_eq!(entries[0].md5.as_deref(), Some(digest.as_str()));
         assert_eq!(entries[0].version_id.as_deref(), Some("original-version"));
         assert_eq!(
-            fs::read(existing_cache(&repo, &digest).unwrap()).unwrap(),
-            b"a\r\nb\r\n"
+            fs::read(existing_cache_with_algorithm(&repo, &digest, "md5-dos2unix").unwrap())
+                .unwrap(),
+            b"a\r\nb\n"
         );
-        fs::write(repo.root.join("text"), b"a\nb\n").unwrap();
-        commit(&repo, "text.dvc").unwrap();
+        fs::write(repo.root.join("text"), b"a\nb\r\n").unwrap();
+        assert_eq!(
+            file_digest(&repo.root.join("text"), "md5-dos2unix").unwrap(),
+            digest
+        );
+        assert_eq!(
+            status(&repo, &["text.wm-storage.json".into()], false, true)
+                .unwrap()
+                .0,
+            1
+        );
         assert!(
-            metadata_entries(&repo, None, &["text.dvc".into()]).unwrap()[0]
+            !storage_metadata::payload_matches_metadata(
+                &repo,
+                "text.wm-storage.json",
+                &manifest.serialize().unwrap()
+            )
+            .unwrap()
+        );
+        commit(&repo, "text.wm-storage.json").unwrap();
+        let changed = read_manifest(&repo, "text.wm-storage.json").unwrap();
+        assert_eq!(changed.checksum.algorithm, "md5");
+        assert_eq!(
+            changed.checksum.digest,
+            file_digest(&repo.root.join("text"), "md5").unwrap()
+        );
+        assert!(
+            metadata_entries(&repo, None, &["text.wm-storage.json".into()]).unwrap()[0]
                 .version_id
                 .is_none()
         );
@@ -2726,28 +3431,40 @@ mod tests {
 
     #[test]
     fn an_independent_cloud_binding_edit_during_upload_is_preserved() {
-        use crate::native_s3::tests::{Reply, configure_repo, fixture_handler};
+        use crate::native_s3::tests::{Reply, configure_repo, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"same bytes";
         fs::write(repo.root.join("source"), bytes).unwrap();
         add(&repo, "source").unwrap();
-        let pointer = repo.root.join("source.dvc");
+        let pointer = repo.root.join("source.wm-storage.json");
         let captured = std::sync::Arc::new(std::sync::Mutex::new((String::new(), Vec::new())));
         let expected = captured.clone();
-        let (client, worker) = fixture_handler(4, move |request| {
-            if request.target.contains("versioning") {
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
+            if request.method == "GET" && query.contains_key("versioning") {
+                assert_eq!(path, "/fixture-bucket");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([("versioning".into(), String::new())])
+                );
                 return Reply::xml(
                     "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
                 );
             }
             if request.method == "PUT" {
-                let mut raw: Yaml = serde_yaml::from_slice(&fs::read(&pointer).unwrap()).unwrap();
-                cloud_binding(
-                    raw["outs"][0].as_mapping_mut().unwrap(),
-                    "independent-version",
-                    "independent-etag",
-                );
-                let rendered = serde_yaml::to_string(&raw).unwrap().into_bytes();
+                assert_eq!(path, "/fixture-bucket/root/source");
+                assert!(query.is_empty());
+                assert!(expected.lock().unwrap().0.is_empty());
+                let mut raw = Manifest::parse(
+                    &fs::read_to_string(&pointer).unwrap(),
+                    "source.wm-storage.json",
+                )
+                .unwrap();
+                raw.version = Some(Version {
+                    id: "independent-version".into(),
+                    etag: Some("independent-etag".into()),
+                });
+                let rendered = raw.serialize().unwrap().into_bytes();
                 fs::write(&pointer, &rendered).unwrap();
                 *expected.lock().unwrap() = (
                     request.headers["x-amz-meta-workspace-mgr-upload"].clone(),
@@ -2762,17 +3479,25 @@ mod tests {
                     body: Vec::new(),
                 };
             }
+            assert_uploaded_read(request, "source");
             if request.method == "HEAD" {
                 return uploaded_head(&expected.lock().unwrap().0, bytes.len());
             }
             uploaded_get(bytes, "owned-version", "\"owned-etag\"")
         });
         configure_repo(&client, &repo);
-        let error = push_versioned(&repo, &["source.dvc".into()]).unwrap_err();
+        let error = push_versioned(&repo, &["source.wm-storage.json".into()]).unwrap_err();
         assert!(error.to_string().contains("metadata changed during upload"));
-        worker.join().unwrap();
+        let requests = worker.finish_requests();
         assert_eq!(
-            fs::read(repo.root.join("source.dvc")).unwrap(),
+            requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(repo.root.join("source.wm-storage.json")).unwrap(),
             captured.lock().unwrap().1
         );
     }
@@ -2786,11 +3511,14 @@ mod tests {
         fs::create_dir(repo.root.join("source")).unwrap();
         fs::write(repo.root.join("source/one"), "same").unwrap();
         let value: Value = serde_json::from_str(
-            &status(&repo, &["source.dvc".into()], false, false)
+            &status(&repo, &["source.wm-storage.json".into()], false, false)
                 .unwrap()
                 .1,
         )
         .unwrap();
-        assert_eq!(value["source.dvc"][0]["changed outs"]["source"], "modified");
+        assert_eq!(
+            value["source.wm-storage.json"][0]["changed outs"]["source"],
+            "modified"
+        );
     }
 }

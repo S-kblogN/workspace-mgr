@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config::{Config, require_supported_cli_at};
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
@@ -16,6 +15,7 @@ use crate::manifest::{
 use crate::path::{reject_symlink_traversal, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::relocation::{RelocationNotice, RelocationPlan};
+use crate::storage_metadata;
 use crate::transaction::validate_remote_task_identity;
 
 #[derive(Debug, Clone)]
@@ -325,7 +325,10 @@ fn apply_rename(
                     relocation.apply()?;
                 }
                 for (index, snapshot) in pointer_snapshots.iter().enumerate() {
-                    if dvc::reset_moved_pointer_cloud_metadata(repo, &snapshot.new_path)? {
+                    if storage_metadata::reset_moved_pointer_cloud_metadata(
+                        repo,
+                        &snapshot.new_path,
+                    )? {
                         changed_pointers.push(index);
                     }
                 }
@@ -373,7 +376,7 @@ fn moved_pointer_snapshots(
     old_task_path: &str,
     new_task_path: &str,
 ) -> Result<Vec<MovedPointerSnapshot>> {
-    dvc::discover(repo, &[old_task_path.to_owned()])?
+    storage_metadata::discover(repo, &[old_task_path.to_owned()])?
         .into_iter()
         .map(|old_pointer| {
             let relative = old_pointer

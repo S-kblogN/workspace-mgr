@@ -5,7 +5,7 @@ use common::{GitFixture, json, workspace, workspace_unchecked};
 #[test]
 fn move_reports_manual_content_review_only_after_success_and_preserves_bytes() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
     workspace(

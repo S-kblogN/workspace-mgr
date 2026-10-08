@@ -3,7 +3,10 @@ mod common;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use common::{GitFixture, document_task, git, git_unchecked, json, workspace, workspace_unchecked};
+use common::{
+    GitFixture, document_task, git, git_unchecked, json, storage_file_manifest, workspace,
+    workspace_unchecked,
+};
 
 fn create_task(fixture: &GitFixture, slug: &str, timestamp: &str) -> (String, std::path::PathBuf) {
     let task_id = format!("{timestamp}-{slug}");
@@ -30,7 +33,7 @@ fn create_task(fixture: &GitFixture, slug: &str, timestamp: &str) -> (String, st
 fn discard_requires_a_current_dry_run_and_exact_task_confirmation() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let (task_id, task) = create_task(&fixture, "confirmation", "20260830-120000");
     let manifest = task.join(".workspace-mgr-task.toml");
     std::fs::write(task.join("notes.txt"), "discard me\n").unwrap();
@@ -151,7 +154,7 @@ fn published_deliverable_discard_deletes_branches_and_restores_additional_scopes
     std::fs::write(fixture.seed.join("shared.txt"), "base value\n").unwrap();
     fixture.commit_seed("Add shared file");
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let task_id = "20260830-120100-published-discard";
     workspace(
         &fixture.shared,
@@ -270,12 +273,17 @@ fn published_deliverable_discard_deletes_branches_and_restores_additional_scopes
 fn discard_reports_the_s3_purge_plan() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let (task_id, task) = create_task(&fixture, "s3-retention", "20260830-120200");
     let manifest = task.join(".workspace-mgr-task.toml");
     std::fs::write(
-        task.join("artifact.bin.dvc"),
-        "outs:\n- md5: abc\n  size: 3\n  path: artifact.bin\n  cloud:\n    storage:\n      version_id: exact-version-1\n",
+        task.join("artifact.bin.wm-storage.json"),
+        storage_file_manifest(
+            "artifact.bin",
+            "900150983cd24fb0d6963f7d28e17f72",
+            3,
+            Some("exact-version-1"),
+        ),
     )
     .unwrap();
     let preview = workspace(&task, ["task", "discard", "--dry-run"]);
@@ -299,7 +307,7 @@ fn discard_reports_the_s3_purge_plan() {
 fn merged_task_is_refused_and_preserved() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let (task_id, task) = create_task(&fixture, "already-merged", "20260830-120300");
     std::fs::write(task.join("result.txt"), "merged result\n").unwrap();
     workspace(&task, ["publish", "-m", "Publish merged fixture"]);
@@ -325,7 +333,7 @@ fn merged_task_is_refused_and_preserved() {
 fn remote_branch_change_after_preview_requires_a_new_discard_plan() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let (task_id, task) = create_task(&fixture, "remote-race", "20260830-120350");
     let manifest = task.join(".workspace-mgr-task.toml");
     std::fs::write(task.join("result.txt"), "remote race\n").unwrap();
@@ -381,7 +389,7 @@ fn remote_branch_change_after_preview_requires_a_new_discard_plan() {
 fn rejected_remote_deletion_restores_the_local_task() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let (task_id, task) = create_task(&fixture, "remote-rollback", "20260830-120400");
     let manifest = task.join(".workspace-mgr-task.toml");
     std::fs::write(task.join("result.txt"), "must survive rollback\n").unwrap();
@@ -444,7 +452,7 @@ fn rejected_remote_deletion_restores_the_local_task() {
 #[test]
 fn infrastructure_discard_restores_scopes_and_keeps_shared_main_checkout() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();
     let created = workspace(

@@ -31,7 +31,7 @@ side effect, and example.
 
 ```sh
 workspace-mgr setup
-workspace-mgr init \
+workspace-mgr manage \
   --s3-url s3://example-bucket/workspace \
   --s3-endpoint-url https://s3.example.invalid
 workspace-mgr doctor
@@ -164,7 +164,7 @@ What leaves the task directory is curated. Every file under a task is either
 selected for publication or ignored by a rule this repository tracks, so the
 by-products of a run are not published by accident. Rules for one task belong
 in that task's own `.gitignore`; this repository's own rules belong in
-`.workspace-mgr/repository.gitignore`, from which `init` generates the root
+`.workspace-mgr/repository.gitignore`, from which `manage` generates the root
 `.gitignore` together with the product's fixed rules. A path that only a
 machine-local rule hides is refused.
 
@@ -181,11 +181,13 @@ deliverable directory and updates task metadata while preserving the immutable
 task ID, target branch, and existing pull request. The next ordinary `publish`
 removes the previously published path and publishes the new one. `storage set`,
 `storage reset`, `move`, `remove`, and `untrack` change local desired state only.
-`storage hydrate` reads from S3. `plan` is read-only. `publish` is the only
-command that publishes repository content, and it verifies S3 before publishing
-a Git revision. It then permanently deletes every S3 version at object paths
-removed by delete, move, rename, untrack, or S3-to-Git placement; current remote branches
-and tags defer deletion until the last live reference disappears. If the user
+`storage hydrate` reads from S3. `plan` is read-only. `publish` verifies S3 before
+publishing the repository's Git revision. It then permanently deletes every S3
+version at object paths removed by delete, move, rename, untrack, or S3-to-Git
+placement; current remote branches
+and tags defer deletion until the last live reference disappears. Shared legacy
+CAS sources remain available to old Git snapshots and are not automatically
+garbage-collected by this cleanup. If the user
 instead decides to retain none of the task, the
 agent closes its unmerged pull request and uses `task discard --dry-run` followed
 by `task discard --confirm <task-id>` to remove its branch and local workspace.
@@ -231,7 +233,7 @@ reset` does not undo a local-only choice. Git commit history remains available.
 
 ## Agent instructions
 
-`workspace-mgr init` installs a deliberately small `AGENTS.md` that tells the
+`workspace-mgr manage` installs a deliberately small `AGENTS.md` that tells the
 agent to run `workspace-mgr instructions --repo .`. The generated document
 begins with the same [workspace model](docs/management-model.md) read by users,
 then gives the operation directory, session-wide constraints and current Git/S3
@@ -239,7 +241,7 @@ control facts. It does not append every operation's policy. Read the relevant
 command's `--help` before acting; detailed compatibility topics remain available
 through `instructions <topic>`. A repository-specific instruction module is
 indexed by default and read with `instructions repository`. Every initialized repository gets the same management strategy; policy evolves with
-the CLI rather than through per-repository switches. Re-running `init` after a
+the CLI rather than through per-repository switches. Re-running `manage` after a
 CLI update deterministically replaces product-owned scaffold files with the
 current versions; their ownership comes from the initialized repository and
 reserved path, never from matching old file content.
@@ -277,8 +279,17 @@ executable prefix.
 
 `setup` checks Git. Storage, exact-version S3 reads, archive, and cancellation
 run inside the Rust executable; Python, DVC, and a separate storage runtime are
-not required. Existing DVC-compatible pointers, cache objects, and archive
-journals remain readable. See [docs/platform-support.md](docs/platform-support.md).
+not required. Native manifests use `.wm-storage.json`; `manage` adopts supported
+legacy pointers and configuration across the whole repository. Existing
+path-based versions retain their exact bindings. Ordinary DVC S3 objects are
+verified and copied from content-addressed keys to native object paths, including
+directories whose listing exists only remotely. Preview with `manage --dry-run`;
+see the [migration contract](docs/storage.md) for supported layouts and recovery.
+Publish all converted manifests, legacy deletions and updated configuration
+together. CAS targets require bucket versioning and conditional writes; original
+shared CAS objects remain available to old Git history.
+Historical snapshots and archive journals remain readable through the isolated
+legacy importer. See [docs/platform-support.md](docs/platform-support.md).
 
 CLI invocations other than `task list`, `task path`, `task show`, help output,
 and argument errors consult a local update cache; `--version` still checks.
@@ -288,7 +299,7 @@ version is available, the
 CLI writes one agent-directed notice to stderr without changing command output
 or exit status. It never updates itself. The agent reports the versions and asks
 the user before updating, then runs `workspace-mgr setup`; managed repository
-scaffolding is reconciled with `workspace-mgr init` in an infrastructure task.
+scaffolding is reconciled with `workspace-mgr manage` in an infrastructure task.
 
 A repository can also declare the oldest compatible release as
 `minimum_cli_version` in `.workspace-mgr.toml`. `workspace-mgr` maintains that

@@ -21,13 +21,13 @@ fn managed_fixture(storage: bool) -> GitFixture {
         workspace(
             &fixture.seed,
             [
-                "init",
+                "manage",
                 "--s3-url",
                 fixture.root.join("storage-remote").to_str().unwrap(),
             ],
         );
     } else {
-        workspace(&fixture.seed, ["init"]);
+        workspace(&fixture.seed, ["manage"]);
     }
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
@@ -115,7 +115,7 @@ fn an_approval_only_publication_is_housekeeping_for_the_curation_guards() {
     workspace(&task, ["publish", "-m", "Publish scaffold"]);
     assert!(
         fixture.shared.join(".gitignore").is_file(),
-        "init generated the product-owned root ignore file"
+        "manage generated the product-owned root ignore file"
     );
     // The configuration is tracked, so this rule hides nothing; it must not be
     // mistaken for content that only a machine-local rule keeps out of review.
@@ -251,10 +251,6 @@ mod test_storage {
     pub const OVER_300KB: [(&str, &str); 1] = [(CLOUD_USAGE_THRESHOLD_ENV, "300000")];
     pub const ROOMY_10MB: [(&str, &str); 1] = [(CLOUD_USAGE_THRESHOLD_ENV, "10000000")];
 
-    pub fn dvc_available() -> bool {
-        true
-    }
-
     pub fn remote_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         if !root.exists() {
             return Vec::new();
@@ -360,9 +356,6 @@ fn structural_refusals_come_before_the_cloud_usage_gate() {
 
     // Content on its way to S3 is refused by the guard before placement or
     // upload, too.
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (_, task) = create_task(&fixture, "gate-before-upload", "20260920-102000");
     let branch = "refs/heads/codex/gate-before-upload";
@@ -371,10 +364,10 @@ fn structural_refusals_come_before_the_cloud_usage_gate() {
     let storage_before = remote_snapshot(&storage_remote);
     std::fs::write(task.join("checkpoint.bin"), noise(10_485_761, 5)).unwrap();
     assert_refused_before_the_gate(&fixture, &task, branch, UNDOCUMENTED);
-    assert!(!task.join("checkpoint.bin.dvc").exists());
+    assert!(!task.join("checkpoint.bin.wm-storage.json").exists());
     assert!(!task.join(".gitignore").exists());
     assert_eq!(
-        remote_snapshot(&fixture.shared.join(".dvc/cache")),
+        remote_snapshot(&fixture.shared.join(".workspace-mgr/local/cache")),
         Vec::new()
     );
     assert_eq!(remote_snapshot(&storage_remote), storage_before);
@@ -387,9 +380,6 @@ fn structural_refusals_come_before_the_cloud_usage_gate() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn an_undocumented_task_over_its_limit_publishes_the_cleanup_the_user_chose() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "undocumented-cleanup", "20260920-103000");
     let branch = "refs/heads/codex/undocumented-cleanup";
@@ -467,7 +457,7 @@ fn an_undocumented_task_over_its_limit_publishes_the_cleanup_the_user_chose() {
     assert!(!tree_contains(
         &fixture.remote,
         &tip,
-        &format!("{stored}.dvc")
+        &format!("{stored}.wm-storage.json")
     ));
     assert!(tree_contains(
         &fixture.remote,
@@ -514,9 +504,6 @@ fn an_undocumented_task_over_its_limit_publishes_the_cleanup_the_user_chose() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn a_boundary_moved_without_its_payload_is_charged_once() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "move-unmaterialized", "20260920-104000");
     let branch = "codex/move-unmaterialized";
@@ -571,7 +558,7 @@ fn a_boundary_moved_without_its_payload_is_charged_once() {
         ],
     );
     let other = second.join(&task_id);
-    assert!(other.join("stored.bin.dvc").is_file());
+    assert!(other.join("stored.bin.wm-storage.json").is_file());
     assert!(!other.join("stored.bin").exists());
 
     // Planning needs every boundary in scope present, so that clone hydrates
@@ -584,7 +571,7 @@ fn a_boundary_moved_without_its_payload_is_charged_once() {
     assert_eq!(waiting["cloud_usage"]["status"], "approval_required");
     assert_eq!(cloud_usage_state(&second).len(), 1);
     std::fs::remove_file(other.join("stored.bin")).unwrap();
-    std::fs::remove_dir_all(second.join(".dvc/cache")).unwrap();
+    std::fs::remove_dir_all(second.join(".workspace-mgr/local/cache")).unwrap();
 
     let output = workspace_env(
         &other,
@@ -599,7 +586,7 @@ fn a_boundary_moved_without_its_payload_is_charged_once() {
     );
     assert_eq!(json(&output)["status"], "updated");
     assert_eq!(std::fs::read(other.join("moved.bin")).unwrap(), payload);
-    assert!(!other.join("stored.bin.dvc").exists());
+    assert!(!other.join("stored.bin.wm-storage.json").exists());
 
     let plan = json(&workspace_env(&other, ["plan"], &OVER_300KB));
     let usage = &plan["cloud_usage"];
@@ -628,12 +615,12 @@ fn a_boundary_moved_without_its_payload_is_charged_once() {
     assert!(tree_contains(
         &fixture.remote,
         &tip,
-        &format!("{moved}.dvc")
+        &format!("{moved}.wm-storage.json")
     ));
     assert!(!tree_contains(
         &fixture.remote,
         &tip,
-        &format!("{stored}.dvc")
+        &format!("{stored}.wm-storage.json")
     ));
     let settled = json(&workspace_env(&other, ["plan"], &OVER_300KB));
     assert_eq!(settled["status"], "no_changes");
@@ -702,9 +689,6 @@ fn a_result_kept_local_before_it_was_published_still_needs_a_task_record() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn content_changed_inside_a_boundary_in_s3_is_refused_before_the_gate() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "boundary-content", "20260920-110000");
     let branch = "refs/heads/codex/boundary-content";
@@ -713,8 +697,8 @@ fn content_changed_inside_a_boundary_in_s3_is_refused_before_the_gate() {
     publish_boundaries_then_retire_the_record(&task, &outputs, &stored);
     let storage_remote = fixture.root.join("storage-remote");
     let storage_before = remote_snapshot(&storage_remote);
-    let outputs_pointer = std::fs::read(task.join("outputs.dvc")).unwrap();
-    let stored_pointer = std::fs::read(task.join("stored.bin.dvc")).unwrap();
+    let outputs_pointer = std::fs::read(task.join("outputs.wm-storage.json")).unwrap();
+    let stored_pointer = std::fs::read(task.join("stored.bin.wm-storage.json")).unwrap();
 
     // A file added to a directory boundary.
     std::fs::write(task.join("outputs/new.bin"), noise(1_000, 14)).unwrap();
@@ -731,11 +715,11 @@ fn content_changed_inside_a_boundary_in_s3_is_refused_before_the_gate() {
     assert_refused_before_the_gate(&fixture, &task, branch, UNDOCUMENTED);
 
     assert_eq!(
-        std::fs::read(task.join("outputs.dvc")).unwrap(),
+        std::fs::read(task.join("outputs.wm-storage.json")).unwrap(),
         outputs_pointer
     );
     assert_eq!(
-        std::fs::read(task.join("stored.bin.dvc")).unwrap(),
+        std::fs::read(task.join("stored.bin.wm-storage.json")).unwrap(),
         stored_pointer
     );
     assert_eq!(remote_snapshot(&storage_remote), storage_before);
@@ -752,7 +736,7 @@ fn content_changed_inside_a_boundary_in_s3_is_refused_before_the_gate() {
         published["changed_paths"]
             .as_array()
             .unwrap()
-            .contains(&Value::from(format!("{stored}.dvc")))
+            .contains(&Value::from(format!("{stored}.wm-storage.json")))
     );
 }
 
@@ -764,15 +748,12 @@ fn content_changed_inside_a_boundary_in_s3_is_refused_before_the_gate() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn a_file_removed_from_a_boundary_in_s3_is_a_cleanup_an_undocumented_task_publishes() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "boundary-cleanup", "20260920-111000");
     let branch = "refs/heads/codex/boundary-cleanup";
     let outputs = format!("{task_id}/outputs");
     let stored = format!("{task_id}/stored.bin");
-    let pointer = format!("{outputs}.dvc");
+    let pointer = format!("{outputs}.wm-storage.json");
     publish_boundaries_then_retire_the_record(&task, &outputs, &stored);
 
     let waiting = json(&workspace_env(&task, ["plan"], &OVER_300KB));
@@ -809,10 +790,9 @@ fn a_file_removed_from_a_boundary_in_s3_is_a_cleanup_an_undocumented_task_publis
     assert_eq!(warning_codes(&removed), ["task-record-unchanged"]);
     assert_eq!(removed["warnings"][0]["message"], advice.as_str());
     let tip = removed["remote_oid"].as_str().unwrap().to_owned();
-    assert!(
-        show(&fixture.remote, &format!("{tip}:{pointer}")).contains("nfiles: 2"),
-        "the published metadata lists the two remaining files"
-    );
+    let published_metadata: Value =
+        serde_json::from_str(&show(&fixture.remote, &format!("{tip}:{pointer}"))).unwrap();
+    assert_eq!(published_metadata["entries"].as_array().unwrap().len(), 2);
 
     // A retry of a publication whose metadata the storage engine already
     // rewrote is the same cleanup: `plan` judges the committed metadata too.
@@ -844,12 +824,10 @@ fn a_file_removed_from_a_boundary_in_s3_is_a_cleanup_an_undocumented_task_publis
     );
     assert_refused(&prepared, "unavailable-push-remote.git");
     assert_eq!(rev(&fixture.remote, branch).as_deref(), Some(tip.as_str()));
-    assert!(
-        std::fs::read_to_string(task.join("outputs.dvc"))
-            .unwrap()
-            .contains("nfiles: 1"),
-        "the failed publication already rewrote the metadata for its retry"
-    );
+    let prepared_metadata: Value =
+        serde_json::from_slice(&std::fs::read(task.join("outputs.wm-storage.json")).unwrap())
+            .unwrap();
+    assert_eq!(prepared_metadata["entries"].as_array().unwrap().len(), 1);
     let retried = json(&workspace_env(&task, ["plan"], &OVER_300KB));
     assert_eq!(retried["status"], "dry_run");
     assert_eq!(retried["changed_paths"], serde_json::json!([pointer]));
@@ -981,56 +959,52 @@ fn a_result_kept_local_before_it_was_published_is_a_cleanup_while_the_task_waits
 
 /// Rewritten S3 metadata retires content only when every line it adds records
 /// one of the entries it keeps. A description, arbitrary `meta`, or a comment
-/// added to published metadata is text the publication carries although the
-/// storage engine sees no change, so a task that documents nothing is refused.
+/// added to a storage sidecar is refused by its strict native schema before
+/// publication can change any remote state.
 #[cfg(feature = "test-storage")]
 #[test]
-fn text_added_to_published_s3_metadata_is_content() {
-    if !dvc_available() {
-        return;
-    }
+fn native_storage_metadata_rejects_annotations_and_unknown_fields() {
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "metadata-text", "20260920-113000");
     let branch = "refs/heads/codex/metadata-text";
     let outputs = format!("{task_id}/outputs");
     let stored = format!("{task_id}/stored.bin");
-    let pointer = format!("{stored}.dvc");
     publish_boundaries_then_retire_the_record(&task, &outputs, &stored);
     let tip = rev(&fixture.remote, branch);
-    let published = std::fs::read_to_string(task.join("stored.bin.dvc")).unwrap();
-    for added in [
-        "desc: Final results of run 3, accuracy 0.93\n",
-        "meta:\n  notes: |\n    Run 3 reached accuracy 0.93.\n",
-        "# Run 3 reached accuracy 0.93.\n",
+    let pointer = task.join("stored.bin.wm-storage.json");
+    let published = std::fs::read_to_string(&pointer).unwrap();
+    let source: Value = serde_json::from_str(&published).unwrap();
+    let mut description = source.clone();
+    description["description"] = Value::from("Final results of run 3, accuracy 0.93");
+    let mut metadata = source;
+    metadata["metadata"] = serde_json::json!({"notes": "Run 3 reached accuracy 0.93."});
+    let storage_before = remote_snapshot(&fixture.root.join("storage-remote"));
+    document_task(&task);
+    for annotated in [
+        serde_json::to_string_pretty(&description).unwrap(),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+        format!("{published}# Run 3 reached accuracy 0.93.\n"),
     ] {
-        std::fs::write(task.join("stored.bin.dvc"), format!("{published}{added}")).unwrap();
-        // The record lets a public plan reach native storage inspection. Its
-        // payload status remains clean despite the added metadata text; once
-        // the record is removed, the curation guard must still refuse it.
-        document_task(&task);
-        let engine = json(&workspace_env(&task, ["plan"], &ROOMY_10MB));
-        assert_eq!(
-            engine["storage"]["s3"]["dirty_files"],
-            serde_json::json!([])
-        );
-        assert!(
-            engine["storage"]["s3"]["files"]
-                .as_array()
-                .unwrap()
-                .contains(&Value::from(pointer.as_str()))
-        );
-        std::fs::remove_file(task.join("record.md")).unwrap();
+        std::fs::write(&pointer, &annotated).unwrap();
         for args in [&["plan"][..], &["publish", "-m", "Annotate the result"][..]] {
             assert_refused(
                 &workspace_env_unchecked(&task, args, &ROOMY_10MB),
-                UNDOCUMENTED,
+                "invalid native storage metadata",
             );
         }
-        assert_eq!(rev(&fixture.remote, branch), tip, "{added}");
+        assert_eq!(rev(&fixture.remote, branch), tip);
+        assert_eq!(
+            remote_snapshot(&fixture.root.join("storage-remote")),
+            storage_before
+        );
+        assert_eq!(std::fs::read_to_string(&pointer).unwrap(), annotated);
     }
-    std::fs::write(task.join("stored.bin.dvc"), &published).unwrap();
-    let plan = json(&workspace_env(&task, ["plan"], &ROOMY_10MB));
-    assert_eq!(plan["status"], "no_changes");
+    std::fs::write(&pointer, &published).unwrap();
+    std::fs::remove_file(task.join("record.md")).unwrap();
+    assert_eq!(
+        json(&workspace_env(&task, ["plan"], &ROOMY_10MB))["status"],
+        "no_changes"
+    );
 }
 
 /// A pointer whose objects are only missing from the local cache is committed
@@ -1042,9 +1016,6 @@ fn text_added_to_published_s3_metadata_is_content() {
 #[cfg(feature = "test-storage")]
 #[test]
 fn outputs_missing_only_from_the_local_cache_change_no_task_content() {
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "cleared-cache", "20260920-114000");
     let outputs = format!("{task_id}/outputs");
@@ -1055,22 +1026,18 @@ fn outputs_missing_only_from_the_local_cache_change_no_task_content() {
 
     // The user deletes the cache to reclaim space, and the engine's own index
     // of directory listings is empty, as in a fresh environment.
-    std::fs::remove_dir_all(fixture.shared.join(".dvc/cache")).unwrap();
-    let site_cache = fixture.root.join("empty-engine-site-cache");
-    let env = [
-        ROOMY_10MB[0],
-        ("DVC_SITE_CACHE_DIR", site_cache.to_str().unwrap()),
-    ];
+    std::fs::remove_dir_all(fixture.shared.join(".workspace-mgr/local/cache")).unwrap();
+    let env = ROOMY_10MB;
     let plan = json(&workspace_env(&task, ["plan"], &env));
     assert_eq!(plan["status"], "dry_run");
     assert_eq!(plan["changed_paths"], serde_json::json!([]));
     let dirty = plan["storage"]["s3"]["dirty_files"].as_array().unwrap();
     assert!(
-        dirty.contains(&Value::from(format!("{outputs}.dvc"))),
+        dirty.contains(&Value::from(format!("{outputs}.wm-storage.json"))),
         "{plan}"
     );
     assert!(
-        dirty.contains(&Value::from(format!("{stored}.dvc"))),
+        dirty.contains(&Value::from(format!("{stored}.wm-storage.json"))),
         "{plan}"
     );
     assert!(plan.get("warnings").is_none(), "{plan}");
@@ -1085,32 +1052,41 @@ fn outputs_missing_only_from_the_local_cache_change_no_task_content() {
     let after = json(&workspace_env(&task, ["plan"], &env));
     assert_eq!(after["status"], "no_changes");
 
-    // Without the directory's manifest anywhere the engine looks, it cannot
-    // compare the directory's files, but their unchanged aggregate still
-    // proves them unchanged.
-    std::fs::remove_dir_all(fixture.shared.join(".dvc/cache")).unwrap();
-    let storage_remote = fixture.root.join("storage-remote");
-    let manifests = walkdir::WalkDir::new(&storage_remote)
-        .into_iter()
-        .map(Result::unwrap)
-        .filter(|entry| entry.path().to_string_lossy().ends_with(".dir"))
-        .map(|entry| entry.into_path())
-        .collect::<Vec<_>>();
-    assert_eq!(manifests.len(), 1, "{manifests:?}");
-    std::fs::remove_file(&manifests[0]).unwrap();
-    let unlisted = json(&workspace_env(&task, ["plan"], &env));
-    assert_eq!(unlisted["status"], "dry_run");
-    assert!(unlisted.get("warnings").is_none(), "{unlisted}");
-    let republished = json(&workspace_env(
-        &task,
-        ["publish", "-m", "Restore the manifest"],
-        &env,
-    ));
-    assert_eq!(republished["status"], "no_changes");
-    assert!(republished.get("warnings").is_none(), "{republished}");
+    // Native directory listings travel with their Git sidecar. Clearing all
+    // local payloads and caches still leaves a complete exact file inventory.
+    std::fs::remove_dir_all(fixture.shared.join(".workspace-mgr/local/cache")).unwrap();
+    let pointer = task.join("outputs.wm-storage.json");
+    let metadata_before = std::fs::read(&pointer).unwrap();
+    let metadata: Value = serde_json::from_slice(&metadata_before).unwrap();
+    assert_eq!(metadata["entries"].as_array().unwrap().len(), 3);
+    let expected_outputs = remote_snapshot(&task.join("outputs"));
+    let expected_stored = std::fs::read(task.join("stored.bin")).unwrap();
+    let storage_before = remote_snapshot(&fixture.root.join("storage-remote"));
     assert!(
-        manifests[0].is_file(),
-        "the publication uploads the manifest again"
+        storage_before
+            .iter()
+            .all(|(path, _)| !path.to_string_lossy().ends_with(".dir"))
+    );
+    std::fs::remove_dir_all(task.join("outputs")).unwrap();
+    std::fs::remove_file(task.join("stored.bin")).unwrap();
+    workspace_env(
+        &task,
+        ["storage", "hydrate", outputs.as_str(), stored.as_str()],
+        &env,
+    );
+    assert_eq!(remote_snapshot(&task.join("outputs")), expected_outputs);
+    assert_eq!(
+        std::fs::read(task.join("stored.bin")).unwrap(),
+        expected_stored
+    );
+    assert_eq!(std::fs::read(&pointer).unwrap(), metadata_before);
+    assert_eq!(
+        remote_snapshot(&fixture.root.join("storage-remote")),
+        storage_before
+    );
+    assert_eq!(
+        json(&workspace_env(&task, ["plan"], &env))["status"],
+        "no_changes"
     );
 }
 
@@ -1124,9 +1100,6 @@ fn outputs_missing_only_from_the_local_cache_change_no_task_content() {
 fn content_written_after_the_preview_is_refused_before_the_upload() {
     use std::os::unix::fs::PermissionsExt;
 
-    if !dvc_available() {
-        return;
-    }
     let fixture = managed_fixture(true);
     let (task_id, task) = create_task(&fixture, "late-content", "20260920-115000");
     let branch = "refs/heads/codex/late-content";
@@ -1158,7 +1131,7 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
     let tip = rev(&fixture.remote, branch);
     let storage_remote = fixture.root.join("storage-remote");
     let storage_before = remote_snapshot(&storage_remote);
-    let pointer_before = std::fs::read(task.join("outputs.dvc")).unwrap();
+    let pointer_before = std::fs::read(task.join("outputs.wm-storage.json")).unwrap();
     let refused = workspace_env_unchecked(
         &task,
         ["publish", "-m", "Remove one output"],
@@ -1175,7 +1148,7 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
     // The refusal restores the metadata the engine committed, so it does not
     // keep naming the late file once that is gone.
     assert_eq!(
-        std::fs::read(task.join("outputs.dvc")).unwrap(),
+        std::fs::read(task.join("outputs.wm-storage.json")).unwrap(),
         pointer_before
     );
 
@@ -1189,7 +1162,7 @@ fn content_written_after_the_preview_is_refused_before_the_upload() {
     assert_eq!(removed["status"], "pushed");
     assert_eq!(
         removed["changed_paths"],
-        serde_json::json!([format!("{outputs}.dvc")])
+        serde_json::json!([format!("{outputs}.wm-storage.json")])
     );
 }
 

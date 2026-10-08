@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::archive_migration::{self, RECEIPT_NAME};
 use crate::config::{Config, require_supported_cli_at};
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
@@ -15,6 +14,7 @@ use crate::manifest::{ResolvedTask, TaskKind, TaskManifest, build_task_path, par
 use crate::path::{allowed, reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::process;
+use crate::storage_metadata;
 use crate::task_rename::validate_checkout;
 
 #[derive(Debug, Clone)]
@@ -696,12 +696,12 @@ fn validate_destination(repo: &GitRepo, base: &str, destination: &str) -> Result
 
 fn validate_materialized(repo: &GitRepo, config: &Config, source: &str) -> Result<()> {
     let scopes = vec![source.to_owned()];
-    let pointers = dvc::discover(repo, &scopes)?;
+    let pointers = storage_metadata::discover(repo, &scopes)?;
     for pointer in &pointers {
         let raw = fs::read_to_string(resolved_under(&repo.root, pointer)).at(pointer)?;
-        let output = dvc::metadata_output(repo, pointer, &raw)?;
+        let output = storage_metadata::metadata_output(repo, pointer, &raw)?;
         if resolved_under(&repo.root, &output).exists()
-            && !dvc::payload_matches_metadata(repo, pointer, &raw)?
+            && !storage_metadata::payload_matches_metadata(repo, pointer, &raw)?
         {
             return Err(Error::message(format!(
                 "archive refuses locally changed materialized S3 output {output} at {}; publish or preserve it first",

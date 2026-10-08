@@ -6,12 +6,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::dvc;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::path::{allowed, reject_symlink_traversal, repo_path, resolved_under};
 use crate::policy::TASK_MANIFEST_NAME;
 use crate::s3_purge::ObjectVersion;
+use crate::storage_metadata;
 
 pub const RECEIPT_NAME: &str = ".workspace-mgr-archive.json";
 
@@ -37,9 +37,9 @@ pub fn plan(repo: &GitRepo, config: &Config, source: &str, destination: &str) ->
             "archive requires version-aware S3 storage; migrate the repository before archiving stored tasks",
         ));
     }
-    dvc::ensure_ready(repo, config)?;
-    dvc::verify_object_versioning(repo, config)?;
-    dvc::version_archive_adapter(
+    storage_metadata::ensure_ready(repo, config)?;
+    storage_metadata::verify_object_versioning(repo, config)?;
+    storage_metadata::version_archive_adapter(
         repo,
         "plan",
         &json!({"source":source,"destination":destination}),
@@ -109,7 +109,7 @@ pub(crate) fn validate(path: &str, receipt: &Value) -> Result<()> {
 pub fn pointer_set(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String>> {
     let mut result = BTreeSet::new();
     for (_, receipt) in receipts(repo, scopes)? {
-        result.extend(dvc::discover(
+        result.extend(storage_metadata::discover(
             repo,
             &[text(&receipt, "destination")?.to_owned()],
         )?);
@@ -135,12 +135,16 @@ pub fn prepare(
                 .ok()
                 .as_ref()
                 == Some(&receipt);
-        let pointers = dvc::discover(repo, std::slice::from_ref(&destination))?;
+        let pointers = storage_metadata::discover(repo, std::slice::from_ref(&destination))?;
         for pointer in &pointers {
             let absolute = resolved_under(&repo.root, pointer);
             let raw = fs::read_to_string(&absolute).at(&absolute)?;
-            let output = resolved_under(&repo.root, pointer.strip_suffix(".dvc").unwrap());
-            if output.exists() && !dvc::payload_matches_metadata(repo, pointer, &raw)? {
+            let output = resolved_under(
+                &repo.root,
+                storage_metadata::boundary_path(pointer).unwrap(),
+            );
+            if output.exists() && !storage_metadata::payload_matches_metadata(repo, pointer, &raw)?
+            {
                 return Err(Error::message(format!(
                     "archived output changed after planning: {pointer}"
                 )));
@@ -179,7 +183,7 @@ pub fn prepare(
                 fs::create_dir_all(&journal_dir).at(&journal_dir)?;
                 let journal = journal_dir.join(format!("{digest}.json"));
                 let reservation = crate::archive_reservation::reserve(repo, &receipt)?;
-                let copied = dvc::version_archive_adapter(
+                let copied = storage_metadata::version_archive_adapter(
                     repo,
                     "copy",
                     &json!({
@@ -198,8 +202,8 @@ pub fn prepare(
                     }
                 }
                 receipt = next;
-                dvc::version_archive_adapter(repo, "verify", &receipt)?;
-                dvc::archive_registry_adapter(repo, "publish", &receipt)?;
+                storage_metadata::version_archive_adapter(repo, "verify", &receipt)?;
+                storage_metadata::archive_registry_adapter(repo, "publish", &receipt)?;
             } else {
                 receipt["status"] = "copied".into();
             }
@@ -207,14 +211,14 @@ pub fn prepare(
         }
         if config.s3_enabled() && receipt["status"] == "copied" {
             if !published && !trusted_copy_journal(repo, &receipt)? {
-                dvc::version_archive_adapter(repo, "verify-source", &receipt)?;
+                storage_metadata::version_archive_adapter(repo, "verify-source", &receipt)?;
             }
-            dvc::version_archive_adapter(repo, "verify", &receipt)?;
-            dvc::archive_registry_adapter(repo, "publish", &receipt)?;
+            storage_metadata::version_archive_adapter(repo, "verify", &receipt)?;
+            storage_metadata::archive_registry_adapter(repo, "publish", &receipt)?;
             for pointer in &pointers {
                 rewrite_pointer(repo, pointer, &receipt)?;
             }
-            dvc::verify_archived(repo, &pointers)?;
+            storage_metadata::verify_archived(repo, &pointers)?;
         }
         completed.push(receipt);
     }
@@ -297,7 +301,24 @@ pub fn purge_candidates(receipts: &[Value]) -> Result<Vec<ObjectVersion>> {
 fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()> {
     let absolute = resolved_under(&repo.root, pointer);
     let raw = fs::read_to_string(&absolute).at(&absolute)?;
-    let entries = dvc::parse_pointer_document(&raw, pointer)?.entries(pointer);
+    let entries = storage_metadata::parse_pointer_document(&raw, pointer)?.entries(pointer);
+    if pointer.ends_with(crate::storage_format::SUFFIX) {
+        let mut manifest = crate::storage_format::Manifest::parse(&raw, pointer)?;
+        match manifest.kind {
+            crate::storage_format::Kind::File => {
+                manifest.version = Some(copied_version(&entries[0], receipt)?);
+            }
+            crate::storage_format::Kind::Directory => {
+                for (file, entry) in manifest.entries.as_mut().unwrap().iter_mut().zip(&entries) {
+                    file.version = Some(copied_version(entry, receipt)?);
+                }
+            }
+        }
+        let rendered = manifest.serialize()?;
+        crate::archive_cancel::record_pointer_rewrite(repo, receipt, pointer, rendered.as_bytes())?;
+        return atomic_write(&absolute, rendered.as_bytes());
+    }
+    // Legacy archive journals retain their original bytes until cancellation or migration.
     let mut document: serde_yaml::Value =
         serde_yaml::from_str(&raw).map_err(|source| Error::Yaml {
             path: absolute.clone(),
@@ -327,11 +348,10 @@ fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()>
     atomic_write(&absolute, rendered.as_bytes())
 }
 
-fn replace_cloud(
-    value: &mut serde_yaml::Value,
-    entry: &dvc::PointerEntry,
+fn copied_version(
+    entry: &storage_metadata::PointerEntry,
     receipt: &Value,
-) -> Result<()> {
+) -> Result<crate::storage_format::Version> {
     let versions = receipt["versions"]
         .as_array()
         .ok_or_else(|| Error::message("archive versions missing"))?;
@@ -346,9 +366,20 @@ fn replace_cloud(
         .ok_or_else(|| {
             Error::message(format!("archive has no copied version for {}", entry.key))
         })?;
-    value["cloud"]["workspace-mgr"]["version_id"] =
-        text(matching, "destination_version_id")?.into();
-    value["cloud"]["workspace-mgr"]["etag"] = text(matching, "destination_etag")?.into();
+    Ok(crate::storage_format::Version {
+        id: text(matching, "destination_version_id")?.to_owned(),
+        etag: Some(text(matching, "destination_etag")?.to_owned()),
+    })
+}
+
+fn replace_cloud(
+    value: &mut serde_yaml::Value,
+    entry: &storage_metadata::PointerEntry,
+    receipt: &Value,
+) -> Result<()> {
+    let version = copied_version(entry, receipt)?;
+    value["cloud"]["workspace-mgr"]["version_id"] = version.id.into();
+    value["cloud"]["workspace-mgr"]["etag"] = version.etag.unwrap().into();
     Ok(())
 }
 

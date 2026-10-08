@@ -32,7 +32,7 @@ fn unaddressable_boundary() -> String {
     format!("{TASK_ID}/top\\level.bin")
 }
 
-/// Reproduce an old DVC3 file boundary without invoking an external engine.
+/// Reproduce a migrated file boundary without invoking an external engine.
 /// Its metadata and raw MD5 cache bytes live only in this fixture's checkout
 /// and filesystem remote, including when the historical path is unaddressable.
 fn fixture_storage_boundary(repo: &Path, remote: &Path, name: &str, payload: &[u8]) {
@@ -42,16 +42,16 @@ fn fixture_storage_boundary(repo: &Path, remote: &Path, name: &str, payload: &[u
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let document = serde_json::json!({
-        "outs": [{"path": name, "hash": "md5", "md5": digest, "size": payload.len()}]
-    });
     std::fs::write(
-        task.join(format!("{name}.dvc")),
-        serde_yaml::to_string(&document).unwrap(),
+        task.join(format!("{name}.wm-storage.json")),
+        storage_file_manifest(name, &digest, payload.len() as u64, None),
     )
     .unwrap();
-    for root in [repo.join(".dvc/cache"), remote.to_owned()] {
-        let cache = root.join("files/md5").join(&digest[..2]).join(&digest[2..]);
+    for root in [repo.join(".workspace-mgr/local/cache"), remote.to_owned()] {
+        let cache = root
+            .join("objects/md5")
+            .join(&digest[..2])
+            .join(&digest[2..]);
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         std::fs::write(cache, payload).unwrap();
     }
@@ -74,15 +74,15 @@ fn fixture_storage_boundary(repo: &Path, remote: &Path, name: &str, payload: &[u
 /// engine can address and one it cannot, plus an ordinary incoming Git file.
 ///
 /// No current command produces the unaddressable boundary: placement refuses
-/// it. A release before that refusal could, so the fixture reproduces that
-/// history with DVC-compatible metadata/cache and Git in a crafting checkout,
+/// it. Migration preserves an existing boundary with this name, so the fixture
+/// reproduces its native metadata/cache and Git in a crafting checkout,
 /// and leaves the shared checkout one fast-forward behind it.
 fn shared_branch_carrying_unaddressable_metadata() -> SharedBranch {
     let fixture = GitFixture::new();
     let storage_remote = fixture.root.join("storage-remote");
     workspace(
         &fixture.seed,
-        ["init", "--s3-url", storage_remote.to_str().unwrap()],
+        ["manage", "--s3-url", storage_remote.to_str().unwrap()],
     );
     fixture.commit_seed("Initialize isolated storage");
     fixture.clone_shared();
@@ -203,7 +203,7 @@ fn refresh_skips_one_unaddressable_boundary_and_hydrates_everything_else() {
         std::fs::read(task.join("second.bin")).unwrap(),
         SECOND_PAYLOAD
     );
-    assert!(task.join("second.bin.dvc").is_file());
+    assert!(task.join("second.bin.wm-storage.json").is_file());
     assert!(task.join("notes.md").is_file());
     assert_eq!(
         std::fs::read(task.join("first.bin")).unwrap(),
@@ -212,7 +212,7 @@ fn refresh_skips_one_unaddressable_boundary_and_hydrates_everything_else() {
 
     // The unaddressable boundary's metadata advances like any other Git file,
     // and its payload is deliberately left behind.
-    assert!(task.join("top\\level.bin.dvc").is_file());
+    assert!(task.join("top\\level.bin.wm-storage.json").is_file());
     assert!(!task.join("top\\level.bin").exists());
     assert_eq!(
         report["storage"]["unaddressable"],
@@ -260,10 +260,10 @@ fn refresh_dry_run_reports_the_condition_instead_of_a_false_green() {
     // it is still a preview.
     assert_eq!(revision(shared, "HEAD"), before);
     assert_eq!(git(shared, ["status", "--porcelain"]).stdout, status_before);
-    assert!(!task.join("second.bin.dvc").exists());
+    assert!(!task.join("second.bin.wm-storage.json").exists());
     assert!(!task.join("second.bin").exists());
     assert!(!task.join("notes.md").exists());
-    assert!(!task.join("top\\level.bin.dvc").exists());
+    assert!(!task.join("top\\level.bin.wm-storage.json").exists());
 }
 
 #[test]
@@ -288,7 +288,11 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
         ],
     );
     configure_git(&consumer);
-    assert!(consumer.join(format!("{boundary}.dvc")).is_file());
+    assert!(
+        consumer
+            .join(format!("{boundary}.wm-storage.json"))
+            .is_file()
+    );
     assert!(!consumer.join(&boundary).exists());
 
     // The warning's recovery, step by step: an infrastructure task scoped to
@@ -317,7 +321,11 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
     let manifest = created["manifest"].as_str().unwrap();
     // The task starts from the fetched base, so it holds the metadata but, like
     // every checkout, no payload for the boundary.
-    assert!(worktree.join(format!("{boundary}.dvc")).is_file());
+    assert!(
+        worktree
+            .join(format!("{boundary}.wm-storage.json"))
+            .is_file()
+    );
     assert!(!worktree.join(&boundary).exists());
 
     let moved = json(&workspace(
@@ -325,8 +333,16 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
         ["move", &boundary, &destination, "--manifest", manifest],
     ));
     assert_eq!(moved["status"], "updated");
-    assert!(!worktree.join(format!("{boundary}.dvc")).exists());
-    assert!(worktree.join(format!("{destination}.dvc")).is_file());
+    assert!(
+        !worktree
+            .join(format!("{boundary}.wm-storage.json"))
+            .exists()
+    );
+    assert!(
+        worktree
+            .join(format!("{destination}.wm-storage.json"))
+            .is_file()
+    );
     // The move fetched the payload through the old metadata and materialized
     // it at the destination, so publication has the bytes to upload under
     // the new path and no separate hydration is needed.
@@ -396,7 +412,11 @@ fn the_recovery_the_warning_names_works_as_written_for_every_other_checkout() {
             std::fs::read(checkout.join(&destination)).unwrap(),
             UNADDRESSABLE_PAYLOAD
         );
-        assert!(!checkout.join(format!("{boundary}.dvc")).exists());
+        assert!(
+            !checkout
+                .join(format!("{boundary}.wm-storage.json"))
+                .exists()
+        );
         assert!(!checkout.join(&boundary).exists());
     }
 }
@@ -407,7 +427,9 @@ fn refresh_refuses_to_leave_a_payload_under_metadata_that_no_longer_describes_it
     // The crafting checkout still holds the payload it published.
     let publisher = branch.fixture.root.join("publisher");
     let payload = publisher.join(TASK_ID).join("top\\level.bin");
-    let metadata = publisher.join(TASK_ID).join("top\\level.bin.dvc");
+    let metadata = publisher
+        .join(TASK_ID)
+        .join("top\\level.bin.wm-storage.json");
     let metadata_before = std::fs::read(&metadata).unwrap();
 
     // Someone replaces that boundary's content upstream, represented by
@@ -480,8 +502,8 @@ fn a_payload_refresh_cannot_address_is_kept_only_when_it_already_matches() {
     // exact payload. There is nothing to reconcile, so refresh advances and
     // keeps those bytes, still warning that no other checkout can have them.
     std::fs::copy(
-        publisher_task.join("top\\level.bin.dvc"),
-        task.join("top\\level.bin.dvc"),
+        publisher_task.join("top\\level.bin.wm-storage.json"),
+        task.join("top\\level.bin.wm-storage.json"),
     )
     .unwrap();
     let report = json(&workspace(shared, ["refresh"]));
@@ -503,7 +525,7 @@ fn a_failed_move_restores_a_boundary_that_has_no_payload_to_put_back() {
     let task = branch.task();
     let boundary = unaddressable_boundary();
     workspace(&branch.fixture.shared, ["refresh"]);
-    let metadata_before = std::fs::read(task.join("top\\level.bin.dvc")).unwrap();
+    let metadata_before = std::fs::read(task.join("top\\level.bin.wm-storage.json")).unwrap();
 
     // A destination the engine cannot address either, refused after the move
     // has begun and its metadata snapshot has been taken.
@@ -521,10 +543,10 @@ fn a_failed_move_restores_a_boundary_that_has_no_payload_to_put_back() {
     assert!(stderr.contains("rolled back"), "{stderr}");
     assert!(!stderr.contains("rollback also failed"), "{stderr}");
     assert_eq!(
-        std::fs::read(task.join("top\\level.bin.dvc")).unwrap(),
+        std::fs::read(task.join("top\\level.bin.wm-storage.json")).unwrap(),
         metadata_before
     );
-    assert!(!task.join("still\\bad.bin.dvc").exists());
+    assert!(!task.join("still\\bad.bin.wm-storage.json").exists());
     assert!(!task.join("still\\bad.bin").exists());
     assert!(!task.join("top\\level.bin").exists());
 }
@@ -557,14 +579,19 @@ fn an_incoming_requirement_is_refused_before_unaddressable_metadata_is_inspected
     configure_git(&raiser);
     let config = raiser.join(".workspace-mgr.toml");
     let original = std::fs::read_to_string(&config).unwrap();
+    let original = if original.starts_with("minimum_cli_version = ") {
+        original.split_once("\n\n").unwrap().1
+    } else {
+        &original
+    };
     std::fs::write(
         &config,
         format!("minimum_cli_version = \"99.0.0\"\n\n{original}"),
     )
     .unwrap();
     std::fs::write(
-        raiser.join(TASK_ID).join("top\\level.bin.dvc"),
-        "schema: 99\nouts: metadata only a newer release reads\n",
+        raiser.join(TASK_ID).join("top\\level.bin.wm-storage.json"),
+        r#"{"schema_version":99,"future_field":"metadata only a newer release reads"}"#,
     )
     .unwrap();
     git(&raiser, ["add", "-A"]);
@@ -601,8 +628,14 @@ fn an_incoming_requirement_is_refused_before_unaddressable_metadata_is_inspected
             status_before,
             "{args:?}"
         );
-        assert!(!task.join("second.bin.dvc").exists(), "{args:?}");
-        assert!(!task.join("top\\level.bin.dvc").exists(), "{args:?}");
+        assert!(
+            !task.join("second.bin.wm-storage.json").exists(),
+            "{args:?}"
+        );
+        assert!(
+            !task.join("top\\level.bin.wm-storage.json").exists(),
+            "{args:?}"
+        );
         assert_eq!(
             std::fs::read(task.join("top\\level.bin")).unwrap(),
             local_payload

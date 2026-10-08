@@ -19,7 +19,7 @@ struct CleanupFixture {
 impl CleanupFixture {
     fn new() -> Self {
         let git = GitFixture::new();
-        workspace(&git.seed, ["init"]);
+        workspace(&git.seed, ["manage"]);
         git.commit_seed("Initialize managed workspace");
         git.clone_shared();
         let gh = git.root.join("fake-gh");

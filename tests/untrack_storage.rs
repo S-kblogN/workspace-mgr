@@ -17,13 +17,13 @@ fn fixture_with_storage(s3: bool) -> (GitFixture, PathBuf) {
         workspace(
             &fixture.seed,
             [
-                "init",
+                "manage",
                 "--s3-url",
                 fixture.root.join("storage-remote").to_str().unwrap(),
             ],
         );
     } else {
-        workspace(&fixture.seed, ["init"]);
+        workspace(&fixture.seed, ["manage"]);
     }
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
@@ -201,7 +201,11 @@ fn complete_directory_boundary_is_supported_and_nested_operations_are_refused() 
         b"one"
     );
     fs::write(task.join("bundle/.gitignore"), b"*.bin\n").unwrap();
-    fs::write(task.join("bundle/generated.dvc"), b"ordinary local file\n").unwrap();
+    fs::write(
+        task.join("bundle/generated.wm-storage.json"),
+        b"ordinary local file\n",
+    )
+    .unwrap();
     workspace(&task, ["untrack", &boundary]);
     let restore = workspace_unchecked(
         &task,
@@ -317,7 +321,7 @@ fn s3_untrack_keeps_payload_and_retrack_restores_pointer() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("hydrate"));
     fs::write(task.join("cloud.bin"), b"cloud payload").unwrap();
     workspace(&task, ["untrack", &payload]);
-    assert!(!task.join("cloud.bin.dvc").exists());
+    assert!(!task.join("cloud.bin.wm-storage.json").exists());
     assert_eq!(fs::read(task.join("cloud.bin")).unwrap(), b"cloud payload");
     workspace(
         &task,
@@ -331,7 +335,7 @@ fn s3_untrack_keeps_payload_and_retrack_restores_pointer() {
             "Share in cloud again",
         ],
     );
-    assert!(task.join("cloud.bin.dvc").is_file());
+    assert!(task.join("cloud.bin.wm-storage.json").is_file());
     assert_eq!(
         json(&workspace(&task, ["storage", "status", &payload]))["placements"][0]["target"],
         "s3"
@@ -357,7 +361,7 @@ fn failed_s3_untrack_rolls_back_all_metadata_and_keeps_payload() {
             "Cloud data",
         ],
     );
-    let pointer = fs::read(task.join("cloud.bin.dvc")).unwrap();
+    let pointer = fs::read(task.join("cloud.bin.wm-storage.json")).unwrap();
     let placement = fs::read(task.join("cloud.bin.workspace-mgr-storage.toml")).unwrap();
     let ignore = fs::read(task.join(".gitignore")).unwrap();
     let engine = fixture.root.join("failing-engine");
@@ -366,14 +370,17 @@ fn failed_s3_untrack_rolls_back_all_metadata_and_keeps_payload() {
     let output = binary_command()
         .current_dir(&task)
         .args(["untrack", &payload])
-        .env("WORKSPACE_MGR_STORAGE_DVC", &engine)
+        .env("WORKSPACE_MGR_TEST_STORAGE_HOOK", &engine)
         .env("WORKSPACE_MGR_FORMAT", "json")
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("rolled back"));
     assert_eq!(fs::read(task.join("cloud.bin")).unwrap(), b"cloud payload");
-    assert_eq!(fs::read(task.join("cloud.bin.dvc")).unwrap(), pointer);
+    assert_eq!(
+        fs::read(task.join("cloud.bin.wm-storage.json")).unwrap(),
+        pointer
+    );
     assert_eq!(
         fs::read(task.join("cloud.bin.workspace-mgr-storage.toml")).unwrap(),
         placement

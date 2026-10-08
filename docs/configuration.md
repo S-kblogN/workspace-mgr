@@ -55,23 +55,83 @@ Set the bucket's region through `AWS_REGION`, `AWS_DEFAULT_REGION`, or the
 selected profile. B2 regions can also be inferred from their service endpoint.
 The native transport does not replay signed requests across provider redirects.
 
-`workspace-mgr init --s3-url <url> [--s3-endpoint-url <url>]` writes these
-public facts and deterministically generates the private storage-engine
-configuration. Every S3 operation rejects drift in that derived file. Users and
-agents should edit only `.workspace-mgr.toml` and rerun `workspace-mgr init`.
-The generated file remains product-owned even if its content is old, edited, or
-damaged; content comparison detects drift but does not determine ownership. If
-retained S3 boundaries exist and that generated file can no longer identify its
-location, `init` uses the committed public facts as the relocation-safety anchor
-before repairing it.
-Once S3 boundaries exist, `init` will not relocate them to another URL or
-endpoint; place all retained boundaries in Git before changing the repository's
-S3 location.
+`workspace-mgr manage --s3-url <url> [--s3-endpoint-url <url>]` writes
+these public facts. The native engine reads `.workspace-mgr.toml` directly;
+there is no generated second remote configuration. Once storage boundaries
+exist, `manage` refuses changing the URL or endpoint. Place retained boundaries
+in Git before changing the repository's S3 location.
+
+Machine-local authentication can be saved in the ignored
+`.workspace-mgr/local/credentials.toml`:
+
+```toml
+profile = "research"
+region = "us-east-1"
+```
+
+The supported optional fields are `access_key_id`, `secret_access_key`,
+`session_token`, `profile`, `region`, and `credential_process`. Access and secret
+keys must be supplied together, and session tokens require those keys. Location
+and endpoint fields are deliberately excluded: tracked repository facts own
+routing. The CLI never prints credential values in management reports.
+
+## Storage manifests and repository migration
+
+Each managed file or directory has one adjacent `.wm-storage.json` sidecar.
+Native schema 1 records `path`, `kind`, `checksum` (algorithm and digest), physical
+`size`, and optional exact `version` (id and etag). Directory boundaries also
+record complete relative `entries`, each with its own checksum, size and version.
+Unknown fields, unsupported schema versions, unsafe paths and inconsistent
+content identities are rejected. See [Native repository storage](storage.md) for
+examples and the engine contract.
+
+`workspace-mgr manage --repo <path> --dry-run` previews legacy storage migration
+and scaffold reconciliation together. Remove `--dry-run` to apply the reviewed
+transaction. The command inventories all current pointers, including nested
+archive directories, while keeping nested Git repositories opaque. It preserves
+payload bytes and imported checksum algorithms, and leaves Git history and the
+index unchanged. Path-based, version-aware imports preserve their existing exact
+object bindings. Ordinary DVC S3 imports retain the source CAS keys and create
+verified native object versions at repository-relative paths.
+Run legacy adoption in the primary shared checkout. A linked worktree can
+reconcile native scaffolding once the repository has been adopted.
+
+The S3 importer supports path-based, version-aware legacy remotes with complete
+exact object bindings, and ordinary DVC 2 or DVC 3 content-addressed remotes.
+Selected legacy remote names can be arbitrary. A remote-only directory listing
+is sufficient when its entries and aggregate identity can be verified. Native
+destinations require bucket versioning and conditional writes; imported CAS
+objects are read under an exact version or ETag condition and copied without
+changing their raw bytes.
+`--dry-run` reports the verified remote inventory and planned transfer bytes
+without local or remote writes. Pipelines, custom controls, incomplete or
+ambiguous identities, active storage transactions and destination collisions
+refuse before conversion. See [the import contract](storage.md#migrating-legacy-dvc-repositories).
+
+Verified legacy sidecars and managed controls are removed after replacement
+verification. Cache trees move into `.workspace-mgr/local/cache`; other legacy
+local state remains in `.workspace-mgr/local/retained-storage-state`. Supported
+local authentication moves into `credentials.toml`. Unrelated attribute and
+payload-ignore rules remain. A private durable journal allows an interrupted
+local operation to roll back on the next `manage`; recovery protects later user
+edits. CAS transfers keep a separate `storage-import.json` journal until local
+conversion succeeds. Re-running `manage` verifies the source inventory and
+reuses owned, verified uploaded versions after a partial transfer or lost response.
+`manage --cancel-migration` abandons a failed import plan without deleting old
+controls, remote versions, cache or upload receipts, so source or metadata repairs
+can be followed by a fresh `manage`. Combine it with `--dry-run` to preview;
+S3 routing options cannot accompany cancellation.
+
+Publish the converted manifests, their legacy sidecar deletions, obsolete
+controls and updated configuration together in one infrastructure task.
+Publication refuses to delete legacy routing controls while its proposed Git
+tree still needs them. Retained source CAS hashes remain available to old Git
+history; native path cleanup does not automatically garbage-collect them.
 
 ## Minimum workspace-mgr version
 
 `minimum_cli_version` names the oldest `workspace-mgr` release that can read
-the repository's tracked task state. It is a compatibility fact that
+the repository's tracked task and storage state. It is a compatibility fact that
 `workspace-mgr` maintains, not a policy switch: it is only a lower bound and
 never selects behavior. When it is absent, the repository has no requirement.
 The value is a plain release version such as `"0.4.0"`; pre-release versions
@@ -80,7 +140,7 @@ when its version is at least the declared one by semantic-version precedence.
 A pre-release also meets a declaration of its own release, so 0.4.0-rc.1 meets
 `"0.4.0"`, while it does not meet `"0.4.1"`.
 
-Publication maintains the declaration. Task manifest schema 3, which records a
+Management raises the declaration to at least 0.8.1 when adopting native storage. Publication maintains the declaration for subsequent task and storage changes. Task manifest schema 3, which records a
 cloud-usage approval, needs `workspace-mgr` 0.4.0. Schema 4, which retains
 archive completion evidence, needs 0.7.0. Top-level manifests with
 schemas 1 and 2 need no declaration. A nested archive task manifest needs
@@ -122,7 +182,8 @@ Once a raise is merged into the base branch, it stays even after the manifests
 that needed it are gone; nothing lowers a merged declaration. A branch that was
 raised before the base branch was raised further conflicts with it until the
 branch is published again; resolving such a conflict by hand must keep the
-higher value. `init` keeps an existing declaration exactly. `init`, and
+higher value. `manage` preserves an existing declaration or raises it to at
+least 0.8.1 when adopting native storage; it never lowers one. `manage`, and
 publication whenever it rewrites the declaration, write this file in its
 canonical form, so comments in it are not preserved then.
 

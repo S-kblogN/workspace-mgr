@@ -13,7 +13,7 @@ use crate::policy::{
 /// All operation help pages contributing to the effective-policy fingerprint.
 pub(crate) const OPERATIONS: &[&str] = &[
     "setup",
-    "init",
+    "manage",
     "instructions",
     "doctor",
     "config",
@@ -51,7 +51,7 @@ const READ_ONLY: &str = "This command is read-only. Reading a path never authori
 const LOCAL_RETENTION: &str = "Keep retained content inside the task's declared scope. Local-only placement keeps materialized bytes on this machine, records their placement and a shared ignore rule, and removes remote payloads at the next publication. New clones receive no local-only payload. Hydrate missing S3 content before untracking; resume tracking only with storage set --to git|s3, because storage reset refuses local-only paths.";
 const SECRET_POLICY: &str = "Keep credentials and private runtime configuration outside tracked files and command output; record how to regenerate them, never their values. Never hand-edit or directly delete workspace-mgr storage metadata.";
 const DELETE_HISTORY: &str = "After publication, obsolete S3 object paths are permanently purged, including all versions and delete markers. Older Git revisions that referenced those removed paths may no longer hydrate. Another current remote branch or tag can protect a version and defer its deletion. Do not run unrelated bucket-wide or cache garbage collection without explicit authorization.";
-const SCAFFOLD: &str = "workspace-mgr init reconciles product-owned scaffold files deterministically by their fixed paths. Do not hand-edit those files. After a CLI update or scaffold-drift report, reconcile them in a scoped infrastructure task and review the resulting repository-wide diff. Repository ignore additions belong in .workspace-mgr/repository.gitignore; init combines that module with product rules to generate the root .gitignore.";
+const SCAFFOLD: &str = "workspace-mgr manage reconciles product-owned scaffold files deterministically by their fixed paths. Do not hand-edit those files. After a CLI update or scaffold-drift report, reconcile them in a scoped infrastructure task and review the resulting repository-wide diff. Repository ignore additions belong in .workspace-mgr/repository.gitignore; manage combines that module with product rules to generate the root .gitignore.";
 const REVIEW: &str = "The agent owns hosting-provider pull-request operations. Query the task's head branch and create exactly one draft PR after a deliverable's initial scaffold publication, or an infrastructure task's first safe scoped publication. Reuse an existing matching PR. Keep its title and living description aligned with the current goal, scope, deliverables, validation and limitations. Verify it is open, targets the configured base, uses the correct head, remains draft, and its head revision equals publish's remote revision. Report hosting failures and the exact unsynchronized state. Do not merge, enable auto-merge, approve, close or mark ready without the user's explicit request for that transition.";
 
 /// Render help without discovering a repository, reading configuration, using
@@ -66,11 +66,11 @@ pub(crate) fn command(operation: &str) -> String {
             ],
             &["core"],
         ),
-        "init" => (
-            "Initialize or reconcile repository facts and managed scaffolding.",
+        "manage" => (
+            "Adopt or reconcile repository facts, native storage metadata and managed scaffolding.",
             vec![
                 SCAFFOLD.into(),
-                "Use --dry-run to inspect changes first. Initial setup detects repository facts; shared-root changes in an existing managed repository need exact user-authorized infrastructure scope. --s3-url and --s3-endpoint-url contain non-secret configuration only. Production S3 storage requires enabled object versioning; keep credentials outside the repository.".into(),
+                "Use --dry-run to inspect every migration and scaffold change first. The command automatically converts supported legacy DVC pointers throughout the current checkout to native .wm-storage.json manifests, imports the selected S3 location and private credentials, preserves the local cache, and removes verified legacy controls. Legacy adoption requires the primary shared checkout; native scaffold reconciliation also supports linked worktrees. Existing path-based exact VersionIds are preserved without remote writes. Ordinary content-addressed DVC S3 data is downloaded, checksum-verified and uploaded to native repository-relative keys in the same versioned bucket; original hash objects remain for historical reads. Dry-run uses read-only S3 metadata requests and directory listings when needed, without uploads or local persistent writes. Unsupported pipelines, custom configuration, incomplete manifests, collisions and symlinks refuse before conversion. Git history, the index and payload bytes remain intact. Durable private journals resume transfers and recover interrupted local changes on the next manage invocation. Initial setup detects repository facts; shared-root changes in an existing managed repository need exact user-authorized infrastructure scope. --s3-url and --s3-endpoint-url contain non-secret configuration only. Production S3 storage requires enabled object versioning; use AWS environment/profile authentication or ignored .workspace-mgr/local/credentials.toml.".into(),
                 "After reconciliation, run doctor and instructions, then plan and publish the authorized infrastructure change. Never add, edit or remove minimum_cli_version or a task's cloud_usage_approval by hand; publication and task approve-cloud-usage maintain them.".into(),
             ],
             &["infrastructure", "core"],
@@ -95,7 +95,7 @@ pub(crate) fn command(operation: &str) -> String {
         "config" | "config show" => (
             "Inspect and validate the effective repository configuration.",
             vec![
-                "Use config show to inspect the configured Git remote/base branch and non-secret storage facts. Repository-wide configuration changes are infrastructure work and need exact declared scope. Use init for supported configuration and scaffold reconciliation; never hand-edit managed minimum_cli_version or task cloud_usage_approval tables.".into(),
+                "Use config show to inspect the configured Git remote/base branch and non-secret storage facts. Repository-wide configuration changes are infrastructure work and need exact declared scope. Use manage for supported configuration and scaffold reconciliation; never hand-edit managed minimum_cli_version or task cloud_usage_approval tables.".into(),
                 SECRET_POLICY.into(),
             ],
             &["infrastructure", "core"],
@@ -372,7 +372,7 @@ fn artifact_workplace() -> String {
 
 fn publication_checks() -> String {
     format!(
-        "Publication retains its existing structural checks: a deliverable README and, for content-bearing deliverable changes, a task-owned Markdown record (an edited README can qualify; initial control-only scaffolds need no extra record). Infrastructure tasks have no task directory and no deliverable README requirement. Other checks include Git whitespace checks, no staged symlink escaping the repository, no outer gitlinks/tracked nested repositories, and shared ignore rules carried by the publication rather than only a global exclude or .git/info/exclude. Task-specific ignores belong in the task's .gitignore; repository rules belong in .workspace-mgr/repository.gitignore and are reconciled by init under authorized infrastructure scope. Product ignore rules do not trigger the machine-local-ignore refusal. Keep the README's Directory map current; decisions, process, tools and hard-to-reproduce results belong in the task's other Markdown records. task-record-unchanged is a reminder to review the record. bulk-publication warns above {BULK_PUBLICATION_FILES} added files or {} added bytes; confirm retained inputs/tools/evidence/deliverables, otherwise ignore regenerable by-products narrowly or keep them local with untrack, then re-plan. Every visible unignored task file is included in the next publication; there is no remembered do-not-commit state. Nested Git repositories must be wholly shared-ignored with no outer-tracked files or gitlinks; do not flatten one unless explicitly requested. S3 is not a dumping ground for bulk by-products.",
+        "Publication retains its existing structural checks: a deliverable README and, for content-bearing deliverable changes, a task-owned Markdown record (an edited README can qualify; initial control-only scaffolds need no extra record). Infrastructure tasks have no task directory and no deliverable README requirement. Other checks include Git whitespace checks, no staged symlink escaping the repository, no outer gitlinks/tracked nested repositories, and shared ignore rules carried by the publication rather than only a global exclude or .git/info/exclude. Task-specific ignores belong in the task's .gitignore; repository rules belong in .workspace-mgr/repository.gitignore and are reconciled by manage under authorized infrastructure scope. Product ignore rules do not trigger the machine-local-ignore refusal. Keep the README's Directory map current; decisions, process, tools and hard-to-reproduce results belong in the task's other Markdown records. task-record-unchanged is a reminder to review the record. bulk-publication warns above {BULK_PUBLICATION_FILES} added files or {} added bytes; confirm retained inputs/tools/evidence/deliverables, otherwise ignore regenerable by-products narrowly or keep them local with untrack, then re-plan. Every visible unignored task file is included in the next publication; there is no remembered do-not-commit state. Nested Git repositories must be wholly shared-ignored with no outer-tracked files or gitlinks; do not flatten one unless explicitly requested. S3 is not a dumping ground for bulk by-products.",
         BULK_PUBLICATION_BYTES
     )
 }

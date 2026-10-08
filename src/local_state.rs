@@ -103,7 +103,7 @@ pub fn directory(repo: &GitRepo) -> Result<PathBuf> {
     Ok(directory)
 }
 
-fn legacy_directories(repo: &GitRepo) -> Result<Vec<PathBuf>> {
+pub(crate) fn legacy_directories(repo: &GitRepo) -> Result<Vec<PathBuf>> {
     let common = repo.common_dir()?.canonicalize().at(&repo.root)?;
     let mut directories = Vec::new();
     let root = common.join("workspace-mgr");

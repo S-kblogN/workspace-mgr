@@ -34,9 +34,9 @@ pub enum Command {
     #[command(long_about = crate::command_guidance::command("setup"))]
     Setup(SetupArgs),
 
-    /// Initialize or reconcile repository facts and managed scaffolding.
-    #[command(long_about = crate::command_guidance::command("init"))]
-    Init(InitArgs),
+    /// Adopt or reconcile a repository, including legacy storage migration.
+    #[command(alias = "init", long_about = crate::command_guidance::command("manage"))]
+    Manage(ManageArgs),
 
     /// Print the shared workspace model and effective repository instructions.
     #[command(long_about = crate::command_guidance::command("instructions"))]
@@ -104,7 +104,7 @@ pub struct RepoArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct InitArgs {
+pub struct ManageArgs {
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 
@@ -118,6 +118,10 @@ pub struct InitArgs {
 
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Cancel an unfinished storage import while retaining all remote data.
+    #[arg(long, conflicts_with_all = ["s3_url", "s3_endpoint_url"])]
+    pub cancel_migration: bool,
 }
 
 #[derive(Debug, Args)]
@@ -561,9 +565,9 @@ mod tests {
                 "/tmp/workspace-mgr-runtime",
                 "--dry-run",
             ],
-            &["init"],
+            &["manage"],
             &[
-                "init",
+                "manage",
                 "--s3-url",
                 "s3://example-bucket/workspace",
                 "--s3-endpoint-url",

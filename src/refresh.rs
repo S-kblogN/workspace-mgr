@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::branch_cleanup::{self, BranchCleanupReport};
-use crate::config::Config;
-use crate::dvc::{self, PreparedRevision};
+use crate::config::{CONFIG_NAME, Config};
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::lock::RepositoryLock;
 use crate::path::{reject_symlink_traversal, repo_path, resolved_under};
 use crate::s3_purge::{self, PurgeReport};
 use crate::storage;
+use crate::storage_metadata::{self, PreparedRevision};
 
 #[derive(Debug, Clone)]
 pub struct RefreshOptions {
@@ -118,14 +118,14 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     } else {
         tree_changed_paths(&repo, &old_oid, &new_oid)?
     };
-    let incoming_dvc: Vec<String> = incoming_paths
+    let incoming_storage: Vec<String> = incoming_paths
         .iter()
-        .filter(|path| path.ends_with(".dvc"))
+        .filter(|path| storage_metadata::is_pointer(path))
         .cloned()
         .collect();
     let incoming_git: Vec<String> = incoming_paths
         .iter()
-        .filter(|path| !path.ends_with(".dvc"))
+        .filter(|path| !storage_metadata::is_pointer(path))
         .cloned()
         .collect();
     let old_local_boundaries = storage::local_boundaries_at(&repo, &old_oid)?;
@@ -143,21 +143,39 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         .filter(|path| !overlaps_local_boundary(path, &local_boundaries))
         .collect();
     let materialized_git_paths = safe_git_materialization_paths(&repo, &old_oid, &incoming_git)?;
-    let old_dvc = existing_at(&repo, &old_oid, &incoming_dvc)?;
-    let new_dvc = existing_at(&repo, &new_oid, &incoming_dvc)?;
-    let retired_local_pointers: BTreeSet<String> = incoming_dvc
+    let old_storage = existing_at(&repo, &old_oid, &incoming_storage)?;
+    let new_storage = existing_at(&repo, &new_oid, &incoming_storage)?;
+    let incoming_config = if new_storage.is_empty() {
+        config.clone()
+    } else {
+        let raw = file_at(&repo, &new_oid, CONFIG_NAME)?.ok_or_else(|| {
+            Error::message("incoming storage metadata requires repository configuration")
+        })?;
+        let parsed = Config::parse(&raw, &Config::path(&repo))?;
+        repo.validate_remote_name(&parsed.git.remote)?;
+        repo.validate_branch(&parsed.git.branch)?;
+        parsed
+    };
+    // During the first introduction of S3, the current checkout's public
+    // configuration does not describe the incoming storage yet. Use the
+    // validated incoming facts for preflight; retirement and rollback retain
+    // the configuration of the current checkout.
+    let old_storage_config = if !config.s3_enabled() && incoming_config.s3_enabled() {
+        &incoming_config
+    } else {
+        &config
+    };
+    let retired_local_pointers: BTreeSet<String> = incoming_storage
         .iter()
         .filter(|pointer| {
-            !new_dvc.contains(pointer)
-                && pointer
-                    .strip_suffix(".dvc")
+            !new_storage.contains(pointer)
+                && storage_metadata::boundary_path(pointer)
                     .is_some_and(|path| overlaps_local_boundary(path, &local_boundaries))
         })
         .cloned()
         .collect();
-    for pointer in &new_dvc {
-        if pointer
-            .strip_suffix(".dvc")
+    for pointer in &new_storage {
+        if storage_metadata::boundary_path(pointer)
             .is_some_and(|path| overlaps_local_boundary(path, &local_boundaries))
         {
             return Err(Error::message(format!(
@@ -173,15 +191,15 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     // one boundary needs no refresh at all. So detect those boundaries here,
     // before the ref, index, worktree, purge queue, or engine state changes,
     // then advance everything else and report them.
-    let (addressable_new_dvc, unaddressable_new_dvc): (Vec<String>, Vec<String>) = new_dvc
-        .iter()
-        .cloned()
-        .partition(|pointer| dvc::is_addressable(pointer));
-    let unaddressable_boundaries: Vec<String> = unaddressable_new_dvc
+    let (addressable_new_storage, unaddressable_new_storage): (Vec<String>, Vec<String>) =
+        new_storage
+            .iter()
+            .cloned()
+            .partition(|pointer| storage_metadata::is_addressable(pointer));
+    let unaddressable_boundaries: Vec<String> = unaddressable_new_storage
         .iter()
         .map(|pointer| {
-            pointer
-                .strip_suffix(".dvc")
+            storage_metadata::boundary_path(pointer)
                 .expect("incoming metadata was selected by that extension above")
                 .to_owned()
         })
@@ -213,9 +231,9 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         branch_cleanup: BranchCleanupReport::default(),
         storage: RefreshStorageReport {
             mode: "hydrate".to_owned(),
-            changed_files: incoming_dvc.clone(),
-            old_files: old_dvc.clone(),
-            new_files: new_dvc.clone(),
+            changed_files: incoming_storage.clone(),
+            old_files: old_storage.clone(),
+            new_files: new_storage.clone(),
             unaddressable: unaddressable_boundaries.clone(),
             old_prepared: None,
             new_prepared: None,
@@ -249,27 +267,52 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         return Ok(report);
     }
 
-    let overlays = if incoming_dvc.is_empty() {
+    let overlays = if incoming_storage.is_empty() {
         BTreeMap::new()
     } else {
         let overlays = capture_overlays(
             &repo,
             &old_oid,
             &new_oid,
-            &incoming_dvc,
+            &incoming_storage,
             &retired_local_pointers,
         )?;
-        let updated_pointers: Vec<String> = incoming_dvc
+        let updated_pointers: Vec<String> = incoming_storage
             .iter()
             .filter(|pointer| {
-                !retired_local_pointers.contains(*pointer) && dvc::is_addressable(pointer)
+                !retired_local_pointers.contains(*pointer)
+                    && storage_metadata::is_addressable(pointer)
             })
             .cloned()
             .collect();
         if !updated_pointers.is_empty() {
-            dvc::validate_worktree(&repo, &config, &updated_pointers)?;
+            let mut missing_normalized = Vec::new();
+            for pointer in &updated_pointers {
+                if resolved_under(&repo.root, pointer).is_file()
+                    && crate::native_engine::normalized_exact_cache_missing(&repo, pointer)?
+                {
+                    missing_normalized.push(pointer.clone());
+                }
+            }
+            if options.dry_run && !missing_normalized.is_empty() {
+                report.warnings.push(RefreshWarning {
+                    code: "exact-raw-comparison-pending".into(),
+                    message: format!("raw-byte comparison requires fetching the current exact versions during refresh: {}", missing_normalized.join(", ")),
+                });
+                let comparable = updated_pointers
+                    .iter()
+                    .filter(|pointer| !missing_normalized.contains(pointer))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                storage_metadata::validate_worktree(&repo, old_storage_config, &comparable)?;
+            } else {
+                if !missing_normalized.is_empty() {
+                    storage_metadata::fetch(&repo, old_storage_config, &missing_normalized)?;
+                }
+                storage_metadata::validate_worktree(&repo, old_storage_config, &updated_pointers)?;
+            }
         }
-        refuse_unreconcilable_payloads(&repo, &new_oid, &unaddressable_new_dvc)?;
+        refuse_unreconcilable_payloads(&repo, &new_oid, &unaddressable_new_storage)?;
         overlays
     };
     if options.dry_run {
@@ -282,23 +325,34 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     s3_purge::queue_archive_prefixes(&repo, &archive_receipts)?;
 
     let mut outputs_absent_before = Vec::new();
-    if !incoming_dvc.is_empty() {
+    if !incoming_storage.is_empty() {
         // Retiring a local-only boundary changes its metadata, never its
         // payload. Its old remote versions may already have been purged, and
         // neither refresh nor rollback needs them to retain the local bytes.
-        let old_checkout_pointers: Vec<String> = old_dvc
+        let old_checkout_pointers: Vec<String> = old_storage
             .iter()
             .filter(|pointer| {
-                !retired_local_pointers.contains(*pointer) && dvc::is_addressable(pointer)
+                !retired_local_pointers.contains(*pointer)
+                    && storage_metadata::is_addressable(pointer)
             })
             .cloned()
             .collect();
-        let old_prepared = dvc::prepare_revision(&repo, &config, &old_oid, &old_checkout_pointers)?;
-        let new_prepared = dvc::prepare_revision(&repo, &config, &new_oid, &addressable_new_dvc)?;
+        let old_prepared = storage_metadata::prepare_revision(
+            &repo,
+            old_storage_config,
+            &old_oid,
+            &old_checkout_pointers,
+        )?;
+        let new_prepared = storage_metadata::prepare_revision(
+            &repo,
+            &incoming_config,
+            &new_oid,
+            &addressable_new_storage,
+        )?;
         for output in new_prepared.outputs.values().flatten() {
             reject_symlink_traversal(&repo.root, output, "incoming managed-storage output")?;
         }
-        let unsafe_outputs: Vec<String> = addressable_new_dvc
+        let unsafe_outputs: Vec<String> = addressable_new_storage
             .iter()
             .filter(|pointer| !resolved_under(&repo.root, pointer).is_file())
             .flat_map(|pointer| new_prepared.outputs.get(pointer).into_iter().flatten())
@@ -311,7 +365,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
                 unsafe_outputs.join(", ")
             )));
         }
-        outputs_absent_before = addressable_new_dvc
+        outputs_absent_before = addressable_new_storage
             .iter()
             .flat_map(|pointer| new_prepared.outputs.get(pointer).into_iter().flatten())
             .filter(|output| !resolved_under(&repo.root, output).exists())
@@ -337,20 +391,21 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     let refreshed = (|| {
         repo.run(["read-tree", "--reset", &new_oid])?;
         materialize_git_paths(&repo, &new_oid, &materialized_git_paths)?;
-        if !incoming_dvc.is_empty() {
-            report.storage.materialized = materialize_metadata(&repo, &new_oid, &incoming_dvc)?;
-            if !addressable_new_dvc.is_empty() {
-                let args = ["checkout".to_owned(), "--".to_owned()]
-                    .into_iter()
-                    .chain(addressable_new_dvc.iter().cloned())
-                    .collect::<Vec<_>>();
-                dvc::execute_engine(&repo.root, args)?;
-                if config.requires_object_versioning() {
+        if !incoming_storage.is_empty() {
+            report.storage.materialized = materialize_metadata(&repo, &new_oid, &incoming_storage)?;
+            if !addressable_new_storage.is_empty() {
+                storage_metadata::execute_engine(
+                    &repo.root,
+                    &crate::native_engine::Operation::Materialize {
+                        pointers: addressable_new_storage.clone(),
+                    },
+                )?;
+                if incoming_config.requires_object_versioning() {
                     // prepare_revision already validated the exact remote
                     // versions, including cache hits, in this refresh.
-                    dvc::verify_local(&repo, &addressable_new_dvc)?;
+                    storage_metadata::verify_local(&repo, &addressable_new_storage)?;
                 } else {
-                    dvc::verify(&repo, &config, &addressable_new_dvc)?;
+                    storage_metadata::verify(&repo, &incoming_config, &addressable_new_storage)?;
                 }
             }
         }
@@ -381,7 +436,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     }
     report.status = "updated".to_owned();
     report.method = Some(
-        if !incoming_dvc.is_empty() {
+        if !incoming_storage.is_empty() {
             "prefetch managed storage, compare-and-swap the repository revision, then hydrate stored outputs"
         } else {
             "compare-and-swap the repository revision and safely materialize ordinary Git paths"
@@ -451,7 +506,7 @@ fn refuse_unreconcilable_payloads(
                 "incoming storage metadata is missing from {new_oid}: {pointer}"
             ))
         })?;
-        let boundary = dvc::metadata_output(repo, pointer, &metadata)?;
+        let boundary = storage_metadata::metadata_output(repo, pointer, &metadata)?;
         let payload = resolved_under(&repo.root, &boundary);
         match fs::symlink_metadata(&payload) {
             Ok(_) => {}
@@ -465,7 +520,7 @@ fn refuse_unreconcilable_payloads(
         }
         if !resolved_under(&repo.root, pointer).is_file() {
             without_metadata.push(boundary);
-        } else if !dvc::payload_matches_metadata(repo, pointer, &metadata)? {
+        } else if !storage_metadata::payload_matches_metadata(repo, pointer, &metadata)? {
             mismatched.push(boundary);
         }
     }
@@ -641,7 +696,7 @@ fn capture_overlays(
                 // cannot address: refresh never checked its output out, so
                 // there is nothing for a rollback to put back.
                 checkout_output: !retired_local_pointers.contains(path)
-                    && dvc::is_addressable(path),
+                    && storage_metadata::is_addressable(path),
             },
         );
         if Some(&current) != old_content.as_ref() && Some(&current) != new_content.as_ref() {
@@ -721,11 +776,10 @@ fn rollback(
         }
     }
     if !restored.is_empty() {
-        let args = ["checkout".to_owned(), "--".to_owned()]
-            .into_iter()
-            .chain(restored)
-            .collect::<Vec<_>>();
-        dvc::execute_engine(&repo.root, args)?;
+        storage_metadata::execute_engine(
+            &repo.root,
+            &crate::native_engine::Operation::Materialize { pointers: restored },
+        )?;
     }
     for output in outputs_absent_before {
         let normalized = repo_path(output, "rollback storage output")?;

@@ -11,13 +11,13 @@ lifecycle against two local network services:
 - a bare repository through `git daemon`, including an intentional server-side
   rejection.
 
-The scenario covers native-engine setup, initialization,
+The scenario covers native-engine setup, repository management,
 instructions, diagnostics, task creation, storage status, explicit Git and S3
 placement, published task slug rename with stable branch/PR identity and exact
 S3 hydration, aggregate boundary sizing, tiny-S3 warnings, the semantic review
 band, automatic placement, reset, hydrate, move, scoped plan and publish,
 configuration drift and repair, disabled-versioning refusal before upload,
-content-independent first-init collisions and whole-file scaffold reconciliation,
+first-adoption instruction collisions, automatic preservation of repository ignore rules and scaffold reconciliation,
 infrastructure task scaffolding with an explicit private manifest in the shared
 `main` checkout, scoped publication without shared-index changes, and stable
 publication of a deleted infrastructure file scope,
@@ -51,7 +51,6 @@ registry without recreating the old prefix. CI runs it after the production
 lifecycle using a `test-storage` binary and its own bucket and evidence directory.
 
 GitHub Actions owns the MinIO process, verifies its pinned official binary's
-SHA-256 checksum, and installs the exact private storage
-runtime. The test owns only newly created repositories, buckets, caches, and
+SHA-256 checksum, and installs an isolated S3 verification client. The test owns only newly created repositories, buckets, caches, and
 refs under its runner directory. It never reads developer configuration or
 credentials.

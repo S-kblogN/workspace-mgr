@@ -8,12 +8,12 @@ use crate::config::{
     CONFIG_NAME, Config, cli_version_satisfies, declared_minimum_cli_version,
     installed_cli_version, minimum_cli_version_at,
 };
-use crate::dvc;
 use crate::error::Result;
 use crate::git::GitRepo;
 use crate::path::reject_symlink_traversal;
 use crate::process::command_exists;
 use crate::scaffold;
+use crate::storage_metadata;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
@@ -122,7 +122,7 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
         });
 
         if config.s3_enabled() {
-            checks.push(match dvc::require_runtime(&repo) {
+            checks.push(match storage_metadata::require_runtime(&repo) {
                 Ok(version) => DoctorCheck {
                     name: "managed-storage-runtime".to_owned(),
                     status: "ok".to_owned(),
@@ -134,11 +134,12 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
                     detail: error.to_string(),
                 },
             });
-            checks.push(match dvc::validate_internal_config(&repo, config) {
-                Ok(()) => DoctorCheck {
+            checks.push(match crate::native_s3::load_credentials_config(&repo) {
+                Ok(_) => DoctorCheck {
                     name: "managed-storage-config".to_owned(),
                     status: "ok".to_owned(),
-                    detail: "internal configuration matches .workspace-mgr.toml".to_owned(),
+                    detail: "repository S3 configuration and optional local credentials are valid"
+                        .to_owned(),
                 },
                 Err(error) => DoctorCheck {
                     name: "managed-storage-config".to_owned(),
@@ -147,35 +148,27 @@ pub fn inspect(path: &Path) -> Result<DoctorReport> {
                 },
             });
             if config.requires_object_versioning() {
-                checks.push(match dvc::require_version_adapter(&repo) {
-                    Ok(adapter) => DoctorCheck {
-                        name: "managed-storage-version-adapter".to_owned(),
-                        status: "ok".to_owned(),
-                        detail: adapter,
+                checks.push(
+                    match storage_metadata::verify_object_versioning(&repo, config) {
+                        Ok(detail) => DoctorCheck {
+                            name: "managed-storage-object-versioning".to_owned(),
+                            status: "ok".to_owned(),
+                            detail: detail.to_string(),
+                        },
+                        Err(error) => DoctorCheck {
+                            name: "managed-storage-object-versioning".to_owned(),
+                            status: "error".to_owned(),
+                            detail: error.to_string(),
+                        },
                     },
-                    Err(error) => DoctorCheck {
-                        name: "managed-storage-version-adapter".to_owned(),
-                        status: "error".to_owned(),
-                        detail: error.to_string(),
-                    },
-                });
-                checks.push(match dvc::verify_object_versioning(&repo, config) {
-                    Ok(detail) => DoctorCheck {
-                        name: "managed-storage-object-versioning".to_owned(),
-                        status: "ok".to_owned(),
-                        detail: detail.to_string(),
-                    },
-                    Err(error) => DoctorCheck {
-                        name: "managed-storage-object-versioning".to_owned(),
-                        status: "error".to_owned(),
-                        detail: error.to_string(),
-                    },
-                });
+                );
             }
-            let local = repo.root.join(".dvc/config.local");
+            let local = crate::native_s3::credentials_path(&repo)?;
             if local.exists() {
-                let relative = ".dvc/config.local";
-                let ignored = repo.run_unchecked(["check-ignore", "--quiet", "--", relative])?;
+                let relative = crate::native_s3::CREDENTIALS_NAME;
+                let primary =
+                    GitRepo::discover(local.parent().expect("credentials have a parent"))?;
+                let ignored = primary.run_unchecked(["check-ignore", "--quiet", "--", relative])?;
                 checks.push(DoctorCheck {
                     name: "managed-storage-local-secrets".to_owned(),
                     status: if ignored.code == 0 { "ok" } else { "error" }.to_owned(),

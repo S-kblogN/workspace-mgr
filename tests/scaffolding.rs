@@ -3,14 +3,14 @@ mod common;
 use common::*;
 
 #[test]
-fn init_instructions_doctor_and_task_create_form_one_workflow() {
+fn manage_instructions_doctor_and_task_create_form_one_workflow() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
 
     let dry = workspace(
         &fixture.shared,
         [
-            "init",
+            "manage",
             "--dry-run",
             "--repo",
             fixture.shared.to_str().unwrap(),
@@ -27,9 +27,9 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 
     let initialized = workspace(
         &fixture.shared,
-        ["init", "--repo", fixture.shared.to_str().unwrap()],
+        ["manage", "--repo", fixture.shared.to_str().unwrap()],
     );
-    assert_eq!(json(&initialized)["status"], "initialized");
+    assert_eq!(json(&initialized)["status"], "managed");
     assert!(fixture.shared.join(".workspace-mgr.toml").is_file());
     assert!(fixture.shared.join("AGENTS.md").is_file());
     let root_ignore = std::fs::read_to_string(fixture.shared.join(".gitignore")).unwrap();
@@ -40,7 +40,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 
     let repeated = workspace(
         &fixture.shared,
-        ["init", "--repo", fixture.shared.to_str().unwrap()],
+        ["manage", "--repo", fixture.shared.to_str().unwrap()],
     );
     assert_eq!(json(&repeated)["status"], "no_changes");
 
@@ -161,7 +161,7 @@ fn init_instructions_doctor_and_task_create_form_one_workflow() {
 #[test]
 fn infrastructure_task_publishes_from_main_with_private_state_and_index() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Add workspace policy");
     fixture.clone_shared();
 
@@ -321,7 +321,7 @@ fn infrastructure_task_publishes_from_main_with_private_state_and_index() {
 #[test]
 fn infrastructure_plan_and_publish_require_main_refresh_before_replacing_upstream_scopes() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     std::fs::write(fixture.seed.join("policy.md"), "original upstream policy\n").unwrap();
     fixture.commit_seed("Initialize shared policy");
     fixture.clone_shared();
@@ -437,11 +437,22 @@ fn setup_verifies_native_storage_without_python_or_directory_changes() {
 }
 
 #[test]
-fn first_init_treats_reserved_paths_as_collisions_without_inspecting_content() {
+fn first_manage_preserves_foreign_agents_and_recovers_a_missing_config() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
     let agents_path = fixture.shared.join("AGENTS.md");
+    std::fs::write(&agents_path, "# Repository-owned instructions\n").unwrap();
+    let rejected = workspace_unchecked(&fixture.shared, ["manage"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("AGENTS.md"));
+    assert_eq!(
+        std::fs::read_to_string(&agents_path).unwrap(),
+        "# Repository-owned instructions\n"
+    );
+    assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+
+    std::fs::remove_file(&agents_path).unwrap();
+    workspace(&fixture.shared, ["manage"]);
     let canonical = std::fs::read_to_string(&agents_path).unwrap();
     assert!(canonical.contains("install the latest stable release"));
     assert!(canonical.contains("    cargo install --locked workspace-mgr\n"));
@@ -449,22 +460,16 @@ fn first_init_treats_reserved_paths_as_collisions_without_inspecting_content() {
     assert!(canonical.contains("workspace-mgr setup"));
     assert!(canonical.contains("retry `workspace-mgr instructions --repo .`"));
     std::fs::remove_file(fixture.shared.join(".workspace-mgr.toml")).unwrap();
-
-    let rejected = workspace_unchecked(&fixture.shared, ["init"]);
-    assert_eq!(rejected.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&rejected.stderr);
-    assert!(stderr.contains("reserved workspace-mgr scaffold paths"));
-    assert!(stderr.contains("AGENTS.md"));
-    assert!(stderr.contains(".gitignore"));
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(std::fs::read_to_string(&agents_path).unwrap(), canonical);
-    assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+    assert!(fixture.shared.join(".workspace-mgr.toml").is_file());
 }
 
 #[test]
-fn init_reconciles_the_owned_agents_bootstrap_regardless_of_content() {
+fn manage_reconciles_the_owned_agents_bootstrap_regardless_of_content() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let agents_path = fixture.shared.join("AGENTS.md");
     let canonical = std::fs::read_to_string(&agents_path).unwrap();
 
@@ -477,15 +482,15 @@ fn init_reconciles_the_owned_agents_bootstrap_regardless_of_content() {
             && check["status"] == "error"
             && check["detail"].as_str().unwrap().contains("AGENTS.md")
     }));
-    let updated = workspace(&fixture.shared, ["init"]);
-    assert_eq!(json(&updated)["status"], "initialized");
+    let updated = workspace(&fixture.shared, ["manage"]);
+    assert_eq!(json(&updated)["status"], "managed");
     assert_eq!(json(&updated)["actions"][0]["action"], "update");
     assert_eq!(json(&updated)["actions"][0]["path"], "AGENTS.md");
     assert_eq!(std::fs::read_to_string(&agents_path).unwrap(), canonical);
 
     std::fs::remove_file(&agents_path).unwrap();
-    let recreated = workspace(&fixture.shared, ["init"]);
-    assert_eq!(json(&recreated)["status"], "initialized");
+    let recreated = workspace(&fixture.shared, ["manage"]);
+    assert_eq!(json(&recreated)["status"], "managed");
     assert_eq!(json(&recreated)["actions"][0]["action"], "create");
     assert_eq!(std::fs::read_to_string(&agents_path).unwrap(), canonical);
 }
@@ -494,7 +499,7 @@ fn init_reconciles_the_owned_agents_bootstrap_regardless_of_content() {
 fn repository_configuration_cannot_change_the_workspace_policy() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
 
     let path = fixture.shared.join(".workspace-mgr.toml");
     let raw = std::fs::read_to_string(&path).unwrap();
@@ -592,7 +597,7 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(artifact_rules.contains("a system temporary directory"));
     assert!(artifact_rules.contains("are task artifacts, not disposables"));
     assert!(artifact_rules.contains("never safely reproducible output"));
-    assert!(artifact_rules.contains("record how to regenerate them, never the values"));
+    assert!(artifact_rules.contains("record how to regenerate credentials, never the values"));
     assert!(artifact_rules.contains("Markdown files of your choosing inside the task directory"));
     assert!(artifact_rules.contains("Curate what the task publishes"));
     assert!(artifact_rules.contains(
@@ -714,65 +719,61 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     std::fs::write(&manifest, original).unwrap();
 }
 
-#[cfg(unix)]
 #[test]
-fn failed_storage_setup_does_not_install_an_unusable_agents_bootstrap() {
-    use std::os::unix::fs::PermissionsExt;
-
+fn fresh_manage_uses_native_storage_without_external_configuration_files() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    let fake_bin = fixture.root.join("fake-bin");
-    std::fs::create_dir(&fake_bin).unwrap();
-    let fake_dvc = fake_bin.join("dvc");
-    std::fs::write(&fake_dvc, "#!/bin/sh\nexit 23\n").unwrap();
-    let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_dvc, permissions).unwrap();
-    let output = binary_command()
-        .args(["init", "--s3-url", "s3://example.invalid/workspace"])
-        .current_dir(&fixture.shared)
-        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(!fixture.shared.join("AGENTS.md").exists());
-    assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn partially_failing_storage_initialization_rolls_back_all_scaffolding() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = GitFixture::new();
-    fixture.clone_shared();
-    let fake_dvc = fixture.root.join("partial-dvc");
-    std::fs::write(
-        &fake_dvc,
-        "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' '3.67.1'\n  exit 0\nfi\nif [ \"${1:-}\" = \"init\" ]; then\n  mkdir -p .dvc\n  printf '%s\\n' 'partial' > .dvc/config\n  printf '%s\\n' 'partial' > .dvcignore\n  exit 23\nfi\nexit 23\n",
+    let storage = fixture.root.join("storage");
+    workspace(
+        &fixture.shared,
+        ["manage", "--s3-url", storage.to_str().unwrap()],
+    );
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(fixture.shared.join(".workspace-mgr.toml")).unwrap(),
     )
     .unwrap();
-    let mut permissions = std::fs::metadata(&fake_dvc).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_dvc, permissions).unwrap();
-    let storage = fixture.root.join("storage");
-    let output = binary_command()
-        .args(["init", "--s3-url", storage.to_str().unwrap()])
-        .current_dir(&fixture.shared)
-        .env("WORKSPACE_MGR_STORAGE_DVC", &fake_dvc)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("rolled back"));
-    for path in [
-        ".workspace-mgr.toml",
-        "AGENTS.md",
-        ".dvc",
-        ".dvcignore",
-        ".gitattributes",
-    ] {
-        assert!(!fixture.shared.join(path).exists(), "{path} remained");
+    assert_eq!(config["minimum_cli_version"].as_str(), Some("0.8.1"));
+    for path in [".dvc", ".dvcignore", ".gitattributes"] {
+        assert!(
+            !fixture.shared.join(path).exists(),
+            "{path} should not be generated"
+        );
     }
+    assert!(fixture.shared.join("AGENTS.md").is_file());
+    let root_ignore = std::fs::read_to_string(fixture.shared.join(".gitignore")).unwrap();
+    assert!(root_ignore.contains("/.workspace-mgr/local/"));
+    assert!(!root_ignore.contains(".dvc"));
+}
+
+#[test]
+fn invalid_native_storage_configuration_changes_no_scaffolds() {
+    let fixture = GitFixture::new();
+    fixture.clone_shared();
+    let root_ignore = fixture.shared.join(".gitignore");
+    std::fs::write(&root_ignore, "/private/\n").unwrap();
+    let rejected = workspace_unchecked(
+        &fixture.shared,
+        [
+            "manage",
+            "--s3-url",
+            "s3://fixture/root",
+            "--s3-endpoint-url",
+            "https://user:secret@example.invalid",
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!fixture.shared.join("AGENTS.md").exists());
+    assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
+    assert_eq!(
+        std::fs::read_to_string(&root_ignore).unwrap(),
+        "/private/\n"
+    );
+    assert!(
+        !fixture
+            .shared
+            .join(".workspace-mgr/repository.gitignore")
+            .exists()
+    );
 }
 
 #[test]
@@ -782,7 +783,7 @@ fn tracked_configuration_rejects_credentials_and_policy_keys() {
     let credentials = workspace_unchecked(
         &fixture.shared,
         [
-            "init",
+            "manage",
             "--s3-url",
             "s3://bucket/prefix?X-Amz-Signature=tracked-secret",
             "--dry-run",
@@ -792,7 +793,7 @@ fn tracked_configuration_rejects_credentials_and_policy_keys() {
     assert!(String::from_utf8_lossy(&credentials.stderr).contains("query or fragment"));
     assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
 
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let config_path = fixture.shared.join(".workspace-mgr.toml");
     let original = std::fs::read_to_string(&config_path).unwrap();
     for field in ["remote", "branch"] {
@@ -817,56 +818,36 @@ fn tracked_configuration_rejects_credentials_and_policy_keys() {
 }
 
 #[test]
-fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
+fn native_storage_location_is_authoritative_and_cannot_move_with_boundaries() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    let dvc_dir = fixture.shared.join(".dvc");
-    std::fs::create_dir(&dvc_dir).unwrap();
-    let dvc_config = dvc_dir.join("config");
-    std::fs::write(&dvc_config, "[core]\n    remote = preexisting\n").unwrap();
     let remote = fixture.root.join("storage");
-    let rejected = workspace_unchecked(
-        &fixture.shared,
-        ["init", "--s3-url", remote.to_str().unwrap()],
-    );
-    assert_eq!(rejected.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("reserved workspace-mgr scaffold paths")
-    );
-    assert_eq!(
-        std::fs::read_to_string(&dvc_config).unwrap(),
-        "[core]\n    remote = preexisting\n"
-    );
-
-    std::fs::remove_dir_all(&dvc_dir).unwrap();
     workspace(
         &fixture.shared,
-        ["init", "--s3-url", remote.to_str().unwrap()],
+        ["manage", "--s3-url", remote.to_str().unwrap()],
     );
-    let managed_config = std::fs::read_to_string(&dvc_config).unwrap();
-    let storage_gitignore = fixture.shared.join(".dvc/.gitignore");
-    let managed_storage_gitignore = std::fs::read_to_string(&storage_gitignore).unwrap();
-    let storage_ignore = fixture.shared.join(".dvcignore");
-    let managed_storage_ignore = std::fs::read_to_string(&storage_ignore).unwrap();
     let config_path = fixture.shared.join(".workspace-mgr.toml");
     let public_config = std::fs::read_to_string(&config_path).unwrap();
     git(&fixture.shared, ["add", "-A"]);
-    git(
-        &fixture.shared,
-        ["commit", "-m", "Initialize managed repository"],
-    );
-    let pointer = fixture.shared.join("retained.bin.dvc");
-    std::fs::write(&pointer, "outs:\n- path: retained.bin\n").unwrap();
-    std::fs::write(&dvc_config, "# old or damaged generated configuration\n").unwrap();
-    std::fs::write(&storage_gitignore, "/locally-edited\n").unwrap();
-    std::fs::write(&storage_ignore, "locally-edited/**\n").unwrap();
-
+    git(&fixture.shared, ["commit", "-m", "Manage native storage"]);
+    let pointer = fixture.shared.join("retained.bin.wm-storage.json");
+    std::fs::write(
+        &pointer,
+        r#"{
+        "schema_version": 1,
+        "path": "retained.bin",
+        "kind": "file",
+        "checksum": {"algorithm": "md5", "digest": "d41d8cd98f00b204e9800998ecf8427e"},
+        "size": 0
+    }"#,
+    )
+    .unwrap();
     let relocated = public_config.replace(
         remote.to_str().unwrap(),
         fixture.root.join("other-storage").to_str().unwrap(),
     );
     std::fs::write(&config_path, relocated).unwrap();
-    let rejected_relocation = workspace_unchecked(&fixture.shared, ["init"]);
+    let rejected_relocation = workspace_unchecked(&fixture.shared, ["manage"]);
     assert_eq!(rejected_relocation.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&rejected_relocation.stderr)
@@ -874,48 +855,26 @@ fn init_owns_internal_storage_config_and_can_disable_an_unused_remote() {
     );
 
     std::fs::write(&config_path, &public_config).unwrap();
-    let repaired = workspace(&fixture.shared, ["init"]);
-    assert_eq!(json(&repaired)["status"], "initialized");
     assert_eq!(
-        std::fs::read_to_string(&dvc_config).unwrap(),
-        managed_config
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
+        "no_changes"
     );
-    assert_eq!(
-        std::fs::read_to_string(&storage_gitignore).unwrap(),
-        managed_storage_gitignore
-    );
-    assert_eq!(
-        std::fs::read_to_string(&storage_ignore).unwrap(),
-        managed_storage_ignore
-    );
-    std::fs::remove_file(&pointer).unwrap();
-    assert!(
-        std::fs::read_to_string(fixture.shared.join(".gitattributes"))
-            .unwrap()
-            .contains("*.dvc whitespace=-blank-at-eol")
-    );
-    let mut config: toml::Value =
-        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mut config: toml::Value = toml::from_str(&public_config).unwrap();
     config.as_table_mut().unwrap().remove("s3");
     std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
-    let disabled = workspace(&fixture.shared, ["init"]);
-    assert_eq!(json(&disabled)["status"], "initialized");
-    assert!(!dvc_config.exists());
-    assert_eq!(
-        std::fs::read_to_string(&storage_gitignore).unwrap(),
-        managed_storage_gitignore
-    );
-    assert_eq!(
-        std::fs::read_to_string(&storage_ignore).unwrap(),
-        managed_storage_ignore
-    );
+    let refused = workspace_unchecked(&fixture.shared, ["manage"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot disable managed S3"));
+    std::fs::remove_file(&pointer).unwrap();
+    workspace(&fixture.shared, ["manage"]);
+    assert!(!fixture.shared.join(".dvc").exists());
 }
 
 #[test]
-fn init_generates_the_root_ignore_file_from_the_repository_module() {
+fn manage_generates_the_root_ignore_file_from_the_repository_module() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let root_ignore = fixture.shared.join(".gitignore");
     let product_only = std::fs::read_to_string(&root_ignore).unwrap();
     assert!(
@@ -923,7 +882,7 @@ fn init_generates_the_root_ignore_file_from_the_repository_module() {
         "an absent module must not leave an empty import section: {product_only}"
     );
     assert_eq!(
-        json(&workspace(&fixture.shared, ["init"]))["status"],
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
         "no_changes"
     );
 
@@ -934,9 +893,9 @@ fn init_generates_the_root_ignore_file_from_the_repository_module() {
     )
     .unwrap();
 
-    let imported = workspace(&fixture.shared, ["init"]);
+    let imported = workspace(&fixture.shared, ["manage"]);
     let imported = json(&imported);
-    assert_eq!(imported["status"], "initialized");
+    assert_eq!(imported["status"], "managed");
     assert!(
         imported["actions"]
             .as_array()
@@ -956,7 +915,7 @@ fn init_generates_the_root_ignore_file_from_the_repository_module() {
             .success()
     );
     assert_eq!(
-        json(&workspace(&fixture.shared, ["init"]))["status"],
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
         "no_changes"
     );
 
@@ -980,8 +939,8 @@ fn init_generates_the_root_ignore_file_from_the_repository_module() {
             })
     );
 
-    let repaired = workspace(&fixture.shared, ["init"]);
-    assert_eq!(json(&repaired)["status"], "initialized");
+    let repaired = workspace(&fixture.shared, ["manage"]);
+    assert_eq!(json(&repaired)["status"], "managed");
     assert_eq!(std::fs::read_to_string(&root_ignore).unwrap(), with_module);
     assert_eq!(
         json(&workspace(&fixture.shared, ["doctor"]))["status"],
@@ -990,53 +949,33 @@ fn init_generates_the_root_ignore_file_from_the_repository_module() {
 }
 
 #[test]
-fn first_init_refuses_a_repository_that_already_owns_a_root_ignore_file() {
+fn first_manage_preserves_existing_root_ignore_rules_without_manual_steps() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
     let root_ignore = fixture.shared.join(".gitignore");
-    let existing = "/build\n*.log\n";
+    let module = fixture.shared.join(".workspace-mgr/repository.gitignore");
+    let existing = "/build\n*.log\n!keep.log\n";
     std::fs::write(&root_ignore, existing).unwrap();
-
-    let rejected = workspace_unchecked(&fixture.shared, ["init"]);
-
-    assert_eq!(rejected.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&rejected.stderr);
-    assert!(
-        stderr.contains("reserved workspace-mgr scaffold paths"),
-        "{stderr}"
-    );
-    assert!(stderr.contains(".gitignore"), "{stderr}");
-    assert!(
-        stderr.contains(".workspace-mgr/repository.gitignore"),
-        "the collision must say where the repository's own rules belong: {stderr}"
-    );
+    let dry_run = workspace(&fixture.shared, ["manage", "--dry-run"]);
+    assert_eq!(json(&dry_run)["status"], "dry_run");
     assert_eq!(std::fs::read_to_string(&root_ignore).unwrap(), existing);
+    assert!(!module.exists());
     assert!(!fixture.shared.join(".workspace-mgr.toml").exists());
-
-    // The documented migration: move the rules into the module, remove the
-    // root file, initialize again.
-    std::fs::create_dir_all(fixture.shared.join(".workspace-mgr")).unwrap();
-    std::fs::write(
-        fixture.shared.join(".workspace-mgr/repository.gitignore"),
-        existing,
-    )
-    .unwrap();
-    std::fs::remove_file(&root_ignore).unwrap();
+    workspace(&fixture.shared, ["manage"]);
+    assert_eq!(std::fs::read_to_string(&module).unwrap(), existing);
+    let generated = std::fs::read_to_string(&root_ignore).unwrap();
+    assert!(generated.starts_with("# Generated by workspace-mgr."));
+    assert!(generated.contains(existing));
     assert_eq!(
-        json(&workspace(&fixture.shared, ["init"]))["status"],
-        "initialized"
-    );
-    assert!(
-        std::fs::read_to_string(&root_ignore)
-            .unwrap()
-            .contains("*.log\n")
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
+        "no_changes"
     );
 }
 
 #[test]
 fn scaffold_reconciliation_preserves_a_managed_local_only_block() {
     let fixture = GitFixture::new();
-    workspace(&fixture.seed, ["init"]);
+    workspace(&fixture.seed, ["manage"]);
     fixture.commit_seed("Initialize workspace");
     fixture.clone_shared();
     workspace(
@@ -1076,8 +1015,8 @@ fn scaffold_reconciliation_preserves_a_managed_local_only_block() {
         format!("{generated}# hand edited\n/stale{block}"),
     )
     .unwrap();
-    let repaired = workspace(&fixture.shared, ["init"]);
-    assert_eq!(json(&repaired)["status"], "initialized");
+    let repaired = workspace(&fixture.shared, ["manage"]);
+    assert_eq!(json(&repaired)["status"], "managed");
     let reconciled = std::fs::read_to_string(&root_ignore).unwrap();
     assert!(!reconciled.contains("/stale"), "{reconciled}");
     assert!(reconciled.contains(".DS_Store"));
@@ -1095,9 +1034,9 @@ fn scaffold_reconciliation_preserves_a_managed_local_only_block() {
         format!("{generated}\n# workspace-mgr local begin 6461746162696e\n/data.bin\n"),
     )
     .unwrap();
-    let repaired = workspace(&fixture.shared, ["init"]);
+    let repaired = workspace(&fixture.shared, ["manage"]);
     let repaired = json(&repaired);
-    assert_eq!(repaired["status"], "initialized");
+    assert_eq!(repaired["status"], "managed");
     let detail = repaired["actions"]
         .as_array()
         .unwrap()
@@ -1118,58 +1057,21 @@ fn scaffold_reconciliation_preserves_a_managed_local_only_block() {
         "ok"
     );
     assert_eq!(
-        json(&workspace(&fixture.shared, ["init"]))["status"],
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
         "no_changes"
     );
 }
 
 #[test]
-fn an_already_initialized_repository_keeps_its_own_root_ignore_rules() {
-    // Every repository initialized before the product owned this path has a
-    // root ignore file of its own. Reconciling it would discard rules nothing
-    // else records, so the takeover is a migration the user performs.
+fn an_already_managed_repository_preserves_new_root_rules_and_existing_module_rules() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let root_ignore = fixture.shared.join(".gitignore");
+    let module = fixture.shared.join(".workspace-mgr/repository.gitignore");
+    std::fs::write(&module, "/existing-private/\n").unwrap();
     let repository_rules = "/secrets.env\n/vendor/\n*.log\n!keep.log\n";
     std::fs::write(&root_ignore, repository_rules).unwrap();
-    // Simulate the old repository's shared scaffold without accidentally
-    // tracking current private state after replacing its generated ignore rule.
-    git(
-        &fixture.shared,
-        [
-            "add",
-            "--",
-            ".workspace-mgr.toml",
-            "AGENTS.md",
-            ".gitignore",
-        ],
-    );
-    git(
-        &fixture.shared,
-        ["commit", "-m", "Initialize managed workspace"],
-    );
-
-    let refused = workspace_unchecked(&fixture.shared, ["init"]);
-
-    assert_eq!(refused.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
-    assert!(
-        stderr.contains("was not generated by workspace-mgr"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(".workspace-mgr/repository.gitignore"),
-        "the refusal must say where the repository's rules belong: {stderr}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&root_ignore).unwrap(),
-        repository_rules
-    );
-
-    // `doctor` must point at the migration rather than at an `init` that
-    // refuses, or its advice is a loop.
     let unhealthy = workspace_unchecked(&fixture.shared, ["doctor"]);
     assert_eq!(unhealthy.status.code(), Some(2));
     assert!(
@@ -1182,36 +1084,31 @@ fn an_already_initialized_repository_keeps_its_own_root_ignore_rules() {
                     && check["detail"]
                         .as_str()
                         .unwrap()
-                        .contains(".workspace-mgr/repository.gitignore")
-            }),
-        "{}",
-        json(&unhealthy)
+                        .contains("workspace-mgr manage")
+            })
     );
-
-    // The documented migration keeps every rule, negation included.
-    std::fs::create_dir_all(fixture.shared.join(".workspace-mgr")).unwrap();
-    std::fs::write(
-        fixture.shared.join(".workspace-mgr/repository.gitignore"),
-        repository_rules,
-    )
-    .unwrap();
-    std::fs::remove_file(&root_ignore).unwrap();
+    workspace(&fixture.shared, ["manage"]);
     assert_eq!(
-        json(&workspace(&fixture.shared, ["init"]))["status"],
-        "initialized"
+        std::fs::read_to_string(&module).unwrap(),
+        format!("/existing-private/\n\n{repository_rules}")
     );
     let regenerated = std::fs::read_to_string(&root_ignore).unwrap();
-    for rule in ["/secrets.env", "/vendor/", "*.log", "!keep.log"] {
+    for rule in [
+        "/existing-private/",
+        "/secrets.env",
+        "/vendor/",
+        "*.log",
+        "!keep.log",
+    ] {
         assert!(regenerated.contains(rule), "{rule} was discarded");
     }
-    assert!(
-        git(&fixture.shared, ["check-ignore", "--", "secrets.env"])
-            .status
-            .success()
-    );
     assert_eq!(
         json(&workspace(&fixture.shared, ["doctor"]))["status"],
         "ok"
+    );
+    assert_eq!(
+        json(&workspace(&fixture.shared, ["manage"]))["status"],
+        "no_changes"
     );
 }
 
@@ -1222,7 +1119,7 @@ fn a_symlinked_root_ignore_file_is_refused_with_the_migration_it_needs() {
     std::fs::write(fixture.shared.join("shared-rules.txt"), "/vendor/\n").unwrap();
     std::os::unix::fs::symlink("shared-rules.txt", fixture.shared.join(".gitignore")).unwrap();
 
-    let refused = workspace_unchecked(&fixture.shared, ["init"]);
+    let refused = workspace_unchecked(&fixture.shared, ["manage"]);
 
     assert_eq!(refused.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
@@ -1236,7 +1133,7 @@ fn a_symlinked_root_ignore_file_is_refused_with_the_migration_it_needs() {
 #[test]
 fn a_repository_module_may_not_carry_the_products_own_block_markers() {
     // Regeneration harvests these markers back out of the file it writes, so a
-    // module that carried one would append its block again on every `init` and
+    // module that carried one would append its block again on every `manage` and
     // the file would never settle.
     let fixture = GitFixture::new();
     fixture.clone_shared();
@@ -1247,7 +1144,7 @@ fn a_repository_module_may_not_carry_the_products_own_block_markers() {
     )
     .unwrap();
 
-    let refused = workspace_unchecked(&fixture.shared, ["init"]);
+    let refused = workspace_unchecked(&fixture.shared, ["manage"]);
 
     assert_eq!(refused.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
@@ -1259,7 +1156,7 @@ fn a_repository_module_may_not_carry_the_products_own_block_markers() {
 fn global_instructions_index_repository_policy_without_leaking_its_body() {
     let fixture = GitFixture::new();
     fixture.clone_shared();
-    workspace(&fixture.shared, ["init"]);
+    workspace(&fixture.shared, ["manage"]);
     let module = fixture
         .shared
         .join(".workspace-mgr/instructions/repository.md");

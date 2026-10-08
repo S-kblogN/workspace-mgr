@@ -10,13 +10,15 @@ Building from source requires Rust 1.85 or newer. The native installer and
 binary, including AWS Signature Version 4, exact-version reads, history copying,
 registry publication, and cancellation. They require no Python or DVC install.
 
-Existing DVC-compatible YAML pointers and MD5 directory/file caches are retained.
+`workspace-mgr manage` converts legacy DVC metadata into versioned native JSON
+manifests while retaining exact object versions and reusable cache bytes.
+Fresh repositories create no DVC configuration or pointers.
 Setup accepts the old `--runtime-dir` flag for installer compatibility but does
 not create, inspect, replace, or remove that directory. A former Python runtime
 may be removed separately after upgrading; the CLI does not alter it.
 
-Python remains a development tool for isolated S3 fixture clients, legacy
-compatibility oracles, and release automation. It is not packaged or invoked by
+Python remains a development tool for isolated S3 fixture clients and release
+automation. It is not packaged or invoked by
 the production executable.
 
 Intel macOS and Windows are not supported release targets. The source contains
