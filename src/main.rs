@@ -3,6 +3,7 @@ use clap::Parser;
 mod archive;
 mod archive_adoption;
 mod archive_cancel;
+mod archive_git_control;
 mod archive_migration;
 mod archive_registry;
 mod archive_reservation;

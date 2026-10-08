@@ -151,7 +151,9 @@ schema 1 and 0.8.7 for storage schema 2. Task manifest schema 3, which records a
 cloud-usage approval, needs `workspace-mgr` 0.4.0. Schema 4, which retains
 archive completion evidence, needs 0.7.0. Top-level manifests with
 schemas 1 and 2 need no declaration. A nested archive task manifest needs
-0.5.0 regardless of whether its schema is 1, 2, or 3. Unless the task is
+0.5.0 regardless of whether its schema is 1, 2, or 3. Archive receipts require
+0.8.9 for the commit-based Git coordination protocol, including empty S3
+inventories; older blob bindings remain readable by that release. Unless the task is
 authorized to change `.workspace-mgr.toml` itself, and as long as the task
 branch's copy of the file is exactly what `workspace-mgr` wrote there, each
 publication reconciles the file in its own private Git index, never in the

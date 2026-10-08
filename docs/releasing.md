@@ -42,7 +42,9 @@ an error rather than an instruction to overwrite state.
    the package version and fails CI when it is below any schema's assigned
    minimum. Archive layout has its own compatibility minimum: nested task
    manifests first become readable in 0.5.0, so publishing them requires at
-   least that release even when their schemas need an older release.
+   least that release even when their schemas need an older release. The
+   commit-based archive coordination protocol requires 0.8.9 independently
+   of manifest schema or S3 inventory.
 2. Move the release notes out of `[Unreleased]` into a dated
    `## [<version>] - YYYY-MM-DD` section.
 3. Review the package with `cargo publish --dry-run --locked` and merge the

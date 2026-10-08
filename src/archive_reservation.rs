@@ -2,7 +2,6 @@
 //!
 //! A non-expiring Git compare-and-create tag binds the frozen source snapshot
 //! and the owning checkout. A competing clone fails before its first S3 write.
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,12 +9,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::archive_git_control::{ControlOids, object_ids};
 use crate::config::Config;
 use crate::error::{Error, IoContext, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
 use crate::path::{reject_symlink_traversal, repo_path};
-use crate::process::run_with;
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
@@ -196,19 +195,10 @@ fn descriptor(state: &Value) -> Value {
     json!({"attempt_nonce":state["attempt_nonce"],"owner_hash":state["owner_hash"],"receipt":state["receipt"]})
 }
 
-fn blob(repo: &GitRepo, state: &Value, write: bool) -> Result<(String, String)> {
+fn control(repo: &GitRepo, state: &Value, write: bool) -> Result<(ControlOids, String)> {
     let body = serde_json::to_string(&descriptor(state))
         .map_err(|error| Error::message(error.to_string()))?;
-    let args = if write {
-        vec!["hash-object", "-w", "--stdin"]
-    } else {
-        vec!["hash-object", "--stdin"]
-    };
-    let oid = run_with("git", args, &repo.root, &BTreeMap::new(), Some(&body), true)?
-        .stdout
-        .trim()
-        .to_owned();
-    Ok((oid, body))
+    Ok((object_ids(&repo.root, &body, write)?, body))
 }
 
 pub fn reserve(repo: &GitRepo, receipt: &Value) -> Result<Value> {
@@ -241,14 +231,16 @@ pub fn reserve(repo: &GitRepo, receipt: &Value) -> Result<Value> {
             "archive source already has a canonical registry binding; refusing a new copy attempt",
         ));
     }
-    let (oid, body) = blob(repo, &state, true)?;
-    if let Some(held) = held {
-        if held != oid {
+    let (ids, body) = control(repo, &state, true)?;
+    let oid = if let Some(held) = held {
+        if held != ids.commit && held != ids.legacy_blob {
             return Err(Error::message(
                 "another checkout owns this archive source reservation; no S3 copy was authorized",
             ));
         }
+        held
     } else {
+        let oid = ids.commit;
         // Save provenance before CAS; after response loss, only this checkout
         // can recover the matching immutable remote descriptor.
         save(&path, &state)?;
@@ -262,7 +254,8 @@ pub fn reserve(repo: &GitRepo, receipt: &Value) -> Result<Value> {
                 pushed.stderr.trim()
             )));
         }
-    }
+        oid
+    };
     state["acquired"] = true.into();
     save(&path, &state)?;
     let receipt_body =
@@ -294,14 +287,14 @@ pub fn release(repo: &GitRepo, receipt: &Value) -> Result<()> {
         "refs/tags/workspace-mgr/archive-copy/{}",
         identity(&planned)?
     );
-    let (oid, _) = blob(repo, &state, false)?;
+    let (ids, _) = control(repo, &state, false)?;
     if let Some(held) = remote_oid(repo, &config.git.remote, &reference)? {
-        if held != oid {
+        if held != ids.commit && held != ids.legacy_blob {
             // Cancellation has already proved this attempt's copies absent
             // and restored its local directory. A failed contender, or an
             // already released owner, must never remove the new winner's ref.
         } else {
-            let lease = format!("--force-with-lease={reference}:{oid}");
+            let lease = format!("--force-with-lease={reference}:{held}");
             let refspec = format!(":{reference}");
             repo.run_unchecked(["push", "--porcelain", &lease, &config.git.remote, &refspec])?;
             if remote_oid(repo, &config.git.remote, &reference)?.is_some() {
@@ -434,7 +427,8 @@ mod tests {
         let state = read_state(&state_path(&first, &receipt).unwrap())
             .unwrap()
             .unwrap();
-        let (oid, _) = blob(&first, &state, true).unwrap();
+        let (ids, _) = control(&first, &state, true).unwrap();
+        let oid = ids.commit;
         first
             .run(["push", "origin", &format!("{oid}:{canonical}")])
             .unwrap();
@@ -460,7 +454,8 @@ mod tests {
         assert_eq!(read_state(&path).unwrap().unwrap()["acquired"], true);
         let foreign = json!({"owner_hash":owner(&second).unwrap().0,"receipt":normalized_receipt(&receipt).unwrap(),
                              "schema_version":1,"acquired":true,"attempt_nonce":"foreign-attempt"});
-        let (foreign_oid, _) = blob(&second, &foreign, true).unwrap();
+        let (ids, _) = control(&second, &foreign, true).unwrap();
+        let foreign_oid = ids.commit;
         let reference = proof["ref"].as_str().unwrap();
         second
             .run([
@@ -477,5 +472,95 @@ mod tests {
             Some(foreign_oid.as_str())
         );
         assert!(!path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn large_source_inventory_uses_commit_only_host_and_legacy_claim_retries_release() {
+        let (temp, repo, _, mut receipt) = fixture();
+        receipt["versions"] = Value::Array(
+            (0..800)
+                .map(|i| {
+                    json!({
+                        "source_object":format!("task/file-{i:04}.bin"),
+                        "destination_object":format!("2026/07/task/file-{i:04}.bin"),
+                        "source_version_id":format!("source-version-{i:04}"),
+                        "source_etag":format!("source-etag-{i:04}"),"delete_marker":false,"size":7
+                    })
+                })
+                .collect(),
+        );
+        assert!(serde_json::to_vec(&receipt).unwrap().len() >= 135_895);
+        let remote = temp.path().join("remote.git");
+        crate::archive_git_control::tests::install_commit_only_hook(&remote);
+        let proof = reserve(&repo, &receipt).unwrap();
+        let oid = proof["oid"].as_str().unwrap();
+        assert_eq!(
+            repo.run(["--git-dir", remote.to_str().unwrap(), "cat-file", "-t", oid])
+                .unwrap()
+                .stdout
+                .trim(),
+            "commit"
+        );
+        let state = read_state(&state_path(&repo, &receipt).unwrap())
+            .unwrap()
+            .unwrap();
+        let body = crate::archive_git_control::read_body(&repo.root, oid).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            descriptor(&state)
+        );
+        let ids = object_ids(&repo.root, &body, false).unwrap();
+        let rejected = repo
+            .run_unchecked([
+                "push",
+                "origin",
+                &format!(
+                    "{}:refs/tags/workspace-mgr/archive-copy/legacy-probe",
+                    ids.legacy_blob
+                ),
+            ])
+            .unwrap();
+        assert!(!rejected.success());
+        assert!(
+            rejected
+                .stderr
+                .contains("archive control claim requires a commit")
+        );
+        assert_eq!(reserve(&repo, &receipt).unwrap(), proof);
+        release(&repo, &receipt).unwrap();
+        assert!(
+            remote_oid(&repo, "origin", proof["ref"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        // Seed a legacy owner before this hosting restriction was introduced.
+        fs::remove_file(remote.join("hooks/pre-receive")).unwrap();
+        let new = reserve(&repo, &receipt).unwrap();
+        let state = read_state(&state_path(&repo, &receipt).unwrap())
+            .unwrap()
+            .unwrap();
+        let (ids, _) = control(&repo, &state, true).unwrap();
+        let reference = new["ref"].as_str().unwrap();
+        repo.run([
+            "push",
+            &format!(
+                "--force-with-lease={reference}:{}",
+                new["oid"].as_str().unwrap()
+            ),
+            "origin",
+            &format!("{}:{reference}", ids.legacy_blob),
+        ])
+        .unwrap();
+        crate::archive_git_control::tests::install_commit_only_hook(&remote);
+        let legacy = reserve(&repo, &receipt).unwrap();
+        assert_eq!(legacy["oid"], ids.legacy_blob);
+        assert_eq!(
+            remote_oid(&repo, "origin", reference).unwrap().as_deref(),
+            Some(ids.legacy_blob.as_str())
+        );
+        assert_eq!(legacy["attempt_nonce"], new["attempt_nonce"]);
+        release(&repo, &receipt).unwrap();
+        assert!(remote_oid(&repo, "origin", reference).unwrap().is_none());
     }
 }

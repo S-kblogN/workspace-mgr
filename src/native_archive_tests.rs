@@ -534,9 +534,13 @@ struct Fixture {
     remote: String,
     store: Memory,
     payload: Value,
+    legacy_controls: bool,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_transport(false)
+    }
+    fn with_transport(legacy_controls: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("checkout");
         fs::create_dir(&root).unwrap();
@@ -558,6 +562,7 @@ impl Fixture {
             remote,
             store: Memory::new(),
             payload,
+            legacy_controls,
         }
     }
     fn run(&self, operation: &str) -> Result<Value> {
@@ -565,9 +570,31 @@ impl Fixture {
     }
     fn reserve(&mut self) {
         let planned = self.run("plan").unwrap();
-        self.payload["reservation"] =
-            crate::archive_reservation::reserve(&self.repo, &planned).unwrap();
+        self.payload["reservation"] = self
+            .transport_proof(crate::archive_reservation::reserve(&self.repo, &planned).unwrap());
         self.payload["planned"] = planned;
+    }
+    fn transport_proof(&self, mut proof: Value) -> Value {
+        if self.legacy_controls {
+            let old = proof["oid"].as_str().unwrap();
+            let body = crate::archive_git_control::read_body(&self.repo.root, old).unwrap();
+            let oid = crate::archive_git_control::object_ids(&self.repo.root, &body, true)
+                .unwrap()
+                .legacy_blob;
+            proof = self.bind_control(proof, &oid);
+        }
+        proof
+    }
+    fn bind_control(&self, mut proof: Value, oid: &str) -> Value {
+        let old = proof["oid"].as_str().unwrap();
+        let reference = proof["ref"].as_str().unwrap();
+        let lease = format!("--force-with-lease={reference}:{old}");
+        let refspec = format!("{oid}:{reference}");
+        self.repo
+            .run(["push", "--porcelain", &lease, "origin", &refspec])
+            .unwrap();
+        proof["oid"] = oid.into();
+        proof
     }
     fn journal(&self) -> Value {
         load_journal(Path::new(self.payload["state_path"].as_str().unwrap()))
@@ -575,7 +602,9 @@ impl Fixture {
             .unwrap()
     }
     fn claim_registry(&self, receipt: &Value) -> Value {
-        crate::archive_registry::coordinate(&self.repo, receipt, true).unwrap()
+        self.transport_proof(
+            crate::archive_registry::coordinate(&self.repo, receipt, true).unwrap(),
+        )
     }
     fn registry(&self, operation: &str, receipt: &Value, proof: &Value) -> Result<Value> {
         registry_with(
@@ -584,6 +613,258 @@ impl Fixture {
             operation,
             &json!({"receipt":receipt,"coordination":proof}),
         )
+    }
+}
+
+#[test]
+fn legacy_and_commit_controls_keep_copy_retry_registry_idempotence_and_cancel() {
+    for legacy in [false, true] {
+        let mut fixture = Fixture::with_transport(legacy);
+        fixture.store.source("data", "source", b"payload", false);
+        fixture.store.source("data", "marker", b"", true);
+        fixture.reserve();
+        let proof = &fixture.payload["reservation"];
+        let oid = proof["oid"].as_str().unwrap();
+        assert_eq!(
+            fixture
+                .repo
+                .run(["cat-file", "-t", oid])
+                .unwrap()
+                .stdout
+                .trim(),
+            if legacy { "blob" } else { "commit" }
+        );
+        let body = crate::archive_git_control::read_body(&fixture.repo.root, oid).unwrap();
+        assert_eq!(digest(body.as_bytes()), proof["descriptor_sha256"]);
+        let receipt = fixture.run("copy").unwrap();
+        let copies = fixture.store.count("copy_object");
+        assert_eq!(fixture.run("copy").unwrap(), receipt);
+        assert_eq!(fixture.store.count("copy_object"), copies);
+        let proof = fixture.claim_registry(&receipt);
+        let oid = proof["oid"].as_str().unwrap();
+        assert_eq!(
+            fixture
+                .repo
+                .run(["cat-file", "-t", oid])
+                .unwrap()
+                .stdout
+                .trim(),
+            if legacy { "blob" } else { "commit" }
+        );
+        assert_eq!(
+            crate::archive_git_control::read_body(&fixture.repo.root, oid)
+                .unwrap()
+                .as_bytes(),
+            canonical(&receipt).unwrap()
+        );
+        assert_eq!(
+            fixture.registry("publish", &receipt, &proof).unwrap()["status"],
+            "published"
+        );
+        assert_eq!(
+            fixture.registry("publish", &receipt, &proof).unwrap()["status"],
+            "unchanged"
+        );
+        assert_eq!(fixture.store.count("put_object"), 1);
+        fixture.registry("cancel", &receipt, &proof).unwrap();
+        fixture.run("cancel").unwrap();
+        assert!(fixture.store.versions("storage/2026/07/task/").is_empty());
+        assert_eq!(fixture.store.versions("storage/task/").len(), 2);
+    }
+}
+
+fn malformed_control(repo: &GitRepo, body: &str, shape: &str) -> String {
+    let objects = crate::archive_git_control::object_ids(&repo.root, body, true).unwrap();
+    let mut commit = repo
+        .run(["cat-file", "commit", &objects.commit])
+        .unwrap()
+        .stdout;
+    let tree = commit
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("tree ")
+        .unwrap()
+        .to_owned();
+    match shape {
+        "parent" => {
+            commit = commit.replacen('\n', &format!("\nparent {}\n", objects.commit), 1);
+        }
+        "metadata" => {
+            commit = commit.replacen("author ", "author Another owner ", 1);
+        }
+        "message" => commit.push('\n'),
+        "extra-path" | "mode" | "path" => {
+            let mut entries = repo.run(["ls-tree", &tree]).unwrap().stdout;
+            match shape {
+                "extra-path" => entries.push_str(&format!(
+                    "100644 blob {}\tother-control.json\n",
+                    objects.legacy_blob
+                )),
+                "mode" => entries = entries.replacen("100644", "100755", 1),
+                "path" => {
+                    entries = entries.replace(
+                        crate::archive_git_control::FILE_NAME,
+                        "another-control.json",
+                    )
+                }
+                _ => unreachable!(),
+            }
+            let written = process::run_with(
+                "git",
+                ["mktree"],
+                &repo.root,
+                &BTreeMap::new(),
+                Some(&entries),
+                true,
+            )
+            .unwrap();
+            commit = commit.replacen(
+                &format!("tree {tree}"),
+                &format!("tree {}", written.stdout.trim()),
+                1,
+            );
+        }
+        _ => unreachable!(),
+    }
+    process::run_with(
+        "git",
+        ["hash-object", "-w", "-t", "commit", "--stdin"],
+        &repo.root,
+        &BTreeMap::new(),
+        Some(&commit),
+        true,
+    )
+    .unwrap()
+    .stdout
+    .trim()
+    .to_owned()
+}
+
+#[test]
+fn noncanonical_control_commits_cannot_authorize_copy_publish_or_cancel() {
+    for shape in [
+        "parent",
+        "metadata",
+        "message",
+        "extra-path",
+        "mode",
+        "path",
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.store.source("data", "source", b"payload", false);
+        fixture.reserve();
+        let proof = fixture.payload["reservation"].clone();
+        let body = crate::archive_git_control::read_body(
+            &fixture.repo.root,
+            proof["oid"].as_str().unwrap(),
+        )
+        .unwrap();
+        let oid = malformed_control(&fixture.repo, &body, shape);
+        fixture.payload["reservation"] = fixture.bind_control(proof, &oid);
+        assert!(fixture.run("copy").is_err(), "copy accepted {shape}");
+        assert_eq!(fixture.store.count("copy_object"), 0, "{shape}");
+        assert_eq!(fixture.store.count("put_object"), 0, "{shape}");
+        assert_eq!(fixture.store.count("delete_object"), 0, "{shape}");
+
+        let mut fixture = Fixture::new();
+        fixture.store.source("data", "source", b"payload", false);
+        fixture.reserve();
+        let receipt = fixture.run("copy").unwrap();
+        let proof = fixture.claim_registry(&receipt);
+        let body = String::from_utf8(canonical(&receipt).unwrap()).unwrap();
+        let oid = malformed_control(&fixture.repo, &body, shape);
+        let proof = fixture.bind_control(proof, &oid);
+        assert!(
+            fixture.registry("publish", &receipt, &proof).is_err(),
+            "publish accepted {shape}"
+        );
+        assert!(
+            fixture.registry("cancel", &receipt, &proof).is_err(),
+            "cancel accepted {shape}"
+        );
+        assert_eq!(fixture.store.count("put_object"), 0, "{shape}");
+        assert_eq!(fixture.store.count("delete_object"), 0, "{shape}");
+    }
+}
+
+#[test]
+fn both_control_transports_require_original_raw_body_and_private_journal() {
+    for legacy in [false, true] {
+        let mut fixture = Fixture::with_transport(legacy);
+        fixture.store.source("data/雪", "source", b"payload", false);
+        fixture.reserve();
+        let proof = fixture.payload["reservation"].clone();
+        let state_path = Path::new(proof["state_path"].as_str().unwrap());
+        let original = fs::read(state_path).unwrap();
+        let mut state: Value = serde_json::from_slice(&original).unwrap();
+        state["attempt_nonce"] = "foreign private owner".into();
+        fs::write(state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(
+            fixture
+                .run("copy")
+                .unwrap_err()
+                .to_string()
+                .contains("private journal")
+        );
+        fs::write(state_path, original).unwrap();
+        let body = crate::archive_git_control::read_body(
+            &fixture.repo.root,
+            proof["oid"].as_str().unwrap(),
+        )
+        .unwrap();
+        let formatted =
+            serde_json::to_string_pretty(&serde_json::from_str::<Value>(&body).unwrap()).unwrap();
+        let objects =
+            crate::archive_git_control::object_ids(&fixture.repo.root, &formatted, true).unwrap();
+        let oid = if legacy {
+            objects.legacy_blob
+        } else {
+            objects.commit
+        };
+        fixture.payload["reservation"] = fixture.bind_control(proof, &oid);
+        assert!(
+            fixture
+                .run("copy")
+                .unwrap_err()
+                .to_string()
+                .contains("differs from its descriptor")
+        );
+        assert_eq!(fixture.store.count("copy_object"), 0);
+
+        let mut fixture = Fixture::with_transport(legacy);
+        fixture.store.source("data/雪", "source", b"payload", false);
+        fixture.reserve();
+        let receipt = fixture.run("copy").unwrap();
+        let proof = fixture.claim_registry(&receipt);
+        let mut other_owner = proof.clone();
+        other_owner["transaction_id"] = "another-private-owner".into();
+        assert!(
+            fixture
+                .registry("publish", &receipt, &other_owner)
+                .unwrap_err()
+                .to_string()
+                .contains("private copy transaction")
+        );
+        let formatted = serde_json::to_string_pretty(&receipt).unwrap();
+        let objects =
+            crate::archive_git_control::object_ids(&fixture.repo.root, &formatted, true).unwrap();
+        let oid = if legacy {
+            objects.legacy_blob
+        } else {
+            objects.commit
+        };
+        let proof = fixture.bind_control(proof, &oid);
+        assert!(
+            fixture
+                .registry("publish", &receipt, &proof)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from its receipt")
+        );
+        assert!(fixture.registry("cancel", &receipt, &proof).is_err());
+        assert_eq!(fixture.store.count("put_object"), 0);
+        assert_eq!(fixture.store.count("delete_object"), 0);
     }
 }
 
@@ -777,7 +1058,13 @@ fn copy_keeps_metadata_tags_and_all_supported_properties() {
 
 #[test]
 fn reservation_requires_nonce_private_ownership_and_fresh_remote_claim() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_reservation_requires_nonce_private_ownership_and_fresh_remote_claim(legacy);
+    }
+}
+
+fn check_reservation_requires_nonce_private_ownership_and_fresh_remote_claim(legacy: bool) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     fixture.payload["reservation"]["attempt_nonce"] = "another-attempt".into();
@@ -807,7 +1094,13 @@ fn reservation_requires_nonce_private_ownership_and_fresh_remote_claim() {
 
 #[test]
 fn claim_loss_after_last_copy_blocks_completion() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_claim_loss_after_last_copy_blocks_completion(legacy);
+    }
+}
+
+fn check_claim_loss_after_last_copy_blocks_completion(legacy: bool) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     fixture.store.state.borrow_mut().remove_claim_after = Some((
@@ -831,7 +1124,15 @@ fn claim_loss_after_last_copy_blocks_completion() {
 
 #[test]
 fn source_change_after_plan_and_foreign_multipart_before_copy_fail_before_writes() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_source_change_after_plan_and_foreign_multipart_before_copy_fail_before_writes(legacy);
+    }
+}
+
+fn check_source_change_after_plan_and_foreign_multipart_before_copy_fail_before_writes(
+    legacy: bool,
+) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     fixture.store.source("data", "next", b"next", false);
@@ -843,7 +1144,7 @@ fn source_change_after_plan_and_foreign_multipart_before_copy_fail_before_writes
             .contains("changed after planning")
     );
     assert_eq!(fixture.store.count("copy_object"), 0);
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     fixture.store.state.borrow_mut().uploads.insert(
@@ -1215,7 +1516,13 @@ fn multipart_preserves_properties_tags_and_recovers_lost_completion() {
 
 #[test]
 fn registry_publish_and_cancel_preserve_explicit_historical_record_metadata() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_registry_publish_and_cancel_preserve_explicit_historical_record_metadata(legacy);
+    }
+}
+
+fn check_registry_publish_and_cancel_preserve_explicit_historical_record_metadata(legacy: bool) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.store.source("data", "marker", b"", true);
     let mut planned = fixture.run("plan").unwrap();
@@ -1303,7 +1610,13 @@ fn generic_provider_and_other_b2_header_never_allow_unconditional_publication() 
 
 #[test]
 fn registry_lost_put_and_delete_responses_keep_idempotence_and_full_history() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_registry_lost_put_and_delete_responses_keep_idempotence_and_full_history(legacy);
+    }
+}
+
+fn check_registry_lost_put_and_delete_responses_keep_idempotence_and_full_history(legacy: bool) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     let receipt = fixture.run("copy").unwrap();
@@ -1391,7 +1704,13 @@ fn hidden_registry_markers_and_conflicting_older_receipts_fail_closed() {
 
 #[test]
 fn registry_claim_loss_refuses_publication_and_withdrawal_before_any_mutation() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_registry_claim_loss_refuses_publication_and_withdrawal_before_any_mutation(legacy);
+    }
+}
+
+fn check_registry_claim_loss_refuses_publication_and_withdrawal_before_any_mutation(legacy: bool) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     let receipt = fixture.run("copy").unwrap();
@@ -1618,7 +1937,13 @@ fn old_python_timestamp_and_journal_bindings_remain_byte_compatible_with_cas() {
 
 #[test]
 fn exact_published_receipt_can_publish_but_cannot_cancel_another_attempt() {
-    let mut fixture = Fixture::new();
+    for legacy in [false, true] {
+        check_exact_published_receipt_can_publish_but_cannot_cancel_another_attempt(legacy);
+    }
+}
+
+fn check_exact_published_receipt_can_publish_but_cannot_cancel_another_attempt(legacy: bool) {
+    let mut fixture = Fixture::with_transport(legacy);
     fixture.store.source("data", "source", b"payload", false);
     fixture.reserve();
     let receipt = fixture.run("copy").unwrap();

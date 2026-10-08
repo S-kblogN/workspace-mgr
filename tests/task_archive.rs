@@ -918,23 +918,25 @@ fn archive_moves_an_ignored_external_git_worktree_without_touching_its_administr
 }
 
 #[test]
-fn archive_new_protocol_requires_070_before_creating_local_attempt_state() {
+fn archive_new_protocol_requires_089_before_creating_local_attempt_state() {
     let (fixture, merged) = managed_fixture(false);
     let gh = fake_gh(&fixture, &merged, false);
-    let output = workspace_env_unchecked(
-        &fixture.shared,
-        ["archive", DONE, "--dry-run"],
-        &[
-            ("WORKSPACE_MGR_TEST_GH", gh.to_str().unwrap()),
-            (CLI_VERSION_ENV, "0.6.0"),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        error.contains("archive protocol requires workspace-mgr 0.7.0"),
-        "{error}"
-    );
+    for version in ["0.6.0", "0.7.0", "0.8.8"] {
+        let output = workspace_env_unchecked(
+            &fixture.shared,
+            ["archive", DONE, "--dry-run"],
+            &[
+                ("WORKSPACE_MGR_TEST_GH", gh.to_str().unwrap()),
+                (CLI_VERSION_ENV, version),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("archive protocol requires workspace-mgr 0.8.9"),
+            "{error}"
+        );
+    }
     assert!(fixture.shared.join(DONE).is_dir());
     assert!(!fixture.shared.join(DESTINATION).exists());
     assert!(!fixture.shared.join(DONE).join(RECEIPT).exists());

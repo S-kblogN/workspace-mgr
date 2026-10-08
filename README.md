@@ -161,14 +161,16 @@ Preview or undo an unpublished local attempt with
 cancel preserves ignored and hydrated local content while removing this
 attempt's S3 copies and registry records. Archive completion requires the old
 S3 prefix to contain no data versions or delete markers; protected or unmapped
-history remains explicitly pending. A Git control tag binds each canonical
-receipt, allowing B2-compatible publication without permanently retaining
-duplicate source history. See the [archive command](docs/commands.md#workspace-mgr-archive)
+history remains explicitly pending. Git control tags bind source reservations
+and canonical receipts through deterministic commits containing only control
+JSON. Existing blob bindings remain readable and cancellable. This allows
+B2-compatible publication without permanently retaining duplicate source
+history. See the [archive command](docs/commands.md#workspace-mgr-archive)
 for review, conflict, and cancellation guarantees.
-Every archive publication requires 0.7.0 independently of task schema; private
-purge/copy journals use schema 2 so 0.6.0 refuses protected retry state.
-An archive that retains Git LFS pointers requires 0.8.8 to preserve their
-identities even when the old filter no longer matches the archived path.
+Every archive publication requires 0.8.9 for the Git control bindings,
+independently of task schema or S3 inventory. Private purge/copy journals use
+schema 2 so 0.6.0 refuses protected retry state. Published Git LFS identities
+remain intact even when the old filter no longer matches the archived path.
 Historical Git snapshots remain readable through `workspace-mgr storage
 hydrate`, including after their original S3 versions have moved.
 
