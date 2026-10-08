@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-07
+
+### Fixed
+
+- Permanent retirement pipelines at most four distinct ordinary S3 objects
+  concurrently. Each object still reads fresh ancestor registries and deletes
+  exact versions with a final history check; archive-prefix retirement keeps
+  its sequential coordination fences. In-flight workers finish before errors
+  return, and the existing purge queue remains available for retry.
+
 ## [0.7.3] - 2026-10-07
 
 ### Fixed

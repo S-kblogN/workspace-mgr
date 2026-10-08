@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 
@@ -16,6 +16,7 @@ use crate::native_s3::S3Client;
 const ARCHIVE_SUFFIX: &str = "/.workspace-mgr-archive.json";
 const MAX_ARCHIVE_HOPS: usize = 32;
 const WORKERS: usize = 16;
+const PURGE_WORKERS: usize = 4;
 
 fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
@@ -43,20 +44,38 @@ fn bounded_map<T: Sync, R: Send>(
     items: &[T],
     function: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
+    bounded_map_with_workers(items, WORKERS, false, function)
+}
+fn bounded_map_with_workers<T: Sync, R: Send>(
+    items: &[T],
+    limit: usize,
+    stop_after_error: bool,
+    function: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
     let next = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let mut workers = Vec::new();
-        for _ in 0..WORKERS.min(items.len()) {
+        for _ in 0..limit.min(items.len()) {
             let function = &function;
             let next = &next;
+            let stopped = &stopped;
             workers.push(scope.spawn(move || {
                 let mut output = Vec::new();
-                loop {
+                while !stopped.load(Ordering::Acquire) {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
                         break;
                     };
-                    output.push(function(item)?);
+                    match function(item) {
+                        Ok(value) => output.push(value),
+                        Err(error) => {
+                            if stop_after_error {
+                                stopped.store(true, Ordering::Release);
+                            }
+                            return Err(error);
+                        }
+                    }
                 }
                 Ok(output)
             }));
@@ -718,104 +737,123 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
             retained.push(json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":format!("{source}/{}",string(&item,"Key")?.strip_prefix(&prefix).ok_or_else(||Error::message("purge history escaped prefix"))?),"version_id":string(&item,"VersionId")?}));
         }
     }
-    for (object, candidates) in generic {
-        let parts = object.split('/').collect::<Vec<_>>();
-        let mut archive = None;
-        for length in (1..parts.len()).rev() {
-            let source = parts[..length].join("/");
-            if let Some(receipt) = native_archive::registry_read(client, repo, &source)? {
-                archive = Some((source, receipt));
-                break;
+    // Archive prefixes finish first. Each worker owns one distinct logical key
+    // and performs fresh ancestor registry checks, exact deletes and verification.
+    // No worker updates pointer documents, coordination bindings or purge state.
+    let generic = generic.into_iter().enumerate().collect::<Vec<_>>();
+    let mut completed = bounded_map_with_workers(
+        &generic,
+        PURGE_WORKERS,
+        true,
+        |(index, (object, candidates))| {
+            let mut deleted = Vec::new();
+            let mut absent = Vec::new();
+            let mut retained = Vec::new();
+            let parts = object.split('/').collect::<Vec<_>>();
+            let mut archive = None;
+            for length in (1..parts.len()).rev() {
+                let source = parts[..length].join("/");
+                if let Some(receipt) = native_archive::registry_read(client, repo, &source)? {
+                    archive = Some((source, receipt));
+                    break;
+                }
             }
-        }
-        let remote = key(client, &object);
-        let versions = client
-            .list_versions(&remote)?
-            .into_iter()
-            .filter(|v| v["Key"] == remote)
-            .collect::<Vec<_>>();
-        if let Some((source, receipt)) = archive {
-            let mapped = receipt["versions"]
-                .as_array()
-                .ok_or_else(|| Error::message("invalid canonical registry"))?
-                .iter()
-                .map(|row| {
-                    Ok((
-                        string(row, "source_object")?.to_owned(),
-                        string(row, "source_version_id")?.to_owned(),
-                    ))
-                })
-                .collect::<Result<BTreeSet<_>>>()?;
-            let exact = candidates
-                .iter()
-                .filter(|item| {
-                    item["version_id"]
-                        .as_str()
-                        .is_some_and(|v| mapped.contains(&(object.clone(), v.to_owned())))
-                })
-                .cloned()
+            let remote = key(client, object);
+            let versions = client
+                .list_versions(&remote)?
+                .into_iter()
+                .filter(|v| v["Key"] == remote)
                 .collect::<Vec<_>>();
-            let objects = BTreeMap::from([(object.clone(), exact.clone())]);
-            if !exact.is_empty() {
-                verify_registry(&source, &objects, None)?;
-            }
-            let mut present = BTreeSet::new();
-            for item in versions {
-                let version = string(&item, "VersionId")?;
-                present.insert(version.to_owned());
-                if mapped.contains(&(object.clone(), version.to_owned())) {
-                    if exact.is_empty() {
-                        return Err(Error::message(
-                            "generic archive retirement has no coordinated exact mapping",
-                        ));
-                    }
+            if let Some((source, receipt)) = archive {
+                let mapped = receipt["versions"]
+                    .as_array()
+                    .ok_or_else(|| Error::message("invalid canonical registry"))?
+                    .iter()
+                    .map(|row| {
+                        Ok((
+                            string(row, "source_object")?.to_owned(),
+                            string(row, "source_version_id")?.to_owned(),
+                        ))
+                    })
+                    .collect::<Result<BTreeSet<_>>>()?;
+                let exact = candidates
+                    .iter()
+                    .filter(|item| {
+                        item["version_id"]
+                            .as_str()
+                            .is_some_and(|v| mapped.contains(&(object.clone(), v.to_owned())))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let objects = BTreeMap::from([(object.clone(), exact.clone())]);
+                if !exact.is_empty() {
                     verify_registry(&source, &objects, None)?;
+                }
+                let mut present = BTreeSet::new();
+                for item in versions {
+                    let version = string(&item, "VersionId")?;
+                    present.insert(version.to_owned());
+                    if mapped.contains(&(object.clone(), version.to_owned())) {
+                        if exact.is_empty() {
+                            return Err(Error::message(
+                                "generic archive retirement has no coordinated exact mapping",
+                            ));
+                        }
+                        verify_registry(&source, &objects, None)?;
+                        client.call_s3(
+                            "delete_object",
+                            &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
+                            None,
+                        )?;
+                    } else {
+                        retained.push(json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":object,"version_id":version}));
+                    }
+                }
+                for candidate in candidates {
+                    let version = string(candidate, "version_id")?;
+                    if !present.contains(version) {
+                        absent.push(candidate.clone());
+                    } else if mapped.contains(&(object.clone(), version.to_owned())) {
+                        deleted.push(candidate.clone());
+                    }
+                }
+            } else {
+                if versions.is_empty() {
+                    absent.push(candidates[0].clone());
+                    return Ok((*index, deleted, absent, retained));
+                }
+                let mut ids = Vec::new();
+                for item in versions {
+                    let version = string(&item, "VersionId")?;
                     client.call_s3(
                         "delete_object",
                         &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
                         None,
                     )?;
-                } else {
-                    retained.push(json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":object,"version_id":version}));
+                    ids.push(version.to_owned());
                 }
-            }
-            for candidate in candidates {
-                let version = string(&candidate, "version_id")?;
-                if !present.contains(version) {
-                    absent.push(candidate);
-                } else if mapped.contains(&(object.clone(), version.to_owned())) {
-                    deleted.push(candidate);
+                if client
+                    .list_versions(&remote)?
+                    .iter()
+                    .any(|v| v["Key"] == remote)
+                {
+                    return Err(Error::message(format!(
+                        "managed-storage object versions still exist after permanent deletion: {object}"
+                    )));
                 }
+                ids.sort();
+                let mut result = candidates[0].clone();
+                result["deleted_version_ids"] = ids.into();
+                deleted.push(result);
             }
-        } else {
-            if versions.is_empty() {
-                absent.push(candidates[0].clone());
-                continue;
-            }
-            let mut ids = Vec::new();
-            for item in versions {
-                let version = string(&item, "VersionId")?;
-                client.call_s3(
-                    "delete_object",
-                    &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
-                    None,
-                )?;
-                ids.push(version.to_owned());
-            }
-            if client
-                .list_versions(&remote)?
-                .iter()
-                .any(|v| v["Key"] == remote)
-            {
-                return Err(Error::message(format!(
-                    "managed-storage object versions still exist after permanent deletion: {object}"
-                )));
-            }
-            ids.sort();
-            let mut result = candidates[0].clone();
-            result["deleted_version_ids"] = ids.into();
-            deleted.push(result);
-        }
+            Ok((*index, deleted, absent, retained))
+        },
+    )?;
+    completed.sort_by_key(|(index, _, _, _)| *index);
+    for (_, object_deleted, object_absent, object_retained) in completed {
+        deleted.extend(object_deleted);
+        absent.extend(object_absent);
+        retained.extend(object_retained);
     }
     retained.sort_by_key(|v| {
         (
