@@ -74,7 +74,7 @@ legacy text hashes explicitly declare `md5-dos2unix`; physical byte sizes are
 still verified. Changing the implementation language does not change imported
 file bytes or checksum semantics.
 
-Repositories using the native format declare `minimum_cli_version = "0.8.0"`
+Repositories using the native format declare `minimum_cli_version = "0.8.1"`
 or a higher existing requirement. Older releases must refuse them before
 interpreting or publishing unfamiliar control metadata.
 

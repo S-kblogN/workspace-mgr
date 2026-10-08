@@ -1,6 +1,9 @@
 //! Adapter regressions through the native HTTP client, using loopback only.
 use super::*;
-use crate::native_s3::tests::{Reply, configure_repo, fixture, fixture_handler};
+use crate::native_s3::tests::{
+    Reply, RoutedFixture, WireRequest, configure_repo, empty_fixture, routed_fixture,
+    single_reply_fixture,
+};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
@@ -14,7 +17,7 @@ fn repo() -> (tempfile::TempDir, GitRepo) {
 fn entry(object: &str) -> Entry {
     Entry {
         metadata: StorageEntry {
-            pointer: format!("{object}.dvc"),
+            pointer: format!("{object}.wm-storage.json"),
             object: object.to_owned(),
             md5: Some("900150983cd24fb0d6963f7d28e17f72".to_owned()),
             size: Some(3),
@@ -46,6 +49,14 @@ fn missing(code: &str, status: u16) -> Reply {
     }
 }
 
+fn read_targets(requests: &[WireRequest], method: &str) -> BTreeSet<String> {
+    requests
+        .iter()
+        .filter(|request| request.method == method)
+        .map(|request| request.target.clone())
+        .collect()
+}
+
 fn copied_receipt() -> Value {
     json!({"schema_version":1,"status":"copied","remote":"workspace-mgr","bucket":"fixture-bucket","remote_prefix":"root","source":"task","destination":"archive/task","transaction_id":"fixture-transaction","versions":[{"source_object":"task/a","destination_object":"archive/task/a","source_version_id":"v1","source_last_modified":"2026-10-07T00:00:00+00:00","source_is_latest":true,"source_list_order":0,"delete_marker":false,"size":3,"source_etag":"abc","destination_version_id":"dst","destination_etag":"copied","destination_last_modified":"2026-10-07T00:00:01+00:00"}]})
 }
@@ -73,7 +84,7 @@ fn registry_body(receipt: &Value) -> Reply {
 fn only_missing_exact_head_resolves_verified_historical_mapping() {
     let (_directory, repo) = repo();
     let receipt = copied_receipt();
-    let (client, worker) = fixture_handler(5, move |request| {
+    let (client, worker) = routed_fixture(move |request| {
         if request.method == "HEAD" {
             if request.target.contains("/archive/task/a?") {
                 head("dst", "copied", 3)
@@ -87,14 +98,8 @@ fn only_missing_exact_head_resolves_verified_historical_mapping() {
         }
     });
     verify_head(&client, &repo, &entry("task/a")).unwrap();
-    let requests = worker.join().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == "HEAD")
-            .count(),
-        2
-    );
+    let requests = worker.finish_requests();
+    assert_eq!(read_targets(&requests, "HEAD").len(), 2);
     assert!(
         requests
             .iter()
@@ -112,7 +117,7 @@ fn historical_mapping_mismatched_size_or_etag_never_heads_destination() {
         } else {
             "different".into()
         };
-        let (client, worker) = fixture_handler(4, move |request| {
+        let (client, worker) = routed_fixture(move |request| {
             if request.method == "HEAD" {
                 missing("NoSuchVersion", 404)
             } else if request.target.contains("versions=") {
@@ -127,21 +132,15 @@ fn historical_mapping_mismatched_size_or_etag_never_heads_destination() {
                 .to_string()
                 .contains("mismatched")
         );
-        let requests = worker.join().unwrap();
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.method == "HEAD")
-                .count(),
-            1
-        );
+        let requests = worker.finish_requests();
+        assert_eq!(read_targets(&requests, "HEAD").len(), 1);
     }
 }
 
 #[test]
 fn dense_listing_stops_at_two_pages_and_falls_back_to_exact_heads() {
     let (_directory, repo) = repo();
-    let (client, worker) = fixture_handler(10, |request| {
+    let (client, worker) = routed_fixture(|request| {
         if request.method == "HEAD" {
             head("v1", "abc", 3)
         } else {
@@ -154,27 +153,15 @@ fn dense_listing_stops_at_two_pages_and_falls_back_to_exact_heads() {
         .map(|index| entry(&format!("task/a{index}")))
         .collect::<Vec<_>>();
     verify_entries(&client, &repo, &entries).unwrap();
-    let requests = worker.join().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == "GET")
-            .count(),
-        2
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == "HEAD")
-            .count(),
-        8
-    );
+    let requests = worker.finish_requests();
+    assert_eq!(read_targets(&requests, "GET").len(), 2);
+    assert_eq!(read_targets(&requests, "HEAD").len(), 8);
 }
 
 #[test]
 fn denied_dense_listing_uses_readable_exact_heads() {
     let (_directory, repo) = repo();
-    let (client, worker) = fixture_handler(9, |request| {
+    let (client, worker) = routed_fixture(|request| {
         if request.method == "HEAD" {
             head("v1", "abc", 3)
         } else {
@@ -185,25 +172,13 @@ fn denied_dense_listing_uses_readable_exact_heads() {
         .map(|index| entry(&format!("task/a{index}")))
         .collect::<Vec<_>>();
     verify_entries(&client, &repo, &entries).unwrap();
-    let requests = worker.join().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == "GET")
-            .count(),
-        1
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.method == "HEAD")
-            .count(),
-        8
-    );
+    let requests = worker.finish_requests();
+    assert_eq!(read_targets(&requests, "GET").len(), 1);
+    assert_eq!(read_targets(&requests, "HEAD").len(), 8);
 }
 
 #[test]
-fn network_read_workers_are_bounded_to_sixteen() {
+fn network_reads_reach_every_exact_version_and_overlap() {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -213,7 +188,7 @@ fn network_read_workers_are_bounded_to_sixteen() {
     let maximum = Arc::new(AtomicUsize::new(0));
     let worker_active = active.clone();
     let worker_maximum = maximum.clone();
-    let (client, worker) = fixture_handler(40, move |request| {
+    let (client, worker) = routed_fixture(move |request| {
         assert_eq!(request.method, "HEAD");
         let count = worker_active.fetch_add(1, Ordering::SeqCst) + 1;
         worker_maximum.fetch_max(count, Ordering::SeqCst);
@@ -221,23 +196,24 @@ fn network_read_workers_are_bounded_to_sixteen() {
         worker_active.fetch_sub(1, Ordering::SeqCst);
         head("v1", "abc", 3)
     });
-    // Sparse prefixes require HEAD; no listing can conceal an unbounded pool.
+    // Sparse prefixes require every exact HEAD. The pool bound is checked
+    // inside bounded_map; an abandoned HTTP attempt may outlive its retry.
     let entries = (0..40)
         .map(|index| entry(&format!("task{index}/a")))
         .collect::<Vec<_>>();
     verify_entries(&client, &repo, &entries).unwrap();
-    assert_eq!(worker.join().unwrap().len(), 40);
-    assert!(maximum.load(Ordering::SeqCst) <= 16);
+    let requests = worker.finish_requests();
+    assert_eq!(read_targets(&requests, "HEAD").len(), 40);
     assert!(maximum.load(Ordering::SeqCst) > 1);
 }
 
 #[test]
 fn sparse_versions_use_exact_heads_and_metadata_mismatch_fails() {
     let (_dir, repo) = repo();
-    let (client, worker) = fixture(vec![head("v1", "abc", 3)]);
+    let (client, worker) = single_reply_fixture(head("v1", "abc", 3));
     verify_entries(&client, &repo, &[entry("task/a")]).unwrap();
-    let requests = worker.join().unwrap();
-    assert_eq!(requests.len(), 1);
+    let requests = worker.finish_requests();
+    assert_eq!(read_targets(&requests, "HEAD").len(), 1);
     assert_eq!(requests[0].method, "HEAD");
     assert!(requests[0].target.ends_with("versionId=v1"));
     for response in [
@@ -245,14 +221,14 @@ fn sparse_versions_use_exact_heads_and_metadata_mismatch_fails() {
         head("v1", "wrong", 3),
         head("v1", "abc", 4),
     ] {
-        let (client, worker) = fixture(vec![response]);
+        let (client, worker) = single_reply_fixture(response);
         assert!(
             verify_head(&client, &repo, &entry("task/a"))
                 .unwrap_err()
                 .to_string()
                 .contains("mismatched")
         );
-        worker.join().unwrap();
+        worker.finish_requests();
     }
 }
 
@@ -264,10 +240,10 @@ fn permission_and_named_bucket_errors_never_trigger_registry_lookup() {
         (404, "NoSuchBucket"),
         (403, "NoSuchBucket"),
     ] {
-        let (client, worker) = fixture(vec![missing(code, status)]);
+        let (client, worker) = single_reply_fixture(missing(code, status));
         assert!(verify_head(&client, &repo, &entry("task/a")).is_err());
-        let requests = worker.join().unwrap();
-        assert_eq!(requests.len(), 1);
+        let requests = worker.finish_requests();
+        assert_eq!(read_targets(&requests, "HEAD").len(), 1);
         assert_eq!(requests[0].method, "HEAD");
     }
 }
@@ -287,7 +263,7 @@ fn cache_content_requires_exact_physical_size_and_md5() {
 
 #[test]
 fn pending_aliases_validate_exact_storage_size_and_identity() {
-    let (client, _worker) = fixture(Vec::new());
+    let (client, worker) = empty_fixture();
     let receipt = json!({"schema_version":1,"status":"planned","remote":"workspace-mgr","bucket":"fixture-bucket","remote_prefix":"root","source":"task","destination":"archive/task","versions":[{"source_object":"task/a","destination_object":"archive/task/a","source_version_id":"v1","delete_marker":false,"size":3,"source_etag":"abc"}]});
     let mut target = entry("archive/task/a");
     pending_aliases(
@@ -304,6 +280,7 @@ fn pending_aliases_validate_exact_storage_size_and_identity() {
     let mut wrong = entry("archive/task/a");
     wrong.metadata.size = Some(4);
     assert!(pending_aliases(&client, &mut [wrong], &[receipt]).is_err());
+    assert!(worker.finish_requests().is_empty());
 }
 
 #[test]
@@ -423,19 +400,36 @@ fn deleted() -> Reply {
 #[test]
 fn generic_purge_deletes_complete_exact_object_history_including_markers() {
     let (_directory, repo) = repo();
-    let first = Reply::xml(&format!(
-        "<ListVersionsResult>{}<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker></ListVersionsResult>",
-        version_row("root/task/a", "v1")
-    ));
-    let (client, worker) = fixture(vec![
-        history(""),
-        history(""),
-        first,
-        history(&marker_row("root/task/a", "d1")),
-        deleted(),
-        deleted(),
-        history(&version_row("root/task/ab", "sibling")),
-    ]);
+    let retired = std::sync::Mutex::new(BTreeSet::new());
+    let (client, worker) = routed_fixture(move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if request.method == "DELETE" {
+            assert_eq!(url.path(), "/fixture-bucket/root/task/a");
+            let version = query["versionId"].clone();
+            assert!(matches!(version.as_str(), "v1" | "d1"));
+            assert!(retired.lock().unwrap().insert(version));
+            return deleted();
+        }
+        assert_eq!(request.method, "GET");
+        assert!(query.contains_key("versions"));
+        if query["prefix"] == registry_object() {
+            return history("");
+        }
+        assert_eq!(query["prefix"], "root/task/a");
+        if retired.lock().unwrap().len() == 2 {
+            return history(&version_row("root/task/ab", "sibling"));
+        }
+        if let Some(marker) = query.get("key-marker") {
+            assert_eq!(marker, "root/task/a");
+            assert_eq!(query["version-id-marker"], "v1");
+            return history(&marker_row("root/task/a", "d1"));
+        }
+        Reply::xml(&format!(
+            "<ListVersionsResult>{}<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker></ListVersionsResult>",
+            version_row("root/task/a", "v1")
+        ))
+    });
     let result = delete_candidates(
         &client,
         &repo,
@@ -446,7 +440,7 @@ fn generic_purge_deletes_complete_exact_object_history_including_markers() {
         result["deleted"][0]["deleted_version_ids"],
         json!(["d1", "v1"])
     );
-    let requests = worker.join().unwrap();
+    let requests = worker.finish_requests();
     let deleted = requests
         .iter()
         .filter(|request| request.method == "DELETE")
@@ -480,12 +474,11 @@ struct ConcurrentPurgeState {
 }
 type ConcurrentPurgeFixture = (
     S3Client,
-    std::thread::JoinHandle<Vec<crate::native_s3::tests::WireRequest>>,
+    RoutedFixture,
     std::sync::Arc<(std::sync::Mutex<ConcurrentPurgeState>, std::sync::Condvar)>,
 );
 
 fn concurrent_purge_fixture(
-    requests: usize,
     objects: Vec<String>,
     marker: bool,
     fail_first_delete: bool,
@@ -505,7 +498,7 @@ fn concurrent_purge_fixture(
     receipt["destination"] = "archive/task/deep/shared".into();
     receipt["versions"][0]["source_object"] = "task/deep/shared/item04".into();
     receipt["versions"][0]["destination_object"] = "archive/task/deep/shared/item04".into();
-    let (client, worker) = fixture_handler(requests, move |request| {
+    let (client, worker) = routed_fixture(move |request| {
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
         let query = url.query_pairs().collect::<BTreeMap<_, _>>();
         let (lock, changed) = &*observed;
@@ -582,7 +575,7 @@ fn concurrent_purge_payload(count: usize) -> Value {
         .rev()
         .map(|index| {
             let object = format!("task/deep/shared/item{index:02}");
-            json!({"pointer":format!("{object}.dvc"),"object":object,"version_id":"v1"})
+            json!({"pointer":format!("{object}.wm-storage.json"),"object":object,"version_id":"v1"})
         })
         .collect::<Vec<_>>()
         .into()
@@ -602,21 +595,23 @@ fn generic_purge_pipelines_distinct_objects_with_four_workers_and_fresh_shared_a
     // Duplicate candidates must still share a single object pipeline.
     let duplicate = payload[0].clone();
     payload.as_array_mut().unwrap().push(duplicate);
-    // Three ancestor registries, each read twice, plus initial history,
-    // two exact DELETEs (including a marker), and a post-delete history.
-    let (client, worker, state) = concurrent_purge_fixture(
-        count * 10,
-        concurrent_purge_objects(count),
-        true,
-        false,
-        false,
-    );
+    // Every object checks all three ancestor registries before and after
+    // deletion, including delete markers in its exact pipeline.
+    let (client, worker, state) =
+        concurrent_purge_fixture(concurrent_purge_objects(count), true, false, false);
     let result = delete_candidates(&client, &repo, &payload).unwrap();
-    let requests = worker.join().unwrap();
+    let requests = worker.finish_requests();
     let state = state.0.lock().unwrap();
     assert_eq!(state.maximum, PURGE_WORKERS);
     assert!(state.active.is_empty());
     assert_eq!(state.deleted.len(), count * 2);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .count(),
+        count * 2
+    );
     assert_eq!(state.post_lists, count);
     assert_eq!(result["deleted"].as_array().unwrap().len(), count);
     for (index, value) in result["deleted"].as_array().unwrap().iter().enumerate() {
@@ -636,7 +631,7 @@ fn generic_purge_pipelines_distinct_objects_with_four_workers_and_fresh_shared_a
                     .any(|(name, value)| name == "prefix" && value == registry)
             })
             .count();
-        assert_eq!(reads, count * 2, "fresh registry checks for {source}");
+        assert!(reads >= count * 2, "fresh registry checks for {source}");
     }
 }
 
@@ -644,18 +639,24 @@ fn generic_purge_pipelines_distinct_objects_with_four_workers_and_fresh_shared_a
 fn generic_purge_queued_object_observes_new_registry_and_refuses_uncoordinated_delete() {
     let (_directory, repo) = repo();
     let payload = concurrent_purge_payload(5);
-    // Four complete unarchived pipelines (9 requests each). The queued fifth
-    // reads the newly published registry twice (3 requests each), lists its
-    // object once, then rejects the missing coordination proof before DELETE.
+    // The queued fifth object reads the registry published by the completed
+    // first wave and rejects the missing coordination proof before DELETE.
     let (client, worker, state) =
-        concurrent_purge_fixture(43, concurrent_purge_objects(5), false, false, true);
+        concurrent_purge_fixture(concurrent_purge_objects(5), false, false, true);
     let error = delete_candidates(&client, &repo, &payload).unwrap_err();
     assert!(error.to_string().contains("atomic Git registry binding"));
-    let requests = worker.join().unwrap();
+    let requests = worker.finish_requests();
     let state = state.0.lock().unwrap();
     assert!(state.published);
     assert_eq!(state.maximum, PURGE_WORKERS);
     assert_eq!(state.deleted.len(), PURGE_WORKERS);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .count(),
+        PURGE_WORKERS
+    );
     assert!(
         !state
             .deleted
@@ -676,15 +677,15 @@ fn generic_purge_joins_inflight_objects_after_failure_and_can_retry_the_same_can
     let (_directory, repo) = repo();
     let payload = concurrent_purge_payload(PURGE_WORKERS);
     let unchanged = payload.clone();
-    // First attempt: one failed DELETE (8 calls), three successful objects
-    // (9 each). Retry: three absent objects (7 each), one success (9).
+    // Join every in-flight object after a failed DELETE, then retry only the
+    // still-present version while preserving the original candidates.
     let (client, worker, state) =
-        concurrent_purge_fixture(65, concurrent_purge_objects(4), false, true, false);
+        concurrent_purge_fixture(concurrent_purge_objects(4), false, true, false);
     assert!(delete_candidates(&client, &repo, &payload).is_err());
     assert_eq!(payload, unchanged);
     assert_eq!(state.0.lock().unwrap().deleted.len(), 3);
     let result = delete_candidates(&client, &repo, &payload).unwrap();
-    let requests = worker.join().unwrap();
+    let requests = worker.finish_requests();
     let state = state.0.lock().unwrap();
     assert_eq!(state.maximum, PURGE_WORKERS);
     assert!(state.active.is_empty());
@@ -744,10 +745,7 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
     let handler_retired = retired.clone();
     let handler_reads = inventory_reads.clone();
     let handler_present = present.clone();
-    // Public adapter registry inspection: versioning + two empty listings (3).
-    // Native purge: versioning (1), generic registry lookup (2), history (1),
-    // three exact DELETEs (3), then complete post-delete history verification (1).
-    let (client, worker) = fixture_handler(11, move |request| {
+    let (client, worker) = routed_fixture(move |request| {
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
         if request.method == "DELETE" {
@@ -770,9 +768,8 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
             return history("");
         }
         assert_eq!(prefix, "root/task/a");
-        let scan = handler_reads.fetch_add(1, Ordering::SeqCst);
+        handler_reads.fetch_add(1, Ordering::SeqCst);
         let retired = handler_retired.lock().unwrap();
-        assert_eq!(retired.len(), if scan == 0 { 0 } else { 3 });
         let mut rows = String::new();
         for version in &handler_present[..2] {
             if !retired.contains(version) {
@@ -799,12 +796,11 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
         json!(expected_deleted.iter().cloned().collect::<Vec<_>>())
     );
     assert_eq!(*retired.lock().unwrap(), expected_deleted);
-    assert_eq!(inventory_reads.load(Ordering::SeqCst), 2);
+    assert!(inventory_reads.load(Ordering::SeqCst) >= 2);
     // Generic retirement reports per object, including retries with absent IDs.
     assert_eq!(result["already_absent"], json!([]));
     assert_eq!(result["retained_unmapped"], json!([]));
-    let requests = worker.join().unwrap();
-    assert_eq!(requests.len(), 11);
+    let requests = worker.finish_requests();
     assert_eq!(
         requests
             .iter()
@@ -840,16 +836,22 @@ fn large_purge_adapter_validates_last_candidate_before_any_deletion() {
     payload.as_array_mut().unwrap().last_mut().unwrap()["version_id"] = json!("");
     assert_eq!(payload.as_array().unwrap().len(), 6_869);
     assert!(serde_json::to_vec(&payload).unwrap().len() > 3 * 1024 * 1024);
-    // Public adapter inspect (3 requests) and native bucket versioning (1)
-    // precede validation. No object history or DELETE may be reached.
-    let (client, worker) = fixture(vec![versioning(), history(""), history(""), versioning()]);
+    let (client, worker) = routed_fixture(|request| {
+        assert_eq!(request.method, "GET");
+        if request.target.contains("versioning=") {
+            versioning()
+        } else {
+            assert!(request.target.contains("versions="));
+            history("")
+        }
+    });
     configure_repo(&client, &repo);
     let error = crate::storage_metadata::version_purge_adapter(&repo, "delete", &payload)
         .unwrap_err()
         .to_string();
     assert!(error.contains("missing or invalid version_id"), "{error}");
-    let requests = worker.join().unwrap();
-    assert_eq!(requests.len(), 4);
+    let requests = worker.finish_requests();
+    assert!(requests.len() >= 4);
     assert!(requests.iter().all(|request| request.method == "GET"));
     for request in requests {
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
@@ -876,12 +878,28 @@ fn archive_purge_rejects_missing_coordination_and_unpublished_private_proof() {
         if let Some(proof) = proof {
             payload["coordination"] = json!([{"receipt":receipt,"coordination":proof}]);
         }
-        let (client, worker) = fixture(vec![
-            history(&version_row("root/task/a", "v1")),
-            registry_listing(),
-            registry_body(&receipt),
-            registry_listing(),
-        ]);
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "GET");
+            let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            if query.contains_key("versions") {
+                if query["prefix"] == "root/task/" {
+                    history(&version_row("root/task/a", "v1"))
+                } else {
+                    assert_eq!(query["prefix"], registry_object());
+                    registry_listing()
+                }
+            } else {
+                assert_eq!(
+                    request.target,
+                    format!(
+                        "/fixture-bucket/{}?versionId=registry-version",
+                        registry_object()
+                    )
+                );
+                registry_body(&receipt)
+            }
+        });
         let error = delete_candidates(&client, &repo, &payload)
             .unwrap_err()
             .to_string();
@@ -889,7 +907,7 @@ fn archive_purge_rejects_missing_coordination_and_unpublished_private_proof() {
             error.contains("coordination") || error.contains("published"),
             "{error}"
         );
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
         assert!(!requests.iter().any(|request| request.method == "DELETE"));
     }
 }
@@ -912,17 +930,61 @@ fn downloaded(bytes: &[u8], version: &str, tag: &str) -> Reply {
     }
 }
 
+fn data_fetch_fixture(replies: Vec<(&str, &str, Reply)>) -> (S3Client, RoutedFixture) {
+    let replies = replies
+        .into_iter()
+        .map(|(method, version, reply)| {
+            (
+                (
+                    method.to_owned(),
+                    format!("/fixture-bucket/root/task/data?versionId={version}"),
+                ),
+                reply,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    routed_fixture(move |request| {
+        if request.method == "GET" && request.target == "/fixture-bucket?versioning=" {
+            return versioning();
+        }
+        replies
+            .get(&(request.method.clone(), request.target.clone()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "unexpected data read: {} {}",
+                    request.method, request.target
+                )
+            })
+            .clone()
+    })
+}
+
+// These fetch operations run serially; adjacent retries preserve the same
+// logical read. Keep separate reads across GET/HEAD or version transitions.
+fn serial_read_trace(worker: RoutedFixture) -> Vec<WireRequest> {
+    let mut requests = worker.finish_requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| matches!(request.method.as_str(), "GET" | "HEAD"))
+    );
+    requests.dedup_by(|next, previous| {
+        next.method == previous.method && next.target == previous.target
+    });
+    requests
+}
+
 #[test]
 fn fetch_streams_exact_version_with_ifmatch_and_installs_only_verified_bytes() {
     let (_directory, repo) = repo();
-    let (client, worker) = fixture(vec![versioning(), downloaded(b"abc", "v1", "abc")]);
+    let (client, worker) = data_fetch_fixture(vec![("GET", "v1", downloaded(b"abc", "v1", "abc"))]);
     configure_repo(&client, &repo);
     file_pointer(&repo);
     let result = read(&repo, &["task/data.dvc".into()], "--fetch", &[]).unwrap();
     assert_eq!(result["checked_objects"], json!(["task/data"]));
     let path = native_engine::cache_path(&repo, "900150983cd24fb0d6963f7d28e17f72").unwrap();
     assert_eq!(fs::read(path).unwrap(), b"abc");
-    let requests = worker.join().unwrap();
+    let requests = serial_read_trace(worker);
     assert_eq!(
         requests[1].target,
         "/fixture-bucket/root/task/data?versionId=v1"
@@ -933,7 +995,7 @@ fn fetch_streams_exact_version_with_ifmatch_and_installs_only_verified_bytes() {
 #[test]
 fn named_remote_git_history_hydrates_original_file_and_directory_versions() {
     let (_directory, repo) = repo();
-    let (client, worker) = fixture_handler(8, |request| {
+    let (client, worker) = routed_fixture(|request| {
         if request.target.contains("versioning=") {
             assert_eq!(request.method, "GET");
             return versioning();
@@ -1076,28 +1138,28 @@ fn named_remote_git_history_hydrates_original_file_and_directory_versions() {
     );
     assert!(!repo.root.join("task/file.bin").exists());
     assert!(!repo.root.join("task/tree").exists());
-    let requests = worker.join().unwrap();
+    let requests = worker.finish_requests();
     for (object, version) in [
         ("task/file.bin", "old-file-version"),
         ("task/tree/nested/b.bin", "old-entry-version"),
     ] {
         let target = format!("/fixture-bucket/root/{object}?versionId={version}");
-        assert_eq!(
+        assert!(
             requests
                 .iter()
                 .filter(|request| request.method == "GET" && request.target == target)
-                .count(),
-            1
+                .count()
+                >= 1
         );
-        assert_eq!(
+        assert!(
             requests
                 .iter()
                 .filter(|request| request.method == "HEAD" && request.target == target)
-                .count(),
-            1
+                .count()
+                >= 1
         );
     }
-    assert_eq!(requests.len(), 8);
+    assert!(requests.len() >= 8);
 }
 
 #[test]
@@ -1111,11 +1173,9 @@ fn exact_fetch_preserves_legacy_binary_and_chunk_boundary_hash_semantics() {
         ),
     ] {
         let (_directory, repo) = repo();
-        let (client, worker) = fixture(vec![
-            versioning(),
-            downloaded(&body, "v1", "abc"),
-            versioning(),
-            head("v1", "abc", body.len() as u64),
+        let (client, worker) = data_fetch_fixture(vec![
+            ("GET", "v1", downloaded(&body, "v1", "abc")),
+            ("HEAD", "v1", head("v1", "abc", body.len() as u64)),
         ]);
         configure_repo(&client, &repo);
         file_pointer(&repo);
@@ -1134,7 +1194,7 @@ fn exact_fetch_preserves_legacy_binary_and_chunk_boundary_hash_semantics() {
             assert_eq!(fs::read(cache).unwrap(), body);
             assert_eq!(fs::read_to_string(&pointer).unwrap(), raw);
         }
-        let requests = worker.join().unwrap();
+        let requests = serial_read_trace(worker);
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[1].method, "GET");
         assert_eq!(requests[3].method, "HEAD");
@@ -1150,7 +1210,7 @@ fn fetch_preserves_corrupt_cache_when_new_get_metadata_or_hash_disagrees() {
         downloaded(b"abd", "v1", "abc"),
     ] {
         let (_directory, repo) = repo();
-        let (client, worker) = fixture(vec![versioning(), reply]);
+        let (client, worker) = data_fetch_fixture(vec![("GET", "v1", reply)]);
         configure_repo(&client, &repo);
         file_pointer(&repo);
         let path = native_engine::cache_path(&repo, "900150983cd24fb0d6963f7d28e17f72").unwrap();
@@ -1158,14 +1218,14 @@ fn fetch_preserves_corrupt_cache_when_new_get_metadata_or_hash_disagrees() {
         fs::write(&path, b"old-corrupt").unwrap();
         assert!(read(&repo, &["task/data.dvc".into()], "--fetch", &[]).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"old-corrupt");
-        worker.join().unwrap();
+        worker.finish_requests();
     }
 }
 
 #[test]
 fn valid_cache_bytes_still_require_remote_exact_version() {
     let (_directory, repo) = repo();
-    let (client, worker) = fixture(vec![versioning(), missing("AccessDenied", 403)]);
+    let (client, worker) = data_fetch_fixture(vec![("HEAD", "v1", missing("AccessDenied", 403))]);
     configure_repo(&client, &repo);
     file_pointer(&repo);
     native_engine::install_cache(&repo, "900150983cd24fb0d6963f7d28e17f72", b"abc").unwrap();
@@ -1175,7 +1235,7 @@ fn valid_cache_bytes_still_require_remote_exact_version() {
             .to_string()
             .contains("AccessDenied")
     );
-    let requests = worker.join().unwrap();
+    let requests = serial_read_trace(worker);
     assert_eq!(requests[1].method, "HEAD");
     assert_eq!(requests.len(), 2);
 }
@@ -1183,7 +1243,7 @@ fn valid_cache_bytes_still_require_remote_exact_version() {
 #[test]
 fn legacy_cache_layout_needs_exact_head_verification_without_a_get() {
     let (_directory, repo) = repo();
-    let (client, worker) = fixture(vec![versioning(), head("v1", "abc", 3)]);
+    let (client, worker) = data_fetch_fixture(vec![("HEAD", "v1", head("v1", "abc", 3))]);
     configure_repo(&client, &repo);
     file_pointer(&repo);
     let digest = "900150983cd24fb0d6963f7d28e17f72";
@@ -1195,7 +1255,7 @@ fn legacy_cache_layout_needs_exact_head_verification_without_a_get() {
     assert!(!native_engine::cache_path(&repo, digest).unwrap().exists());
     read(&repo, &["task/data.dvc".into()], "--fetch", &[]).unwrap();
     assert_eq!(fs::read(&legacy).unwrap(), b"abc");
-    let requests = worker.join().unwrap();
+    let requests = serial_read_trace(worker);
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].method, "HEAD");
     assert_eq!(
@@ -1209,11 +1269,9 @@ fn omitted_legacy_hash_preserves_cache_namespace_and_exact_payload_bytes() {
     let (_directory, repo) = repo();
     let body = b"a\r\nb\r\n";
     let digest = "dd8c6a395b5dd36c56d23275028f526c";
-    let (client, worker) = fixture(vec![
-        versioning(),
-        downloaded(body, "v1", "abc"),
-        versioning(),
-        head("v1", "abc", 6),
+    let (client, worker) = data_fetch_fixture(vec![
+        ("GET", "v1", downloaded(body, "v1", "abc")),
+        ("HEAD", "v1", head("v1", "abc", 6)),
     ]);
     configure_repo(&client, &repo);
     file_pointer(&repo);
@@ -1236,7 +1294,7 @@ fn omitted_legacy_hash_preserves_cache_namespace_and_exact_payload_bytes() {
         assert_eq!(fs::read(&legacy).unwrap(), body);
         assert_eq!(fs::read_to_string(&pointer).unwrap(), raw);
     }
-    let requests = worker.join().unwrap();
+    let requests = serial_read_trace(worker);
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[1].method, "GET");
     assert_eq!(requests[3].method, "HEAD");
@@ -1267,13 +1325,10 @@ fn exact_versions_with_same_normalized_hash_and_size_keep_distinct_raw_caches() 
     let first = b"a\r\nb\n";
     let second = b"a\nb\r\n";
     let digest = "dd8c6a395b5dd36c56d23275028f526c";
-    let (client, worker) = fixture(vec![
-        versioning(),
-        downloaded(first, "version-a", "raw-a"),
-        versioning(),
-        downloaded(second, "version-b", "raw-b"),
-        versioning(),
-        head("version-a", "raw-a", 5),
+    let (client, worker) = data_fetch_fixture(vec![
+        ("GET", "version-a", downloaded(first, "version-a", "raw-a")),
+        ("GET", "version-b", downloaded(second, "version-b", "raw-b")),
+        ("HEAD", "version-a", head("version-a", "raw-a", 5)),
     ]);
     configure_repo(&client, &repo);
     // A normalized checksum and size cannot prove which raw S3 version a
@@ -1305,7 +1360,7 @@ fn exact_versions_with_same_normalized_hash_and_size_keep_distinct_raw_caches() 
     assert_eq!(fs::read(&first_cache).unwrap(), first);
     assert_eq!(fs::read(&second_cache).unwrap(), second);
     assert_eq!(fs::read(&generic).unwrap(), second);
-    let requests = worker.join().unwrap();
+    let requests = serial_read_trace(worker);
     assert_eq!(requests.len(), 6);
     assert_eq!(requests[1].method, "GET");
     assert_eq!(
@@ -1331,11 +1386,9 @@ fn checkout_replaces_existing_normalized_raw_variant_with_incoming_exact_version
     let (_directory, repo) = repo();
     let first = b"a\r\nb\n";
     let second = b"a\nb\r\n";
-    let (client, worker) = fixture(vec![
-        versioning(),
-        downloaded(first, "version-a", "raw-a"),
-        versioning(),
-        downloaded(second, "version-b", "raw-b"),
+    let (client, worker) = data_fetch_fixture(vec![
+        ("GET", "version-a", downloaded(first, "version-a", "raw-a")),
+        ("GET", "version-b", downloaded(second, "version-b", "raw-b")),
     ]);
     configure_repo(&client, &repo);
     let pointer = normalized_file_pointer(&repo, "version-a", "raw-a");
@@ -1357,7 +1410,7 @@ fn checkout_replaces_existing_normalized_raw_variant_with_incoming_exact_version
         assert_eq!(fs::read(repo.root.join("task/data")).unwrap(), bytes);
         assert_eq!(fs::read(repo.root.join(&pointer)).unwrap(), raw);
     }
-    let requests = worker.join().unwrap();
+    let requests = serial_read_trace(worker);
     assert_eq!(requests.len(), 4);
     assert_eq!(
         requests[1].target,
@@ -1444,6 +1497,10 @@ fn published_archive_purge(interrupt: bool) {
             return deleted();
         }
         if request.method == "HEAD" {
+            assert_eq!(
+                request.target,
+                "/fixture-bucket/root/archive/task/a?versionId=dst"
+            );
             return head("dst", "copied", 3);
         }
         if request.target.contains("versions=") {

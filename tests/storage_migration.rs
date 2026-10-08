@@ -111,7 +111,7 @@ fn manage_converts_entire_checkout_without_payload_or_history_changes() {
     assert!(
         fs::read_to_string(fixture.shared.join(".workspace-mgr.toml"))
             .unwrap()
-            .contains("minimum_cli_version = \"0.8.0\"")
+            .contains("minimum_cli_version = \"0.8.1\"")
     );
     assert_eq!(git(&fixture.shared, ["rev-parse", "HEAD"]).stdout, head);
     assert_eq!(git(&fixture.shared, ["ls-files", "-s"]).stdout, index);

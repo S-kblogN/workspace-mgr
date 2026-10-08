@@ -2998,16 +2998,63 @@ mod tests {
         }
     }
 
+    fn upload_request_route(
+        request: &crate::native_s3::tests::WireRequest,
+    ) -> (String, BTreeMap<String, String>) {
+        let target = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = target
+            .query_pairs()
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(query.len(), target.query_pairs().count());
+        (target.path().into(), query)
+    }
+
+    fn assert_uploaded_read(request: &crate::native_s3::tests::WireRequest, object: &str) {
+        assert!(matches!(request.method.as_str(), "HEAD" | "GET"));
+        let (path, query) = upload_request_route(request);
+        assert_eq!(path, format!("/fixture-bucket/root/{object}"));
+        assert_eq!(
+            query,
+            BTreeMap::from([("versionId".into(), "owned-version".into())])
+        );
+        if request.method == "GET" {
+            assert_eq!(request.headers["if-match"], "\"owned-etag\"");
+        }
+    }
+
+    fn uploaded_read_fixture(
+        bytes: &'static [u8],
+        version: &'static str,
+        etag: &'static str,
+    ) -> (
+        crate::native_s3::S3Client,
+        crate::native_s3::tests::RoutedFixture,
+    ) {
+        crate::native_s3::tests::routed_fixture(move |request| {
+            assert_uploaded_read(request, "task/source");
+            if request.method == "HEAD" {
+                uploaded_head("owned-token", bytes.len())
+            } else {
+                uploaded_get(bytes, version, etag)
+            }
+        })
+    }
+
     #[test]
     fn multipart_upload_streams_complete_parts_and_verifies_its_exact_version() {
-        use crate::native_s3::tests::{Reply, fixture_handler};
+        use crate::native_s3::tests::{Reply, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"abcdefghijkl";
         let (entry, source) = upload_fixture(&repo, bytes);
         let token = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured = token.clone();
-        let (client, worker) = fixture_handler(7, move |request| {
-            if request.method == "POST" && request.target.contains("uploads") {
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
+            assert_eq!(path, "/fixture-bucket/root/task/source");
+            if request.method == "POST" && query.contains_key("uploads") {
+                assert_eq!(query, BTreeMap::from([("uploads".into(), String::new())]));
+                assert!(captured.lock().unwrap().is_empty());
                 *captured.lock().unwrap() =
                     request.headers["x-amz-meta-workspace-mgr-upload"].clone();
                 return Reply::xml(
@@ -3015,6 +3062,9 @@ mod tests {
                 );
             }
             if request.method == "PUT" {
+                assert_eq!(query.len(), 2);
+                assert_eq!(query["uploadId"], "owned-upload");
+                assert!(matches!(query["partNumber"].as_str(), "1" | "2" | "3"));
                 return Reply {
                     status: 200,
                     headers: vec![("etag", "\"part-etag\"".into())],
@@ -3022,8 +3072,14 @@ mod tests {
                 };
             }
             if request.method == "POST" {
+                assert_eq!(
+                    query,
+                    BTreeMap::from([("uploadId".into(), "owned-upload".into())])
+                );
+                assert!(!captured.lock().unwrap().is_empty());
                 return Reply {status:200,headers:vec![("x-amz-version-id","owned-version".into())],body:b"<CompleteMultipartUploadResult><ETag>\"owned-etag\"</ETag></CompleteMultipartUploadResult>".to_vec()};
             }
+            assert_uploaded_read(request, "task/source");
             if request.method == "HEAD" {
                 return uploaded_head(&captured.lock().unwrap(), bytes.len());
             }
@@ -3033,7 +3089,14 @@ mod tests {
             upload_version(&client, &repo, &entry, &source, 4, 5).unwrap(),
             ("owned-version".into(), "owned-etag".into())
         );
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            2
+        );
         let parts = requests
             .iter()
             .filter(|request| request.method == "PUT")
@@ -3065,34 +3128,70 @@ mod tests {
 
     #[test]
     fn lost_put_response_recovers_owned_version_without_another_upload() {
-        use crate::native_s3::tests::{Reply, fixture_handler};
+        lost_put_response_recovers_owned_version(false);
+    }
+
+    #[test]
+    fn lost_put_response_replays_interrupted_reads_without_another_upload() {
+        lost_put_response_recovers_owned_version(true);
+    }
+
+    fn lost_put_response_recovers_owned_version(interrupt: bool) {
+        use crate::native_s3::tests::{Reply, interrupt_response_once, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"recovered bytes";
         let (entry, source) = upload_fixture(&repo, bytes);
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let token = captured.clone();
-        let (client, worker) = fixture_handler(5, move |request| {
+        let (received, request_received) = std::sync::mpsc::channel();
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
             if request.method == "PUT" {
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert!(query.is_empty());
+                assert!(token.lock().unwrap().is_empty());
                 *token.lock().unwrap() = request.headers["x-amz-meta-workspace-mgr-upload"].clone();
                 return Reply {status:500,headers:Vec::new(),body:b"<Error><Code>InternalError</Code><Message>response lost after commit</Message></Error>".to_vec()};
             }
-            if request.target.contains("versions") {
+            assert!(!token.lock().unwrap().is_empty());
+            if request.method == "GET" && query.contains_key("versions") {
+                assert_eq!(path, "/fixture-bucket");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([
+                        ("versions".into(), String::new()),
+                        ("prefix".into(), "root/task/source".into()),
+                        ("max-keys".into(), "1000".into())
+                    ])
+                );
                 return Reply::xml(
                     "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>root/task/source</Key><VersionId>owned-version</VersionId><Size>15</Size><ETag>\"owned-etag\"</ETag></Version></ListVersionsResult>",
                 );
             }
+            assert_uploaded_read(request, "task/source");
+            let _ = received.send(());
             if request.method == "HEAD" {
                 return uploaded_head(&token.lock().unwrap(), bytes.len());
             }
             uploaded_get(bytes, "owned-version", "\"owned-etag\"")
         });
+        let (client, injected) = if interrupt {
+            let (client, injected) = interrupt_response_once(
+                client,
+                "/fixture-bucket/root/task/source?versionId=owned-version".into(),
+                request_received,
+            );
+            (client, Some(injected))
+        } else {
+            (client, None)
+        };
         assert_eq!(
             upload_version(&client, &repo, &entry, &source, 100, 5)
                 .unwrap()
                 .0,
             "owned-version"
         );
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
         assert_eq!(
             requests
                 .iter()
@@ -3103,20 +3202,41 @@ mod tests {
         let (_, journal) = upload_journal(&repo, &client, &entry).unwrap();
         assert_eq!(journal["phase"], "complete");
         assert_eq!(journal["version_id"], "owned-version");
+        if let Some(injected) = injected {
+            assert_eq!(injected.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == "HEAD")
+                    .count()
+                    >= 2
+            );
+        }
     }
 
     #[test]
     fn multipart_failure_aborts_only_the_known_owned_upload() {
-        use crate::native_s3::tests::{Reply, fixture_handler};
+        use crate::native_s3::tests::{Reply, routed_fixture};
         let (_temporary, repo) = repository();
         let (entry, source) = upload_fixture(&repo, b"multipart bytes");
-        let (client, worker) = fixture_handler(4, move |request| {
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
             if request.method == "POST" {
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert_eq!(query, BTreeMap::from([("uploads".into(), String::new())]));
                 return Reply::xml(
                     "<InitiateMultipartUploadResult><UploadId>owned-upload</UploadId></InitiateMultipartUploadResult>",
                 );
             }
             if request.method == "PUT" {
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([
+                        ("partNumber".into(), "1".into()),
+                        ("uploadId".into(), "owned-upload".into())
+                    ])
+                );
                 return Reply {
                     status: 403,
                     headers: Vec::new(),
@@ -3124,24 +3244,40 @@ mod tests {
                 };
             }
             if request.method == "DELETE" {
-                assert!(request.target.contains("uploadId=owned-upload"));
+                assert_eq!(path, "/fixture-bucket/root/task/source");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([("uploadId".into(), "owned-upload".into())])
+                );
                 return Reply {
                     status: 204,
                     headers: Vec::new(),
                     body: Vec::new(),
                 };
             }
+            assert_eq!(request.method, "GET");
+            assert_eq!(path, "/fixture-bucket");
+            assert_eq!(
+                query,
+                BTreeMap::from([
+                    ("versions".into(), String::new()),
+                    ("prefix".into(), "root/task/source".into()),
+                    ("max-keys".into(), "1000".into())
+                ])
+            );
             Reply::xml("<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>")
         });
         assert!(upload_version(&client, &repo, &entry, &source, 4, 5).is_err());
-        let requests = worker.join().unwrap();
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.method == "DELETE")
-                .count(),
-            1
-        );
+        let requests = worker.finish_requests();
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == method)
+                    .count(),
+                1
+            );
+        }
         let (_, journal) = upload_journal(&repo, &client, &entry).unwrap();
         assert_eq!(journal["phase"], "planned");
         assert!(journal["upload_id"].is_null());
@@ -3149,7 +3285,6 @@ mod tests {
 
     #[test]
     fn uploaded_get_cannot_substitute_another_exact_generation_or_etag() {
-        use crate::native_s3::tests::fixture;
         for (version, etag) in [
             ("foreign-version", "\"owned-etag\""),
             ("owned-version", "\"foreign-etag\""),
@@ -3157,10 +3292,7 @@ mod tests {
             let (_temporary, repo) = repository();
             let bytes = b"same bytes";
             let (entry, _source) = upload_fixture(&repo, bytes);
-            let (client, worker) = fixture(vec![
-                uploaded_head("owned-token", bytes.len()),
-                uploaded_get(bytes, version, etag),
-            ]);
+            let (client, worker) = uploaded_read_fixture(bytes, version, etag);
             assert!(
                 verify_uploaded_version(
                     &client,
@@ -3172,13 +3304,14 @@ mod tests {
                 )
                 .is_err()
             );
-            worker.join().unwrap();
+            let requests = worker.finish_requests();
+            assert!(requests.iter().any(|request| request.method == "GET"));
         }
     }
 
     #[test]
     fn import_upload_receipts_distinguish_raw_variants_of_one_normalized_checksum() {
-        use crate::native_s3::tests::fixture;
+        use crate::native_s3::tests::empty_fixture;
         let (_temporary, repo) = repository();
         let (mut entry, source) = upload_fixture(&repo, b"a\r\nb\n");
         entry.hash_name = "md5-dos2unix".into();
@@ -3190,7 +3323,7 @@ mod tests {
             entry.md5.as_deref().unwrap()
         );
         let b = file_sha256(&source).unwrap();
-        let (client, worker) = fixture(vec![]);
+        let (client, worker) = empty_fixture();
         let (a_path, a_receipt) =
             upload_journal_in(&repo, &client, &entry, "storage-import-uploads", Some(&a)).unwrap();
         let (b_path, b_receipt) =
@@ -3204,22 +3337,18 @@ mod tests {
             a_receipt
         );
         assert!(upload_context(&repo, &client, &entry, "storage-import-uploads", None).is_err());
-        worker.join().unwrap();
+        assert!(worker.finish_requests().is_empty());
     }
 
     #[test]
     fn imported_exact_uploaded_get_rejects_a_different_raw_normalized_variant() {
-        use crate::native_s3::tests::fixture;
         let (_temporary, repo) = repository();
         let (mut entry, source) = upload_fixture(&repo, b"a\r\nb\n");
         entry.hash_name = "md5-dos2unix".into();
         entry.md5 = Some(file_digest(&source, &entry.hash_name).unwrap());
         let expected = file_sha256(&source).unwrap();
         let bytes = b"a\nb\r\n";
-        let (client, worker) = fixture(vec![
-            uploaded_head("owned-token", bytes.len()),
-            uploaded_get(bytes, "owned-version", "\"owned-etag\""),
-        ]);
+        let (client, worker) = uploaded_read_fixture(bytes, "owned-version", "\"owned-etag\"");
         assert!(
             verify_uploaded_version(
                 &client,
@@ -3231,7 +3360,8 @@ mod tests {
             )
             .is_err()
         );
-        worker.join().unwrap();
+        let requests = worker.finish_requests();
+        assert!(requests.iter().any(|request| request.method == "GET"));
     }
 
     #[test]
@@ -3301,7 +3431,7 @@ mod tests {
 
     #[test]
     fn an_independent_cloud_binding_edit_during_upload_is_preserved() {
-        use crate::native_s3::tests::{Reply, configure_repo, fixture_handler};
+        use crate::native_s3::tests::{Reply, configure_repo, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"same bytes";
         fs::write(repo.root.join("source"), bytes).unwrap();
@@ -3309,13 +3439,22 @@ mod tests {
         let pointer = repo.root.join("source.wm-storage.json");
         let captured = std::sync::Arc::new(std::sync::Mutex::new((String::new(), Vec::new())));
         let expected = captured.clone();
-        let (client, worker) = fixture_handler(4, move |request| {
-            if request.target.contains("versioning") {
+        let (client, worker) = routed_fixture(move |request| {
+            let (path, query) = upload_request_route(request);
+            if request.method == "GET" && query.contains_key("versioning") {
+                assert_eq!(path, "/fixture-bucket");
+                assert_eq!(
+                    query,
+                    BTreeMap::from([("versioning".into(), String::new())])
+                );
                 return Reply::xml(
                     "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
                 );
             }
             if request.method == "PUT" {
+                assert_eq!(path, "/fixture-bucket/root/source");
+                assert!(query.is_empty());
+                assert!(expected.lock().unwrap().0.is_empty());
                 let mut raw = Manifest::parse(
                     &fs::read_to_string(&pointer).unwrap(),
                     "source.wm-storage.json",
@@ -3340,6 +3479,7 @@ mod tests {
                     body: Vec::new(),
                 };
             }
+            assert_uploaded_read(request, "source");
             if request.method == "HEAD" {
                 return uploaded_head(&expected.lock().unwrap().0, bytes.len());
             }
@@ -3348,7 +3488,14 @@ mod tests {
         configure_repo(&client, &repo);
         let error = push_versioned(&repo, &["source.wm-storage.json".into()]).unwrap_err();
         assert!(error.to_string().contains("metadata changed during upload"));
-        worker.join().unwrap();
+        let requests = worker.finish_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1
+        );
         assert_eq!(
             fs::read(repo.root.join("source.wm-storage.json")).unwrap(),
             captured.lock().unwrap().1

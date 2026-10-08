@@ -148,7 +148,7 @@ release, a repository declares the oldest compatible release in
   the base tip and the task-branch tip, and `refresh` checks the incoming
   revision before it changes the ref, index, or files. A `task create --dry-run` fetches a missing
   base commit without moving any ref. `manage` preserves higher existing
-  declarations and raises the requirement to at least 0.8.0 when adopting
+  declarations and raises the requirement to at least 0.8.1 when adopting
   native storage.
 - Declarations are plain release versions. An installed release meets one by
   semantic-version precedence, and a pre-release also meets a declaration of

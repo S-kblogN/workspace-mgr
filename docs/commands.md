@@ -194,7 +194,7 @@ reported action names the marker it dropped. `doctor` reports a hand-edited
 root file through its `repository-scaffold` check. `manage` refuses to change the S3
 location while retained S3 boundaries exist. It preserves higher existing
 `minimum_cli_version` declarations and raises the requirement to at least
-0.8.0 when adopting native storage. It does not push Git refs. Ordinary CAS
+0.8.1 when adopting native storage. It does not push Git refs. Ordinary CAS
 adoption reads S3 sources and creates verified native object versions;
 `--dry-run` reads only the remote metadata and listings needed for its inventory.
 The generated `AGENTS.md` includes an approval-gated command that

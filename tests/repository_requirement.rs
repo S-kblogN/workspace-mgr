@@ -822,7 +822,7 @@ fn manage_with_storage_raises_the_native_format_requirement() {
         read(&config_path),
         format!(
             "{}\n[s3]\nurl = \"{}\"\n",
-            declaring("0.8.0", &declared),
+            declaring("0.8.1", &declared),
             storage.display()
         )
     );
@@ -1575,7 +1575,7 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
     fixture.clone_shared();
     let config_path = fixture.shared.join(CONFIG);
     let original = read(&config_path);
-    let current = [(CLI_VERSION_ENV, "0.8.0")];
+    let current = [(CLI_VERSION_ENV, "0.8.1")];
     let (task_id, task) = create_task(&fixture, "relocation", "20260918-202000");
     approve(
         &task,
@@ -1611,7 +1611,7 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
     let tip = authorized["remote_oid"].as_str().unwrap();
     assert_eq!(
         show(&fixture.remote, &format!("{tip}:{CONFIG}")),
-        declaring("0.8.0", &relocated)
+        declaring("0.8.1", &relocated)
     );
 
     // A later release raises the shared branch further for its own schema.
@@ -1627,7 +1627,7 @@ fn an_authorized_configuration_follows_a_further_raised_shared_branch() {
         "path": CONFIG,
         "change": "follow",
         "minimum_cli_version": "0.9.0",
-        "previous_minimum_cli_version": "0.8.0",
+        "previous_minimum_cli_version": "0.8.1",
         "task_manifest_schema": 3,
     });
     let published = json(&workspace_env(
@@ -1680,30 +1680,32 @@ fn native_storage_metadata_requires_a_compatible_writer_before_publication() {
     .unwrap();
     let index = git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout;
     let head = rev(&fixture.shared, "HEAD").unwrap();
-    for args in [
-        &["plan"][..],
-        &["publish", "--dry-run", "-m", "Native metadata"][..],
-        &["publish", "-m", "Native metadata"][..],
-    ] {
-        let rejected = workspace_env_unchecked(&task, args, &[(CLI_VERSION_ENV, "0.7.2")]);
-        assert_eq!(rejected.status.code(), Some(2));
-        assert!(
-            stderr(&rejected).contains("native storage manifest"),
-            "{}",
-            stderr(&rejected)
-        );
-        assert!(stderr(&rejected).contains("0.8.0"), "{}", stderr(&rejected));
-        assert_eq!(
-            git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
-            index
-        );
-        assert_eq!(rev(&fixture.shared, "HEAD").unwrap(), head);
-        assert!(rev(&fixture.remote, "refs/heads/codex/native-format").is_none());
+    for older in ["0.7.2", "0.8.0"] {
+        for args in [
+            &["plan"][..],
+            &["publish", "--dry-run", "-m", "Native metadata"][..],
+            &["publish", "-m", "Native metadata"][..],
+        ] {
+            let rejected = workspace_env_unchecked(&task, args, &[(CLI_VERSION_ENV, older)]);
+            assert_eq!(rejected.status.code(), Some(2));
+            assert!(
+                stderr(&rejected).contains("native storage manifest"),
+                "{}",
+                stderr(&rejected)
+            );
+            assert!(stderr(&rejected).contains("0.8.1"), "{}", stderr(&rejected));
+            assert_eq!(
+                git(&fixture.shared, ["ls-files", "--stage", "-z"]).stdout,
+                index
+            );
+            assert_eq!(rev(&fixture.shared, "HEAD").unwrap(), head);
+            assert!(rev(&fixture.remote, "refs/heads/codex/native-format").is_none());
+        }
     }
     let plan = json(&workspace(&task, ["plan"]));
     assert_eq!(
         plan["repository_requirement"]["minimum_cli_version"],
-        "0.8.0"
+        "0.8.1"
     );
     let published = json(&workspace(
         &task,
@@ -1712,7 +1714,7 @@ fn native_storage_metadata_requires_a_compatible_writer_before_publication() {
     let tip = published["remote_oid"].as_str().unwrap();
     assert!(
         show(&fixture.remote, &format!("{tip}:{CONFIG}"))
-            .starts_with("minimum_cli_version = \"0.8.0\"")
+            .starts_with("minimum_cli_version = \"0.8.1\"")
     );
     assert!(commit_message(&fixture.remote, tip).contains("storage metadata compatibility"));
     assert!(

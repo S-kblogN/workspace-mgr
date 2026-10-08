@@ -732,7 +732,7 @@ fn fresh_manage_uses_native_storage_without_external_configuration_files() {
         &std::fs::read_to_string(fixture.shared.join(".workspace-mgr.toml")).unwrap(),
     )
     .unwrap();
-    assert_eq!(config["minimum_cli_version"].as_str(), Some("0.8.0"));
+    assert_eq!(config["minimum_cli_version"].as_str(), Some("0.8.1"));
     for path in [".dvc", ".dvcignore", ".gitattributes"] {
         assert!(
             !fixture.shared.join(path).exists(),

@@ -1865,13 +1865,17 @@ mod tests {
 
     #[test]
     fn purge_pending_never_deletes_versions_referenced_by_a_new_parent_pointer() {
-        use crate::native_s3::tests::{Reply, configure_repo, fixture};
+        use crate::native_s3::tests::{Reply, configure_repo, routed_fixture};
 
         let (_directory, repo, _reference) = parent_reference_fixture(false);
         let old = retired_child_version();
-        let (client, worker) = fixture(vec![Reply::xml(
-            "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
-        )]);
+        let (client, worker) = routed_fixture(|request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.target, "/fixture-bucket?versioning=");
+            Reply::xml(
+                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            )
+        });
         configure_repo(&client, &repo);
         let endpoint_url = Config::load(&repo).unwrap().s3.unwrap().endpoint_url;
         let config = Config {
@@ -1888,10 +1892,8 @@ mod tests {
         assert_eq!(report.protected.as_slice(), std::slice::from_ref(&old));
         assert_eq!(report.pending, [old]);
         assert!(report.deleted.is_empty());
-        let requests = worker.join().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "GET");
-        assert!(requests[0].target.contains("versioning="));
+        let requests = worker.finish_requests();
+        assert!(!requests.is_empty());
         assert!(requests.iter().all(|request| request.method != "DELETE"));
     }
 }

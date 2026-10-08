@@ -1241,7 +1241,7 @@ fn lost_upload_response_recovers_the_owned_exact_version_before_binding() {
 fn old_git_revision_hydrates_retained_cas_objects_after_native_adoption() {
     let remote = S3Fixture::new();
     let fixture = legacy_repository(&remote);
-    fs::write(fixture.shared.join(".workspace-mgr.toml"), format!("minimum_cli_version = \"0.8.0\"\n[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = \"s3://{BUCKET}/{PREFIX}\"\nendpoint_url = \"{}\"\n", remote.endpoint)).unwrap();
+    fs::write(fixture.shared.join(".workspace-mgr.toml"), format!("minimum_cli_version = \"0.8.1\"\n[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = \"s3://{BUCKET}/{PREFIX}\"\nendpoint_url = \"{}\"\n", remote.endpoint)).unwrap();
     let task = run(
         &fixture.shared,
         &[
@@ -1339,7 +1339,7 @@ fn old_git_revision_hydrates_retained_cas_objects_after_native_adoption() {
 fn mixed_historical_cas_and_native_exact_bindings_hydrate_from_their_own_keys() {
     let remote = S3Fixture::new();
     let fixture = legacy_repository(&remote);
-    fs::write(fixture.shared.join(".workspace-mgr.toml"), format!("minimum_cli_version = \"0.8.0\"\n[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = \"s3://{BUCKET}/{PREFIX}\"\nendpoint_url = \"{}\"\n", remote.endpoint)).unwrap();
+    fs::write(fixture.shared.join(".workspace-mgr.toml"), format!("minimum_cli_version = \"0.8.1\"\n[git]\nremote = \"origin\"\nbranch = \"main\"\n[s3]\nurl = \"s3://{BUCKET}/{PREFIX}\"\nendpoint_url = \"{}\"\n", remote.endpoint)).unwrap();
     let task = run(
         &fixture.shared,
         &[

@@ -140,7 +140,7 @@ when its version is at least the declared one by semantic-version precedence.
 A pre-release also meets a declaration of its own release, so 0.4.0-rc.1 meets
 `"0.4.0"`, while it does not meet `"0.4.1"`.
 
-Management raises the declaration to at least 0.8.0 when adopting native storage. Publication maintains the declaration for subsequent task and storage changes. Task manifest schema 3, which records a
+Management raises the declaration to at least 0.8.1 when adopting native storage. Publication maintains the declaration for subsequent task and storage changes. Task manifest schema 3, which records a
 cloud-usage approval, needs `workspace-mgr` 0.4.0. Schema 4, which retains
 archive completion evidence, needs 0.7.0. Top-level manifests with
 schemas 1 and 2 need no declaration. A nested archive task manifest needs
@@ -183,7 +183,7 @@ that needed it are gone; nothing lowers a merged declaration. A branch that was
 raised before the base branch was raised further conflicts with it until the
 branch is published again; resolving such a conflict by hand must keep the
 higher value. `manage` preserves an existing declaration or raises it to at
-least 0.8.0 when adopting native storage; it never lowers one. `manage`, and
+least 0.8.1 when adopting native storage; it never lowers one. `manage`, and
 publication whenever it rewrites the declaration, write this file in its
 canonical form, so comments in it are not preserved then.
 

@@ -937,10 +937,43 @@ mod tests {
     }
     #[test]
     fn bounded_workers_visit_every_item_once() {
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
         let input = (0..100).collect::<Vec<_>>();
-        let mut output = bounded_map(&input, |value| Ok(value * 2)).unwrap();
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let first_callbacks = (Mutex::new((0_usize, false)), Condvar::new());
+        let mut output = bounded_map(&input, |value| {
+            // Count client work itself: an abandoned HTTP response handler
+            // cannot inflate the number of bounded-map callbacks in flight.
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(current, Ordering::SeqCst);
+            let (lock, changed) = &first_callbacks;
+            let mut gate = lock.lock().unwrap();
+            gate.0 += 1;
+            if gate.0 >= 2 {
+                gate.1 = true;
+                changed.notify_all();
+            }
+            if !gate.1 {
+                let (mut gate, _) = changed
+                    .wait_timeout_while(gate, Duration::from_secs(5), |gate| !gate.1)
+                    .unwrap();
+                // A sequential regression waits only once, then releases
+                // every remaining callback before the overlap assertion fails.
+                gate.1 = true;
+                changed.notify_all();
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(value * 2)
+        })
+        .unwrap();
         output.sort();
         assert_eq!(output, (0..100).map(|v| v * 2).collect::<Vec<_>>());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(maximum.load(Ordering::SeqCst) <= WORKERS);
+        assert!(maximum.load(Ordering::SeqCst) > 1);
     }
 }
 

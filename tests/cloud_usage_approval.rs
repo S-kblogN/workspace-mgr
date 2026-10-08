@@ -1129,11 +1129,11 @@ mod test_storage {
     // schema 3, so these tests stand in for one explicitly.
     pub const LIMIT_10MB: [(&str, &str); 2] = [
         (CLOUD_USAGE_THRESHOLD_ENV, "10000000"),
-        (CLI_VERSION_ENV, "0.8.0"),
+        (CLI_VERSION_ENV, "0.8.1"),
     ];
     pub const LIMIT_300KB: [(&str, &str); 2] = [
         (CLOUD_USAGE_THRESHOLD_ENV, "300000"),
-        (CLI_VERSION_ENV, "0.8.0"),
+        (CLI_VERSION_ENV, "0.8.1"),
     ];
     pub const LARGE: usize = 10_485_761;
 
@@ -1767,7 +1767,7 @@ fn declined_growth_is_cleaned_up_and_cleanup_only_publications_stay_allowed() {
     let plan = json(&workspace_env(&task, ["plan"], env));
     let usage = &plan["cloud_usage"];
     // Removing the approval changes only the task manifest. Native storage
-    // keeps the repository compatibility floor at 0.8.0.
+    // keeps the repository compatibility floor at 0.8.1.
     assert_eq!(plan["status"], "dry_run");
     assert_eq!(
         plan["changed_paths"],

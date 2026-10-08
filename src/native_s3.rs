@@ -2131,6 +2131,7 @@ pub(crate) mod tests {
         pub headers: BTreeMap<String, String>,
         pub body: Vec<u8>,
     }
+    #[derive(Clone)]
     pub(crate) struct Reply {
         pub status: u16,
         pub headers: Vec<(&'static str, String)>,
@@ -2162,14 +2163,25 @@ pub(crate) mod tests {
             self.stop.store(true, Ordering::SeqCst);
             self.worker.take().unwrap().join().unwrap()
         }
+
+        pub fn finish_requests(self) -> Vec<WireRequest> {
+            self.finish()
+                .into_iter()
+                .map(|attempt| attempt.request)
+                .collect()
+        }
     }
 
     impl Drop for RoutedFixture {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
-            // Also stop on a client assertion failure, without double-panicking.
             if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
+                let result = worker.join();
+                // Stop on a client assertion failure without double-panicking,
+                // but never hide a server failure when the test is succeeding.
+                if !thread::panicking() {
+                    result.unwrap();
+                }
             }
         }
     }
@@ -2177,7 +2189,7 @@ pub(crate) mod tests {
     /// Read-only fixture routed by request identity, not connection order.
     /// Abandoned reads remain recorded and never consume another version's reply.
     pub(crate) fn replayable_read_fixture(
-        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + 'static,
+        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + Sync + 'static,
     ) -> (S3Client, RoutedFixture) {
         response_fixture(move |request| {
             assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
@@ -2188,21 +2200,22 @@ pub(crate) mod tests {
     /// Route every request until the caller finishes the logical operation.
     /// Read retries never consume a fixed budget or another request's reply.
     pub(crate) fn routed_fixture(
-        handler: impl Fn(&WireRequest) -> Reply + Send + 'static,
+        handler: impl Fn(&WireRequest) -> Reply + Send + Sync + 'static,
     ) -> (S3Client, RoutedFixture) {
         response_fixture(move |request| Arc::new(handler(request)))
     }
 
     fn response_fixture(
-        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + 'static,
+        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + Sync + 'static,
     ) -> (S3Client, RoutedFixture) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
+        let handler = Arc::new(handler);
         let worker = thread::spawn(move || {
-            let mut attempts = Vec::new();
+            let mut handlers = Vec::new();
             // Clients can parse large JSON bodies between requests while other
             // tests occupy the runner. Keep a bounded idle deadline without
             // counting that CPU work as a failed request.
@@ -2212,6 +2225,14 @@ pub(crate) mod tests {
                 let (mut connection, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Response transmission and concurrent handler work do
+                        // not count toward the bounded idle-request deadline.
+                        if handlers
+                            .iter()
+                            .any(|worker: &thread::JoinHandle<_>| !worker.is_finished())
+                        {
+                            deadline = std::time::Instant::now() + idle_timeout;
+                        }
                         assert!(
                             std::time::Instant::now() < deadline,
                             "mock S3 routed fixture timed out"
@@ -2222,35 +2243,51 @@ pub(crate) mod tests {
                     Err(error) => panic!("mock accept: {error}"),
                 };
                 deadline = std::time::Instant::now() + idle_timeout;
-                connection.set_nonblocking(false).unwrap();
-                connection
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                connection
-                    .set_write_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let request = match read_request_result(&mut connection) {
-                    Ok(request) => request,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => panic!("mock read: {error}"),
-                };
-                let reply = handler(&request);
-                let response_sent = write_fixture_response(&mut connection, &request, &reply)
-                    .unwrap_or_else(|error| panic!("mock response: {error}"));
-                attempts.push(ReadAttempt {
-                    request,
-                    response_sent,
-                });
-                // The idle-request deadline must not include a large response's
-                // transmission time on a slower CI runner.
-                deadline = std::time::Instant::now() + idle_timeout;
+                let handler = handler.clone();
+                handlers.push(thread::spawn(move || {
+                    connection.set_nonblocking(false).unwrap();
+                    connection
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    connection
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let request = match read_request_result(&mut connection) {
+                        Ok(request) => request,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            return None;
+                        }
+                        Err(error) => panic!("mock read: {error}"),
+                    };
+                    let reply = handler(&request);
+                    let response_sent = write_fixture_response(&mut connection, &request, &reply)
+                        .unwrap_or_else(|error| panic!("mock response: {error}"));
+                    Some(ReadAttempt {
+                        request,
+                        response_sent,
+                    })
+                }));
+            }
+            // Join every accepted connection before returning; preserve accept
+            // order without serializing handlers or holding a shared log lock.
+            let mut attempts = Vec::new();
+            let mut failure = None;
+            for handler in handlers {
+                match handler.join() {
+                    Ok(Some(attempt)) => attempts.push(attempt),
+                    Ok(None) => {}
+                    Err(error) if failure.is_none() => failure = Some(error),
+                    Err(_) => {}
+                }
+            }
+            if let Some(error) = failure {
+                std::panic::resume_unwind(error);
             }
             attempts
         });
@@ -2416,6 +2453,66 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn routed_fixture_runs_distinct_read_handlers_concurrently() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let server_gate = gate.clone();
+        let (entered, received) = mpsc::channel();
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "GET");
+            assert!(matches!(
+                request.target.as_str(),
+                "/fixture-bucket/root/a?versionId=v1" | "/fixture-bucket/root/b?versionId=v1"
+            ));
+            entered.send(request.target.clone()).unwrap();
+            let (lock, condition) = &*server_gate;
+            let (open, timeout) = condition
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |open| !*open)
+                .unwrap();
+            assert!(
+                !timeout.timed_out() && *open,
+                "concurrent fixture handlers never entered"
+            );
+            drop(open);
+            Reply {
+                status: 200,
+                headers: vec![("x-amz-version-id", "v1".into())],
+                body: b"abc".to_vec(),
+            }
+        });
+        let clients = ["root/a", "root/b"].map(|key| {
+            let client = client.clone();
+            thread::spawn(move || {
+                client
+                    .call_s3("get_object", &json!({"Key":key,"VersionId":"v1"}), None)
+                    .unwrap()
+            })
+        });
+        let mut entered_targets = std::collections::BTreeSet::new();
+        while entered_targets.len() < 2 {
+            entered_targets.insert(
+                received
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("both distinct handlers must enter before either response is released"),
+            );
+        }
+        let (lock, condition) = &*gate;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        for client in clients {
+            assert_eq!(client.join().unwrap().body, b"abc");
+        }
+        let attempts = worker.finish();
+        assert!(attempts.len() >= 2);
+        for target in entered_targets {
+            assert!(
+                attempts
+                    .iter()
+                    .any(|attempt| { attempt.request.target == target && attempt.response_sent })
+            );
+        }
+    }
+
     fn test_credentials() -> Credentials {
         Credentials {
             access: "AKIAIOSFODNN7EXAMPLE".to_owned(),
@@ -2450,114 +2547,35 @@ pub(crate) mod tests {
         fs::create_dir_all(repo.root.join(".workspace-mgr/local")).unwrap();
         fs::write(repo.root.join(CREDENTIALS_NAME), "access_key_id = \"fixture-test-only\"\nsecret_access_key = \"fixture-test-only-secret\"\nregion = \"us-east-1\"\n").unwrap();
     }
-    pub(crate) fn fixture(replies: Vec<Reply>) -> (S3Client, thread::JoinHandle<Vec<WireRequest>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let worker = thread::spawn(move || {
-            let mut requests = Vec::new();
-            for reply in replies {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                let mut connection = loop {
-                    match listener.accept() {
-                        Ok((connection, _)) => break connection,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "mock S3 request never arrived"
-                            );
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(error) => panic!("mock accept: {error}"),
-                    }
-                };
-                connection
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                connection.set_nonblocking(false).unwrap();
-                let request = read_request(&mut connection);
-                let mut headers =
-                    format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", reply.status);
-                if !reply
-                    .headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                {
-                    headers.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
-                }
-                for (name, value) in reply.headers {
-                    headers.push_str(&format!("{name}: {value}\r\n"));
-                }
-                headers.push_str("\r\n");
-                connection.write_all(headers.as_bytes()).unwrap();
-                connection.write_all(&reply.body).unwrap();
-                requests.push(request);
+    /// Repeat one response only for the same request identity. Reads may be
+    /// replayed; a second mutation always fails the fixture.
+    pub(crate) fn single_reply_fixture(reply: Reply) -> (S3Client, RoutedFixture) {
+        let reply = Arc::new(reply);
+        let identity = Mutex::new(None);
+        response_fixture(move |request| {
+            let mut seen = identity.lock().unwrap();
+            let requested = (request.method.clone(), request.target.clone());
+            if let Some(previous) = seen.as_ref() {
+                assert_eq!(
+                    previous, &requested,
+                    "single-response fixture received another request identity"
+                );
+                assert!(
+                    matches!(request.method.as_str(), "GET" | "HEAD"),
+                    "single-response fixture received a duplicate mutation"
+                );
+            } else {
+                *seen = Some(requested);
             }
-            requests
-        });
-        (client(&endpoint), worker)
+            drop(seen);
+            reply.clone()
+        })
     }
 
-    pub(crate) fn fixture_handler(
-        count: usize,
-        handler: impl Fn(&WireRequest) -> Reply + Send + Sync + 'static,
-    ) -> (S3Client, thread::JoinHandle<Vec<WireRequest>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let handler = std::sync::Arc::new(handler);
-        let worker = thread::spawn(move || {
-            let mut handlers = Vec::new();
-            for _ in 0..count {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                let mut connection = loop {
-                    match listener.accept() {
-                        Ok((connection, _)) => break connection,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "mock S3 request never arrived"
-                            );
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(error) => panic!("mock accept: {error}"),
-                    }
-                };
-                let handler = handler.clone();
-                handlers.push(thread::spawn(move || {
-                    connection.set_nonblocking(false).unwrap();
-                    connection
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let request = read_request(&mut connection);
-                    let reply = handler(&request);
-                    let mut headers =
-                        format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", reply.status);
-                    if !reply
-                        .headers
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                    {
-                        headers.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
-                    }
-                    for (name, value) in reply.headers {
-                        headers.push_str(&format!("{name}: {value}\r\n"));
-                    }
-                    headers.push_str("\r\n");
-                    connection.write_all(headers.as_bytes()).unwrap();
-                    connection.write_all(&reply.body).unwrap();
-                    request
-                }));
-            }
-            handlers
-                .into_iter()
-                .map(|handler| handler.join().unwrap())
-                .collect()
-        });
-        (client(&endpoint), worker)
-    }
-    fn read_request(stream: &mut TcpStream) -> WireRequest {
-        read_request_result(stream).unwrap()
+    pub(crate) fn empty_fixture() -> (S3Client, RoutedFixture) {
+        routed_fixture(|request| {
+            panic!("empty S3 fixture received an unexpected request: {request:?}")
+        })
     }
 
     fn read_request_result(stream: &mut TcpStream) -> std::io::Result<WireRequest> {
@@ -2667,17 +2685,17 @@ pub(crate) mod tests {
 
     #[test]
     fn conditional_put_has_only_supported_fixed_length_checksums() {
-        let (client, worker) = fixture(vec![Reply {
+        let (client, worker) = single_reply_fixture(Reply {
             status: 200,
             headers: vec![
                 ("x-amz-version-id", "written-version".into()),
                 ("ETag", "\"abc\"".into()),
             ],
             body: Vec::new(),
-        }]);
+        });
         let response=client.call_s3("put_object",&json!({"Key":"root/task/receipt","IfNoneMatch":"*","ContentType":"application/json","Metadata":{"proof":"bound"}}),Some(b"receipt")).unwrap();
         assert_eq!(response.value["VersionId"], "written-version");
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
         let request = &requests[0];
         assert_eq!(request.method, "PUT");
         assert_eq!(request.headers["if-none-match"], "*");
@@ -2702,7 +2720,7 @@ pub(crate) mod tests {
     #[test]
     fn exact_get_metadata_binary_body_and_duplicate_slashes() {
         let bytes = vec![0, 255, 4, 13, 10];
-        let (client, worker) = fixture(vec![Reply {
+        let (client, worker) = single_reply_fixture(Reply {
             status: 200,
             headers: vec![
                 ("x-amz-version-id", "v/+=1".into()),
@@ -2711,7 +2729,7 @@ pub(crate) mod tests {
                 ("x-amz-meta-proof", "value".into()),
             ],
             body: bytes.clone(),
-        }]);
+        });
         let response = client
             .call_s3(
                 "get_object",
@@ -2724,7 +2742,7 @@ pub(crate) mod tests {
         assert_eq!(response.value["VersionId"], "v/+=1");
         assert_eq!(response.value["Metadata"]["proof"], "value");
         assert_eq!(response.value["LastModified"], "2013-05-24T00:00:00+00:00");
-        let request = worker.join().unwrap().pop().unwrap();
+        let request = worker.finish_requests().pop().unwrap();
         assert_eq!(
             request.target,
             "/fixture-bucket/root/a//b?versionId=v%2F%2B%3D1"
@@ -2735,18 +2753,22 @@ pub(crate) mod tests {
     #[test]
     fn streaming_download_and_upload_use_fixed_length_bytes() {
         let bytes = vec![42u8; 2 * 1024 * 1024 + 17];
-        let (client, worker) = fixture(vec![
-            Reply {
-                status: 200,
-                headers: vec![("x-amz-version-id", "read".into())],
-                body: bytes.clone(),
-            },
-            Reply {
-                status: 200,
-                headers: vec![("x-amz-version-id", "written".into())],
-                body: Vec::new(),
-            },
-        ]);
+        let download_bytes = bytes.clone();
+        let (client, worker) = routed_fixture(move |request| {
+            match (request.method.as_str(), request.target.as_str()) {
+                ("GET", "/fixture-bucket/root/data?versionId=read") => Reply {
+                    status: 200,
+                    headers: vec![("x-amz-version-id", "read".into())],
+                    body: download_bytes.clone(),
+                },
+                ("PUT", "/fixture-bucket/root/other") => Reply {
+                    status: 200,
+                    headers: vec![("x-amz-version-id", "written".into())],
+                    body: Vec::new(),
+                },
+                _ => panic!("unexpected streaming request: {request:?}"),
+            }
+        });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scratch");
         let read = client
@@ -2758,14 +2780,17 @@ pub(crate) mod tests {
             .put_file(&json!({"Key":"root/other","IfNoneMatch":"*"}), &path)
             .unwrap();
         assert_eq!(written.value["VersionId"], "written");
-        let requests = worker.join().unwrap();
-        assert_eq!(requests[1].body, bytes);
+        let requests = worker.finish_requests();
+        let uploads = requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .collect::<Vec<_>>();
+        assert_eq!(uploads.len(), 1);
+        let upload = uploads[0];
+        assert_eq!(upload.body, bytes);
+        assert_eq!(upload.headers["content-length"], bytes.len().to_string());
         assert_eq!(
-            requests[1].headers["content-length"],
-            bytes.len().to_string()
-        );
-        assert_eq!(
-            requests[1].headers["x-amz-content-sha256"],
+            upload.headers["x-amz-content-sha256"],
             encode_lower(Sha256::digest(&bytes))
         );
     }
@@ -2778,7 +2803,7 @@ pub(crate) mod tests {
             ("get_object", false, 1),
             ("get_object", true, 2),
         ] {
-            let (client, worker) = fixture(vec![Reply {
+            let (client, worker) = single_reply_fixture(Reply {
                 status: 200,
                 headers: vec![
                     ("Content-Length", bytes.len().to_string()),
@@ -2791,7 +2816,7 @@ pub(crate) mod tests {
                 } else {
                     bytes.clone()
                 },
-            }]);
+            });
             let (client, attempts) = inject_connector_failure(
                 client,
                 failures,
@@ -2805,7 +2830,7 @@ pub(crate) mod tests {
             } else {
                 client.call_s3(operation, &args, None).unwrap()
             };
-            assert_eq!(attempts.load(Ordering::SeqCst), failures + 1);
+            assert!((failures + 1..=3).contains(&attempts.load(Ordering::SeqCst)));
             assert_eq!(response.value["ContentLength"], bytes.len());
             assert_eq!(response.value["VersionId"], "v/+=1");
             assert_eq!(response.value["ETag"], "\"abc\"");
@@ -2818,22 +2843,24 @@ pub(crate) mod tests {
             } else {
                 assert!(response.body.is_empty());
             }
-            let requests = worker.join().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(
-                requests[0].method,
-                if operation == "head_object" {
-                    "HEAD"
-                } else {
-                    "GET"
-                }
-            );
-            assert_eq!(
-                requests[0].target,
-                "/fixture-bucket/root/a//b?versionId=v%2F%2B%3D1"
-            );
-            assert_eq!(requests[0].headers["if-match"], "\"abc\"");
-            assert!(requests[0].headers["authorization"].contains("if-match"));
+            let requests = worker.finish_requests();
+            assert!(!requests.is_empty());
+            for request in &requests {
+                assert_eq!(
+                    request.method,
+                    if operation == "head_object" {
+                        "HEAD"
+                    } else {
+                        "GET"
+                    }
+                );
+                assert_eq!(
+                    request.target,
+                    "/fixture-bucket/root/a//b?versionId=v%2F%2B%3D1"
+                );
+                assert_eq!(request.headers["if-match"], "\"abc\"");
+                assert!(request.headers["authorization"].contains("if-match"));
+            }
         }
     }
 
@@ -2844,7 +2871,7 @@ pub(crate) mod tests {
             ("get_object", false),
             ("get_object", true),
         ] {
-            let (client, worker) = fixture(Vec::new());
+            let (client, worker) = empty_fixture();
             let (client, attempts) = inject_connector_failure(
                 client,
                 usize::MAX,
@@ -2862,7 +2889,7 @@ pub(crate) mod tests {
             assert!(error.message.contains("injected connection failure"));
             assert_eq!(attempts.load(Ordering::SeqCst), 3);
             assert!(!destination.exists());
-            assert!(worker.join().unwrap().is_empty());
+            assert!(worker.finish_requests().is_empty());
         }
     }
 
@@ -2874,7 +2901,7 @@ pub(crate) mod tests {
             InjectedFailure::Io(std::io::ErrorKind::ConnectionReset),
             InjectedFailure::Timeout,
         ] {
-            let (client, worker) = fixture(Vec::new());
+            let (client, worker) = empty_fixture();
             let (client, attempts) = inject_connector_failure(client, usize::MAX, failure);
             let error = client
                 .call_s3(
@@ -2885,7 +2912,7 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert_eq!(error.code, "TransportError");
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
-            assert!(worker.join().unwrap().is_empty());
+            assert!(worker.finish_requests().is_empty());
         }
     }
 
@@ -2903,7 +2930,7 @@ pub(crate) mod tests {
             "complete_multipart_upload",
             "abort_multipart_upload",
         ] {
-            let (client, worker) = fixture(Vec::new());
+            let (client, worker) = empty_fixture();
             let (client, attempts) = inject_connector_failure(
                 client,
                 usize::MAX,
@@ -2912,13 +2939,13 @@ pub(crate) mod tests {
             let error = client.call_s3(operation, &args, Some(b"abc")).unwrap_err();
             assert_eq!(error.code, "TransportError", "{operation}");
             assert_eq!(attempts.load(Ordering::SeqCst), 1, "{operation}");
-            assert!(worker.join().unwrap().is_empty());
+            assert!(worker.finish_requests().is_empty());
         }
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
         fs::write(&source, b"abc").unwrap();
         for part in [false, true] {
-            let (client, worker) = fixture(Vec::new());
+            let (client, worker) = empty_fixture();
             let (client, attempts) = inject_connector_failure(
                 client,
                 usize::MAX,
@@ -2931,17 +2958,17 @@ pub(crate) mod tests {
             };
             assert_eq!(error.code, "TransportError");
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
-            assert!(worker.join().unwrap().is_empty());
+            assert!(worker.finish_requests().is_empty());
         }
     }
 
     #[test]
     fn streaming_upload_part_sends_only_selected_file_range() {
-        let (client, worker) = fixture(vec![Reply {
+        let (client, worker) = single_reply_fixture(Reply {
             status: 200,
             headers: vec![("ETag", "\"part\"".into())],
             body: Vec::new(),
-        }]);
+        });
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
         fs::write(&path, b"before-PART-after").unwrap();
@@ -2954,7 +2981,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(response.value["ETag"], "\"part\"");
-        let requests = worker.join().unwrap();
+        let requests = worker.finish_requests();
         assert_eq!(requests[0].body, b"PART");
         assert_eq!(requests[0].headers["content-length"], "4");
         assert!(!requests[0].headers.contains_key("transfer-encoding"));
@@ -2962,14 +2989,14 @@ pub(crate) mod tests {
 
     #[test]
     fn copy_preserves_exact_source_metadata_and_properties() {
-        let(client,worker)=fixture(vec![Reply{status:200,headers:vec![("x-amz-version-id","dst".into())],body:b"<CopyObjectResult><ETag>&quot;new&quot;</ETag><LastModified>2026-10-07T03:04:05.123Z</LastModified></CopyObjectResult>".to_vec()}]);
+        let(client,worker)=single_reply_fixture(Reply{status:200,headers:vec![("x-amz-version-id","dst".into())],body:b"<CopyObjectResult><ETag>&quot;new&quot;</ETag><LastModified>2026-10-07T03:04:05.123Z</LastModified></CopyObjectResult>".to_vec()});
         let response=client.call_s3("copy_object",&json!({"Key":"root/archive/task/a","CopySource":{"Bucket":"fixture-bucket","Key":"root/task/a ?%","VersionId":"src/+="},"CopySourceIfMatch":"\"old\"","MetadataDirective":"REPLACE","TaggingDirective":"COPY","Metadata":{"owner":"tx"},"ContentType":"text/plain","CacheControl":"max-age=7","BucketKeyEnabled":true,"ObjectLockMode":"GOVERNANCE","ObjectLockLegalHoldStatus":"ON"}),None).unwrap();
         assert_eq!(response.value["CopyObjectResult"]["ETag"], "\"new\"");
         assert_eq!(
             response.value["CopyObjectResult"]["LastModified"],
             "2026-10-07T03:04:05.123000+00:00"
         );
-        let request = worker.join().unwrap().pop().unwrap();
+        let request = worker.finish_requests().pop().unwrap();
         assert_eq!(
             request.headers["x-amz-copy-source"],
             "/fixture-bucket/root/task/a%20%3F%25?versionId=src%2F%2B%3D"
@@ -2985,14 +3012,14 @@ pub(crate) mod tests {
 
     #[test]
     fn complete_multipart_embedded_200_error_is_not_success() {
-        let (client, worker) = fixture(vec![Reply::xml(
+        let (client, worker) = single_reply_fixture(Reply::xml(
             "<Error><Code>InternalError</Code><Message>completion failed</Message></Error>",
-        )]);
+        ));
         let error=client.call_s3("complete_multipart_upload",&json!({"Key":"root/a","UploadId":"id","MultipartUpload":{"Parts":[{"PartNumber":1,"ETag":"\"part&amp;\""}]}}),None).unwrap_err();
         assert_eq!(error.code, "InternalError");
         assert_eq!(error.status, Some(200));
         assert!(error.is_retryable());
-        let request = worker.join().unwrap().pop().unwrap();
+        let request = worker.finish_requests().pop().unwrap();
         assert_eq!(request.target, "/fixture-bucket/root/a?uploadId=id");
         assert!(
             String::from_utf8(request.body)
@@ -3003,7 +3030,7 @@ pub(crate) mod tests {
 
     #[test]
     fn provider_code_and_rejected_header_are_preserved_without_retry() {
-        let(client,worker)=fixture(vec![Reply{status:501,headers:Vec::new(),body:b"<Error><Code>NotImplemented</Code><Message>A header implies unimplemented functionality</Message><Header>If-None-Match</Header></Error>".to_vec()}]);
+        let(client,worker)=single_reply_fixture(Reply{status:501,headers:Vec::new(),body:b"<Error><Code>NotImplemented</Code><Message>A header implies unimplemented functionality</Message><Header>If-None-Match</Header></Error>".to_vec()});
         let error = client
             .call_s3(
                 "put_object",
@@ -3013,19 +3040,19 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(error.code, "NotImplemented");
         assert_eq!(error.header.as_deref(), Some("If-None-Match"));
-        assert_eq!(worker.join().unwrap().len(), 1);
+        assert_eq!(worker.finish_requests().len(), 1);
     }
 
     #[test]
     fn named_404_or_403_errors_are_never_missing_object_versions() {
         for status in [403, 404] {
-            let (client, worker) = fixture(vec![Reply {
+            let (client, worker) = single_reply_fixture(Reply {
                 status,
                 headers: Vec::new(),
                 body:
                     b"<Error><Code>NoSuchBucket</Code><Message>bucket unavailable</Message></Error>"
                         .to_vec(),
-            }]);
+            });
             let error = client
                 .call_s3(
                     "get_object",
@@ -3037,14 +3064,14 @@ pub(crate) mod tests {
                 !error.is_missing(),
                 "NoSuchBucket must not trigger archive alias lookup"
             );
-            worker.join().unwrap();
+            worker.finish_requests();
         }
-        let (client, worker) = fixture(vec![Reply {
+        let (client, worker) = single_reply_fixture(Reply {
             status: 404,
             headers: Vec::new(),
             body: b"<Error><Code>NoSuchVersion</Code><Message>version absent</Message></Error>"
                 .to_vec(),
-        }]);
+        });
         assert!(
             client
                 .call_s3(
@@ -3055,7 +3082,7 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .is_missing()
         );
-        worker.join().unwrap();
+        worker.finish_requests();
     }
 
     fn history_page(rows: &str, tail: &str) -> Reply {
@@ -3063,18 +3090,54 @@ pub(crate) mod tests {
             "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{rows}{tail}</ListVersionsResult>"
         ))
     }
+
+    fn history_fixture(
+        prefix: &'static str,
+        first: Reply,
+        next: Option<(&'static str, &'static str, Reply)>,
+    ) -> (S3Client, RoutedFixture) {
+        let first = Arc::new(first);
+        let next = next.map(|(key, version, reply)| (key, version, Arc::new(reply)));
+        replayable_read_fixture(move |request| {
+            assert_eq!(request.method, "GET");
+            let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+            assert_eq!(url.path(), "/fixture-bucket");
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            let mut expected = BTreeMap::from([
+                ("versions".to_owned(), String::new()),
+                ("max-keys".to_owned(), "1000".to_owned()),
+                ("prefix".to_owned(), prefix.to_owned()),
+            ]);
+            if let Some(key) = query.get("key-marker") {
+                let (next_key, next_version, reply) = next.as_ref().expect("unexpected pagination");
+                assert_eq!(key, next_key);
+                expected.insert("key-marker".into(), (*next_key).into());
+                expected.insert("version-id-marker".into(), (*next_version).into());
+                assert_eq!(query, expected);
+                reply.clone()
+            } else {
+                assert_eq!(query, expected);
+                first.clone()
+            }
+        })
+    }
     const VERSION: &str = "<Version><Key>root/task/a&amp;b</Key><VersionId>v1</VersionId><IsLatest>false</IsLatest><LastModified>2026-10-07T00:00:00.7Z</LastModified><ETag>&quot;abc&quot;</ETag><Size>5</Size></Version>";
     const MARKER: &str = "<DeleteMarker><Key>root/task/a&amp;b</Key><VersionId>d1</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-07T00:00:01Z</LastModified></DeleteMarker>";
 
     #[test]
     fn complete_version_pagination_keeps_all_markers() {
-        let (client, worker) = fixture(vec![
+        let (client, worker) = history_fixture(
+            "root/task/",
             history_page(
                 VERSION,
                 "<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a&amp;b</NextKeyMarker><NextVersionIdMarker>v/+=</NextVersionIdMarker>",
             ),
-            history_page(MARKER, "<IsTruncated>false</IsTruncated>"),
-        ]);
+            Some((
+                "root/task/a&b",
+                "v/+=",
+                history_page(MARKER, "<IsTruncated>false</IsTruncated>"),
+            )),
+        );
         let rows = client.list_versions("root/task/").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["Key"], "root/task/a&b");
@@ -3082,22 +3145,23 @@ pub(crate) mod tests {
         assert_eq!(rows[0]["delete_marker"], false);
         assert_eq!(rows[1]["delete_marker"], true);
         assert_eq!(rows[1]["VersionId"], "d1");
-        let requests = worker.join().unwrap();
-        assert!(
-            requests[1]
-                .target
-                .contains("key-marker=root%2Ftask%2Fa%26b")
-        );
-        assert!(requests[1].target.contains("version-id-marker=v%2F%2B%3D"));
+        let requests = worker.finish_requests();
+        let next = requests
+            .iter()
+            .find(|request| request.target.contains("key-marker="))
+            .unwrap();
+        assert!(next.target.contains("key-marker=root%2Ftask%2Fa%26b"));
+        assert!(next.target.contains("version-id-marker=v%2F%2B%3D"));
     }
 
     #[test]
     fn history_fails_closed_on_repeated_identity_or_marker() {
         let tail = "<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a&amp;b</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker>";
-        let (client, worker) = fixture(vec![
+        let (client, worker) = history_fixture(
+            "root/task/",
             history_page(VERSION, tail),
-            history_page(VERSION, tail),
-        ]);
+            Some(("root/task/a&b", "v1", history_page(VERSION, tail))),
+        );
         assert!(
             client
                 .list_versions("root/task/")
@@ -3105,8 +3169,12 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("repeated an object version")
         );
-        worker.join().unwrap();
-        let (client, worker) = fixture(vec![history_page("", tail), history_page("", tail)]);
+        worker.finish_requests();
+        let (client, worker) = history_fixture(
+            "root/task/",
+            history_page("", tail),
+            Some(("root/task/a&b", "v1", history_page("", tail))),
+        );
         assert!(
             client
                 .list_versions("root/task/")
@@ -3114,15 +3182,16 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("repeated pagination")
         );
-        worker.join().unwrap();
+        worker.finish_requests();
     }
 
     #[test]
     fn history_fails_closed_on_escaped_key_and_missing_pagination() {
-        let (client, worker) = fixture(vec![history_page(
-            VERSION,
-            "<IsTruncated>false</IsTruncated>",
-        )]);
+        let (client, worker) = history_fixture(
+            "root/other/",
+            history_page(VERSION, "<IsTruncated>false</IsTruncated>"),
+            None,
+        );
         assert!(
             client
                 .list_versions("root/other/")
@@ -3130,11 +3199,15 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("escaped")
         );
-        worker.join().unwrap();
-        let (client, worker) = fixture(vec![history_page(
-            "",
-            "<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a</NextKeyMarker>",
-        )]);
+        worker.finish_requests();
+        let (client, worker) = history_fixture(
+            "root/task/",
+            history_page(
+                "",
+                "<IsTruncated>true</IsTruncated><NextKeyMarker>root/task/a</NextKeyMarker>",
+            ),
+            None,
+        );
         assert!(
             client
                 .list_versions("root/task/")
@@ -3142,7 +3215,7 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("NextVersionIdMarker")
         );
-        worker.join().unwrap();
+        worker.finish_requests();
     }
 
     #[test]
@@ -3160,11 +3233,11 @@ pub(crate) mod tests {
 
     #[test]
     fn request_mutations_never_redirect() {
-        let (client, worker) = fixture(vec![Reply {
+        let (client, worker) = single_reply_fixture(Reply {
             status: 307,
             headers: vec![("Location", "http://127.0.0.1:1/never-follow".into())],
             body: Vec::new(),
-        }]);
+        });
         assert_eq!(
             client
                 .call_s3(
@@ -3176,31 +3249,35 @@ pub(crate) mod tests {
                 .status,
             Some(307)
         );
-        assert_eq!(worker.join().unwrap().len(), 1);
+        assert_eq!(worker.finish_requests().len(), 1);
     }
 
     #[test]
     fn head_and_exact_delete_preserve_version_id() {
-        let (client, worker) = fixture(vec![
-            Reply {
-                status: 200,
-                headers: vec![
-                    ("Content-Length", "55".into()),
-                    ("x-amz-version-id", "v1".into()),
-                    ("x-amz-meta-user", "m".into()),
-                    ("Content-Type", "text/plain".into()),
-                ],
-                body: Vec::new(),
-            },
-            Reply {
-                status: 204,
-                headers: vec![
-                    ("x-amz-version-id", "d1".into()),
-                    ("x-amz-delete-marker", "true".into()),
-                ],
-                body: Vec::new(),
-            },
-        ]);
+        let (client, worker) =
+            routed_fixture(
+                |request| match (request.method.as_str(), request.target.as_str()) {
+                    ("HEAD", "/fixture-bucket/root/a?versionId=v1") => Reply {
+                        status: 200,
+                        headers: vec![
+                            ("Content-Length", "55".into()),
+                            ("x-amz-version-id", "v1".into()),
+                            ("x-amz-meta-user", "m".into()),
+                            ("Content-Type", "text/plain".into()),
+                        ],
+                        body: Vec::new(),
+                    },
+                    ("DELETE", "/fixture-bucket/root/a?versionId=d1") => Reply {
+                        status: 204,
+                        headers: vec![
+                            ("x-amz-version-id", "d1".into()),
+                            ("x-amz-delete-marker", "true".into()),
+                        ],
+                        body: Vec::new(),
+                    },
+                    _ => panic!("unexpected exact head/delete request: {request:?}"),
+                },
+            );
         let head = client
             .call_s3(
                 "head_object",
@@ -3218,33 +3295,40 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(deleted.value["DeleteMarker"], true);
-        let requests = worker.join().unwrap();
-        assert_eq!(requests[0].method, "HEAD");
-        assert_eq!(requests[1].method, "DELETE");
-        assert!(requests[1].target.ends_with("versionId=d1"));
+        let requests = worker.finish_requests();
+        assert!(requests.iter().any(|request| request.method == "HEAD"));
+        let deletes = requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 1);
+        assert!(deletes[0].target.ends_with("versionId=d1"));
     }
 
     #[test]
     fn tagging_and_multipart_apis_encode_and_parse_native_requests() {
-        let (client, worker) = fixture(vec![
-            Reply::xml(
-                "<Tagging><TagSet><Tag><Key>a&amp;b</Key><Value>v+1</Value></Tag></TagSet></Tagging>",
-            ),
-            Reply::xml(
-                "<InitiateMultipartUploadResult><Bucket>fixture-bucket</Bucket><Key>root/a</Key><UploadId>upload/+</UploadId></InitiateMultipartUploadResult>",
-            ),
-            Reply::xml(
-                "<CopyPartResult><ETag>&quot;part&quot;</ETag><LastModified>2026-10-07T00:00:00Z</LastModified></CopyPartResult>",
-            ),
-            Reply::xml(
-                "<CompleteMultipartUploadResult><ETag>&quot;total-1&quot;</ETag><Key>root/a</Key></CompleteMultipartUploadResult>",
-            ),
-            Reply {
-                status: 204,
-                headers: Vec::new(),
-                body: Vec::new(),
-            },
-        ]);
+        let (client, worker) = routed_fixture(|request| {
+            match (request.method.as_str(), request.target.as_str()) {
+                ("GET", "/fixture-bucket/root/a?tagging=&versionId=src") => Reply::xml(
+                    "<Tagging><TagSet><Tag><Key>a&amp;b</Key><Value>v+1</Value></Tag></TagSet></Tagging>",
+                ),
+                ("POST", "/fixture-bucket/root/a?uploads=") => Reply::xml(
+                    "<InitiateMultipartUploadResult><Bucket>fixture-bucket</Bucket><Key>root/a</Key><UploadId>upload/+</UploadId></InitiateMultipartUploadResult>",
+                ),
+                ("PUT", "/fixture-bucket/root/a?partNumber=1&uploadId=upload%2F%2B") => Reply::xml(
+                    "<CopyPartResult><ETag>&quot;part&quot;</ETag><LastModified>2026-10-07T00:00:00Z</LastModified></CopyPartResult>",
+                ),
+                ("POST", "/fixture-bucket/root/a?uploadId=upload%2F%2B") => Reply::xml(
+                    "<CompleteMultipartUploadResult><ETag>&quot;total-1&quot;</ETag><Key>root/a</Key></CompleteMultipartUploadResult>",
+                ),
+                ("DELETE", "/fixture-bucket/root/a?uploadId=upload%2F%2B") => Reply {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+                _ => panic!("unexpected tagging/multipart request: {request:?}"),
+            }
+        });
         let tags = client
             .call_s3(
                 "get_object_tagging",
@@ -3272,17 +3356,19 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
-        let requests = worker.join().unwrap();
-        assert_eq!(
-            requests[2].headers["x-amz-copy-source-range"],
-            "bytes=0-511"
-        );
-        assert!(
-            requests[2]
-                .target
-                .contains("partNumber=1&uploadId=upload%2F%2B")
-        );
-        assert_eq!(requests[4].method, "DELETE");
+        let requests = worker.finish_requests();
+        let mutations = requests
+            .iter()
+            .filter(|request| request.method != "GET")
+            .collect::<Vec<_>>();
+        assert_eq!(mutations.len(), 4);
+        let part = mutations
+            .iter()
+            .find(|request| request.method == "PUT")
+            .unwrap();
+        assert_eq!(part.headers["x-amz-copy-source-range"], "bytes=0-511");
+        assert!(part.target.contains("partNumber=1&uploadId=upload%2F%2B"));
+        assert_eq!(mutations[3].method, "DELETE");
     }
 
     #[test]

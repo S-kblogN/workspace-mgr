@@ -531,7 +531,7 @@ class Harness:
         self.check("workspace-mgr instructions" in bootstrap, "thin AGENTS bootstrap installed")
         self.check(self.remote_url not in config_text, "repository Git URL is not embedded in policy")
         self.check("[git]" in config_text and "[s3]" in config_text, "one root config owns Git and S3 facts")
-        self.check('minimum_cli_version = "0.8.0"' in config_text, "native metadata gates incompatible older clients")
+        self.check('minimum_cli_version = "0.8.1"' in config_text, "native metadata gates incompatible older clients")
         self.check(f"s3://{self.bucket}/objects" in config_text and self.endpoint in config_text,
                    "tracked native configuration owns storage URL and endpoint")
         for forbidden in ("schema_version", "required_cli", "profile", "[publication]", "[tasks]", "[review]", "[storage]", "[agent]", "branch_prefix", "auto_s3_above_bytes"):
@@ -580,7 +580,7 @@ class Harness:
         self.check(self.remote_ref("main") is not None, "managed main exists on Git server")
         config = self.wm(self.shared, "config", "show")
         self.check(set(config) == {"minimum_cli_version", "git", "s3"}, "config exposes repository facts and compatibility requirement")
-        self.check(config["minimum_cli_version"] == "0.8.0", "config reports the native compatibility requirement")
+        self.check(config["minimum_cli_version"] == "0.8.1", "config reports the native compatibility requirement")
         self.check(config["git"]["remote"] == "origin" and config["git"]["branch"] == "main", "config resolves Git topology")
         self.check(config["s3"]["url"] == f"s3://{self.bucket}/objects", "config resolves native storage location")
 
@@ -2348,7 +2348,7 @@ class Harness:
         )
         self.check(reminder not in covered.stderr, "the reminder stops once an approval covers the projection")
 
-        # Native repositories already require 0.8.0. A task schema 3
+        # Native repositories already require 0.8.1. A task schema 3
         # approval preserves that higher compatibility floor.
         # Recording the approval does not measure, so the pending decision
         # stays until the next measurement: this plan, within the approved
@@ -2428,7 +2428,7 @@ class Harness:
         )
         published_config = self.remote_file(commit, config_name)
         self.check(
-            published_config == shared_config and 'minimum_cli_version = "0.8.0"' in published_config,
+            published_config == shared_config and 'minimum_cli_version = "0.8.1"' in published_config,
             "the published tree retains the repository native compatibility requirement",
             config=published_config,
         )
@@ -2440,7 +2440,7 @@ class Harness:
             (self.shared / config_name).read_text(encoding="utf-8") == shared_config
             and self.git(self.shared, "status", "--porcelain", "--", config_name).stdout == ""
             and self.remote_ref("main") == main_before
-            and 'minimum_cli_version = "0.8.0"' in self.remote_file(main_before, config_name),
+            and 'minimum_cli_version = "0.8.1"' in self.remote_file(main_before, config_name),
             "publication leaves shared main and its native compatibility requirement unchanged",
         )
         self.check(
@@ -2904,9 +2904,9 @@ class Harness:
         # Advance main by a fast-forward whose configuration requires a
         # release that does not exist yet.
         config = self.remote_file(local_main, config_name)
-        self.check('minimum_cli_version = "0.8.0"' in config, "shared main declares the native compatibility requirement")
+        self.check('minimum_cli_version = "0.8.1"' in config, "shared main declares the native compatibility requirement")
         raised = self.root / "raised-workspace-config.toml"
-        raised.write_text(config.replace('minimum_cli_version = "0.8.0"', 'minimum_cli_version = "99.0.0"'), encoding="utf-8")
+        raised.write_text(config.replace('minimum_cli_version = "0.8.1"', 'minimum_cli_version = "99.0.0"'), encoding="utf-8")
         blob = self.git(self.shared, "hash-object", "-w", str(raised)).stdout.strip()
         index = {"GIT_INDEX_FILE": str(self.root / "raised-workspace-index")}
         self.run(["git", "-C", self.shared, "read-tree", local_main], cwd=self.shared, env=index)

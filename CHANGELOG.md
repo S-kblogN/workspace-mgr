@@ -5,7 +5,7 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-10-07
+## [0.8.1] - 2026-10-07
 
 ### Changed
 
@@ -15,7 +15,7 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Native storage uses strict, versioned `.wm-storage.json` manifests and typed
   Rust operations. `.workspace-mgr.toml` supplies public S3 routing directly;
   credentials, cache and retry state stay in ignored shared local storage.
-  Native repositories require CLI 0.8.0 or later.
+  Native repositories require CLI 0.8.1 or later.
 
 ### Added
 
