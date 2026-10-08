@@ -30,6 +30,12 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
   identities. Publication refuses partial migration that removes routing
   controls still required by legacy manifests.
 
+### Fixed
+
+- S3 response and upload-file reads continue after a system-call interruption
+  on the existing connection and byte position. Response reads retain their
+  original timeout deadline, and mutation requests are never replayed.
+
 ## [0.7.4] - 2026-10-07
 
 ### Fixed

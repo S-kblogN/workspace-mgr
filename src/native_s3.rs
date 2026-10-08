@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git::GitRepo;
 use crate::hex::encode_lower;
+use crate::s3_transport::{ReadResumingConnector, ReadResumingReader};
 
 const MAX_LIST_PAGES: usize = 100_000;
 const XML_LIMIT: u64 = 64 * 1024 * 1024;
@@ -427,7 +428,11 @@ impl S3Client {
         {
             agent_config = agent_config.proxy(None);
         }
-        let agent = ureq::Agent::new_with_config(agent_config.build());
+        let agent = ureq::Agent::with_parts(
+            agent_config.build(),
+            ReadResumingConnector::new(ureq::unversioned::transport::DefaultConnector::default()),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
         Ok(Self {
             bucket: bucket.to_owned(),
             prefix: prefix.trim_end_matches('/').to_owned(),
@@ -526,7 +531,11 @@ impl S3Client {
         }
         let mut plan = self.plan("put_object", args, None)?;
         plan.headers.insert("content-md5".to_owned(), content_md5);
-        let request = self.request(&plan, file, Some((&sha256, length)))?;
+        let request = self.request(
+            &plan,
+            ureq::SendBody::from_owned_reader(ReadResumingReader::new(file)),
+            Some((&sha256, length)),
+        )?;
         let response = self
             .agent
             .run(request)
@@ -574,7 +583,7 @@ impl S3Client {
         plan.headers
             .insert("content-md5".to_owned(), STANDARD.encode(md5.finalize()));
         let hash = encode_lower(sha.finalize());
-        let mut limited = file.take(length);
+        let mut limited = ReadResumingReader::new(file.take(length));
         let request = self.request(
             &plan,
             ureq::SendBody::from_reader(&mut limited),
@@ -1180,7 +1189,7 @@ fn file_hashes(file: &mut File) -> S3Result<(String, String, u64)> {
     let mut buffer = [0u8; 1024 * 1024];
     let mut count = 0;
     loop {
-        let size = file
+        let size = ReadResumingReader::new(&mut *file)
             .read(&mut buffer)
             .map_err(|error| S3Error::local(format!("read upload cache file: {error}")))?;
         if size == 0 {
@@ -2106,21 +2115,36 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn interrupt_response_once(
-        mut client: S3Client,
+        client: S3Client,
         target: String,
         request_received: mpsc::Receiver<()>,
     ) -> (S3Client, Arc<AtomicUsize>) {
+        inject_response_interruption(client, target, request_received, false)
+    }
+
+    fn inject_response_interruption(
+        mut client: S3Client,
+        target: String,
+        request_received: mpsc::Receiver<()>,
+        resume_read: bool,
+    ) -> (S3Client, Arc<AtomicUsize>) {
         let injected = Arc::new(AtomicUsize::new(0));
-        client.agent = ureq::Agent::with_parts(
-            client.agent.config().clone(),
-            InterruptResponseConnector {
-                target,
-                injected: injected.clone(),
-                request_received: Arc::new(Mutex::new(request_received)),
-                delegate: DefaultConnector::default(),
-            },
-            DefaultResolver::default(),
-        );
+        let connector = InterruptResponseConnector {
+            target,
+            injected: injected.clone(),
+            request_received: Arc::new(Mutex::new(request_received)),
+            delegate: DefaultConnector::default(),
+        };
+        let config = client.agent.config().clone();
+        client.agent = if resume_read {
+            ureq::Agent::with_parts(
+                config,
+                ReadResumingConnector::new(connector),
+                DefaultResolver::default(),
+            )
+        } else {
+            ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+        };
         (client, injected)
     }
 
@@ -2752,8 +2776,18 @@ pub(crate) mod tests {
 
     #[test]
     fn streaming_download_and_upload_use_fixed_length_bytes() {
+        streaming_roundtrip(false);
+    }
+
+    #[test]
+    fn streaming_upload_resumes_interrupted_response_without_replaying_request() {
+        streaming_roundtrip(true);
+    }
+
+    fn streaming_roundtrip(interrupted: bool) {
         let bytes = vec![42u8; 2 * 1024 * 1024 + 17];
         let download_bytes = bytes.clone();
+        let (request_sent, request_received) = mpsc::channel();
         let (client, worker) = routed_fixture(move |request| {
             match (request.method.as_str(), request.target.as_str()) {
                 ("GET", "/fixture-bucket/root/data?versionId=read") => Reply {
@@ -2761,14 +2795,29 @@ pub(crate) mod tests {
                     headers: vec![("x-amz-version-id", "read".into())],
                     body: download_bytes.clone(),
                 },
-                ("PUT", "/fixture-bucket/root/other") => Reply {
-                    status: 200,
-                    headers: vec![("x-amz-version-id", "written".into())],
-                    body: Vec::new(),
-                },
+                ("PUT", "/fixture-bucket/root/other") => {
+                    if interrupted {
+                        request_sent.send(()).unwrap();
+                    }
+                    Reply {
+                        status: 200,
+                        headers: vec![("x-amz-version-id", "written".into())],
+                        body: Vec::new(),
+                    }
+                }
                 _ => panic!("unexpected streaming request: {request:?}"),
             }
         });
+        let (client, injected) = if interrupted {
+            inject_response_interruption(
+                client,
+                "/fixture-bucket/root/other".into(),
+                request_received,
+                true,
+            )
+        } else {
+            (client, Arc::new(AtomicUsize::new(0)))
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scratch");
         let read = client
@@ -2780,6 +2829,7 @@ pub(crate) mod tests {
             .put_file(&json!({"Key":"root/other","IfNoneMatch":"*"}), &path)
             .unwrap();
         assert_eq!(written.value["VersionId"], "written");
+        assert_eq!(injected.load(Ordering::SeqCst), usize::from(interrupted));
         let requests = worker.finish_requests();
         let uploads = requests
             .iter()
@@ -2913,6 +2963,68 @@ pub(crate) mod tests {
             assert_eq!(error.code, "TransportError");
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
             assert!(worker.finish_requests().is_empty());
+        }
+    }
+
+    #[test]
+    fn mutation_responses_resume_on_the_same_connection_without_replay() {
+        for (operation, method, target, response_body) in [
+            ("put_object", "PUT", "/fixture-bucket/root/a", ""),
+            (
+                "delete_object",
+                "DELETE",
+                "/fixture-bucket/root/a?versionId=v1",
+                "",
+            ),
+            (
+                "create_multipart_upload",
+                "POST",
+                "/fixture-bucket/root/a?uploads=",
+                "<InitiateMultipartUploadResult><UploadId>upload</UploadId></InitiateMultipartUploadResult>",
+            ),
+            (
+                "complete_multipart_upload",
+                "POST",
+                "/fixture-bucket/root/a?uploadId=upload",
+                "<CompleteMultipartUploadResult><ETag>complete</ETag></CompleteMultipartUploadResult>",
+            ),
+        ] {
+            let (sent, received) = mpsc::channel();
+            let (client, worker) = routed_fixture(move |request| {
+                assert_eq!(request.method, method);
+                assert_eq!(request.target, target);
+                sent.send(()).unwrap();
+                Reply {
+                    status: 200,
+                    headers: vec![("x-amz-version-id", "v1".into())],
+                    body: response_body.as_bytes().to_vec(),
+                }
+            });
+            let (client, injected) =
+                inject_response_interruption(client, target.into(), received, true);
+            let mut args = json!({"Key":"root/a"});
+            if operation == "delete_object" {
+                args["VersionId"] = "v1".into();
+            }
+            if operation == "complete_multipart_upload" {
+                args["UploadId"] = "upload".into();
+                args["MultipartUpload"] = json!({"Parts":[{"PartNumber":1,"ETag":"\"part\""}]});
+            }
+            let response = client.call_s3(operation, &args, Some(b"abc")).unwrap();
+            assert_eq!(response.value["VersionId"], "v1", "{operation}");
+            assert_eq!(injected.load(Ordering::SeqCst), 1, "{operation}");
+            let requests = worker.finish_requests();
+            assert_eq!(requests.len(), 1, "{operation}");
+            if operation == "put_object" {
+                assert_eq!(requests[0].body, b"abc");
+            }
+            if operation == "create_multipart_upload" {
+                assert_eq!(response.value["UploadId"], "upload");
+            }
+            if operation == "complete_multipart_upload" {
+                assert_eq!(response.value["ETag"], "complete");
+                assert!(String::from_utf8_lossy(&requests[0].body).contains("&quot;part&quot;"));
+            }
         }
     }
 
