@@ -64,31 +64,58 @@ pub(crate) fn parse_document(raw: &str, origin: &str) -> Result<PointerDocument>
             .into_iter()
             .map(|out| {
                 let (version_id, etag) = version(out.cloud.as_ref());
+                let files: Option<Vec<PointerFileVersion>> = out.files.map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| {
+                            let (version_id, etag) = version(file.cloud.as_ref());
+                            PointerFileVersion {
+                                relpath: file.relpath,
+                                md5: file.md5,
+                                size: file.size,
+                                version_id,
+                                etag,
+                            }
+                        })
+                        .collect()
+                });
+                let derived = match (&out.md5, &files) {
+                    (None, Some(files)) => files_only_aggregate(files),
+                    _ => None,
+                };
+                let (md5, size) = match derived {
+                    Some((md5, size)) => (Some(md5), out.size.or(size)),
+                    None => (out.md5, out.size),
+                };
                 PointerOutput {
                     path: out.path,
-                    md5: out.md5,
-                    size: out.size,
+                    md5,
+                    size,
                     version_id,
                     etag,
-                    files: out.files.map(|files| {
-                        files
-                            .into_iter()
-                            .map(|file| {
-                                let (version_id, etag) = version(file.cloud.as_ref());
-                                PointerFileVersion {
-                                    relpath: file.relpath,
-                                    md5: file.md5,
-                                    size: file.size,
-                                    version_id,
-                                    etag,
-                                }
-                            })
-                            .collect()
-                    }),
+                    files,
                 }
             })
             .collect(),
     })
+}
+
+/// DVC 3 records a cloud-versioned directory by its complete `files` list
+/// alone, omitting the aggregate `md5`, `size` and `nfiles` that it rebuilds on
+/// load (`dvc/output.py`, `Output.__init__`). Rebuild the same aggregate so
+/// those pointers read like ones that state it. DVC does not treat an empty
+/// list as a directory, and an entry without a usable digest leaves the
+/// aggregate unknown, so the consumer that needs it still refuses. The size is
+/// known only when every entry states one.
+fn files_only_aggregate(files: &[PointerFileVersion]) -> Option<(String, Option<u64>)> {
+    if files.is_empty() {
+        return None;
+    }
+    let md5 = directory_digest(files).ok()?;
+    let size = files
+        .iter()
+        .try_fold(0u64, |total, file| total.checked_add(file.size?));
+    Some((md5, size))
 }
 
 pub(crate) fn normalize_remote_binding(
@@ -366,13 +393,16 @@ pub(crate) fn import_manifest_with_remote_inventory(
     sizes: &std::collections::BTreeMap<String, u64>,
 ) -> Result<Manifest> {
     hash_algorithm(raw, origin)?;
+    // The parsed digest includes the aggregate of a files-only directory.
+    let digest = parse_document(raw, origin)?
+        .outs
+        .into_iter()
+        .next()
+        .and_then(|out| out.md5)
+        .ok_or_else(|| Error::message("legacy output has no MD5 checksum"))?;
     let mut yaml: Value =
         serde_yaml::from_str(raw).map_err(|error| Error::message(error.to_string()))?;
     let out = &mut yaml["outs"][0];
-    let digest = out["md5"]
-        .as_str()
-        .ok_or_else(|| Error::message("legacy output has no MD5 checksum"))?
-        .to_owned();
     if digest.ends_with(".dir") {
         if let Some(bytes) = directory_bytes {
             let files = parse_directory_manifest(bytes, &digest)?;
@@ -615,10 +645,13 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
         .into_iter()
         .next()
         .ok_or_else(|| Error::message("legacy DVC metadata has no output"))?;
-    let digest = out
-        .md5
-        .as_deref()
-        .ok_or_else(|| Error::message("legacy DVC metadata has no MD5 checksum"))?;
+    let digest = match (&out.md5, &out.files) {
+        (Some(digest), _) => digest.clone(),
+        // An aggregate that could not be rebuilt names the entry at fault.
+        (None, Some(files)) if !files.is_empty() => directory_digest(files)?,
+        _ => return Err(Error::message("legacy DVC metadata has no MD5 checksum")),
+    };
+    let declared_size = out.size;
     let kind = if digest.ends_with(".dir") {
         Kind::Directory
     } else {
@@ -641,9 +674,14 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
         path,
         kind,
         checksum,
-        size: out
-            .size
-            .ok_or_else(|| Error::message("legacy DVC metadata has no physical size"))?,
+        size: match (kind, declared_size) {
+            (_, Some(size)) => size,
+            // A directory's size is the sum of its resolved entries, set below.
+            (Kind::Directory, None) => 0,
+            (Kind::File, None) => {
+                return Err(Error::message("legacy DVC metadata has no physical size"));
+            }
+        },
         version: binding(out.version_id, out.etag),
         entries: None,
     };
@@ -661,7 +699,7 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
                         "legacy directory has no file list; its local cache is required for import",
                     )
                 })?;
-                let cache = existing_cache(root, digest, &algorithm).ok_or_else(|| Error::message("legacy directory cache manifest is unavailable; hydrate it before migration"))?;
+                let cache = existing_cache(root, &digest, &algorithm).ok_or_else(|| Error::message("legacy directory cache manifest is unavailable; hydrate it before migration"))?;
                 let bytes = fs::read(cache).map_err(|error| Error::message(error.to_string()))?;
                 use md5::Digest;
                 if crate::hex::encode_lower(md5::Md5::digest(&bytes))
@@ -720,6 +758,12 @@ fn import_manifest_inner(raw: &str, origin: &str, root: Option<&Path>) -> Result
             return Err(Error::message(
                 "legacy directory manifest checksum mismatch",
             ));
+        }
+        if declared_size.is_none() {
+            manifest.size = entries
+                .iter()
+                .try_fold(0u64, |total, entry| total.checked_add(entry.size))
+                .ok_or_else(|| Error::message("legacy directory physical size overflows"))?;
         }
         manifest.checksum.digest = crate::storage_format::directory_digest(&entries)?;
         manifest.entries = Some(entries);
@@ -1041,5 +1085,107 @@ mod tests {
             );
             assert!(error.contains("data.dvc"));
         }
+    }
+
+    /// DVC 3's cloud-versioned directory: a complete `files` list without the
+    /// aggregate `md5`, `size` or `nfiles`.
+    const FILES_ONLY: &str = "outs:\n- hash: md5\n  path: data\n  files:\n  - relpath: a.txt\n    md5: b1946ac92492d2347c6235b4d2611184\n    size: 6\n    cloud:\n      workspace-mgr:\n        etag: b1946ac92492d2347c6235b4d2611184\n        version_id: v1\n";
+
+    fn with_aggregate(raw: &str, aggregate: &str) -> String {
+        raw.replacen("  path: data\n", &format!("  path: data\n{aggregate}"), 1)
+    }
+
+    #[test]
+    fn files_only_directory_reads_like_its_stated_aggregate() {
+        // md5 of `[{"md5": "b1946ac92492d2347c6235b4d2611184", "relpath": "a.txt"}]`,
+        // the bytes DVC hashes for this tree.
+        let stated = with_aggregate(
+            FILES_ONLY,
+            "  md5: b47e3488a546e2214c42aa9bec8396e2.dir\n  size: 6\n  nfiles: 1\n",
+        );
+        let derived = parse_document(FILES_ONLY, "data.dvc").unwrap();
+        assert_eq!(
+            derived.outs[0].md5.as_deref(),
+            Some("b47e3488a546e2214c42aa9bec8396e2.dir")
+        );
+        assert_eq!(derived.outs[0].size, Some(6));
+        assert_eq!(derived, parse_document(&stated, "data.dvc").unwrap());
+        assert_eq!(
+            import_manifest(FILES_ONLY, "data.dvc").unwrap(),
+            import_manifest(&stated, "data.dvc").unwrap()
+        );
+        let manifest = import_manifest(FILES_ONLY, "data.dvc").unwrap();
+        assert_eq!(manifest.kind, Kind::Directory);
+        assert_eq!(manifest.size, 6);
+        let entries = manifest.entries.as_ref().unwrap();
+        assert_eq!(entries[0].version.as_ref().unwrap().id, "v1");
+        assert_eq!(
+            manifest.checksum.digest,
+            crate::storage_format::directory_digest(entries).unwrap()
+        );
+    }
+
+    #[test]
+    fn files_only_aggregate_is_rebuilt_only_from_a_usable_complete_list() {
+        let parsed = |raw: &str| parse_document(raw, "data.dvc").unwrap().outs.remove(0);
+        // A stated digest is kept verbatim, so its consumers still refuse a mismatch.
+        let stated = with_aggregate(FILES_ONLY, "  md5: 00000000000000000000000000000000.dir\n");
+        assert_eq!(
+            parsed(&stated).md5.as_deref(),
+            Some("00000000000000000000000000000000.dir")
+        );
+        assert!(
+            import_manifest(&stated, "data.dvc")
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+        // DVC does not treat an empty list as a directory.
+        let empty = "outs:\n- hash: md5\n  path: data\n  files: []\n";
+        assert_eq!(parsed(empty).md5, None);
+        assert!(import_manifest(empty, "data.dvc").is_err());
+        // Unusable entries leave the aggregate unknown without failing the parse.
+        for unusable in [
+            FILES_ONLY.replace("    md5: b1946ac92492d2347c6235b4d2611184\n", ""),
+            FILES_ONLY.replace(
+                "    md5: b1946ac92492d2347c6235b4d2611184\n",
+                "    md5: a1\n",
+            ),
+            FILES_ONLY.replace("relpath: a.txt", "relpath: ../a.txt"),
+        ] {
+            let out = parsed(&unusable);
+            assert_eq!((out.md5, out.size), (None, None));
+            assert!(import_manifest(&unusable, "data.dvc").is_err());
+        }
+        assert!(
+            import_manifest(
+                &FILES_ONLY.replace("    md5: b1946ac92492d2347c6235b4d2611184\n", ""),
+                "data.dvc"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no MD5 digest")
+        );
+        // An entry without a size still names the directory; its size stays unknown.
+        let unsized_entry = FILES_ONLY.replace("    size: 6\n", "");
+        let out = parsed(&unsized_entry);
+        assert_eq!(
+            out.md5.as_deref(),
+            Some("b47e3488a546e2214c42aa9bec8396e2.dir")
+        );
+        assert_eq!(out.size, None);
+        assert!(
+            import_manifest(&unsized_entry, "data.dvc")
+                .unwrap_err()
+                .to_string()
+                .contains("physical size is unavailable")
+        );
+        // A stated entry count must still agree with the list.
+        assert!(
+            import_manifest(&with_aggregate(FILES_ONLY, "  nfiles: 2\n"), "data.dvc")
+                .unwrap_err()
+                .to_string()
+                .contains("entry count")
+        );
     }
 }
