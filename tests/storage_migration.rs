@@ -295,6 +295,34 @@ fn directory_manifest_migrates_without_fetching_payloads() {
 }
 
 #[test]
+fn files_only_directory_manifest_migrates_without_its_omitted_aggregate() {
+    let fixture = legacy_repository();
+    // DVC 3 writes a cloud-versioned directory without `md5`, `size` or `nfiles`.
+    let raw = "outs:\n- hash: md5\n  path: absent-directory\n  files:\n  - relpath: nested/sample.bin\n    md5: 900150983cd24fb0d6963f7d28e17f72\n    size: 3\n    cloud:\n      workspace-mgr:\n        etag: exact-directory-file-etag\n        version_id: exact-directory-file-version\n";
+    fs::write(fixture.shared.join("absent-directory.dvc"), raw).unwrap();
+    let preview = json(&workspace(&fixture.shared, ["manage", "--dry-run"]));
+    assert_eq!(preview["status"], "dry_run");
+    assert_eq!(
+        fs::read_to_string(fixture.shared.join("absent-directory.dvc")).unwrap(),
+        raw
+    );
+    workspace(&fixture.shared, ["manage"]);
+    let native: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.shared.join("absent-directory.wm-storage.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(native["kind"], "directory");
+    assert_eq!(native["size"], 3);
+    assert_eq!(native["entries"][0]["path"], "nested/sample.bin");
+    assert_eq!(
+        native["entries"][0]["version"]["id"],
+        "exact-directory-file-version"
+    );
+    assert!(!fixture.shared.join("absent-directory.dvc").exists());
+    assert!(!fixture.shared.join("absent-directory").exists());
+}
+
+#[test]
 fn legacy_pointer_cannot_overlap_an_existing_native_boundary() {
     let fixture = legacy_repository();
     pointer(&fixture.shared, "mixed/data.bin.dvc", "data.bin");

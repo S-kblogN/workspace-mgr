@@ -90,7 +90,9 @@ Legacy adoption runs in the primary shared checkout, including configuration or
 cache-only adoption. Native scaffold reconciliation also supports linked worktrees.
 
 Path-based, version-aware S3 metadata imports without transferring objects when
-every file already has an exact VersionId. Ordinary DVC S3 remotes instead store
+every file already has an exact VersionId. DVC 3 records such a directory by its
+complete `files` list alone; the importer rebuilds the omitted aggregate checksum
+and size from that list, as DVC does when it loads the pointer. Ordinary DVC S3 remotes instead store
 objects by content identity. `manage` supports the DVC 3 `files/md5/<digest>`
 layout and the DVC 2 `<digest>` layout, with their split digest directories and
 recorded checksum algorithms. It can read a directory's `.dir` listing directly

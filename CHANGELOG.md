@@ -5,6 +5,20 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-10-07
+
+### Fixed
+
+- Legacy DVC 3 pointers for cloud-versioned directories, which record a
+  complete `files` list without the aggregate `md5`, `size` or `nfiles`, are
+  read again. The aggregate is rebuilt in memory as DVC does on load, so
+  `refresh`, hydration, usage accounting, S3 retirement protection and `manage`
+  migration accept them instead of refusing with a directory manifest hash
+  mismatch or a missing MD5 checksum. A stated aggregate that disagrees with
+  its list is still refused, an empty list is not a directory, and pointer files
+  are never rewritten. Migration takes an undeclared directory size from its
+  resolved entries.
+
 ## [0.8.2] - 2026-10-07
 
 ### Changed

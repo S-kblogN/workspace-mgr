@@ -310,6 +310,54 @@ fn historical_directory_manifest_flattens_without_reading_payload() {
 }
 
 #[test]
+fn historical_files_only_directory_reads_without_its_omitted_aggregate() {
+    let (dir, repo) = repo();
+    repo.run(["init"]).unwrap();
+    repo.run(["config", "user.name", "Fixture"]).unwrap();
+    repo.run(["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    fs::create_dir_all(dir.path().join("task")).unwrap();
+    // DVC 3 writes a cloud-versioned directory without `md5`, `size` or `nfiles`.
+    let pointer = "outs:\n- hash: md5\n  path: data\n  files:\n  - relpath: a\n    md5: 900150983cd24fb0d6963f7d28e17f72\n    size: 3\n    cloud:\n      workspace-mgr:\n        etag: abc\n        version_id: v1\n";
+    fs::write(dir.path().join("task/data.dvc"), pointer).unwrap();
+    repo.run(["add", "task/data.dvc"]).unwrap();
+    repo.run(["commit", "-m", "fixture"]).unwrap();
+    let payload = json!([{"revision":"HEAD","pointers":["task/data.dvc"]}]);
+    assert_eq!(
+        purge(&repo, "list", &payload).unwrap(),
+        json!([{"pointer":"task/data.dvc","object":"task/data/a","version_id":"v1"}])
+    );
+    let pointers = vec!["task/data.dvc".to_owned()];
+    for revision in [Some("HEAD"), None] {
+        let entries = crate::native_engine::metadata_entries(&repo, revision, &pointers).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].object, "task/data/a");
+        assert_eq!(entries[0].version_id.as_deref(), Some("v1"));
+    }
+    crate::native_engine::install_directory_manifests(&repo, &pointers).unwrap();
+    // The rebuilt aggregate stays in memory; the pointer is never rewritten.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("task/data.dvc")).unwrap(),
+        pointer
+    );
+    // A stated aggregate that disagrees with the list is still refused.
+    fs::write(
+        dir.path().join("task/data.dvc"),
+        pointer.replace(
+            "  path: data\n",
+            "  path: data\n  md5: 00000000000000000000000000000000.dir\n",
+        ),
+    )
+    .unwrap();
+    assert!(
+        crate::native_engine::metadata_entries(&repo, None, &pointers)
+            .unwrap_err()
+            .to_string()
+            .contains("legacy directory manifest hash mismatch")
+    );
+}
+
+#[test]
 fn shared_cas_history_is_retained_outside_path_version_retirement() {
     let (dir, repo) = repo();
     repo.run(["init"]).unwrap();
