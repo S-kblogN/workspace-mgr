@@ -5,6 +5,15 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-07
+
+### Fixed
+
+- The large-registry loopback test fixture serves repeated reads by exact
+  request identity and keeps listening when a reader abandons a response.
+  A deterministic response-header interruption regression verifies complete
+  registry reads above 64 MiB without changing production retry behavior.
+
 ## [0.7.1] - 2026-10-07
 
 ### Fixed
