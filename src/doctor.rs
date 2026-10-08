@@ -286,10 +286,11 @@ pub fn inspect(path: &Path, selector: Option<&str>) -> Result<DoctorReport> {
                             }
                             .into(),
                             detail: format!(
-                                "{} expected objects, {} remote versions, {} differences; {} remote checksums, {} streamed objects ({} bytes)",
+                                "{} expected objects, {} remote versions, {} differences; {} verified versions, {} remote checksums, {} streamed objects ({} bytes)",
                                 report.expected_objects,
                                 report.remote_versions,
                                 report.issues.len(),
+                                report.verified_version_objects,
                                 report.remote_checksum_objects,
                                 report.streamed_objects,
                                 report.streamed_bytes,

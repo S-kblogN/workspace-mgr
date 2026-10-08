@@ -1761,6 +1761,7 @@ mod tests {
             size: Some(3),
             version_id: Some(version.to_owned()),
             etag: Some("abc".to_owned()),
+            verification: None,
         }];
         let path = repo.root.join(pointer);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1776,6 +1777,7 @@ mod tests {
                 version: Some(Version {
                     id: version.to_owned(),
                     etag: Some("abc".to_owned()),
+                    verification: None,
                 }),
             }];
             let manifest = Manifest {

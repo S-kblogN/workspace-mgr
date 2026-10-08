@@ -50,9 +50,36 @@ on it. Compressed Git usage accounting retains `pack.threads=1`: changing its
 packing result would also change quota approval decisions. These are correctness
 constraints, not unchecked performance shortcuts.
 
-## S3 checksums
+## Shared exact-version verification
 
-Doctor requests `HeadObject` for the exact version with `ChecksumMode=ENABLED`.
+Schema 2 manifests record a verified association between raw-byte SHA256 and an
+exact endpoint, bucket, key and non-null VersionId. Local files are checked
+against this shared record. Remote verification checks the immutable version's
+existence, scope, physical size and ETag, while retaining the layout and
+transaction inventories. It does not download the payload, even when the
+provider exposes only CRC checksums. Verification records do not expire by time;
+changes to bytes or storage identity require a new record.
+The record repeats its exact VersionId and must match its enclosing version
+binding. Bound schema 2 cache entries use `objects/sha256/`; MD5 remains the
+logical checksum and the routing identity of older or unbound cache entries.
+
+New uploads establish the association through signed payload SHA256 and
+Content-MD5 checks, bounded ordered multipart completion where needed, and an
+exact-version metadata check. Source SHA256 is checked against the bytes being
+uploaded; interrupted uploads retain evidence of the verified transfer in their
+private ownership journal. A journal from an older release cannot acquire this
+status merely because its ownership token or VersionId still exists.
+
+`manage` upgrades schema 1 bindings once, after establishing the raw-byte
+association. A reliable provider checksum can avoid reading the remote payload;
+bindings lacking suitable evidence use the previous streamed verification path.
+Dry runs list pending upgrades without downloading file payloads. Historical
+schema 1 manifests continue to use the compatibility path below.
+
+## Legacy S3 checksum verification
+
+For schema 1, doctor requests `HeadObject` for the exact version with
+`ChecksumMode=ENABLED`.
 It accepts a correctly encoded `FULL_OBJECT` MD5 to verify an unmaterialized
 raw-MD5 manifest. When local bytes are present, skipping GET requires a matching
 `FULL_OBJECT` SHA256 of those checked raw bytes; matching MD5 alone retains the
@@ -71,13 +98,21 @@ and payload generation snapshots are also checked after the audit. Provider
 digest equality is a cryptographic checksum proof, with the collision limits of
 the underlying algorithm.
 
-New uploads to official AWS S3 HTTPS endpoints send a provider-validated SHA256
+New uploads to official AWS S3 HTTPS endpoints also send a provider-validated SHA256
 alongside the existing MD5 and request signing, using the same local digest.
-Custom S3 endpoints, including B2, retain their existing upload protocol until
-support for that header is established. A read-only probe of two existing B2
-objects returned only `FULL_OBJECT` CRC32 through S3, so those objects still
-require streamed verification. No B2 Native API is used; the backend remains
-`s3`.
+Custom S3 endpoints, including B2, use the signed SHA256 and Content-MD5 upload
+protocol; schema 2 records the resulting verified version association without
+depending on a remotely retrievable SHA256 header. A read-only probe of two
+existing B2 objects returned only `FULL_OBJECT` CRC32 through S3. Schema 1 objects
+with that response retain streamed verification until they are upgraded. No B2
+Native API is used; the backend remains `s3`.
+
+An upload response must identify the exact version before the signed transfer
+can establish its proof. If that response is lost, the ownership token locates
+a recovery candidate but does not prove its content: an offered full-object
+SHA256 or an exact-version read must verify the candidate first. This recovery
+does not change the metadata-only verification of already proven schema 2
+bindings.
 
 Protocol references: [AWS HeadObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html),
 [AWS PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html),
@@ -107,8 +142,9 @@ The reproducible [doctor benchmark](../scripts/benchmark-doctor.py) runs complet
 CLI audits against a temporary loopback S3 fixture. It verifies the official
 release archive's SHA256 before comparison and uses isolated Git/AWS configuration
 with dummy credentials. Each case has 128 materialized objects of 64 KiB and
-20 ms delay per HEAD or payload GET. The official release 0.8.5 was compared with
-the optimized working-tree debug build after the final rebuild, with no concurrent
+20 ms delay per HEAD or payload GET. These measurements used schema 1 manifests
+before the schema 2 upgrade. The official release 0.8.5 was compared with
+the optimized working-tree debug build after that rebuild, with no concurrent
 build or test work. Release 0.8.5's doctor storage source is unchanged from 0.8.4.
 
 | Provider checksum | Release time | Current time | Payload GETs, release → current | Peak concurrency, release → current |

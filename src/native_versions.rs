@@ -212,8 +212,19 @@ fn content_matches_with_inventory(
     {
         return Ok(false);
     }
-    let digest = hashes.digest(path, &entry.metadata.hash_name)?;
-    Ok(entry.metadata.md5.as_deref() == Some(digest.as_str()))
+    match &entry.metadata.verification {
+        Some(proof) => {
+            let actual = hashes.hashes(path)?;
+            Ok(
+                entry.metadata.md5.as_deref() == Some(actual.digest(&entry.metadata.hash_name)?)
+                    && actual.sha256 == proof.checksum.digest,
+            )
+        }
+        None => {
+            let digest = hashes.digest(path, &entry.metadata.hash_name)?;
+            Ok(entry.metadata.md5.as_deref() == Some(digest.as_str()))
+        }
+    }
 }
 fn pending_aliases(client: &S3Client, entries: &mut [Entry], receipts: &[Value]) -> Result<()> {
     let mut aliases = BTreeMap::new();
@@ -462,6 +473,7 @@ pub(crate) fn verify_storage_entries(
         .iter()
         .map(|metadata| {
             validate_digest(metadata)?;
+            native_engine::validate_verification_scope(client, metadata)?;
             let version = metadata
                 .version_id
                 .clone()
@@ -515,6 +527,19 @@ pub(crate) fn read(
         });
     }
     pending_aliases(&client, &mut entries, receipts)?;
+    for entry in &entries {
+        if let Some(proof) = &entry.metadata.verification
+            && (proof.endpoint != client.endpoint_identity()
+                || proof.bucket != client.bucket
+                || proof.key != entry.key
+                || proof.version_id != entry.version
+                || entry.metadata.size != Some(proof.size))
+        {
+            return Err(Error::message(
+                "storage proof differs from its resolved physical binding",
+            ));
+        }
+    }
     if operation == "--fetch" {
         let cache = native_engine::CachePaths::new(repo)?;
         let mut cached = Vec::new();

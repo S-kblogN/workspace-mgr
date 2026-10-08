@@ -34,6 +34,7 @@ pub(crate) struct AuditReport {
     pub expected_objects: usize,
     pub remote_versions: usize,
     pub remote_checksum_objects: usize,
+    pub verified_version_objects: usize,
     pub streamed_objects: usize,
     pub streamed_bytes: u64,
     pub materialized_boundaries: usize,
@@ -59,6 +60,7 @@ impl AuditReport {
             expected_objects: 0,
             remote_versions: 0,
             remote_checksum_objects: 0,
+            verified_version_objects: 0,
             streamed_objects: 0,
             streamed_bytes: 0,
             materialized_boundaries: 0,
@@ -308,6 +310,7 @@ fn inspect_with(
     })?;
     for partial in remote_results {
         report.remote_checksum_objects += partial.remote_checksum_objects;
+        report.verified_version_objects += partial.verified_version_objects;
         report.streamed_objects += partial.streamed_objects;
         report.streamed_bytes += partial.streamed_bytes;
         report.issues.extend(partial.issues);
@@ -772,6 +775,9 @@ fn inspect_local_entry(
         let hashes = native_engine::HashInventory::new().hashes(&local)?;
         if entry.size != Some(metadata.len())
             || entry.md5.as_deref() != Some(hashes.digest(&entry.hash_name)?)
+            || entry.verification.as_ref().is_some_and(|proof| {
+                proof.size != metadata.len() || proof.checksum.digest != hashes.sha256
+            })
         {
             report.entry_issue(
                 "local-content-mismatch",
@@ -809,6 +815,7 @@ fn inspect_remote_entry(
     else {
         return;
     };
+    let original_issues = report.issues.len();
     let latest = rows
         .iter()
         .filter(|row| row["IsLatest"] == true)
@@ -858,6 +865,82 @@ fn inspect_remote_entry(
     // failed local read must still receive the streamed byte comparison.
     let local_absent = fs::symlink_metadata(&local)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if let Some(proof) = &entry.verification {
+        // Schema 2 records a previously established raw SHA256 binding to
+        // this exact immutable storage version. Reading object metadata is
+        // sufficient to re-use that proof; a payload read cannot be the
+        // recovery path for an invalid binding or a failed metadata check.
+        if proof.endpoint != client.endpoint_identity()
+            || proof.bucket != client.bucket
+            || proof.key != client.key_for(&entry.object)
+            || proof.version_id != version
+            || Some(proof.size) != entry.size
+        {
+            report.entry_issue(
+                "remote-verification-binding-mismatch",
+                entry,
+                "verified content binding differs from the configured endpoint, bucket, key, exact version or physical size",
+            );
+            return;
+        }
+        let head = match client.head_with_checksums(&args) {
+            Ok(head) => head,
+            Err(error) => {
+                report.entry_issue(
+                    if error.status == Some(412) {
+                        "remote-etag-mismatch"
+                    } else {
+                        "remote-read-failed"
+                    },
+                    entry,
+                    error.to_string(),
+                );
+                return;
+            }
+        };
+        validate_remote_response(entry, recorded, version, &head.value, report);
+        if head.value["ChecksumType"] == "FULL_OBJECT"
+            && let Some(raw) = head.value.get("ChecksumSHA256")
+        {
+            match raw
+                .as_str()
+                .and_then(|raw| STANDARD.decode(raw).ok())
+                .filter(|bytes| bytes.len() == 32)
+                .map(crate::hex::encode_lower)
+            {
+                Some(digest) if digest == proof.checksum.digest => {}
+                Some(_) => report.entry_issue(
+                    "remote-content-mismatch",
+                    entry,
+                    "S3 full-object SHA256 differs from the verified exact-version checksum",
+                ),
+                None => report.entry_issue(
+                    "remote-checksum-invalid",
+                    entry,
+                    "S3 returned a malformed full-object SHA256 checksum",
+                ),
+            }
+        }
+        if let Some(hashes) = local_hashes {
+            if hashes.sha256 != proof.checksum.digest {
+                report.entry_issue(
+                    "local-remote-bytes-mismatch",
+                    entry,
+                    "local raw-byte SHA256 differs from the verified exact-version checksum",
+                );
+            }
+        } else if !local_absent {
+            report.entry_issue(
+                "local-content-unverified",
+                entry,
+                "materialized local payload could not be hashed against its verified exact-version checksum",
+            );
+        }
+        if original_issues == report.issues.len() {
+            report.verified_version_objects += 1;
+        }
+        return;
+    }
     if let Ok(head) = client.call_s3("head_object", &head_args, None) {
         let prior_issues = report.issues.len();
         validate_remote_response(entry, recorded, version, &head.value, report);
@@ -1221,7 +1304,9 @@ fn signature(
 mod tests {
     use super::*;
     use crate::native_s3::tests::{Reply, RoutedFixture, configure_repo, replayable_read_fixture};
-    use crate::storage_format::{Checksum, Entry, Kind, Manifest, Version, directory_digest};
+    use crate::storage_format::{
+        Checksum, Entry, Kind, Manifest, Verification, Version, directory_digest,
+    };
     use std::io::Cursor;
     use std::sync::{
         Arc,
@@ -1254,6 +1339,7 @@ mod tests {
                 version: Some(Version {
                     id: "v1".into(),
                     etag: Some("remote-etag".into()),
+                    verification: None,
                 }),
                 entries: None,
             };
@@ -1267,6 +1353,44 @@ mod tests {
             let pointer = self.repo.root.join(storage_metadata::pointer_path(object));
             fs::create_dir_all(pointer.parent().unwrap()).unwrap();
             fs::write(pointer, manifest.serialize().unwrap()).unwrap();
+        }
+
+        fn verified_file(
+            &self,
+            object: &str,
+            body: &[u8],
+            materialized: bool,
+            client: &S3Client,
+        ) -> Manifest {
+            let manifest = Manifest {
+                schema_version: 2,
+                path: object.rsplit('/').next().unwrap().into(),
+                kind: Kind::File,
+                checksum: checksum(body, "md5-dos2unix"),
+                size: body.len() as u64,
+                version: Some(Version {
+                    id: "v1".into(),
+                    etag: Some("remote-etag".into()),
+                    verification: Some(Verification {
+                        endpoint: client.endpoint_identity(),
+                        bucket: client.bucket.clone(),
+                        key: client.key_for(object),
+                        version_id: "v1".into(),
+                        checksum: Checksum {
+                            algorithm: "sha256".into(),
+                            digest: crate::hex::encode_lower(Sha256::digest(body)),
+                        },
+                        size: body.len() as u64,
+                        method: "verified-upload".into(),
+                    }),
+                }),
+                entries: None,
+            };
+            self.manifest(object, &manifest);
+            if materialized {
+                fs::write(self.repo.root.join(object), body).unwrap();
+            }
+            manifest
         }
 
         fn run(
@@ -1500,6 +1624,7 @@ mod tests {
             version: Some(Version {
                 id: "v1".into(),
                 etag: Some("remote-etag".into()),
+                verification: None,
             }),
         }];
         fixture.manifest(
@@ -1593,6 +1718,7 @@ mod tests {
             version: Some(Version {
                 id: "v1".into(),
                 etag: Some("remote-etag".into()),
+                verification: None,
             }),
         }];
         fixture.manifest(
@@ -1685,6 +1811,7 @@ mod tests {
             version_id: Some("v1".into()),
             etag: Some("remote-etag".into()),
             hash_name: algorithm.into(),
+            verification: None,
         }
     }
 
@@ -1948,6 +2075,280 @@ mod tests {
             3,
             "two inventories plus one HEAD"
         );
+    }
+
+    fn verified_server(
+        body: &'static [u8],
+        checksum_headers: Vec<(&'static str, String)>,
+        head_status: u16,
+    ) -> (S3Client, RoutedFixture) {
+        replayable_read_fixture(move |request| {
+            let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            if query.contains_key("versions") {
+                return Arc::new(Reply::xml(&listing(
+                    &[row("task/data", "v1", true, body, false)],
+                    &query["prefix"],
+                )));
+            }
+            assert_eq!(
+                request.method, "HEAD",
+                "schema 2 diagnosis must never GET payload bytes"
+            );
+            assert_eq!(query.get("versionId").map(String::as_str), Some("v1"));
+            let mut headers = vec![
+                ("x-amz-version-id", "v1".into()),
+                ("etag", "\"remote-etag\"".into()),
+            ];
+            headers.extend(checksum_headers.clone());
+            Arc::new(Reply {
+                status: head_status,
+                headers,
+                body: body.to_vec(),
+            })
+        })
+    }
+
+    #[test]
+    fn verified_versions_need_no_payload_read_without_strong_provider_checksums() {
+        for materialized in [false, true] {
+            for crc in [false, true] {
+                let fixture = Fixture::new();
+                let headers = if crc {
+                    vec![
+                        ("x-amz-checksum-type", "FULL_OBJECT".into()),
+                        ("x-amz-checksum-crc32", "AAAAAA==".into()),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let (client, server) = verified_server(b"a\r\nb\n", headers, 200);
+                configure_repo(&client, &fixture.repo);
+                fixture.verified_file("task/data", b"a\r\nb\n", materialized, &client);
+                let before = snapshot(&fixture.repo);
+                let report =
+                    inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+                assert_eq!(report.status, "ok", "{:?}", report.issues);
+                assert_eq!(report.verified_version_objects, 1);
+                assert_eq!(report.remote_checksum_objects, 0);
+                assert_eq!(report.streamed_objects, 0);
+                assert_eq!(report.streamed_bytes, 0);
+                assert_eq!(snapshot(&fixture.repo), before);
+                assert_eq!(
+                    server.finish_requests().len(),
+                    3,
+                    "two inventories and HEAD"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verified_versions_reject_conflicting_or_malformed_full_sha_without_get() {
+        for (sha, expected_code) in [
+            (
+                STANDARD.encode(Sha256::digest(b"different bytes")),
+                "remote-content-mismatch",
+            ),
+            ("malformed".into(), "remote-checksum-invalid"),
+            (STANDARD.encode([0u8; 31]), "remote-checksum-invalid"),
+        ] {
+            let fixture = Fixture::new();
+            let (client, server) = verified_server(
+                b"abc",
+                vec![
+                    ("x-amz-checksum-type", "FULL_OBJECT".into()),
+                    ("x-amz-checksum-sha256", sha),
+                ],
+                200,
+            );
+            configure_repo(&client, &fixture.repo);
+            fixture.verified_file("task/data", b"abc", true, &client);
+            let report =
+                inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+            assert!(has(&report, expected_code, "task/data"));
+            assert_eq!(report.verified_version_objects, 0);
+            assert_eq!(report.streamed_objects, 0);
+            assert_eq!(report.streamed_bytes, 0);
+            assert_eq!(server.finish_requests().len(), 3);
+        }
+    }
+
+    #[test]
+    fn verified_raw_sha_rejects_local_changes_hidden_by_normalized_md5_without_get() {
+        let fixture = Fixture::new();
+        let (client, server) = verified_server(b"a\r\nb\n", Vec::new(), 200);
+        configure_repo(&client, &fixture.repo);
+        fixture.verified_file("task/data", b"a\r\nb\n", true, &client);
+        fs::write(fixture.repo.root.join("task/data"), b"a\nb\r\n").unwrap();
+        let report = inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+        assert!(has(&report, "local-content-mismatch", "task/data"));
+        assert!(has(&report, "local-remote-bytes-mismatch", "task/data"));
+        assert_eq!(report.verified_version_objects, 0);
+        assert_eq!(report.streamed_objects, 0);
+        assert_eq!(server.finish_requests().len(), 3);
+    }
+
+    #[test]
+    fn verified_storage_scope_cannot_be_reused_at_another_endpoint_bucket_or_key() {
+        for changed_field in ["endpoint", "bucket", "key"] {
+            let fixture = Fixture::new();
+            let (client, server) = verified_server(b"abc", Vec::new(), 200);
+            configure_repo(&client, &fixture.repo);
+            let mut manifest = fixture.verified_file("task/data", b"abc", true, &client);
+            let proof = manifest
+                .version
+                .as_mut()
+                .unwrap()
+                .verification
+                .as_mut()
+                .unwrap();
+            match changed_field {
+                "endpoint" => proof.endpoint = "https://different.example".into(),
+                "bucket" => proof.bucket = "different-bucket".into(),
+                "key" => proof.key = "another-root/task/data".into(),
+                _ => unreachable!(),
+            }
+            fixture.manifest("task/data", &manifest);
+            let report =
+                inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+            assert!(has(
+                &report,
+                "remote-verification-binding-mismatch",
+                "task/data"
+            ));
+            assert_eq!(report.verified_version_objects, 0);
+            assert_eq!(report.streamed_objects, 0);
+            assert_eq!(
+                server.finish_requests().len(),
+                2,
+                "only the inventory snapshots"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_metadata_failure_never_falls_back_to_payload_read() {
+        let fixture = Fixture::new();
+        let (client, server) = verified_server(b"abc", Vec::new(), 404);
+        configure_repo(&client, &fixture.repo);
+        fixture.verified_file("task/data", b"abc", false, &client);
+        let report = inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+        assert!(has(&report, "remote-read-failed", "task/data"));
+        assert_eq!(report.verified_version_objects, 0);
+        assert_eq!(report.streamed_objects, 0);
+        assert_eq!(server.finish_requests().len(), 3);
+    }
+
+    #[test]
+    fn verified_content_proof_cannot_follow_a_changed_version_id_without_get() {
+        let fixture = Fixture::new();
+        let (client, server) = verified_server(b"abc", Vec::new(), 200);
+        configure_repo(&client, &fixture.repo);
+        let mut manifest = fixture.verified_file("task/data", b"abc", false, &client);
+        manifest.version.as_mut().unwrap().id = "v2".into();
+        let pointer = storage_metadata::pointer_path("task/data");
+        // Bypass serialization's validation to model an incorrectly edited
+        // control file: proof for v1 must not attest the replacement v2.
+        fs::write(
+            fixture.repo.root.join(&pointer),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        let report = inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+        assert!(has(&report, "invalid-metadata", &pointer));
+        assert_eq!(report.expected_objects, 0);
+        assert_eq!(report.verified_version_objects, 0);
+        assert_eq!(report.streamed_objects, 0);
+        assert_eq!(server.finish_requests().len(), 2);
+
+        // Also guard callers already holding expanded storage entries, even
+        // if they do not go through the strict manifest parser again.
+        let (client, server) = verified_server(b"abc", Vec::new(), 200);
+        let manifest = fixture.verified_file("task/data", b"abc", false, &client);
+        let mut entry = proof_entry(b"abc", "md5");
+        entry.verification = manifest.version.unwrap().verification;
+        entry.version_id = Some("v2".into());
+        let recorded = row("task/data", "v2", true, b"abc", false);
+        let mut report = AuditReport::new();
+        inspect_remote_entry(
+            &fixture.repo,
+            &client,
+            &entry,
+            &[&recorded],
+            None,
+            &mut report,
+        );
+        assert!(has(
+            &report,
+            "remote-verification-binding-mismatch",
+            "task/data"
+        ));
+        assert_eq!(report.streamed_objects, 0);
+        assert_eq!(report.verified_version_objects, 0);
+        assert!(server.finish_requests().is_empty());
+    }
+
+    #[test]
+    fn verified_versions_retry_only_explicitly_unsupported_checksum_mode_without_get() {
+        for (code, message, status, retry) in [
+            (
+                "NotImplemented",
+                "Unsupported x-amz-checksum-mode header",
+                501,
+                true,
+            ),
+            ("InvalidRequest", "ChecksumMode is unsupported", 400, true),
+            ("InvalidRequest", "Checksum is invalid", 400, false),
+            (
+                "NotImplemented",
+                "Other functionality is unsupported",
+                501,
+                false,
+            ),
+            ("AccessDenied", "Checksum access denied", 403, false),
+        ] {
+            let fixture = Fixture::new();
+            let (client, server) = replayable_read_fixture(move |request| {
+                let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+                let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                if query.contains_key("versions") {
+                    return Arc::new(Reply::xml(&listing(
+                        &[row("task/data", "v1", true, b"abc", false)],
+                        &query["prefix"],
+                    )));
+                }
+                assert_eq!(request.method, "HEAD", "schema 2 must never GET payloads");
+                if request.headers.contains_key("x-amz-checksum-mode") {
+                    Arc::new(Reply {
+                        status,
+                        headers: vec![
+                            ("x-amz-error-code", code.into()),
+                            ("x-amz-error-message", message.into()),
+                        ],
+                        body: Vec::new(),
+                    })
+                } else {
+                    assert!(retry, "must not discard a different metadata error");
+                    Arc::new(Reply {
+                        status: 200,
+                        headers: vec![
+                            ("x-amz-version-id", "v1".into()),
+                            ("etag", "\"remote-etag\"".into()),
+                        ],
+                        body: b"abc".to_vec(),
+                    })
+                }
+            });
+            configure_repo(&client, &fixture.repo);
+            fixture.verified_file("task/data", b"abc", false, &client);
+            let report =
+                inspect_with(&fixture.repo, &["task".into()], false, &[], &client).unwrap();
+            assert_eq!(report.status == "ok", retry, "{:?}", report.issues);
+            assert_eq!(report.verified_version_objects, usize::from(retry));
+            assert_eq!(report.streamed_objects, 0);
+            assert_eq!(server.finish_requests().len(), if retry { 4 } else { 3 });
+        }
     }
 
     #[cfg(unix)]

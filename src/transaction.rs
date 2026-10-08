@@ -2644,11 +2644,12 @@ fn require_publishable(
     needs: &ManifestNeeds,
     declaration: &Version,
 ) -> Result<()> {
-    if let Some(path) = &needs.native_storage {
-        let required = crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION;
-        if !cli_version_satisfies(installed, &required) {
+    if let Some(storage) = &needs.native_storage {
+        let required = &storage.version;
+        if !cli_version_satisfies(installed, required) {
             return Err(Error::message(format!(
-                "this build (workspace-mgr {installed}) cannot publish native storage manifest {path}; workspace-mgr {required} or newer is required"
+                "this build (workspace-mgr {installed}) cannot publish native storage manifest {} (schema {}); workspace-mgr {required} or newer is required",
+                storage.path, storage.schema
             )));
         }
     }
@@ -2703,9 +2704,10 @@ fn require_publishable(
 
 fn missing_configuration(required: &Version, schema: Option<u32>, needs: &ManifestNeeds) -> Error {
     let Some(schema) = schema else {
-        if let Some(path) = &needs.native_storage {
+        if let Some(storage) = &needs.native_storage {
             return Error::message(format!(
-                "native storage manifest {path} requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; run `workspace-mgr manage` first"
+                "native storage manifest {} (schema {}) requires workspace-mgr {required} or newer, but the publication has no {CONFIG_NAME}; run `workspace-mgr manage` first",
+                storage.path, storage.schema
             ));
         }
         return Error::message(format!(
@@ -2736,6 +2738,13 @@ struct ManifestNeed {
     archived: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageManifestNeed {
+    version: Version,
+    schema: u32,
+    path: String,
+}
+
 /// What the task manifests in a private index need, split by whether the
 /// manifest is this task's own, since only this task's approval can be
 /// withdrawn by this task.
@@ -2748,7 +2757,7 @@ struct ManifestNeeds {
     /// Archive receipts use a storage protocol newer than their task manifest
     /// and public data schemas. This floor must not depend on schema 4.
     archive_protocol: Option<String>,
-    native_storage: Option<String>,
+    native_storage: Option<StorageManifestNeed>,
 }
 
 impl ManifestNeeds {
@@ -2756,14 +2765,15 @@ impl ManifestNeeds {
     /// instance's schema.
     fn highest(&self) -> Option<(Version, Option<u32>)> {
         let manifest = self.highest_need();
-        if self.native_storage.is_some()
-            && manifest.is_none_or(|need| {
-                crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION
-                    .cmp_precedence(&need.version)
-                    .is_ge()
-            })
+        if let Some(storage) = &self.native_storage
+            && manifest.is_none_or(|need| storage.version.cmp_precedence(&need.version).is_ge())
+            && (self.archive_protocol.is_none()
+                || storage
+                    .version
+                    .cmp_precedence(&ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION)
+                    .is_ge())
         {
-            return Some((crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION, None));
+            return Some((storage.version.clone(), None));
         }
         if self.archive_protocol.is_some()
             && manifest.is_none_or(|need| {
@@ -2821,25 +2831,36 @@ fn manifest_requirement(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let storage_origins = entries
+        .iter()
+        .filter(|entry| {
+            entry.is_regular_file() && entry.path.ends_with(crate::storage_format::SUFFIX)
+        })
+        .map(|entry| (entry.oid.clone(), entry.path.clone()))
+        .collect::<BTreeMap<_, _>>();
     let oids = manifests
         .iter()
         .map(|entry| entry.oid.clone())
+        .chain(storage_origins.keys().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let mut schemas = std::collections::BTreeMap::new();
+    let mut storage_schemas = BTreeMap::new();
     crate::cloud_usage::read_blobs(repo, &oids, |oid, content| {
         if let Some(schema) = manifest_schema(content) {
             schemas.insert(oid.to_owned(), schema);
         }
+        if let Some(origin) = storage_origins.get(oid) {
+            let raw = std::str::from_utf8(content).map_err(|_| {
+                Error::message(format!("native storage metadata is not UTF-8: {origin}"))
+            })?;
+            let manifest = crate::storage_format::Manifest::parse(raw, origin)?;
+            storage_schemas.insert(oid.to_owned(), manifest.schema_version);
+        }
         Ok(())
     })?;
     let mut needs = ManifestNeeds {
-        native_storage: entries
-            .iter()
-            .filter(|entry| entry.path.ends_with(".wm-storage.json"))
-            .find(|entry| entry.is_regular_file())
-            .map(|entry| entry.path.clone()),
         archive_protocol: entries
             .iter()
             .filter(|entry| {
@@ -2852,6 +2873,26 @@ fn manifest_requirement(
             .map(|entry| entry.path.clone()),
         ..ManifestNeeds::default()
     };
+    for entry in entries.iter().filter(|entry| {
+        entry.is_regular_file() && entry.path.ends_with(crate::storage_format::SUFFIX)
+    }) {
+        let schema = storage_schemas[&entry.oid];
+        let version = match schema {
+            1 => crate::policy::NATIVE_STORAGE_MINIMUM_CLI_VERSION,
+            _ => crate::policy::VERIFIED_STORAGE_MINIMUM_CLI_VERSION,
+        };
+        if needs
+            .native_storage
+            .as_ref()
+            .is_none_or(|need| version.cmp_precedence(&need.version).is_gt())
+        {
+            needs.native_storage = Some(StorageManifestNeed {
+                version,
+                schema,
+                path: entry.path.clone(),
+            });
+        }
+    }
     for entry in manifests {
         let Some(schema) = schemas.get(&entry.oid).copied() else {
             continue;

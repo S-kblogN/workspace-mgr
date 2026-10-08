@@ -18,11 +18,17 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 - Bound independent S3 reads and checks to 16 workers, upload four objects
   concurrently, and save completed version bindings in one atomic manifest
   update while preserving durable upload recovery.
-- Doctor uses suitable provider checksums for exact-version verification and
-  otherwise streams complete payload verification without temporary-file
-  writes or rereads. Materialized bytes require full-object SHA256 to skip
-  download; MD5-only evidence retains literal byte comparison. Terminal
-  progress and reports expose checksum proofs and streamed payload counts.
+- Native storage schema 2 records reliably verified raw SHA256 bindings to
+  endpoint, bucket, key and exact version. New uploads establish proof through
+  signed payload checks and exact-version metadata, including ordered multipart
+  part checksums. Doctor checks local SHA256 and remote metadata without payload
+  downloads; schema 1 retains provider-checksum and streamed verification.
+- `manage` upgrades existing storage controls after establishing each binding's
+  proof once, preserves exact versions, and raises the repository compatibility
+  floor to 0.8.7. Dry runs inventory upgrades without payload downloads. Proofs
+  follow verified archive copies and invalidate when raw bytes or identity change.
+  Lost upload responses require content proof before accepting a recovered version.
+  Terminal progress and reports expose checksum proofs and streamed counts.
 - Batch ordinary immutable-version retirement with S3 DeleteObjects while
   retaining per-item result validation, historical null-version handling,
   archive coordination and final version inventories. All storage transport

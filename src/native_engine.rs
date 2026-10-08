@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::legacy_dvc::{TreeEntry, directory_digest, tree_bytes, tree_manifest_bytes};
-use crate::storage_format::{Checksum, Entry, Kind, Manifest, Version};
+use crate::storage_format::{Checksum, Entry, Kind, Manifest, Verification, Version};
 use md5::{Digest, Md5};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
@@ -26,6 +26,7 @@ pub(crate) struct StorageEntry {
     pub size: Option<u64>,
     pub version_id: Option<String>,
     pub etag: Option<String>,
+    pub verification: Option<Verification>,
     pub hash_name: String,
 }
 
@@ -36,6 +37,202 @@ pub(crate) struct CasSource {
     pub etag: String,
     pub size: u64,
     pub checksum: Checksum,
+}
+
+pub(crate) fn verification_for(
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+    version_id: &str,
+    sha256: &str,
+    method: &str,
+) -> Result<Verification> {
+    let proof = Verification {
+        endpoint: client.endpoint_identity(),
+        bucket: client.bucket.clone(),
+        key: client.key_for(&entry.object),
+        version_id: version_id.into(),
+        checksum: Checksum {
+            algorithm: "sha256".into(),
+            digest: sha256.into(),
+        },
+        size: entry
+            .size
+            .ok_or_else(|| Error::message("verified storage entry has no size"))?,
+        method: method.into(),
+    };
+    proof.checksum.validate()?;
+    Ok(proof)
+}
+
+pub(crate) fn validate_verification_scope(
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+) -> Result<()> {
+    if let Some(proof) = &entry.verification
+        && (proof.endpoint != client.endpoint_identity()
+            || proof.bucket != client.bucket
+            || proof.key != client.key_for(&entry.object)
+            || entry.version_id.as_deref() != Some(proof.version_id.as_str())
+            || entry.size != Some(proof.size))
+    {
+        return Err(Error::message(format!(
+            "storage verification proof does not match its physical location: {}",
+            entry.object
+        )));
+    }
+    Ok(())
+}
+
+/// Establish a raw-byte proof for an old exact binding before upgrading it.
+/// Legacy-only fallback reads retain the former validation guarantees.
+fn attest_legacy_entry(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    entry: &StorageEntry,
+) -> Result<Verification> {
+    use base64::Engine;
+    let version = entry
+        .version_id
+        .as_deref()
+        .ok_or_else(|| Error::message("legacy entry has no version"))?;
+    let request =
+        json!({"Bucket":client.bucket,"Key":client.key_for(&entry.object),"VersionId":version});
+    let info = client.head_with_checksums(&request)?.value;
+    let matching = |value: &Value| {
+        value["VersionId"].as_str() == Some(version)
+            && value["DeleteMarker"] != true
+            && value["ContentLength"].as_u64() == entry.size
+            && entry.etag.as_deref().is_none_or(|wanted| {
+                value["ETag"]
+                    .as_str()
+                    .is_some_and(|got| got.trim_matches('"') == wanted.trim_matches('"'))
+            })
+    };
+    if !matching(&info) {
+        return Err(Error::message(
+            "legacy exact version metadata differs from control",
+        ));
+    }
+    let mut local_hashes = HashInventory::new();
+    let local = repo.root.join(&entry.object);
+    reject_symlink_traversal(&repo.root, &entry.object, "legacy verification payload")?;
+    let local_hash = if local.is_file() {
+        let hashes = local_hashes.hashes(&local)?;
+        if fs::metadata(&local).at(&local)?.len() != entry.size.unwrap_or(u64::MAX)
+            || hashes.digest(&entry.hash_name)? != entry.md5.as_deref().unwrap_or("")
+        {
+            return Err(Error::message(
+                "local legacy payload differs from its control checksum or size",
+            ));
+        }
+        Some(hashes.sha256)
+    } else {
+        None
+    };
+    let provider = if info["ChecksumType"] == "FULL_OBJECT" {
+        info["ChecksumSHA256"]
+            .as_str()
+            .map(|raw| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(raw)
+                    .map_err(|_| Error::message("invalid provider SHA256 checksum"))?;
+                if bytes.len() != 32 {
+                    return Err(Error::message("invalid provider SHA256 checksum"));
+                }
+                Ok(crate::hex::encode_lower(bytes))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let (Some(local), Some(provider)) = (&local_hash, &provider) {
+        if local != provider {
+            return Err(Error::message(
+                "legacy remote raw SHA256 differs from local payload",
+            ));
+        }
+        if local_hashes.hashes(&repo.root.join(&entry.object))?.sha256 != *local {
+            return Err(Error::message(
+                "local legacy payload changed during verification",
+            ));
+        }
+        return verification_for(client, entry, version, provider, "provider-checksum");
+    }
+    let mut request = request;
+    request["IfMatch"] = info["ETag"].clone();
+    let mut attempt = 0;
+    let (response, hashes) = loop {
+        let mut hasher = FileHashStream::new();
+        match client.get_stream(&request, |bytes| {
+            hasher.update(bytes);
+            Ok(())
+        }) {
+            Ok(response) => break (response, hasher.finish()),
+            Err(error) if error.is_retryable() && attempt < 2 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if !matching(&response.value)
+        || response.value["ETag"] != info["ETag"]
+        || hashes.digest(&entry.hash_name)? != entry.md5.as_deref().unwrap_or("")
+        || local_hash
+            .as_ref()
+            .is_some_and(|local| local != &hashes.sha256)
+        || provider
+            .as_ref()
+            .is_some_and(|provider| provider != &hashes.sha256)
+    {
+        return Err(Error::message(
+            "legacy exact-version content verification failed",
+        ));
+    }
+    if let Some(before) = local_hash
+        && local_hashes.hashes(&local)?.sha256 != before
+    {
+        return Err(Error::message(
+            "local legacy payload changed during verification",
+        ));
+    }
+    verification_for(client, entry, version, &hashes.sha256, "verified-read")
+}
+
+pub(crate) fn upgrade_manifest_verification(
+    repo: &GitRepo,
+    client: &crate::native_s3::S3Client,
+    pointer: &str,
+    manifest: &mut Manifest,
+) -> Result<()> {
+    if manifest.schema_version == crate::storage_format::SCHEMA_VERSION {
+        return Ok(());
+    }
+    let document = storage_metadata::logical_document(manifest);
+    let entries = entries_from_document(pointer, &document, &manifest.checksum.algorithm)?;
+    let bound = entries
+        .into_iter()
+        .filter(|entry| entry.version_id.is_some())
+        .collect::<Vec<_>>();
+    let proofs = crate::native_versions::bounded_map(&bound, |entry| {
+        Ok((
+            entry.object.clone(),
+            attest_legacy_entry(repo, client, entry)?,
+        ))
+    })?
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    let object = output_object(pointer, &manifest.path)?;
+    if let Some(entries) = &mut manifest.entries {
+        for entry in entries {
+            if let Some(version) = &mut entry.version {
+                version.verification = proofs.get(&format!("{object}/{}", entry.path)).cloned();
+            }
+        }
+    } else if let Some(version) = &mut manifest.version {
+        version.verification = proofs.get(&object).cloned();
+    }
+    manifest.schema_version = crate::storage_format::SCHEMA_VERSION;
+    manifest.validate(pointer)
 }
 
 pub(crate) fn fetch_cas_to_cache(
@@ -125,6 +322,8 @@ pub(crate) fn upload_verified(
     )?;
     let mut bound = entry.clone();
     bound.version_id = Some(id.clone());
+    let proof = verification_for(client, entry, &id, &raw_sha256, "verified-upload")?;
+    bound.verification = Some(proof.clone());
     cache.install_entry_with_inventory(&bound, source, &mut hashes)?;
     if hashes.hashes(&cache.entry(&bound)?)?.sha256 != raw_sha256 {
         return Err(Error::message(
@@ -134,6 +333,7 @@ pub(crate) fn upload_verified(
     Ok(Version {
         id,
         etag: Some(etag),
+        verification: Some(proof),
     })
 }
 
@@ -368,6 +568,7 @@ fn import_destination_condition(
             };
             checksum.validate()?;
             let owned_entry = StorageEntry {
+                verification: None,
                 pointer: entry.pointer.clone(),
                 object: entry.object.clone(),
                 md5: Some(checksum.digest),
@@ -391,7 +592,20 @@ fn import_destination_condition(
             if path != expected_path
                 || context != &expected_context
                 || receipts
-                    .insert(token.to_owned(), (owned_entry, raw_sha256.to_owned()))
+                    .insert(
+                        token.to_owned(),
+                        (
+                            owned_entry,
+                            raw_sha256.to_owned(),
+                            if journal["verified_transfer"] == true
+                                && journal["transfer_endpoint"] == client.endpoint_identity()
+                            {
+                                journal["version_id"].as_str().map(str::to_owned)
+                            } else {
+                                None
+                            },
+                        ),
+                    )
                     .is_some()
             {
                 return Err(Error::message(
@@ -429,7 +643,7 @@ fn import_destination_condition(
         let token = info["Metadata"][UPLOAD_TOKEN].as_str().ok_or_else(|| {
             Error::message("storage import destination already has unowned object history")
         })?;
-        let (owned_entry, raw_sha256) = receipts.get(token).ok_or_else(|| {
+        let (owned_entry, raw_sha256, verified_version) = receipts.get(token).ok_or_else(|| {
             Error::message("storage import destination has no matching private ownership receipt")
         })?;
         if !used.insert(token.to_owned()) {
@@ -437,7 +651,15 @@ fn import_destination_condition(
                 "storage import ownership token matches conflicting destination versions",
             ));
         }
-        verify_uploaded_version(client, repo, owned_entry, token, version, Some(raw_sha256))?;
+        verify_uploaded_version(
+            client,
+            repo,
+            owned_entry,
+            token,
+            version,
+            Some(raw_sha256),
+            verified_version.as_deref() == Some(version),
+        )?;
         if row["IsLatest"] == true {
             if latest.is_some() {
                 return Err(Error::message(
@@ -458,6 +680,7 @@ struct FileState {
     md5: String,
     size: u64,
     version_id: Option<String>,
+    verification: Option<Verification>,
 }
 
 #[derive(Debug, Clone)]
@@ -731,6 +954,15 @@ impl<'a> CachePaths<'a> {
     }
 
     pub(crate) fn entry(&self, entry: &StorageEntry) -> Result<PathBuf> {
+        if let Some(proof) = &entry.verification {
+            proof.checksum.validate()?;
+            let (first, rest) = proof.checksum.digest.split_at(2);
+            let path = self.checked_path(
+                &format!("objects/sha256/{first}/{rest}"),
+                "verified storage cache",
+            )?;
+            return Ok(path);
+        }
         let digest = entry
             .md5
             .as_deref()
@@ -784,20 +1016,27 @@ impl<'a> CachePaths<'a> {
             .md5
             .as_deref()
             .ok_or_else(|| Error::message("storage cache entry has no checksum"))?;
-        let full = entry.hash_name == "md5-dos2unix"
+        let full = entry.verification.is_some()
+            || entry.hash_name == "md5-dos2unix"
             || hashes
                 .files
                 .get(source)
                 .is_some_and(|(_, hashes)| !hashes.sha256.is_empty());
         let source_hashes = hashes.inspect(source, full)?;
         if source_hashes.digest(&entry.hash_name)? != digest
+            || entry
+                .verification
+                .as_ref()
+                .is_some_and(|proof| source_hashes.sha256 != proof.checksum.digest)
             || entry.size.is_some_and(|size| {
                 fs::metadata(source).map(|metadata| metadata.len()).ok() != Some(size)
             })
         {
             return Err(Error::message("downloaded content size or hash mismatch"));
         }
-        let destination = if entry.hash_name == "md5-dos2unix" && entry.version_id.is_some() {
+        let destination = if entry.verification.is_some()
+            || (entry.hash_name == "md5-dos2unix" && entry.version_id.is_some())
+        {
             self.entry(entry)?
         } else {
             self.path(digest, &entry.hash_name)?
@@ -805,6 +1044,10 @@ impl<'a> CachePaths<'a> {
         atomic_copy(source, &destination)?;
         let destination_hashes = hashes.inspect(&destination, full)?;
         if destination_hashes.digest(&entry.hash_name)? != digest
+            || entry
+                .verification
+                .as_ref()
+                .is_some_and(|proof| destination_hashes.sha256 != proof.checksum.digest)
             || (entry.hash_name == "md5-dos2unix"
                 && hashes.hashes(source)?.sha256 != destination_hashes.sha256)
         {
@@ -873,6 +1116,9 @@ pub(crate) fn exact_raw_bytes_match(
     entry: &StorageEntry,
     local: &Path,
 ) -> Result<bool> {
+    if let Some(proof) = &entry.verification {
+        return Ok(local.is_file() && file_sha256(local)? == proof.checksum.digest);
+    }
     if entry.hash_name != "md5-dos2unix" || entry.version_id.is_none() {
         return Ok(true);
     }
@@ -885,7 +1131,10 @@ pub(crate) fn normalized_exact_cache_missing(repo: &GitRepo, pointer: &str) -> R
         return Ok(false);
     }
     for entry in metadata_entries(repo, None, &[pointer.into()])? {
-        if entry.version_id.is_some() && !cache_path_for_entry(repo, &entry)?.is_file() {
+        if entry.verification.is_none()
+            && entry.version_id.is_some()
+            && !cache_path_for_entry(repo, &entry)?.is_file()
+        {
             return Ok(true);
         }
     }
@@ -909,6 +1158,7 @@ fn cache_for_recorded_file(
         size: Some(file.size),
         version_id: file.version_id.clone(),
         etag: None,
+        verification: file.verification.clone(),
         hash_name: algorithm.into(),
     })
 }
@@ -921,19 +1171,34 @@ fn normalized_exact_bytes_match(
     files: &[FileState],
     algorithm: &str,
 ) -> Result<bool> {
+    for file in files.iter().filter(|file| file.verification.is_some()) {
+        let local = if file.relpath.is_empty() {
+            repo.root.join(object)
+        } else {
+            repo.root.join(object).join(&file.relpath)
+        };
+        if !local.is_file()
+            || hashes.hashes(&local)?.sha256 != file.verification.as_ref().unwrap().checksum.digest
+        {
+            return Ok(false);
+        }
+    }
     if algorithm != "md5-dos2unix" {
         return Ok(true);
     }
     let cache_files = files
         .iter()
-        .filter(|file| file.version_id.is_some())
+        .filter(|file| file.version_id.is_some() && file.verification.is_none())
         .map(|file| cache_for_recorded_file(cache_paths, object, file, algorithm))
         .collect::<Result<Vec<_>>>()?;
     if cache_files.iter().any(|path| !path.is_file()) {
         return Ok(false);
     }
     hashes.preload(&cache_files, algorithm)?;
-    for file in files.iter().filter(|file| file.version_id.is_some()) {
+    for file in files
+        .iter()
+        .filter(|file| file.version_id.is_some() && file.verification.is_none())
+    {
         let cache = cache_for_recorded_file(cache_paths, object, file, algorithm)?;
         let local = if file.relpath.is_empty() {
             repo.root.join(object)
@@ -1424,6 +1689,7 @@ pub(crate) fn entries_from_document(
                     size: file.size,
                     version_id: file.version_id.clone(),
                     etag: file.etag.clone(),
+                    verification: file.verification.clone(),
                     hash_name: hash_name.to_owned(),
                 });
             }
@@ -1443,6 +1709,7 @@ pub(crate) fn entries_from_document(
                 size: out.size,
                 version_id: out.version_id.clone(),
                 etag: out.etag.clone(),
+                verification: out.verification.clone(),
                 hash_name: hash_name.to_owned(),
             });
         }
@@ -1617,6 +1884,7 @@ fn current_files_with_inventory(
             md5,
             size,
             version_id: None,
+            verification: None,
         });
     }
     files.sort_by(|a, b| a.relpath.cmp(&b.relpath));
@@ -1659,6 +1927,7 @@ fn recorded_files_with_cache(
                         .ok_or_else(|| Error::message("directory file has no digest"))?,
                     size: file.size.unwrap_or(0),
                     version_id: file.version_id.clone(),
+                    verification: file.verification.clone(),
                 })
             })
             .collect();
@@ -1673,6 +1942,7 @@ fn recorded_files_with_cache(
             md5: digest.to_owned(),
             size: out.size.unwrap_or(0),
             version_id: out.version_id.clone(),
+            verification: out.verification.clone(),
         }]);
     }
     let mut path = cache.existing(digest, algorithm)?;
@@ -1698,6 +1968,7 @@ fn recorded_files_with_cache(
                 md5: file.md5,
                 size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
                 version_id: None,
+                verification: None,
             })
         })
         .collect()
@@ -1726,7 +1997,7 @@ fn add(repo: &GitRepo, target: &str) -> Result<()> {
         read_manifest(repo, &pointer)?
     } else {
         Manifest {
-            schema_version: 1,
+            schema_version: crate::storage_format::SCHEMA_VERSION,
             path: filename.to_owned(),
             kind: Kind::File,
             checksum: Checksum {
@@ -1792,6 +2063,39 @@ fn update_manifest_with_cache(
         return Err(Error::message(format!(
             "storage output is missing: {object}"
         )));
+    }
+    // Retain exact bindings only when the proven raw bytes remain unchanged.
+    let previous = entries_from_document(
+        pointer,
+        &storage_metadata::logical_document(manifest),
+        &manifest.checksum.algorithm,
+    )?;
+    let proof_paths = previous
+        .iter()
+        .filter(|entry| entry.verification.is_some())
+        .map(|entry| repo.root.join(&entry.object))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    hashes.preload(&proof_paths, "md5-dos2unix")?;
+    let changed_proofs = previous
+        .iter()
+        .filter_map(|entry| entry.verification.as_ref().map(|proof| (entry, proof)))
+        .map(|(entry, proof)| {
+            let local = repo.root.join(&entry.object);
+            Ok((
+                entry.object.clone(),
+                !local.is_file() || hashes.hashes(&local)?.sha256 != proof.checksum.digest,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if let Some(entries) = &mut manifest.entries {
+        for entry in entries {
+            if changed_proofs.get(&format!("{object}/{}", entry.path)) == Some(&true) {
+                entry.version = None;
+            }
+        }
+    } else if changed_proofs.get(&object) == Some(&true) {
+        manifest.version = None;
     }
     if manifest.checksum.algorithm == "md5-dos2unix" {
         let document = storage_metadata::read_pointer_document(repo, pointer)?;
@@ -1868,6 +2172,14 @@ fn update_manifest_with_cache(
     manifest.checksum.digest = digest;
     manifest.size = size;
     manifest.entries = entries;
+    let bindings = entries_from_document(
+        pointer,
+        &storage_metadata::logical_document(manifest),
+        &manifest.checksum.algorithm,
+    )?
+    .into_iter()
+    .map(|entry| (entry.object.clone(), entry))
+    .collect::<BTreeMap<_, _>>();
     let mut copies: BTreeMap<PathBuf, Vec<_>> = BTreeMap::new();
     for file in files {
         let source = if file.relpath.is_empty() {
@@ -1878,7 +2190,29 @@ fn update_manifest_with_cache(
         if hashes.digest(&source, &manifest.checksum.algorithm)? != file.md5 {
             return Err(Error::message("downloaded content hash mismatch"));
         }
-        let destination = cache.path(&file.md5, &manifest.checksum.algorithm)?;
+        let object_path = if file.relpath.is_empty() {
+            object.clone()
+        } else {
+            format!("{object}/{}", file.relpath)
+        };
+        let bound = bindings
+            .get(&object_path)
+            .filter(|entry| entry.verification.is_some());
+        let expected_raw = bound
+            .and_then(|entry| entry.verification.as_ref())
+            .map(|proof| proof.checksum.digest.clone());
+        if let Some(expected) = &expected_raw
+            && hashes.hashes(&source)?.sha256 != *expected
+        {
+            return Err(Error::message(
+                "storage payload changed after its raw content verification",
+            ));
+        }
+        let destination = if let Some(bound) = bound {
+            cache.entry(bound)?
+        } else {
+            cache.path(&file.md5, &manifest.checksum.algorithm)?
+        };
         let verified = hashes.files[&source].clone();
         // Hash-equivalent files share a destination. Keep those copies in
         // their original order, with all source/post-copy checks, while
@@ -1886,7 +2220,7 @@ fn update_manifest_with_cache(
         copies
             .entry(destination)
             .or_default()
-            .push((source, file.md5, verified));
+            .push((source, file.md5, verified, expected_raw));
     }
     let copies = copies.into_iter().collect::<Vec<_>>();
     crate::native_versions::bounded_map_with_workers(
@@ -1894,14 +2228,26 @@ fn update_manifest_with_cache(
         workers,
         false,
         |(destination, sources)| {
-            for (source, wanted, verified) in sources {
+            for (source, wanted, verified, expected_raw) in sources {
                 let mut checked = HashInventory::with_workers(1);
                 checked.files.insert(source.clone(), verified.clone());
-                if checked.digest(source, &manifest.checksum.algorithm)? != *wanted {
+                let full = expected_raw.is_some() || !verified.1.sha256.is_empty();
+                let current = checked.inspect(source, full)?;
+                if current.digest(&manifest.checksum.algorithm)? != *wanted
+                    || expected_raw
+                        .as_ref()
+                        .is_some_and(|expected| current.sha256 != *expected)
+                {
                     return Err(Error::message("downloaded content hash mismatch"));
                 }
                 atomic_copy(source, destination)?;
-                if checked.digest(destination, &manifest.checksum.algorithm)? != *wanted {
+                let copied = checked.inspect(destination, full)?;
+                let expected = expected_raw.as_deref().or_else(|| {
+                    (!verified.1.sha256.is_empty()).then_some(verified.1.sha256.as_str())
+                });
+                if copied.digest(&manifest.checksum.algorithm)? != *wanted
+                    || expected.is_some_and(|expected| copied.sha256 != expected)
+                {
                     return Err(Error::message(
                         "content changed while installing the storage cache",
                     ));
@@ -2036,6 +2382,15 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
         ));
     }
     let cache = CachePaths::new(repo)?;
+    let proof_pointers = pointers
+        .iter()
+        .filter_map(|pointer| {
+            read_manifest(repo, pointer)
+                .ok()
+                .filter(|manifest| manifest.schema_version == crate::storage_format::SCHEMA_VERSION)
+                .map(|_| pointer.clone())
+        })
+        .collect::<BTreeSet<_>>();
     let entries = metadata_entries(repo, None, pointers)?;
     let mut objects = BTreeSet::new();
     for entry in &entries {
@@ -2056,7 +2411,23 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
             .md5
             .as_deref()
             .ok_or_else(|| Error::message("stored object has no content hash"))?;
-        let source = cache.existing(digest, &entry.hash_name)?;
+        let source = if proof_pointers.contains(&entry.pointer) {
+            let local = repo.root.join(&entry.object);
+            reject_symlink_traversal(&repo.root, &entry.object, "new storage payload")?;
+            if !local.is_file() {
+                return Err(Error::message(
+                    "an unbound schema 2 payload must be materialized before its first upload",
+                ));
+            }
+            local
+        } else {
+            cache.existing(digest, &entry.hash_name)?
+        };
+        let mut hashes = HashInventory::new();
+        let raw_sha256 = proof_pointers
+            .contains(&entry.pointer)
+            .then(|| hashes.hashes(&source).map(|hashes| hashes.sha256))
+            .transpose()?;
         // upload_version_in verifies the source before sending and the
         // exact uploaded generation before returning. Every worker owns
         // a distinct durable object journal and never edits metadata.
@@ -2070,18 +2441,26 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
             UploadPolicy {
                 namespace: "uploads",
                 condition: None,
-                raw_sha256: None,
+                raw_sha256: raw_sha256.as_deref(),
                 local: Some(cache.local()),
-                hashes: None,
+                hashes: Some(&mut hashes),
             },
         )?;
-        Ok((
-            entry.clone(),
-            Version {
-                id: version,
-                etag: Some(etag),
-            },
-        ))
+        let version = Version {
+            id: version.clone(),
+            etag: Some(etag),
+            verification: raw_sha256
+                .as_deref()
+                .map(|sha| verification_for(&client, entry, &version, sha, "verified-upload"))
+                .transpose()?,
+        };
+        if version.verification.is_some() {
+            let mut bound = entry.clone();
+            bound.version_id = Some(version.id.clone());
+            bound.verification = version.verification.clone();
+            cache.install_entry_with_inventory(&bound, &source, &mut hashes)?;
+        }
+        Ok((entry.clone(), version))
     })?;
     let mut by_pointer: BTreeMap<String, BTreeMap<String, (StorageEntry, Version)>> =
         BTreeMap::new();
@@ -2098,6 +2477,11 @@ fn push_versioned(repo: &GitRepo, pointers: &[String]) -> Result<()> {
         // Re-read once after all workers finish. Bind only unchanged entries;
         // an intervening metadata edit never overwrites or loses its state.
         let mut manifest = read_manifest(repo, &pointer)?;
+        if (manifest.schema_version == crate::storage_format::SCHEMA_VERSION)
+            != proof_pointers.contains(&pointer)
+        {
+            return Err(Error::message("storage schema changed during upload"));
+        }
         let object = output_object(&pointer, &manifest.path)?;
         if let Some(entries) = &mut manifest.entries {
             for file in entries {
@@ -2150,6 +2534,7 @@ fn binding_is_unchanged(
         && Some(size) == entry.size
         && version.map(|version| version.id.as_str()) == entry.version_id.as_deref()
         && version.and_then(|version| version.etag.as_deref()) == entry.etag.as_deref()
+        && version.and_then(|version| version.verification.as_ref()) == entry.verification.as_ref()
 }
 
 const UPLOAD_TOKEN: &str = "workspace-mgr-upload";
@@ -2182,6 +2567,36 @@ fn upload_journal_at(
     raw_sha256: Option<&str>,
 ) -> Result<(PathBuf, Value)> {
     let (path, context) = upload_context_at(local, client, entry, namespace, raw_sha256)?;
+    // Preserve an older owned transaction when adding raw identity changes
+    // the journal filename. Its token alone is never transfer evidence.
+    if namespace == "uploads" && raw_sha256.is_some() {
+        let (old_path, old_context) = upload_context_at(local, client, entry, namespace, None)?;
+        if old_path.is_file() {
+            let mut old: Value = serde_json::from_slice(&fs::read(&old_path).at(&old_path)?)
+                .map_err(|error| {
+                    Error::message(format!("invalid legacy upload journal: {error}"))
+                })?;
+            if old["context"] != old_context || !old["token"].is_string() {
+                return Err(Error::message(
+                    "legacy upload journal differs from its object identity",
+                ));
+            }
+            if path.is_file() {
+                let current: Value = serde_json::from_slice(&fs::read(&path).at(&path)?)
+                    .map_err(|error| Error::message(error.to_string()))?;
+                if current["context"] != context || current["token"] != old["token"] {
+                    return Err(Error::message(
+                        "conflicting legacy and current owned upload journals",
+                    ));
+                }
+            } else {
+                old["context"] = context.clone();
+                old["verified_transfer"] = false.into();
+                save_upload(&path, &old)?;
+            }
+            fs::remove_file(&old_path).at(&old_path)?;
+        }
+    }
     if path.is_file() {
         let journal: Value = serde_json::from_slice(&fs::read(&path).at(&path)?)
             .map_err(|e| Error::message(format!("invalid private storage upload journal: {e}")))?;
@@ -2237,7 +2652,7 @@ fn upload_context_at(
         .as_deref()
         .ok_or_else(|| Error::message("storage upload has no digest"))?;
     let mut context = json!({"schema":1,"bucket":client.bucket,"key":key,"md5":digest,"hash_name":entry.hash_name,"size":entry.size});
-    if namespace == "storage-import-uploads" {
+    if namespace == "storage-import-uploads" || raw_sha256.is_some() {
         let raw_sha256 = raw_sha256
             .filter(|digest| {
                 digest.len() == 64
@@ -2246,7 +2661,7 @@ fn upload_context_at(
                         .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
             })
             .ok_or_else(|| {
-                Error::message("storage import upload requires a raw SHA256 identity")
+                Error::message("verified storage upload requires a raw SHA256 identity")
             })?;
         context["schema"] = 2.into();
         context["raw_sha256"] = raw_sha256.into();
@@ -2274,16 +2689,20 @@ fn verify_uploaded_version(
     token: &str,
     version: &str,
     raw_sha256: Option<&str>,
+    verified_transfer: bool,
 ) -> Result<String> {
     let key = client.key_for(&entry.object);
-    let info = client
-        .call_s3(
-            "head_object",
-            &json!({"Bucket":client.bucket,"Key":key,"VersionId":version}),
-            None,
-        )?
-        .value;
-    if info["VersionId"].as_str() != Some(version)
+    let request = json!({"Bucket":client.bucket,"Key":key,"VersionId":version});
+    let info = if raw_sha256.is_some() {
+        client.head_with_checksums(&request)?
+    } else {
+        client.call_s3("head_object", &request, None)?
+    }
+    .value;
+    if version.is_empty()
+        || version == "null"
+        || info["DeleteMarker"] == true
+        || info["VersionId"].as_str() != Some(version)
         || info["Metadata"][UPLOAD_TOKEN].as_str() != Some(token)
         || entry
             .size
@@ -2292,6 +2711,29 @@ fn verify_uploaded_version(
         return Err(Error::message(
             "uploaded exact version does not match its private ownership journal",
         ));
+    }
+    let mut provider_verified = false;
+    if raw_sha256.is_some()
+        && info["ChecksumType"] == "FULL_OBJECT"
+        && let Some(checksum) = info["ChecksumSHA256"].as_str()
+    {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(checksum)
+            .map_err(|_| Error::message("uploaded version returned a malformed provider SHA256"))?;
+        if bytes.len() != 32 || Some(crate::hex::encode_lower(bytes).as_str()) != raw_sha256 {
+            return Err(Error::message(
+                "uploaded version provider SHA256 conflicts with its expected raw bytes",
+            ));
+        }
+        provider_verified = true;
+    }
+    if raw_sha256.is_some() && (verified_transfer || provider_verified) {
+        return info["ETag"]
+            .as_str()
+            .filter(|etag| !etag.trim_matches('"').is_empty())
+            .map(|etag| etag.trim_matches('"').to_owned())
+            .ok_or_else(|| Error::message("uploaded exact version has no ETag"));
     }
     let request =
         json!({"Bucket":client.bucket,"Key":key,"VersionId":version,"IfMatch":info["ETag"]});
@@ -2386,6 +2828,10 @@ fn recover_uploaded_version(
                 token,
                 &version,
                 journal["context"]["raw_sha256"].as_str(),
+                // The token identifies a candidate after an unacknowledged
+                // write; it does not establish that candidate's content. Only
+                // an offered provider SHA256 or exact read can prove it.
+                false,
             )
             .map(|etag| (version, etag))
         })
@@ -2426,6 +2872,45 @@ struct UploadPolicy<'a> {
     hashes: Option<&'a mut HashInventory>,
 }
 
+/// Hash the ordered part bytes and their concatenation in one pass. Expected
+/// part hashes then bind each signed UploadPart to this exact full SHA256,
+/// including on platforms without a reliable filesystem generation counter.
+fn multipart_part_checksums(
+    source: &Path,
+    size: u64,
+    part_size: u64,
+    expected: &str,
+) -> Result<Vec<String>> {
+    use sha2::Sha256;
+    let mut input = fs::File::open(source).at(source)?;
+    let mut whole = Sha256::new();
+    let mut parts = Vec::new();
+    let mut remaining = size;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let length = remaining.min(part_size);
+        let mut part = Sha256::new();
+        let mut left = length;
+        while left > 0 {
+            let amount = left.min(buffer.len() as u64) as usize;
+            input.read_exact(&mut buffer[..amount]).at(source)?;
+            whole.update(&buffer[..amount]);
+            part.update(&buffer[..amount]);
+            left -= amount as u64;
+        }
+        parts.push(crate::hex::encode_lower(part.finalize()));
+        remaining -= length;
+    }
+    if input.read(&mut buffer[..1]).at(source)? != 0
+        || crate::hex::encode_lower(whole.finalize()) != expected
+    {
+        return Err(Error::message(
+            "multipart source differs from its raw SHA256 identity",
+        ));
+    }
+    Ok(parts)
+}
+
 fn upload_version_in(
     client: &crate::native_s3::S3Client,
     repo: &GitRepo,
@@ -2453,8 +2938,17 @@ fn upload_version_in(
         .ok_or_else(|| Error::message("private upload journal has no ownership token"))?
         .to_owned();
     if let Some(version) = journal["version_id"].as_str() {
-        return verify_uploaded_version(client, repo, entry, &token, version, raw_sha256)
-            .map(|etag| (version.to_owned(), etag));
+        return verify_uploaded_version(
+            client,
+            repo,
+            entry,
+            &token,
+            version,
+            raw_sha256,
+            journal["verified_transfer"] == true
+                && journal["transfer_endpoint"] == client.endpoint_identity(),
+        )
+        .map(|etag| (version.to_owned(), etag));
     }
     if journal["phase"] != "planned" {
         if let Some((version, etag)) = recover_uploaded_version(client, repo, entry, &journal)? {
@@ -2494,7 +2988,9 @@ fn upload_version_in(
     let mut private_hashes = HashInventory::new();
     let hashes = hashes.unwrap_or(&mut private_hashes);
     let source_hashes = hashes.hashes(source)?;
-    if source_hashes.digest(&entry.hash_name)? != entry.md5.as_deref().unwrap_or("") {
+    if source_hashes.digest(&entry.hash_name)? != entry.md5.as_deref().unwrap_or("")
+        || raw_sha256.is_some_and(|expected| source_hashes.sha256 != expected)
+    {
         return Err(Error::message(
             "cached upload checksum differs from storage metadata",
         ));
@@ -2502,6 +2998,11 @@ fn upload_version_in(
     let request = json!({"Bucket":client.bucket,"Key":key,"Metadata":{UPLOAD_TOKEN:token}});
     let response = if size <= single_limit {
         journal["phase"] = "uploading".into();
+        if let Some(sha256) = raw_sha256 {
+            journal["verified_transfer"] = true.into();
+            journal["transfer_endpoint"] = client.endpoint_identity().into();
+            journal["context"]["raw_sha256"] = sha256.into();
+        }
         save_upload(&path, &journal)?;
         let mut request = request;
         if namespace == "storage-import-uploads" {
@@ -2512,6 +3013,9 @@ fn upload_version_in(
             }
         }
         request["ExpectedMD5"] = source_hashes.md5.into();
+        if let Some(sha256) = raw_sha256 {
+            request["ExpectedSHA256"] = sha256.into();
+        }
         request["ExpectedSize"] = size.into();
         client.put_file(&request, source)
     } else {
@@ -2521,6 +3025,9 @@ fn upload_version_in(
                 "stored object exceeds S3 multipart upload limits",
             ));
         }
+        let part_sha256 = raw_sha256
+            .map(|expected| multipart_part_checksums(source, size, part_size, expected))
+            .transpose()?;
         journal["phase"] = "creating".into();
         save_upload(&path, &journal)?;
         let created = client.call_s3("create_multipart_upload", &request, None)?;
@@ -2544,12 +3051,11 @@ fn upload_version_in(
                 4,
                 true,
                 |&(part, offset, length)| {
-                    let response = client.upload_part_file(
-                    &json!({"Bucket":client.bucket,"Key":key,"UploadId":upload,"PartNumber":part}),
-                    source,
-                    offset,
-                    length,
-                )?;
+                    let mut request = json!({"Bucket":client.bucket,"Key":key,"UploadId":upload,"PartNumber":part});
+                    if let Some(parts) = &part_sha256 {
+                        request["ExpectedSHA256"] = parts[(part - 1) as usize].clone().into();
+                    }
+                    let response = client.upload_part_file(&request, source, offset, length)?;
                     let etag = response.value["ETag"]
                         .as_str()
                         .ok_or_else(|| Error::message("multipart part returned no ETag"))?;
@@ -2557,12 +3063,16 @@ fn upload_version_in(
                 },
             )?;
             parts.sort_by_key(|part| part["PartNumber"].as_u64().unwrap_or_default());
-            if hashes.digest(source, &entry.hash_name)? != entry.md5.as_deref().unwrap_or("") {
+            if hashes.hashes(source)?.sha256 != source_hashes.sha256 {
                 return Err(Error::message(
                     "cached content changed during multipart upload",
                 ));
             }
             journal["phase"] = "completing".into();
+            if raw_sha256.is_some() {
+                journal["verified_transfer"] = true.into();
+                journal["transfer_endpoint"] = client.endpoint_identity().into();
+            }
             save_upload(&path, &journal)?;
             let mut complete = json!({"Bucket":client.bucket,"Key":key,"UploadId":upload,"MultipartUpload":{"Parts":parts}});
             if namespace == "storage-import-uploads" {
@@ -2631,7 +3141,16 @@ fn upload_version_in(
     // Record the exact generation before its read-back, including a failure.
     journal["version_id"] = version.clone().into();
     save_upload(&path, &journal)?;
-    let etag = verify_uploaded_version(client, repo, entry, &token, &version, raw_sha256)?;
+    let etag = verify_uploaded_version(
+        client,
+        repo,
+        entry,
+        &token,
+        &version,
+        raw_sha256,
+        journal["verified_transfer"] == true
+            && journal["transfer_endpoint"] == client.endpoint_identity(),
+    )?;
     journal["etag"] = etag.clone().into();
     journal["phase"] = "complete".into();
     save_upload(&path, &journal)?;
@@ -2710,6 +3229,21 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
     let documents = storage_metadata::read_pointer_documents(repo, None, pointers)?;
     for pointer in pointers {
         let (document, algorithm) = &documents[pointer];
+        let mut proof_paths = Vec::new();
+        for entry in entries_from_document(pointer, document, algorithm)?
+            .into_iter()
+            .filter(|entry| entry.verification.is_some())
+        {
+            let local = repo.root.join(&entry.object);
+            if local.is_file() {
+                proof_paths.push(local);
+            }
+            let cached = cache.entry(&entry)?;
+            if cached.is_file() {
+                proof_paths.push(cached);
+            }
+        }
+        hashes.preload(&proof_paths, "md5-dos2unix")?;
         for out in &document.outs {
             let hash_name = algorithm.as_str();
             let object = output_object(pointer, &out.path)?;
@@ -2731,6 +3265,11 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                     .ok_or_else(|| Error::message("cached content size overflows"))?;
                 if (file.size != 0 && size != file.size)
                     || hashes.digest(&source, hash_name)? != file.md5
+                    || file.verification.as_ref().is_some_and(|proof| {
+                        !hashes
+                            .hashes(&source)
+                            .is_ok_and(|value| value.sha256 == proof.checksum.digest)
+                    })
                 {
                     return Err(Error::message("cached content size or hash mismatch"));
                 }
@@ -2809,12 +3348,22 @@ fn checkout(repo: &GitRepo, pointers: &[String]) -> Result<()> {
                 let source_size = fs::metadata(&source).at(&source)?.len();
                 if (file.size != 0 && source_size != file.size)
                     || hashes.digest(&source, hash_name)? != file.md5
+                    || file.verification.as_ref().is_some_and(|proof| {
+                        !hashes
+                            .hashes(&source)
+                            .is_ok_and(|value| value.sha256 == proof.checksum.digest)
+                    })
                 {
                     return Err(Error::message("cached content size or hash mismatch"));
                 }
                 atomic_copy(&source, &destination)?;
                 if fs::metadata(&destination).at(&destination)?.len() != source_size
                     || hashes.digest(&destination, hash_name)? != file.md5
+                    || file.verification.as_ref().is_some_and(|proof| {
+                        !hashes
+                            .hashes(&destination)
+                            .is_ok_and(|value| value.sha256 == proof.checksum.digest)
+                    })
                 {
                     return Err(Error::message("cached content changed during checkout"));
                 }
@@ -2880,6 +3429,13 @@ fn status(repo: &GitRepo, pointers: &[String], cloud: bool, quiet: bool) -> Resu
             let mut hashes = HashInventory::with_workers(cpus / workers);
             let mut changed = serde_json::Map::new();
             let (document, algorithm) = &documents[pointer];
+            let proof_paths = entries_from_document(pointer, document, algorithm)?
+                .into_iter()
+                .filter(|entry| entry.verification.is_some())
+                .map(|entry| repo.root.join(entry.object))
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>();
+            hashes.preload(&proof_paths, "md5-dos2unix")?;
             for out in &document.outs {
                 let algorithm = algorithm.as_str();
                 let object = output_object(pointer, &out.path)?;
@@ -2956,6 +3512,11 @@ fn status(repo: &GitRepo, pointers: &[String], cloud: bool, quiet: bool) -> Resu
                             |path| {
                                 path.is_file()
                                     && hashes.digest(&path, algorithm).is_ok_and(|d| d == file.md5)
+                                    && file.verification.as_ref().is_none_or(|proof| {
+                                        hashes.hashes(&path).is_ok_and(|value| {
+                                            value.sha256 == proof.checksum.digest
+                                        })
+                                    })
                             },
                         )
                     }) {
@@ -3019,6 +3580,20 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                     }
                     Err(error) => return Err(error),
                 };
+                let mut proof_paths = Vec::new();
+                for file in files.iter().filter(|file| file.verification.is_some()) {
+                    let local = if file.relpath.is_empty() {
+                        repo.root.join(&object)
+                    } else {
+                        repo.root.join(&object).join(&file.relpath)
+                    };
+                    if local.is_file() {
+                        proof_paths.push(local);
+                    }
+                }
+                // Populate the combined hashes before the ordinary MD5 walk,
+                // so verified local files are read only once in this phase.
+                hashes.preload(&proof_paths, "md5-dos2unix")?;
                 let current = current_files_with_inventory(repo, &object, algorithm, &mut hashes)?;
                 let old = files
                     .iter()
@@ -3039,7 +3614,7 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                     && let Some(digest) = &out.md5
                     && !cache.existing(digest, algorithm)?.is_file()
                 {
-                    not_in_cache.insert(label);
+                    not_in_cache.insert(label.clone());
                 }
                 for file in &files {
                     let label = if file.relpath.is_empty() {
@@ -3047,7 +3622,25 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                     } else {
                         format!("{object}/{}", file.relpath)
                     };
-                    if !cache.existing(&file.md5, algorithm)?.is_file() {
+                    let cached = if file.verification.is_some() {
+                        cache_for_recorded_file(&cache, &object, file, algorithm)?
+                    } else {
+                        cache.existing(&file.md5, algorithm)?
+                    };
+                    let cached_matches = if let Some(proof) = &file.verification {
+                        cached.is_file()
+                            && fs::metadata(&cached)
+                                .is_ok_and(|metadata| metadata.len() == file.size)
+                            && hashes.hashes(&cached).is_ok_and(|actual| {
+                                actual.sha256 == proof.checksum.digest
+                                    && actual
+                                        .digest(algorithm)
+                                        .is_ok_and(|digest| digest == file.md5)
+                            })
+                    } else {
+                        cached.is_file()
+                    };
+                    if !cached_matches {
                         not_in_cache.insert(label.clone());
                     }
                     match new.get(&file.relpath) {
@@ -3057,7 +3650,17 @@ fn data_status(repo: &GitRepo, targets: &[String]) -> Result<Value> {
                         Some(state) if state != &(file.md5.clone(), file.size) => {
                             modified.insert(label);
                         }
-                        _ => {}
+                        Some(_) => {
+                            if let Some(proof) = &file.verification
+                                && hashes.hashes(&repo.root.join(&label))?.sha256
+                                    != proof.checksum.digest
+                            {
+                                if directory {
+                                    modified.insert(format!("{object}/"));
+                                }
+                                modified.insert(label);
+                            }
+                        }
                     }
                 }
                 for file in &current {
@@ -3310,6 +3913,171 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_data_status_checks_raw_content_and_verified_cache() {
+        for directory in [false, true] {
+            let (_temporary, repo) = repository();
+            let object = if directory { "data/a" } else { "data" };
+            let source = repo.root.join(object);
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            fs::write(&source, b"alpha\r\nbeta\n").unwrap();
+            let mut hashes = HashInventory::new();
+            let actual = hashes.hashes(&source).unwrap();
+            let checksum = Checksum {
+                algorithm: "md5-dos2unix".into(),
+                digest: actual.normalized_md5,
+            };
+            let proof = Verification {
+                endpoint: "https://s3.example.invalid".into(),
+                bucket: "bucket".into(),
+                key: format!("prefix/{object}"),
+                version_id: "exact-version".into(),
+                checksum: Checksum {
+                    algorithm: "sha256".into(),
+                    digest: actual.sha256,
+                },
+                size: 12,
+                method: "verified-read".into(),
+            };
+            let version = Version {
+                id: "exact-version".into(),
+                etag: Some("exact-etag".into()),
+                verification: Some(proof),
+            };
+            let entries = directory.then(|| {
+                vec![Entry {
+                    path: "a".into(),
+                    checksum: checksum.clone(),
+                    size: 12,
+                    version: Some(version.clone()),
+                }]
+            });
+            let manifest = Manifest {
+                schema_version: crate::storage_format::SCHEMA_VERSION,
+                path: "data".into(),
+                kind: if directory {
+                    Kind::Directory
+                } else {
+                    Kind::File
+                },
+                checksum: Checksum {
+                    algorithm: checksum.algorithm.clone(),
+                    digest: match &entries {
+                        Some(entries) => crate::storage_format::directory_digest(entries).unwrap(),
+                        None => checksum.digest,
+                    },
+                },
+                size: 12,
+                version: (!directory).then_some(version),
+                entries,
+            };
+            let pointer = "data.wm-storage.json";
+            write_manifest(&repo, pointer, &manifest).unwrap();
+            let entry = metadata_entries(&repo, None, &[pointer.into()])
+                .unwrap()
+                .remove(0);
+            let cache = CachePaths::new(&repo).unwrap();
+            cache
+                .install_entry_with_inventory(&entry, &source, &mut hashes)
+                .unwrap();
+            let verified_cache = cache.entry(&entry).unwrap();
+            assert_eq!(data_status(&repo, &["data".into()]).unwrap(), json!({}));
+            commit(&repo, pointer).unwrap();
+            assert_eq!(read_manifest(&repo, pointer).unwrap(), manifest);
+            assert_eq!(fs::read(&verified_cache).unwrap(), b"alpha\r\nbeta\n");
+
+            // The normalized digest and physical size still match, but the
+            // shared control's raw-byte proof detects corruption in its cache.
+            fs::write(&verified_cache, b"alpha\nbeta\r\n").unwrap();
+            let corrupt_cache = data_status(&repo, &["data".into()]).unwrap();
+            assert_eq!(corrupt_cache["not_in_cache"], json!([object]));
+            assert!(corrupt_cache["uncommitted"].is_null());
+            fs::write(&verified_cache, b"alpha\r\nbeta\n").unwrap();
+
+            fs::write(&source, b"alpha\nbeta\r\n").unwrap();
+            let local_change = data_status(&repo, &["data".into()]).unwrap();
+            assert_eq!(
+                local_change["uncommitted"]["modified"],
+                if directory {
+                    json!(["data/", "data/a"])
+                } else {
+                    json!(["data"])
+                }
+            );
+            assert!(local_change["not_in_cache"].is_null());
+            // Recording the changed representation must drop its old proof,
+            // while the cache named by that old proof keeps the old bytes.
+            commit(&repo, pointer).unwrap();
+            let changed = read_manifest(&repo, pointer).unwrap();
+            assert!(changed.version.is_none());
+            assert!(
+                changed
+                    .entries
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .all(|entry| entry.version.is_none())
+            );
+            assert_eq!(changed.checksum.algorithm, "md5");
+            assert_eq!(fs::read(&verified_cache).unwrap(), b"alpha\r\nbeta\n");
+        }
+    }
+
+    #[test]
+    fn optimistic_version_binding_rejects_changed_verification_evidence() {
+        let checksum = Checksum {
+            algorithm: "md5".into(),
+            digest: "0cc175b9c0f1b6a831c399e269772661".into(),
+        };
+        let proof = Verification {
+            endpoint: "https://s3.example.invalid".into(),
+            bucket: "bucket".into(),
+            key: "prefix/data".into(),
+            version_id: "exact-version".into(),
+            checksum: Checksum {
+                algorithm: "sha256".into(),
+                digest: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".into(),
+            },
+            size: 1,
+            method: "verified-read".into(),
+        };
+        let mut version = Version {
+            id: "exact-version".into(),
+            etag: Some("exact-etag".into()),
+            verification: Some(proof.clone()),
+        };
+        let captured = StorageEntry {
+            pointer: "data.wm-storage.json".into(),
+            object: "data".into(),
+            md5: Some(checksum.digest.clone()),
+            size: Some(1),
+            version_id: Some(version.id.clone()),
+            etag: version.etag.clone(),
+            verification: Some(proof),
+            hash_name: "md5".into(),
+        };
+        assert!(binding_is_unchanged(
+            &checksum,
+            1,
+            Some(&version),
+            &captured
+        ));
+        version.verification.as_mut().unwrap().bucket = "other-bucket".into();
+        assert!(!binding_is_unchanged(
+            &checksum,
+            1,
+            Some(&version),
+            &captured
+        ));
+        version.verification = None;
+        assert!(!binding_is_unchanged(
+            &checksum,
+            1,
+            Some(&version),
+            &captured
+        ));
+    }
+
+    #[test]
     fn dos2unix_hash_matches_fixed_dvc_oracles_across_short_reads_and_binary_chunks() {
         let (_temporary, repo) = repository();
         let path = repo.root.join("legacy.txt");
@@ -3488,6 +4256,7 @@ mod tests {
         remote(&repo, Path::new("first-remote"));
         let cache = CachePaths::new(&repo).unwrap();
         let entry = StorageEntry {
+            verification: None,
             pointer: "source.wm-storage.json".into(),
             object: "source".into(),
             md5: Some("0cc175b9c0f1b6a831c399e269772661".into()),
@@ -3515,6 +4284,7 @@ mod tests {
         fs::write(repo.root.join("data/z"), "z").unwrap();
         add(&repo, "data").unwrap();
         let mut document = read_manifest(&repo, "data.wm-storage.json").unwrap();
+        document.schema_version = 1;
         assert_eq!(document.checksum.algorithm, "md5");
         for (entry, id) in document
             .entries
@@ -3524,6 +4294,7 @@ mod tests {
             .zip(["old-a", "old-z"])
         {
             entry.version = Some(Version {
+                verification: None,
                 id: id.into(),
                 etag: Some(format!("etag-{id}")),
             });
@@ -3809,6 +4580,7 @@ mod tests {
         install_cache_file(repo, &digest, &source).unwrap();
         (
             StorageEntry {
+                verification: None,
                 pointer: "source.dvc".into(),
                 object: "task/source".into(),
                 md5: Some(digest),
@@ -3887,6 +4659,15 @@ mod tests {
 
     #[test]
     fn multipart_upload_streams_complete_parts_and_verifies_its_exact_version() {
+        multipart_upload_with_proof(false);
+    }
+
+    #[test]
+    fn proven_multipart_upload_binds_ordered_signed_parts_without_downloading() {
+        multipart_upload_with_proof(true);
+    }
+
+    fn multipart_upload_with_proof(proven: bool) {
         use crate::native_s3::tests::{Reply, routed_fixture};
         let (_temporary, repo) = repository();
         let bytes = b"abcdefghijkl";
@@ -3906,6 +4687,10 @@ mod tests {
                 );
             }
             if request.method == "PUT" {
+                assert_eq!(
+                    request.headers["x-amz-content-sha256"],
+                    crate::hex::encode_lower(sha2::Sha256::digest(&request.body))
+                );
                 assert_eq!(query.len(), 2);
                 assert_eq!(query["uploadId"], "owned-upload");
                 assert!(matches!(query["partNumber"].as_str(), "1" | "2" | "3"));
@@ -3929,11 +4714,34 @@ mod tests {
             }
             uploaded_get(bytes, "owned-version", "\"owned-etag\"")
         });
+        let raw = file_sha256(&source).unwrap();
         assert_eq!(
-            upload_version(&client, &repo, &entry, &source, 4, 5).unwrap(),
+            upload_version_in(
+                &client,
+                &repo,
+                &entry,
+                &source,
+                4,
+                5,
+                UploadPolicy {
+                    namespace: "uploads",
+                    condition: None,
+                    raw_sha256: proven.then_some(raw.as_str()),
+                    local: None,
+                    hashes: None,
+                }
+            )
+            .unwrap(),
             ("owned-version".into(), "owned-etag".into())
         );
         let requests = worker.finish_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "GET")
+                .count(),
+            usize::from(!proven)
+        );
         assert_eq!(
             requests
                 .iter()
@@ -4156,7 +4964,8 @@ mod tests {
                     &entry,
                     "owned-token",
                     "owned-version",
-                    None
+                    None,
+                    false
                 )
                 .is_err()
             );
@@ -4212,7 +5021,8 @@ mod tests {
                 &entry,
                 "owned-token",
                 "owned-version",
-                Some(&expected)
+                Some(&expected),
+                false
             )
             .is_err()
         );
@@ -4293,6 +5103,9 @@ mod tests {
         fs::write(repo.root.join("source"), bytes).unwrap();
         add(&repo, "source").unwrap();
         let pointer = repo.root.join("source.wm-storage.json");
+        let mut legacy = read_manifest(&repo, "source.wm-storage.json").unwrap();
+        legacy.schema_version = 1;
+        write_manifest(&repo, "source.wm-storage.json", &legacy).unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new((String::new(), Vec::new())));
         let expected = captured.clone();
         let (client, worker) = routed_fixture(move |request| {
@@ -4317,6 +5130,7 @@ mod tests {
                 )
                 .unwrap();
                 raw.version = Some(Version {
+                    verification: None,
                     id: "independent-version".into(),
                     etag: Some("independent-etag".into()),
                 });
@@ -4376,5 +5190,185 @@ mod tests {
             value["source.wm-storage.json"][0]["changed outs"]["source"],
             "modified"
         );
+    }
+
+    #[test]
+    fn schema2_publication_records_exact_proof_and_sha_cache_without_payload_get() {
+        use crate::native_s3::tests::{Reply, configure_repo, routed_fixture};
+        let (_temporary, repo) = repository();
+        let bytes = b"raw bytes\r\n";
+        fs::write(repo.root.join("source"), bytes).unwrap();
+        add(&repo, "source").unwrap();
+        let token = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = token.clone();
+        let (client, worker) = routed_fixture(move |request| {
+            let (_, query) = upload_request_route(request);
+            if query.contains_key("versioning") {
+                return Reply::xml(
+                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                );
+            }
+            if request.method == "PUT" {
+                assert_eq!(request.body, bytes);
+                assert_eq!(
+                    request.headers["x-amz-content-sha256"],
+                    crate::hex::encode_lower(sha2::Sha256::digest(bytes))
+                );
+                *captured.lock().unwrap() =
+                    request.headers["x-amz-meta-workspace-mgr-upload"].clone();
+                return Reply {
+                    status: 200,
+                    headers: vec![
+                        ("x-amz-version-id", "owned-version".into()),
+                        ("etag", "\"owned-etag\"".into()),
+                    ],
+                    body: Vec::new(),
+                };
+            }
+            assert_eq!(request.method, "HEAD");
+            assert_uploaded_read(request, "source");
+            uploaded_head(&captured.lock().unwrap(), bytes.len())
+        });
+        configure_repo(&client, &repo);
+        push_versioned(&repo, &["source.wm-storage.json".into()]).unwrap();
+        let entry = metadata_entries(&repo, None, &["source.wm-storage.json".into()])
+            .unwrap()
+            .remove(0);
+        let proof = entry.verification.as_ref().unwrap();
+        assert_eq!(proof.version_id, "owned-version");
+        assert_eq!(
+            proof.checksum.digest,
+            file_sha256(&repo.root.join("source")).unwrap()
+        );
+        assert_eq!(proof.endpoint, client.endpoint_identity());
+        assert_eq!(
+            file_sha256(&cache_path_for_entry(&repo, &entry).unwrap()).unwrap(),
+            proof.checksum.digest
+        );
+        assert_eq!(data_status(&repo, &["source".into()]).unwrap(), json!({}));
+        push_versioned(&repo, &["source.wm-storage.json".into()]).unwrap();
+        let requests = worker.finish_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method == "GET" && !request.target.contains("versioning"))
+        );
+    }
+
+    #[test]
+    fn unacknowledged_upload_recovery_requires_content_proof_beyond_its_token() {
+        use crate::native_s3::tests::{Reply, routed_fixture};
+        use base64::Engine;
+        for (remote, provider) in [
+            (b"a\r\nb\n".as_slice(), false),
+            (b"a\nb\r\n".as_slice(), false),
+            (b"a\r\nb\n".as_slice(), true),
+        ] {
+            let (_temporary, repo) = repository();
+            let expected_bytes = b"a\r\nb\n";
+            let (mut entry, source) = upload_fixture(&repo, expected_bytes);
+            entry.hash_name = "md5-dos2unix".into();
+            entry.md5 = Some(file_digest(&source, &entry.hash_name).unwrap());
+            let raw = file_sha256(&source).unwrap();
+            let (client, worker) = routed_fixture(move |request| {
+                let (_, query) = upload_request_route(request);
+                if request.method == "GET" && query.contains_key("versions") {
+                    return Reply::xml(
+                        "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>root/task/source</Key><VersionId>owned-version</VersionId><Size>5</Size><ETag>\"owned-etag\"</ETag></Version></ListVersionsResult>",
+                    );
+                }
+                assert_uploaded_read(request, "task/source");
+                if request.method == "HEAD" {
+                    let mut reply = uploaded_head("owned-token", remote.len());
+                    if provider
+                        && request
+                            .headers
+                            .get("x-amz-checksum-mode")
+                            .map(String::as_str)
+                            == Some("ENABLED")
+                    {
+                        reply
+                            .headers
+                            .push(("x-amz-checksum-type", "FULL_OBJECT".into()));
+                        reply.headers.push((
+                            "x-amz-checksum-sha256",
+                            base64::engine::general_purpose::STANDARD
+                                .encode(sha2::Sha256::digest(remote)),
+                        ));
+                    }
+                    return reply;
+                }
+                uploaded_get(remote, "owned-version", "\"owned-etag\"")
+            });
+            let journal = json!({
+                "token":"owned-token", "phase":"uploading",
+                "verified_transfer":true, "transfer_endpoint":client.endpoint_identity(),
+                "context":{"raw_sha256":raw},
+            });
+            let recovered = recover_uploaded_version(&client, &repo, &entry, &journal);
+            assert_eq!(recovered.is_ok(), remote == expected_bytes);
+            let requests = worker.finish_requests();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(
+                        |request| request.method == "GET" && request.target.contains("versionId=")
+                    )
+                    .count(),
+                usize::from(!provider),
+            );
+            assert!(!requests.iter().any(|request| request.method == "PUT"));
+        }
+    }
+
+    #[test]
+    fn legacy_upload_journal_is_recovered_before_creating_a_proven_upload() {
+        let (_temporary, repo) = repository();
+        let bytes = b"same bytes";
+        let (entry, source) = upload_fixture(&repo, bytes);
+        let (client, worker) = uploaded_read_fixture(bytes, "owned-version", "\"owned-etag\"");
+        let (old_path, mut old) = upload_journal(&repo, &client, &entry).unwrap();
+        old["token"] = "owned-token".into();
+        old["phase"] = "complete".into();
+        old["version_id"] = "owned-version".into();
+        save_upload(&old_path, &old).unwrap();
+        let raw = file_sha256(&source).unwrap();
+        let result = upload_version_in(
+            &client,
+            &repo,
+            &entry,
+            &source,
+            100,
+            5,
+            UploadPolicy {
+                namespace: "uploads",
+                condition: None,
+                raw_sha256: Some(&raw),
+                local: None,
+                hashes: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.0, "owned-version");
+        assert!(!old_path.exists());
+        let (_, new) = upload_journal_in(&repo, &client, &entry, "uploads", Some(&raw)).unwrap();
+        assert_eq!(new["token"], "owned-token");
+        assert_ne!(new["verified_transfer"], true);
+        let requests = worker.finish_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "GET")
+                .count(),
+            1
+        );
+        assert!(!requests.iter().any(|request| request.method == "PUT"));
     }
 }

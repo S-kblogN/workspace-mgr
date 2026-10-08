@@ -23,6 +23,7 @@ fn entry(object: &str) -> Entry {
             size: Some(3),
             version_id: Some("v1".to_owned()),
             etag: Some("abc".to_owned()),
+            verification: None,
             hash_name: "md5".to_owned(),
         },
         key: format!("root/{object}"),
@@ -398,6 +399,7 @@ fn shared_cas_history_is_retained_outside_path_version_retirement() {
             version: Some(crate::storage_format::Version {
                 id: "native-exact".into(),
                 etag: None,
+                verification: None,
             }),
             entries: None,
         }

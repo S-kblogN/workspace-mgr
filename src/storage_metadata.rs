@@ -125,6 +125,8 @@ pub(crate) struct PointerOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::storage_format::Verification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<PointerFileVersion>>,
 }
 
@@ -139,6 +141,8 @@ pub(crate) struct PointerFileVersion {
     pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::storage_format::Verification>,
 }
 
 /// One stored object named by a metadata file: a file boundary, one file of a
@@ -150,6 +154,7 @@ pub(crate) struct PointerEntry {
     pub size: Option<u64>,
     pub version_id: Option<String>,
     pub etag: Option<String>,
+    pub verification: Option<crate::storage_format::Verification>,
     pub aggregate: bool,
 }
 
@@ -179,6 +184,10 @@ pub(crate) fn logical_document(manifest: &crate::storage_format::Manifest) -> Po
                 .version
                 .as_ref()
                 .and_then(|version| version.etag.clone()),
+            verification: manifest
+                .version
+                .as_ref()
+                .and_then(|version| version.verification.clone()),
             files: manifest.entries.as_ref().map(|entries| {
                 entries
                     .iter()
@@ -191,6 +200,10 @@ pub(crate) fn logical_document(manifest: &crate::storage_format::Manifest) -> Po
                             .version
                             .as_ref()
                             .and_then(|version| version.etag.clone()),
+                        verification: entry
+                            .version
+                            .as_ref()
+                            .and_then(|version| version.verification.clone()),
                     })
                     .collect()
             }),
@@ -322,6 +335,7 @@ impl PointerDocument {
                             size: file.size,
                             version_id: file.version_id.clone(),
                             etag: file.etag.clone(),
+                            verification: file.verification.clone(),
                             aggregate: false,
                         });
                     }
@@ -332,6 +346,7 @@ impl PointerDocument {
                     size: output.size,
                     version_id: output.version_id.clone(),
                     etag: output.etag.clone(),
+                    verification: output.verification.clone(),
                     aggregate: output
                         .md5
                         .as_deref()
@@ -1054,6 +1069,7 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
                     size: file.size,
                     version_id: file.version_id.clone(),
                     etag: file.etag.clone(),
+                    verification: file.verification.clone(),
                     hash_name: algorithm.clone(),
                 })
                 .collect::<Vec<_>>(),
@@ -1064,10 +1080,14 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
                 size: output.size,
                 version_id: output.version_id.clone(),
                 etag: output.etag.clone(),
+                verification: output.verification.clone(),
                 hash_name: algorithm.clone(),
             }],
         };
         for entry in entries {
+            if entry.verification.is_some() {
+                continue;
+            }
             if !crate::native_engine::exact_raw_bytes_match(
                 repo,
                 &entry,
@@ -1077,6 +1097,7 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
             }
         }
     }
+    let mut hashes = crate::native_engine::HashInventory::new();
     match &output.files {
         None => {
             if !boundary_path.is_file() {
@@ -1090,7 +1111,13 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
             if output.size != Some(fs::metadata(&boundary_path).at(&boundary_path)?.len()) {
                 return Ok(false);
             }
-            Ok(crate::native_engine::file_digest(&boundary_path, &algorithm)? == *expected_md5)
+            content_matches_control(
+                &boundary_path,
+                &algorithm,
+                expected_md5,
+                output.verification.as_ref(),
+                &mut hashes,
+            )
         }
         Some(files) => {
             if !boundary_path.is_dir() {
@@ -1109,6 +1136,7 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
                             file.size.ok_or_else(|| {
                                 Error::message("directory entry has no physical size")
                             })?,
+                            file.verification.as_ref(),
                         ),
                     )
                     .is_some()
@@ -1140,12 +1168,18 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
                     &boundary_path,
                     "managed-storage directory entry",
                 )?;
-                let Some((expected_md5, expected_size)) = expected.get(&relative) else {
+                let Some((expected_md5, expected_size, verification)) = expected.get(&relative)
+                else {
                     return Ok(false);
                 };
                 if fs::metadata(entry.path()).at(entry.path())?.len() != *expected_size
-                    || crate::native_engine::file_digest(entry.path(), &algorithm)?
-                        != **expected_md5
+                    || !content_matches_control(
+                        entry.path(),
+                        &algorithm,
+                        expected_md5,
+                        *verification,
+                        &mut hashes,
+                    )?
                 {
                     return Ok(false);
                 }
@@ -1153,6 +1187,25 @@ pub fn payload_matches_metadata(repo: &GitRepo, pointer: &str, raw: &str) -> Res
             }
             Ok(actual.len() == expected.len())
         }
+    }
+}
+
+fn content_matches_control(
+    path: &Path,
+    algorithm: &str,
+    digest: &str,
+    verification: Option<&crate::storage_format::Verification>,
+    hashes: &mut crate::native_engine::HashInventory,
+) -> Result<bool> {
+    match verification {
+        Some(verification) => {
+            let actual = hashes.hashes(path)?;
+            Ok(
+                actual.sha256 == verification.checksum.digest
+                    && actual.digest(algorithm)? == digest,
+            )
+        }
+        None => Ok(hashes.digest(path, algorithm)? == digest),
     }
 }
 
@@ -1565,6 +1618,7 @@ mod tests {
             version: Some(Version {
                 id: "old-alpha".into(),
                 etag: None,
+                verification: None,
             }),
         }];
         let manifest = Manifest {
@@ -1705,6 +1759,57 @@ mod tests {
         assert!(!pointer_matches_worktree(&repo, "task/data.bin.dvc").unwrap());
         assert!(!pointer_matches_worktree(&repo, "task/bundle.dvc").unwrap());
     }
+
+    #[test]
+    fn schema_two_local_matching_checks_raw_bytes_with_normalized_logical_hashes() {
+        use crate::storage_format::{Checksum, Kind, Manifest, Verification, Version};
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temp.path().to_path_buf(),
+        };
+        let payload = temp.path().join("data");
+        fs::write(&payload, b"alpha\r\nbeta\n").unwrap();
+        let mut hashes = crate::native_engine::HashInventory::new();
+        let original = hashes.hashes(&payload).unwrap();
+        let manifest = Manifest {
+            schema_version: crate::storage_format::SCHEMA_VERSION,
+            path: "data".into(),
+            kind: Kind::File,
+            checksum: Checksum {
+                algorithm: "md5-dos2unix".into(),
+                digest: original.normalized_md5.clone(),
+            },
+            size: 12,
+            version: Some(Version {
+                id: "exact-version".into(),
+                etag: None,
+                verification: Some(Verification {
+                    endpoint: "https://s3.example.invalid".into(),
+                    bucket: "bucket".into(),
+                    key: "prefix/data".into(),
+                    version_id: "exact-version".into(),
+                    checksum: Checksum {
+                        algorithm: "sha256".into(),
+                        digest: original.sha256,
+                    },
+                    size: 12,
+                    method: "verified-read".into(),
+                }),
+            }),
+            entries: None,
+        };
+        let raw = manifest.serialize().unwrap();
+        assert!(payload_matches_metadata(&repo, "data.wm-storage.json", &raw).unwrap());
+
+        fs::write(&payload, b"alpha\nbeta\r\n").unwrap();
+        assert_eq!(
+            crate::native_engine::file_digest(&payload, "md5-dos2unix").unwrap(),
+            original.normalized_md5
+        );
+        assert!(!payload_matches_metadata(&repo, "data.wm-storage.json", &raw).unwrap());
+    }
+
     #[test]
     fn pointer_entries_cover_every_metadata_shape() {
         let file = parse_pointer_document(
@@ -1720,6 +1825,7 @@ mod tests {
                 size: Some(11),
                 version_id: None,
                 etag: None,
+                verification: None,
                 aggregate: false,
             }]
         );
@@ -1775,6 +1881,83 @@ mod tests {
         );
         assert!(parse_pointer_document("outs: [", "broken.dvc").is_err());
         assert!(parse_pointer_document("outs:\n- md5: a\n", "pathless.dvc").is_err());
+    }
+
+    #[test]
+    fn schema_two_verification_survives_logical_document_and_blob_cache() {
+        use crate::storage_format::{Checksum, Entry, Kind, Manifest, Verification, Version};
+
+        let checksum = Checksum {
+            algorithm: "md5".into(),
+            digest: "0cc175b9c0f1b6a831c399e269772661".into(),
+        };
+        let proof = Verification {
+            endpoint: "https://s3.example.invalid".into(),
+            bucket: "bucket".into(),
+            key: "prefix/task/data".into(),
+            version_id: "exact-version".into(),
+            checksum: Checksum {
+                algorithm: "sha256".into(),
+                digest: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".into(),
+            },
+            size: 1,
+            method: "verified-upload".into(),
+        };
+        let version = Version {
+            id: "exact-version".into(),
+            etag: Some("etag".into()),
+            verification: Some(proof.clone()),
+        };
+        let mut manifest = Manifest {
+            schema_version: crate::storage_format::SCHEMA_VERSION,
+            path: "data".into(),
+            kind: Kind::File,
+            checksum: checksum.clone(),
+            size: 1,
+            version: Some(version.clone()),
+            entries: None,
+        };
+        let file =
+            parse_pointer_document(&manifest.serialize().unwrap(), "task/data.wm-storage.json")
+                .unwrap();
+        assert_eq!(file.outs[0].verification.as_ref(), Some(&proof));
+        assert_eq!(
+            file.entries("task/data.wm-storage.json")[0]
+                .verification
+                .as_ref(),
+            Some(&proof)
+        );
+        let entries = vec![Entry {
+            path: "a".into(),
+            checksum,
+            size: 1,
+            version: Some(version),
+        }];
+        manifest.kind = Kind::Directory;
+        manifest.version = None;
+        manifest.checksum.digest = crate::storage_format::directory_digest(&entries).unwrap();
+        manifest.entries = Some(entries);
+        let directory =
+            parse_pointer_document(&manifest.serialize().unwrap(), "task/data.wm-storage.json")
+                .unwrap();
+        assert!(directory.outs[0].verification.is_none());
+        assert_eq!(
+            directory.outs[0].files.as_ref().unwrap()[0]
+                .verification
+                .as_ref(),
+            Some(&proof)
+        );
+        assert_eq!(
+            directory.entries("task/data.wm-storage.json")[0]
+                .verification
+                .as_ref(),
+            Some(&proof)
+        );
+        let cached = serde_json::to_string(&directory).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PointerDocument>(&cached).unwrap(),
+            directory
+        );
     }
 
     #[test]

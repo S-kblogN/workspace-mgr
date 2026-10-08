@@ -126,6 +126,7 @@ pub fn prepare(
     base: &str,
 ) -> Result<Vec<Value>> {
     let mut completed = Vec::new();
+    let mut proof_client = None;
     for (path, mut receipt) in receipts(repo, scopes)? {
         let source = text(&receipt, "source")?.to_owned();
         let destination = text(&receipt, "destination")?.to_owned();
@@ -216,7 +217,7 @@ pub fn prepare(
             storage_metadata::version_archive_adapter(repo, "verify", &receipt)?;
             storage_metadata::archive_registry_adapter(repo, "publish", &receipt)?;
             for pointer in &pointers {
-                rewrite_pointer(repo, pointer, &receipt)?;
+                rewrite_pointer_with_client(repo, pointer, &receipt, &mut proof_client)?;
             }
             storage_metadata::verify_archived(repo, &pointers)?;
         }
@@ -298,19 +299,40 @@ pub fn purge_candidates(receipts: &[Value]) -> Result<Vec<ObjectVersion>> {
     Ok(result.into_iter().collect())
 }
 
+#[cfg(test)]
 fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()> {
+    rewrite_pointer_with_client(repo, pointer, receipt, &mut None)
+}
+
+fn rewrite_pointer_with_client(
+    repo: &GitRepo,
+    pointer: &str,
+    receipt: &Value,
+    proof_client: &mut Option<crate::native_s3::S3Client>,
+) -> Result<()> {
     let absolute = resolved_under(&repo.root, pointer);
     let raw = fs::read_to_string(&absolute).at(&absolute)?;
-    let entries = storage_metadata::parse_pointer_document(&raw, pointer)?.entries(pointer);
-    if pointer.ends_with(crate::storage_format::SUFFIX) {
-        let mut manifest = crate::storage_format::Manifest::parse(&raw, pointer)?;
+    let manifest = if pointer.ends_with(crate::storage_format::SUFFIX) {
+        Some(crate::storage_format::Manifest::parse(&raw, pointer)?)
+    } else {
+        None
+    };
+    let entries = match &manifest {
+        Some(manifest) => storage_metadata::logical_document(manifest).entries(pointer),
+        None => storage_metadata::parse_pointer_document(&raw, pointer)?.entries(pointer),
+    };
+    if proof_client.is_none() && entries.iter().any(|entry| entry.verification.is_some()) {
+        *proof_client = Some(crate::native_s3::S3Client::from_repo(repo)?);
+    }
+    let client = proof_client.as_ref();
+    if let Some(mut manifest) = manifest {
         match manifest.kind {
             crate::storage_format::Kind::File => {
-                manifest.version = Some(copied_version(&entries[0], receipt)?);
+                manifest.version = Some(copied_version(client, &entries[0], receipt)?);
             }
             crate::storage_format::Kind::Directory => {
                 for (file, entry) in manifest.entries.as_mut().unwrap().iter_mut().zip(&entries) {
-                    file.version = Some(copied_version(entry, receipt)?);
+                    file.version = Some(copied_version(client, entry, receipt)?);
                 }
             }
         }
@@ -334,11 +356,11 @@ fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()>
             .and_then(serde_yaml::Value::as_sequence_mut)
         {
             for file in files {
-                replace_cloud(file, &entries[entry_index], receipt)?;
+                replace_cloud(client, file, &entries[entry_index], receipt)?;
                 entry_index += 1;
             }
         } else {
-            replace_cloud(out, &entries[entry_index], receipt)?;
+            replace_cloud(client, out, &entries[entry_index], receipt)?;
             entry_index += 1;
         }
     }
@@ -349,8 +371,30 @@ fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()>
 }
 
 fn copied_version(
+    client: Option<&crate::native_s3::S3Client>,
     entry: &storage_metadata::PointerEntry,
     receipt: &Value,
+) -> Result<crate::storage_format::Version> {
+    copied_version_for_scope(
+        entry,
+        receipt,
+        client.map(|client| {
+            (
+                client.endpoint_identity(),
+                client.bucket.as_str(),
+                client.prefix.as_str(),
+            )
+        }),
+    )
+}
+
+/// `prepare` verifies the exact source/copy journal and destination ownership
+/// before rewriting a pointer. Derive a content proof only from a matching
+/// source proof; a copy receipt alone cannot establish a content checksum.
+fn copied_version_for_scope(
+    entry: &storage_metadata::PointerEntry,
+    receipt: &Value,
+    scope: Option<(String, &str, &str)>,
 ) -> Result<crate::storage_format::Version> {
     let versions = receipt["versions"]
         .as_array()
@@ -366,18 +410,83 @@ fn copied_version(
         .ok_or_else(|| {
             Error::message(format!("archive has no copied version for {}", entry.key))
         })?;
+    let id = text(matching, "destination_version_id")?.to_owned();
+    let etag = text(matching, "destination_etag")?.to_owned();
+    let verification = entry
+        .verification
+        .as_ref()
+        .map(|proof| {
+            proof.validate()?;
+            let (endpoint, bucket, prefix) = scope.as_ref().ok_or_else(|| {
+                Error::message("archive content proof requires its configured storage scope")
+            })?;
+            let full_key = |object: &str| {
+                if prefix.is_empty() {
+                    object.to_owned()
+                } else {
+                    format!("{}/{object}", prefix.trim_end_matches('/'))
+                }
+            };
+            let source_key = full_key(text(matching, "source_object")?);
+            let destination_key = full_key(text(matching, "destination_object")?);
+            let source_version = text(matching, "source_version_id")?;
+            let same_source = proof.key == source_key
+                && entry.version_id.as_deref() == Some(source_version)
+                && proof.version_id == source_version;
+            let same_destination = proof.key == destination_key
+                && entry.version_id.as_deref() == Some(id.as_str())
+                && proof.version_id == id;
+            let expected_etag = if same_source {
+                text(matching, "source_etag")?
+            } else {
+                etag.as_str()
+            };
+            if receipt["status"] != "copied"
+                || proof.endpoint != *endpoint
+                || proof.bucket != *bucket
+                || receipt["bucket"].as_str() != Some(*bucket)
+                || receipt["remote_prefix"].as_str() != Some(*prefix)
+                || !same_source && !same_destination
+                || matching["size"].as_u64() != Some(proof.size)
+                || entry.size != Some(proof.size)
+                || entry
+                    .etag
+                    .as_deref()
+                    .is_none_or(|tag| tag.trim_matches('"') != expected_etag.trim_matches('"'))
+            {
+                return Err(Error::message(format!(
+                    "archive content proof does not match its exact copy identity: {}",
+                    entry.key
+                )));
+            }
+            if id == "null" || source_version == "null" {
+                return Err(Error::message(
+                    "archive content proof requires immutable exact object versions",
+                ));
+            }
+            let mut next = proof.clone();
+            if same_source {
+                next.key = destination_key;
+                next.version_id = id.clone();
+                next.method = "verified-copy".to_owned();
+            }
+            Ok(next)
+        })
+        .transpose()?;
     Ok(crate::storage_format::Version {
-        id: text(matching, "destination_version_id")?.to_owned(),
-        etag: Some(text(matching, "destination_etag")?.to_owned()),
+        id,
+        etag: Some(etag),
+        verification,
     })
 }
 
 fn replace_cloud(
+    client: Option<&crate::native_s3::S3Client>,
     value: &mut serde_yaml::Value,
     entry: &storage_metadata::PointerEntry,
     receipt: &Value,
 ) -> Result<()> {
-    let version = copied_version(entry, receipt)?;
+    let version = copied_version(client, entry, receipt)?;
     value["cloud"]["workspace-mgr"]["version_id"] = version.id.into();
     value["cloud"]["workspace-mgr"]["etag"] = version.etag.unwrap().into();
     Ok(())
@@ -447,6 +556,119 @@ mod tests {
         let absolute = repo.root.join(path);
         fs::create_dir_all(absolute.parent().unwrap()).unwrap();
         fs::write(absolute, raw).unwrap();
+    }
+
+    fn verified_copy_input() -> (storage_metadata::PointerEntry, Value) {
+        let proof = crate::storage_format::Verification {
+            endpoint: "https://s3.example.invalid".to_owned(),
+            bucket: "test-bucket".to_owned(),
+            key: format!("prefix/{SOURCE}/artifact.bin"),
+            version_id: "source-0".to_owned(),
+            checksum: crate::storage_format::Checksum {
+                algorithm: "sha256".to_owned(),
+                digest: crate::hex::encode_lower(Sha256::digest(b"a")),
+            },
+            size: 1,
+            method: "verified-upload".to_owned(),
+        };
+        let entry = storage_metadata::PointerEntry {
+            key: format!("{DESTINATION}/artifact.bin"),
+            md5: Some("0cc175b9c0f1b6a831c399e269772661".to_owned()),
+            size: Some(1),
+            version_id: Some("source-0".to_owned()),
+            etag: Some("source-etag".to_owned()),
+            verification: Some(proof),
+            aggregate: false,
+        };
+        let mut copied = receipt("copied", &["artifact.bin"]);
+        copied["bucket"] = "test-bucket".into();
+        copied["remote_prefix"] = "prefix".into();
+        copied["versions"][0]["source_etag"] = "source-etag".into();
+        copied["versions"][0]["size"] = 1.into();
+        (entry, copied)
+    }
+
+    fn copy_in_scope(
+        entry: &storage_metadata::PointerEntry,
+        receipt: &Value,
+    ) -> Result<crate::storage_format::Version> {
+        copied_version_for_scope(
+            entry,
+            receipt,
+            Some((
+                "https://s3.example.invalid".to_owned(),
+                "test-bucket",
+                "prefix",
+            )),
+        )
+    }
+
+    #[test]
+    fn archive_copy_derives_and_reuses_exact_destination_content_proof() {
+        let (mut entry, copied) = verified_copy_input();
+        let version = copy_in_scope(&entry, &copied).unwrap();
+        assert_eq!(version.id, "destination-0");
+        let proof = version.verification.as_ref().unwrap();
+        assert_eq!(proof.key, format!("prefix/{DESTINATION}/artifact.bin"));
+        assert_eq!(proof.method, "verified-copy");
+        assert_eq!(proof.version_id, "destination-0");
+        assert_eq!(
+            proof.checksum,
+            entry.verification.as_ref().unwrap().checksum
+        );
+        entry.version_id = Some(version.id.clone());
+        entry.etag = version.etag.clone();
+        entry.verification = version.verification.clone();
+        assert_eq!(copy_in_scope(&entry, &copied).unwrap(), version);
+    }
+
+    #[test]
+    fn archive_copy_cannot_invent_or_rebind_content_proof() {
+        let (entry, copied) = verified_copy_input();
+        let mut legacy = entry.clone();
+        legacy.verification = None;
+        assert!(
+            copied_version_for_scope(&legacy, &copied, None)
+                .unwrap()
+                .verification
+                .is_none()
+        );
+        assert!(copied_version_for_scope(&entry, &copied, None).is_err());
+        for field in ["endpoint", "bucket", "key"] {
+            let mut changed = entry.clone();
+            let proof = changed.verification.as_mut().unwrap();
+            match field {
+                "endpoint" => proof.endpoint = "https://another.example.invalid".to_owned(),
+                "bucket" => proof.bucket = "another-bucket".to_owned(),
+                "key" => proof.key = format!("prefix/{SOURCE}/another.bin"),
+                _ => unreachable!(),
+            }
+            assert!(
+                copy_in_scope(&changed, &copied).is_err(),
+                "accepted {field}"
+            );
+        }
+        let mut wrong_version = entry.clone();
+        wrong_version.version_id = Some("destination-0".to_owned());
+        assert!(copy_in_scope(&wrong_version, &copied).is_err());
+        let mut wrong_proof_version = entry.clone();
+        wrong_proof_version
+            .verification
+            .as_mut()
+            .unwrap()
+            .version_id = "another-version".to_owned();
+        assert!(copy_in_scope(&wrong_proof_version, &copied).is_err());
+        let mut wrong_etag = entry.clone();
+        wrong_etag.etag = Some("another-etag".to_owned());
+        assert!(copy_in_scope(&wrong_etag, &copied).is_err());
+        for field in ["bucket", "remote_prefix", "status"] {
+            let mut changed = copied.clone();
+            changed[field] = "untrusted".into();
+            assert!(copy_in_scope(&entry, &changed).is_err(), "accepted {field}");
+        }
+        let mut wrong_size = copied;
+        wrong_size["versions"][0]["size"] = 2.into();
+        assert!(copy_in_scope(&entry, &wrong_size).is_err());
     }
 
     #[test]

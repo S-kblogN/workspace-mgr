@@ -98,7 +98,7 @@ fn automatic_policy_plans_without_mutation_and_publishes_to_s3() {
     let native: serde_json::Value =
         serde_json::from_slice(&std::fs::read(task.join("large.bin.wm-storage.json")).unwrap())
             .unwrap();
-    assert_eq!(native["schema_version"], 1);
+    assert_eq!(native["schema_version"], 2);
     assert_eq!(native["kind"], "file");
     assert_eq!(native["checksum"]["algorithm"], "md5");
     assert!(native.get("outs").is_none());

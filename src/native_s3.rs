@@ -187,6 +187,30 @@ impl S3Error {
                 "SlowDown" | "RequestTimeout" | "InternalError" | "ServiceUnavailable"
             )
     }
+
+    fn checksum_mode_unsupported(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        matches!(self.status, Some(400 | 501))
+            && matches!(
+                self.code.as_str(),
+                "NotImplemented"
+                    | "Unsupported"
+                    | "NotSupported"
+                    | "UnsupportedOperation"
+                    | "InvalidRequest"
+            )
+            && (self.code != "InvalidRequest"
+                || message.contains("unsupported")
+                || message.contains("not supported")
+                || message.contains("not implemented"))
+            && (message.contains("checksum")
+                || self.header.as_ref().is_some_and(|header| {
+                    matches!(
+                        header.to_ascii_lowercase().as_str(),
+                        "x-amz-checksum-mode" | "checksummode"
+                    )
+                }))
+    }
 }
 
 impl fmt::Display for S3Error {
@@ -243,6 +267,10 @@ struct RequestPlan {
 type S3Result<T> = std::result::Result<T, S3Error>;
 
 impl S3Client {
+    /// Stable physical service identity, including a configured path prefix.
+    pub(crate) fn endpoint_identity(&self) -> String {
+        format!("{}{}", self.endpoint, self.endpoint_path)
+    }
     pub(crate) fn cache_route(repo: &GitRepo) -> Result<Option<(String, Option<String>)>> {
         match fs::symlink_metadata(Config::path(repo)) {
             Ok(_) => Ok(Config::load_compatible(repo)?
@@ -467,6 +495,21 @@ impl S3Client {
         self.read_response(operation, response)
     }
 
+    /// Request provider checksums, retrying ordinary metadata only when the
+    /// endpoint explicitly rejects checksum mode. Other failures stay errors.
+    pub(crate) fn head_with_checksums(&self, args: &Value) -> S3Result<S3Response> {
+        let mut request = args.clone();
+        request["ChecksumMode"] = "ENABLED".into();
+        self.call_s3("head_object", &request, None)
+            .or_else(|error| {
+                if error.checksum_mode_unsupported() {
+                    self.call_s3("head_object", args, None)
+                } else {
+                    Err(error)
+                }
+            })
+    }
+
     /// Visits the exact GET body in bounded chunks without a scratch file.
     /// The caller can hash and compare local bytes in the same pass, then verify
     /// the returned version, ETag and size before accepting the result. A failed
@@ -611,6 +654,14 @@ impl S3Client {
         let mut file = File::open(source)
             .map_err(|error| S3Error::local(format!("open upload cache file: {error}")))?;
         let hashes = file_hashes(&mut file)?;
+        if args["ExpectedSHA256"]
+            .as_str()
+            .is_some_and(|expected| expected != hashes.sha256)
+        {
+            return Err(S3Error::local(
+                "upload cache file raw SHA256 differs from its verified metadata",
+            ));
+        }
         if args["ExpectedSize"]
             .as_u64()
             .is_some_and(|expected| expected != hashes.length)
@@ -710,6 +761,14 @@ impl S3Client {
         plan.headers
             .insert("content-md5".to_owned(), STANDARD.encode(md5.finalize()));
         let hash = encode_lower(sha.finalize());
+        if args["ExpectedSHA256"]
+            .as_str()
+            .is_some_and(|expected| expected != hash)
+        {
+            return Err(S3Error::local(
+                "upload part differs from its verified raw SHA256",
+            ));
+        }
         let mut limited = ReadResumingReader::new(file.take(length));
         let request = self.request(
             &plan,

@@ -1591,6 +1591,7 @@ impl DirectoryListings {
                     size: Some(file.size),
                     version_id: None,
                     etag: None,
+                    verification: None,
                     aggregate: false,
                 })),
                 None => expanded.push(entry),
@@ -2340,6 +2341,7 @@ mod tests {
             size: Some(size),
             version_id: version.map(ToOwned::to_owned),
             etag: None,
+            verification: None,
             aggregate: false,
         }
     }
@@ -2351,6 +2353,7 @@ mod tests {
             size: Some(size),
             version_id: None,
             etag: None,
+            verification: None,
             aggregate: false,
         }
     }
@@ -3014,6 +3017,7 @@ mod tests {
             version: Some(Version {
                 id: "original-v1".into(),
                 etag: Some("original-etag".into()),
+                verification: None,
             }),
         };
         let manifest = |entries: Vec<Entry>| Manifest {
