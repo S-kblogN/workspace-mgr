@@ -12,7 +12,7 @@ pub const BULK_PUBLICATION_BYTES: u64 = 268_435_456;
 /// in, derived from the threshold itself so the two cannot disagree.
 pub const BULK_PUBLICATION_MIB: u64 = BULK_PUBLICATION_BYTES / 1_048_576;
 pub const CLOUD_USAGE_APPROVAL_BYTES: u64 = 1_073_741_824;
-pub const INSTRUCTION_POLICY_VERSION: u32 = 15;
+pub const INSTRUCTION_POLICY_VERSION: u32 = 16;
 /// The first workspace-mgr release that reads task manifest schema 3, which
 /// adds the optional `[cloud_usage_approval]` table.
 pub const TASK_SCHEMA_3_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 4, 0);

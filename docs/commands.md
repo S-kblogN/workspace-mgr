@@ -571,26 +571,27 @@ workspace-mgr archive [<source-or-destination> ...]
   --cancel --manifest <owning-infrastructure-manifest> [--dry-run]
 ```
 
-With no paths, inspect top-level deliverable directories and skip tasks without
-a corresponding closed pull request. An explicitly named task whose PR is
-open, missing, or unverifiable is refused. Archive reads only the
-current task configuration for task identity, branch, and any saved associated
-review branches, then verifies corresponding PR state in the
-configured repository through `gh`. The PR need not target today's configured
-base branch. An associated open PR blocks archive, including when the task's
-current branch has changed.
-Both merged PRs and PRs closed without merging qualify; an open PR does not.
-Current configuration remains strictly validated.
+With no paths, inspect top-level deliverable directories and skip pending tasks.
+An explicitly named task with an OPEN PR is refused. Archive reads the current
+task identity, branch and compatible saved branch hints, then queries their
+current PR state in the configured repository through `gh`. An OPEN PR means
+pending; MERGED, CLOSED without merging, or a successful query finding no
+corresponding PR means done. The PR need not target today's configured base
+branch. An open PR found through a saved hint still blocks archive.
+Authentication, network and other hosting-query failures are reported as errors;
+they are never treated as a successful no-PR result. Current configuration
+remains strictly validated.
 
 Archive does not inspect historical configuration, directory-tree history,
 commit-to-PR associations, or historical checkpoint proofs. Saved review
 metadata supplies branch lookup hints only; its historical tree and ancestry
-checks are not replayed. If there is no matching PR, a pre-0.7 adoption record
-can provide a current branch hint; malformed or unrelated records add no
-extra refusal. Archive needs a verifiable closed PR and no associated open PR.
-It does not require earlier commits to have reviewed PRs, full Git history,
-or retained branch tips to equal or descend from reviewed heads. Changes to
-ordinary task contents do not determine eligibility. Active task directories
+checks are not replayed. A compatible pre-0.7 adoption record can provide a
+current branch hint; malformed or unrelated records add no extra refusal.
+Archive does not require finding an earlier branch or PR when the current
+queries succeed without a match. It does not require earlier commits to have
+reviewed PRs, full Git history, or retained branch tips to equal or descend from
+reviewed heads. Changes to
+ordinary task contents do not determine eligibility. Pending task directories
 stay at the top level,
 and merge or turn-end synchronization never runs archive automatically.
 
@@ -738,19 +739,21 @@ did not save the local attempt journal cannot provide a verified lossless cancel
 
 Legacy directories without a manifest appear in `skipped` with an adoption
 instruction. First adopt explicitly through an infrastructure task scoped to
-that directory, selecting its merged PR. Adoption verifies current PR and
-branch/ref control association, then creates the manifest and
-`.workspace-mgr-legacy.json` review record. It does not compare historical or
-current payload trees, inspect earlier content imports or require ordinary task
-payloads to be clean. Publish and review that new control metadata through the normal task flow;
-its separate adoption PR need not merge before archive. Archive verifies the
-current associated PR, and neither inventory nor archive invents legacy ownership.
+that directory, supplying its title and purpose. `--pull-request` is optional.
+Without it, adoption writes current task metadata without querying old PRs or
+creating a review record. If supplied, the known merged PR is verified in the
+configured same repository and base branch, and its branch hint is saved.
+Adoption preserves ordinary contents and does not compare them to historical
+trees or parse old task configuration. Its infrastructure PR need not merge
+before archive. Existing managed tasks do not need adoption or an invented
+review association merely because their current branch has no matching PR.
 
 ```sh
-workspace-mgr task adopt <legacy-task-path> --pull-request <number> \
-  --title "Retained task" --purpose "Retain reviewed work" \
+workspace-mgr task adopt <legacy-task-path> \
+  --title "Retained task" --purpose "Retain task materials" \
   --manifest "$task_manifest" --dry-run
 # Repeat without --dry-run; publish the adopted control metadata through its normal review.
+# Add --pull-request <number> only to record a known merged PR.
 ```
 
 Cancel only an archive attempt that has already moved locally and remains

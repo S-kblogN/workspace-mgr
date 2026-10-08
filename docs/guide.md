@@ -827,8 +827,8 @@ neither produces new historical content proofs nor replays existing trees,
 ancestry or commit-to-PR coverage. Current manifest validation remains strict.
 Upgrade is not an archive prerequisite.
 
-Active deliverable task directories remain at the repository's top level.
-After a task's corresponding pull request is closed, the user may
+Pending deliverable task directories remain at the repository's top level.
+After a task is done, the user may
 explicitly request that old task directories be organized under time folders.
 Handle that request through a repository-infrastructure task with the affected
 paths in scope; do not organize them automatically after merge or as part of
@@ -837,7 +837,7 @@ turn-end synchronization.
 The user may choose a structure such as `YYYY/<task-dir>`,
 `YYYYMM/<task-dir>`, or `YYYY/MM/<task-dir>`. If the request does not specify a
 structure, use `YYYY/MM/<task-dir>` based on each task directory's timestamp,
-unless the user specifies another date basis. Keep active tasks at the top
+unless the user specifies another date basis. Keep pending tasks at the top
 level and preserve each completed task's basename, retained contents, immutable
 task ID, and target branch. Inspect the request first:
 
@@ -845,9 +845,10 @@ task ID, and target branch. Inspect the request first:
 workspace-mgr archive --dry-run
 ```
 
-With no paths, the command scans top-level deliverable tasks and skips active
-or unverified tasks. Naming an active task explicitly refuses the operation.
-The preview reports closed-PR evidence, proposed destinations, complete S3
+With no paths, the command scans top-level deliverable tasks and skips pending
+tasks. Naming a task with an OPEN PR explicitly refuses the operation. A failed
+hosting query reports an error instead of classifying the task as done.
+The preview reports current PR state, proposed destinations, complete S3
 history, and the source and destination paths to declare in an infrastructure
 task. It changes no repository content or remote. In the shared checkout, run
 `archive --manifest <path>`, then `plan --manifest <path>` and
@@ -855,14 +856,14 @@ task. It changes no repository content or remote. In the shared checkout, run
 `--layout '{year}'` and `--layout '{year}{month}'` select the other example
 structures; the default `{year}/{month}` uses each task's creation timestamp.
 
-Archive verifies the current task configuration and its associated PRs in the
-configured repository, regardless of their target base branch. Merged PRs and
-PRs closed without merging qualify; an associated open PR, including a saved
-association from a previous task branch, blocks archive. One matching closed PR is required;
-when none is found, a pre-0.7 adoption record can provide a current branch
-hint. Malformed or unrelated adoption records add no extra gate. There is no
-commit-by-commit review, historical configuration parsing, full-history
-requirement, or branch-tip comparison for archive eligibility.
+Archive queries the current task branch and compatible saved branch hints in
+the configured repository, regardless of a PR's target base branch. OPEN means
+pending. MERGED, CLOSED without merging, or a successful query finding no
+matching PR means done. A saved hint that finds an open PR still blocks archive;
+a hint that finds no PR does not require a search for a historical match.
+Authentication, network and other hosting-query failures remain errors.
+There is no commit-by-commit review, historical configuration parsing,
+full-history requirement, or branch-tip comparison for archive eligibility.
 
 Archive checks managed-storage integrity and move conflicts. Ordinary
 tracked, staged, untracked, ignored, and local-only files are retained;
@@ -883,10 +884,13 @@ content. The
 [command reference](commands.md#workspace-mgr-archive) describes this boundary.
 
 For a manifestless directory, use `task adopt` to establish current task
-metadata before archiving. Adoption has current PR/ref control checks but no
-ordinary content-tree proof. Its separate adoption PR need not merge before
-archive. Archive checks the resulting current manifest and associated closed PR,
-without tracing earlier imports or the adoption record's introducing commit.
+metadata before archiving. Supply the title and purpose through a scoped
+infrastructure task; `--pull-request` is optional. Without that option, adoption
+does not query old PRs or create a review record. A supplied known merged PR is
+checked using live control metadata and saved as a branch hint. Ordinary
+contents remain unchanged. Its infrastructure PR need not merge before archive.
+Archive checks the resulting current metadata and live PR state, without
+tracing earlier imports or requiring any historical content proof.
 
 Archive moves the local directory and manifest together. Publication copies
 the complete retained S3 history, including old versions, delete markers, and
@@ -951,7 +955,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
 | `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
 | `task upgrade` | Upgrades current task metadata while preserving compatible saved fields; dry-run changes nothing | Fetches the configured shared branch for current manifest identity and version control | None |
-| `archive` | Moves closed-PR task directories and records migration receipts in an infrastructure task; dry-run changes no content | Reads current GitHub PR states, current task/storage metadata, and complete S3 version history | None; publication copies history and records exact-version mappings |
+| `archive` | Moves done task directories and records migration receipts in an infrastructure task; dry-run changes no content | Queries current GitHub PR state: OPEN is pending; closed or no matching PR is done; query failures are errors. Reads current task/storage metadata and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |
 | `task discard --dry-run` | Saves private confirmation state | Git refs | None |
 | `task approve-cloud-usage` | Rewrites the task manifest with the user's approval | None | None |
