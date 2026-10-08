@@ -2030,14 +2030,17 @@ pub(crate) mod tests {
     }
 
     #[derive(Debug)]
-    struct InterruptResponseConnector {
+    struct InterruptResponseConnector<C> {
         target: String,
         injected: Arc<AtomicUsize>,
         request_received: Arc<Mutex<mpsc::Receiver<()>>>,
-        delegate: DefaultConnector,
+        delegate: ReadResumingConnector<C>,
     }
 
-    impl Connector for InterruptResponseConnector {
+    impl<C: Connector> Connector for InterruptResponseConnector<C>
+    where
+        C::Out: 'static,
+    {
         type Out = Box<dyn Transport>;
 
         fn connect(
@@ -2049,7 +2052,7 @@ pub(crate) mod tests {
                 == Some(self.target.as_str());
             Ok(self.delegate.connect(details, chained)?.map(|delegate| {
                 Box::new(InterruptResponseTransport {
-                    delegate,
+                    delegate: Box::new(delegate),
                     interrupt,
                     sent: false,
                     injected: self.injected.clone(),
@@ -2125,17 +2128,38 @@ pub(crate) mod tests {
     }
 
     fn inject_response_interruption(
-        mut client: S3Client,
+        client: S3Client,
         target: String,
         request_received: mpsc::Receiver<()>,
         resume_read: bool,
     ) -> (S3Client, Arc<AtomicUsize>) {
+        inject_response_interruption_with_connector(
+            client,
+            target,
+            request_received,
+            resume_read,
+            DefaultConnector::default(),
+        )
+    }
+
+    fn inject_response_interruption_with_connector<C: Connector + 'static>(
+        mut client: S3Client,
+        target: String,
+        request_received: mpsc::Receiver<()>,
+        resume_read: bool,
+        delegate: C,
+    ) -> (S3Client, Arc<AtomicUsize>)
+    where
+        C::Out: 'static,
+    {
         let injected = Arc::new(AtomicUsize::new(0));
         let connector = InterruptResponseConnector {
             target,
             injected: injected.clone(),
             request_received: Arc::new(Mutex::new(request_received)),
-            delegate: DefaultConnector::default(),
+            // Preserve production read continuation below the artificial
+            // interruption, which must still reach GET/HEAD replay above it.
+            delegate: ReadResumingConnector::new(delegate),
         };
         let config = client.agent.config().clone();
         client.agent = if resume_read {
@@ -2414,6 +2438,75 @@ pub(crate) mod tests {
 
     #[test]
     fn routed_fixture_records_an_abandoned_get_retry_and_one_subsequent_delete() {
+        use std::collections::BTreeSet;
+
+        #[derive(Debug)]
+        struct InterruptedReads {
+            targets: Arc<Mutex<BTreeSet<String>>>,
+        }
+
+        impl Connector for InterruptedReads {
+            type Out = Box<dyn Transport>;
+
+            fn connect(
+                &self,
+                details: &ConnectionDetails,
+                chained: Option<()>,
+            ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+                let target = details.uri.path_and_query().unwrap().as_str().to_owned();
+                Ok(DefaultConnector::default()
+                    .connect(details, chained)?
+                    .map(|delegate| {
+                        Box::new(InterruptedRead {
+                            target,
+                            targets: self.targets.clone(),
+                            delegate,
+                        }) as Box<dyn Transport>
+                    }))
+            }
+        }
+
+        #[derive(Debug)]
+        struct InterruptedRead {
+            target: String,
+            targets: Arc<Mutex<BTreeSet<String>>>,
+            delegate: Box<dyn Transport>,
+        }
+
+        impl Transport for InterruptedRead {
+            fn buffers(&mut self) -> &mut dyn Buffers {
+                self.delegate.buffers()
+            }
+
+            fn transmit_output(
+                &mut self,
+                amount: usize,
+                timeout: NextTimeout,
+            ) -> std::result::Result<(), ureq::Error> {
+                self.delegate.transmit_output(amount, timeout)
+            }
+
+            fn await_input(
+                &mut self,
+                timeout: NextTimeout,
+            ) -> std::result::Result<bool, ureq::Error> {
+                // A real transport interruption is independent of the outer
+                // fixture's deliberate registry-read abandonment.
+                if self.targets.lock().unwrap().insert(self.target.clone()) {
+                    return Err(ureq::Error::Io(std::io::ErrorKind::Interrupted.into()));
+                }
+                self.delegate.await_input(timeout)
+            }
+
+            fn is_open(&mut self) -> bool {
+                self.delegate.is_open()
+            }
+
+            fn is_tls(&self) -> bool {
+                self.delegate.is_tls()
+            }
+        }
+
         let (received, receiver) = mpsc::channel();
         let (client, worker) = routed_fixture(move |request| {
             if request.method == "GET" {
@@ -2435,10 +2528,15 @@ pub(crate) mod tests {
                 }
             }
         });
-        let (client, injected) = interrupt_response_once(
+        let underlying_interruptions = Arc::new(Mutex::new(BTreeSet::new()));
+        let (client, injected) = inject_response_interruption_with_connector(
             client,
             "/fixture-bucket/root/read?versionId=v1".into(),
             receiver,
+            false,
+            InterruptedReads {
+                targets: underlying_interruptions.clone(),
+            },
         );
         let result = client
             .call_s3(
@@ -2452,19 +2550,26 @@ pub(crate) mod tests {
         client
             .call_s3(
                 "delete_object",
-                &json!({"Key":"root/read","VersionId":"v1"}),
+                &json!({"Key":"root/non-target","VersionId":"v1"}),
                 None,
             )
             .unwrap();
         assert_eq!(injected.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *underlying_interruptions.lock().unwrap(),
+            BTreeSet::from([
+                "/fixture-bucket/root/read?versionId=v1".to_owned(),
+                "/fixture-bucket/root/non-target?versionId=v1".to_owned(),
+            ])
+        );
         let attempts = worker.finish();
-        assert!(attempts.len() >= 3);
-        assert!(
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(
             attempts
                 .iter()
                 .filter(|attempt| attempt.request.method == "GET")
-                .count()
-                >= 2
+                .count(),
+            2
         );
         let deletes = attempts
             .iter()
@@ -2472,11 +2577,16 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert_eq!(deletes.len(), 1);
         assert!(deletes[0].response_sent);
-        assert!(
-            attempts
-                .iter()
-                .all(|attempt| attempt.request.target == "/fixture-bucket/root/read?versionId=v1")
-        );
+        for attempt in attempts {
+            assert_eq!(
+                attempt.request.target,
+                if attempt.request.method == "GET" {
+                    "/fixture-bucket/root/read?versionId=v1"
+                } else {
+                    "/fixture-bucket/root/non-target?versionId=v1"
+                }
+            );
+        }
     }
 
     #[test]
