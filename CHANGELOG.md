@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-10-08
+
+### Fixed
+
+- S3 response-interruption test clients retain the production transport's
+  same-connection read recovery beneath the targeted fault injector. Injected
+  GET/HEAD failures still exercise request replay, while unrelated real I/O
+  interruptions no longer bypass recovery or spuriously fail DELETE tests.
+  Production request behavior and the no-retry rule for writes are unchanged.
+
 ## [0.8.5] - 2026-10-08
 
 ### Fixed
