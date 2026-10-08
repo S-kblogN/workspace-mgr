@@ -47,7 +47,7 @@ const SCOPED: &str = "Run from the task directory, or select its manifest with -
 const EXTRA_SCOPES: &str = "--include and --scope-note record exact additional user authorization for this invocation; they never create authorization. Additional scopes must not overlap another declared scope.";
 const CHECKOUT_EXCEPTION: &str = "--allow-non-shared-head requires a separately authorized checkout exception recorded with --scope-note; it does not grant permission to switch the shared checkout or disturb another task.";
 const NEXT_PUBLICATION: &str = "This changes local desired state only. Run workspace-mgr plan, inspect changed_paths, ignored_paths and storage decisions, then workspace-mgr publish -m <message>. Update and verify the matching draft pull request and finish with a no-change plan. Preserve unrelated working-tree overlays.";
-const READ_ONLY: &str = "This command is read-only. Reading a path never authorizes writing it. A task's directory placement and archive receipt are not proof that its pull request is closed.";
+const READ_ONLY: &str = "This command is read-only. Reading a path never authorizes writing it. A task's directory placement and archive receipt do not establish its current PR state or archive eligibility.";
 const LOCAL_RETENTION: &str = "Keep retained content inside the task's declared scope. Local-only placement keeps materialized bytes on this machine, records their placement and a shared ignore rule, and removes remote payloads at the next publication. New clones receive no local-only payload. Hydrate missing S3 content before untracking; resume tracking only with storage set --to git|s3, because storage reset refuses local-only paths.";
 const SECRET_POLICY: &str = "Keep credentials and private runtime configuration outside tracked files and command output; record how to regenerate them, never their values. Never hand-edit or directly delete workspace-mgr storage metadata.";
 const DELETE_HISTORY: &str = "After publication, obsolete S3 object paths are permanently purged, including all versions and delete markers. Older Git revisions that referenced those removed paths may no longer hydrate. Another current remote branch or tag can protect a version and defer its deletion. Do not run unrelated bucket-wide or cache garbage collection without explicit authorization.";
@@ -164,15 +164,15 @@ pub(crate) fn command(operation: &str) -> String {
                 SCOPED.into(),
                 "Payloads move unchanged. The command updates workspace-mgr path and storage metadata; it does not scan or repair scripts, environments, ordinary links or external Git administration. Every nested Git repository must be ignored as an entire directory by the outer repository's shared ignore rules at both locations, with no outer-tracked files or gitlinks.".into(),
                 NEXT_PUBLICATION.into(),
-                "Update the existing PR's title and living description to match the new topic. For old tasks with closed PRs that need date grouping, use archive instead.".into(),
+                "Update the existing PR's title and living description to match the new topic. For old tasks that are done and need date grouping, use archive instead.".into(),
             ],
             &["task"],
         ),
         "task adopt" => (
             "Attach current task metadata to a legacy directory with no manifest.",
             vec![
-                "Use this for a legacy deliverable discovered by task list or archive preview. Supply the task directory, its reviewed merged --pull-request, --title and --purpose. --dry-run previews adoption. A scoped infrastructure task must authorize the affected directory and any shared control changes.".into(),
-                "Adoption verifies live PR control metadata and writes the current task identity and review-branch hint. It does not compare ordinary payloads with a historical Git tree or parse historical task configurations. Existing content remains unchanged.".into(),
+                "Use this only for a legacy deliverable with no manifest, discovered by task list or archive preview. Supply the task directory, --title and --purpose. --pull-request is optional. --dry-run previews adoption. A scoped infrastructure task must authorize the affected directory and any shared control changes.".into(),
+                "Without --pull-request, adoption establishes current task metadata without querying old PRs or creating a review record. If you supply a known merged PR, adoption verifies its live control metadata and records a branch hint. It does not compare ordinary payloads with a historical Git tree or parse historical task configurations. Existing content remains unchanged.".into(),
                 NEXT_PUBLICATION.into(),
                 "Adoption and its infrastructure PR do not automatically archive the task. Use archive --dry-run and archive --help when the user requests organization.".into(),
             ],
@@ -300,17 +300,17 @@ pub(crate) fn command(operation: &str) -> String {
             vec![
                 SCOPED.into(),
                 EXTRA_SCOPES.into(),
-                "Use --dry-run to inspect the source, destination and metadata changes. Move updates desired local path/storage state; payloads remain unchanged. Complete storage boundaries move together, and no-clobber/control containment checks protect existing content. Use task rename for a task's current name, and archive for authorized date grouping of tasks with closed PRs.".into(),
+                "Use --dry-run to inspect the source, destination and metadata changes. Move updates desired local path/storage state; payloads remain unchanged. Complete storage boundaries move together, and no-clobber/control containment checks protect existing content. Use task rename for a task's current name, and archive for authorized date grouping of done tasks.".into(),
                 NEXT_PUBLICATION.into(),
                 DELETE_HISTORY.into(),
             ],
             &["storage"],
         ),
         "archive" => (
-            "Group explicitly selected tasks whose associated pull requests are closed.",
+            "Group explicitly selected tasks that are done according to current PR state.",
             vec![
-                "Archive only when the user requests organization; merge, refresh and turn-end synchronization never trigger it automatically. Start with --dry-run to inspect eligibility and exact source/destination scopes, then use a user-authorized infrastructure task with --manifest. Active tasks stay at the repository root. The default layout is {year}/{month} using each task's creation timestamp; {year} and {year}{month} are supported too, and directory basenames are preserved.".into(),
-                "Eligibility uses current task configuration and current associated PR state, including saved review-branch hints. MERGED and CLOSED without merging qualify; open or unverifiable associated PRs refuse. No historical task-format parsing, payload-tree proof, commit review coverage, branch-tip ancestry or completion checkpoint is required. Adopt legacy directories with no manifest before archiving.".into(),
+                "Archive only when the user requests organization; merge, refresh and turn-end synchronization never trigger it automatically. Start with --dry-run to inspect eligibility and exact source/destination scopes, then use a user-authorized infrastructure task with --manifest. Pending tasks stay at the repository root. The default layout is {year}/{month} using each task's creation timestamp; {year} and {year}{month} are supported too, and directory basenames are preserved.".into(),
+                "Eligibility uses current task configuration and live hosting queries for its branch and saved branch hints. An OPEN PR means pending and prevents archive. MERGED, CLOSED without merging, or a successful query finding no corresponding PR means done. Authentication, network or other hosting-query failures are errors, never a no-PR result. No historical branch match, task-format parsing, payload-tree proof, commit review coverage, branch-tip ancestry or completion checkpoint is required. Adopt legacy directories with no manifest before archiving; adoption does not require a PR.".into(),
                 "Current managed-storage integrity, scope, identity and move conflicts are checked. Ordinary tracked, staged, untracked, ignored and local-only bytes move unchanged. Nested Git repositories must be ignored as entire directories by shared outer-repository rules at source and destination, with no outer-tracked files or gitlinks. Git controls/registrations move unchanged; external administration is never repaired. Zero-byte .git cache markers are ordinary content.".into(),
                 "Then plan and publish the infrastructure task. Publication copies complete S3 versions/delete-marker history, verifies copies, updates exact managed references and publishes historical registry mappings. Source retirement requires the complete receipt on the shared branch and zero old-prefix versions or delete markers. Protected or unmapped history remains explicitly pending with durable retry records; report that state and do not claim complete retirement. Historical revisions hydrate through the registry using workspace-mgr storage hydrate. Archive publication requires protocol-capable clients by raising minimum_cli_version to at least 0.7.0.".into(),
                 "To restore an unpublished attempt, first preview archive --cancel --dry-run --manifest <path>, then run archive --cancel --manifest <path>. Cancellation is idempotent and restores attempt-local content, manifest/receipt state and paths after verifying cleanup of its S3 copies, markers, registry records and unfinished uploads. Preserve other tasks' changes. A published archive cannot be cancelled this way; task discard is destructive and is never an archive rollback.".into(),

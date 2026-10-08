@@ -96,7 +96,7 @@ repository, credentials, external commands or network state.
 | Semantic placement and size bands | Storage leaf help and placement reports | Detailed storage topic; placement guide |
 | Exact storage versions, transport and destructive retirement | Hydrate/move/remove/untrack/publish help and reports | Storage/transaction architecture |
 | Cloud approval, pause and accounting | Plan/publish/approve help and blocking diagnostics | Detailed core/task/storage topics; cloud-usage architecture |
-| Current closed PR, scoped grouping, complete S3 copy and cancel | Archive help and archive/cancel reports | Archive command reference and architecture |
+| Current PR pending/done state, scoped grouping, complete S3 copy and cancel | Archive help and archive/cancel reports | Archive command reference and architecture |
 | Manual link/path audit after an actual move | Successful relocation `notices` only | Output schema in command reference |
 | Shared overlays and verified branch-ref cleanup | Refresh help and report | Detailed shared-checkout topic; refresh architecture |
 | Product scaffold, client compatibility and update approval | Setup/manage/config/doctor help and relevant diagnostics | Detailed core topic; configuration/reference docs |

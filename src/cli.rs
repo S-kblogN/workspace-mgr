@@ -70,7 +70,7 @@ pub enum Command {
     #[command(long_about = crate::command_guidance::command("move"))]
     Move(MoveArgs),
 
-    /// Organize tasks with closed pull requests in an infrastructure task.
+    /// Organize done tasks, preserving tasks with open pull requests.
     #[command(long_about = crate::command_guidance::command("archive"))]
     Archive(ArchiveArgs),
 
@@ -175,7 +175,7 @@ pub enum TaskCommand {
     /// Create a deliverable directory or a private infrastructure manifest on the shared branch.
     #[command(long_about = crate::command_guidance::command("task create"))]
     Create(TaskCreateArgs),
-    /// Attach current task metadata to a legacy directory with a reviewed PR.
+    /// Attach current task metadata to a legacy directory, optionally preserving a reviewed PR hint.
     #[command(long_about = crate::command_guidance::command("task adopt"))]
     Adopt(TaskAdoptArgs),
     /// Change a task's current slug while preserving its identity and review branch.
@@ -276,7 +276,7 @@ pub struct ArchiveArgs {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
 
-    /// Inspect tasks with closed pull requests without moving content.
+    /// Inspect tasks with no open pull requests without moving content.
     #[arg(long)]
     pub dry_run: bool,
 
@@ -289,7 +289,7 @@ pub struct ArchiveArgs {
 pub struct TaskAdoptArgs {
     pub path: String,
     #[arg(long)]
-    pub pull_request: u64,
+    pub pull_request: Option<u64>,
     #[arg(long)]
     pub title: String,
     #[arg(long)]

@@ -70,7 +70,7 @@ only become relevant once the operation runs.
 | Preview and publish one task | `workspace-mgr plan --help`, `publish --help` |
 | Respond to a measured resource decision | `workspace-mgr task approve-cloud-usage --help` and the blocking report |
 | Move, remove or stop publishing selected paths | `workspace-mgr move --help`, `remove --help`, `untrack --help` |
-| Group closed-PR tasks or cancel an unpublished attempt | `workspace-mgr archive --help` |
+| Group done tasks or cancel an unpublished attempt | `workspace-mgr archive --help` |
 | Explicitly abandon an unmerged task | `workspace-mgr task discard --help` |
 | Synchronize the shared checkout after merge | `workspace-mgr refresh --help` |
 | Install dependencies, adopt or update a repository, diagnose control state | `workspace-mgr setup --help`, `manage --help`, `doctor --help`, `config show --help` |

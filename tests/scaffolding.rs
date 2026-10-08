@@ -553,9 +553,9 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
     assert!(task_rules.contains("outside the repository is outside the task directory too"));
     assert!(task_rules.contains("own files are its durable record"));
     for organization_rule in [
-        "Active deliverable task directories must remain at the repository top level",
-        "Only tasks whose corresponding pull requests are closed",
-        "merged and closed without merging both qualify",
+        "Pending deliverable task directories must remain at the repository top level",
+        "An OPEN PR means pending",
+        "MERGED, CLOSED without merging, or a successful current-metadata query finding no corresponding PR means done",
         "`YYYY/<task-dir>`, `YYYYMM/<task-dir>`, and `YYYY/MM/<task-dir>`",
         "only when the user explicitly requests it",
         "through a repository-infrastructure task",
@@ -569,7 +569,7 @@ fn repository_configuration_cannot_change_the_workspace_policy() {
         );
     }
     for archive_rule in [
-        "Archive uses current task configuration and its associated PRs",
+        "Archive queries the current task branch and compatible saved review branch hints",
         "without inspecting historical configuration, tree history, commit review coverage, or branch-tip ancestry",
         "Completion checkpoints and task upgrade are not archive prerequisites",
         "Ordinary tracked, staged, untracked, ignored, and local-only content moves unchanged",

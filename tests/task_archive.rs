@@ -191,7 +191,7 @@ fn archive_keeps_a_branch_with_an_open_pr_to_another_base_active() {
         &workplace,
         &gh,
         &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
-        "refuses active or unverified task",
+        "archive refuses pending task",
     );
     assert!(workplace.join(DONE).is_dir());
     assert!(!workplace.join(DESTINATION).exists());
@@ -373,7 +373,7 @@ fn archive_verifies_squash_merged_pr_skips_active_and_applies_in_infrastructure_
         &fixture.shared,
         &gh,
         &["archive", ACTIVE, "--dry-run"],
-        "refuses active or unverified task",
+        "archive refuses pending task",
     );
 
     let (worktree, infrastructure_manifest) = organizer(&fixture, &[DONE, DESTINATION]);
@@ -1105,16 +1105,18 @@ fn archive_follows_reviewed_task_updates_without_reading_historical_configuratio
 }
 
 #[test]
-fn archive_refuses_a_current_branch_without_an_associated_closed_pr() {
+fn archive_accepts_a_migrated_branch_without_any_current_pull_request() {
     let (fixture, gh) = migrated_fixture(false);
-    rejected(
+    let preview = json(&archive(
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
-    );
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    assert!(preview["tasks"][0]["pull_request"].is_null());
     assert!(fixture.shared.join(DONE).is_dir());
     assert!(!fixture.shared.join(DESTINATION).exists());
+    assert!(!fixture.root.join("historical-config-read").exists());
 }
 
 struct CompletionFixture {
@@ -1417,7 +1419,7 @@ fn completion_checkpoint_keeps_a_historical_branch_with_an_open_pr_active() {
         &fixture.git.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
+        "archive refuses pending task",
     );
     assert!(fixture.git.shared.join(DONE).join(MANIFEST).is_file());
     assert!(!fixture.git.shared.join(DESTINATION).exists());
@@ -1864,7 +1866,7 @@ fn archive_rejects_open_prs_for_all_currently_recorded_task_branches() {
             &workplace,
             &gh,
             &["archive", DONE, "--dry-run"],
-            "refuses active or unverified task",
+            "archive refuses pending task",
         );
         assert!(workplace.join(DONE).is_dir());
         assert!(!workplace.join(DESTINATION).exists());
@@ -2309,7 +2311,7 @@ fn archive_refuses_a_closed_pr_if_any_current_branch_review_is_open() {
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
+        "archive refuses pending task",
     );
     assert!(fixture.shared.join(DONE).is_dir());
     assert!(!fixture.shared.join(DESTINATION).exists());
@@ -2479,7 +2481,7 @@ fn archive_does_not_let_same_named_fork_prs_mask_current_repository_pr_state() {
         &fixture.shared,
         &gh,
         &["archive", DONE, "--dry-run"],
-        "refuses active or unverified task",
+        "archive refuses pending task",
     );
     let mut fork_closed = pr("CLOSED", 4, "codex/completed", "", &head);
     fork_closed["isCrossRepository"] = value!(true);
@@ -2550,4 +2552,294 @@ fn archive_rejects_invalid_unhydrated_dvc_hashes_and_incomplete_directory_manife
             assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
         }
     }
+}
+
+#[test]
+fn archive_treats_a_successful_empty_pr_lookup_as_done_and_cancel_restores_contents() {
+    let (fixture, merged) = managed_fixture(false);
+    let gh = write_gh_without_historical_queries(&fixture, &BTreeMap::new(), &[merged]);
+    let preview = json(&archive(&fixture.shared, &gh, &["archive", "--dry-run"]));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    assert!(preview["tasks"][0]["pull_request"].is_null());
+    assert!(preview["skipped"].as_array().unwrap().is_empty());
+
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let source = workplace.join(DONE);
+    let original_manifest = std::fs::read(source.join(MANIFEST)).unwrap();
+    let payload = std::fs::read(source.join("result.md")).unwrap();
+    let index = git(&workplace, ["ls-files", "--stage", "-z"]).stdout;
+    let archived = json(&archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    ));
+    assert_eq!(archived["status"], "archived");
+    assert!(archived["tasks"][0]["pull_request"].is_null());
+    let destination = workplace.join(DESTINATION);
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(destination.join(RECEIPT)).unwrap()).unwrap();
+    assert_eq!(receipt.get("closed_pull_request"), Some(&Value::Null));
+    assert_eq!(
+        std::fs::read(destination.join("result.md")).unwrap(),
+        payload
+    );
+    assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+
+    let cancelled = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--cancel",
+        ],
+    ));
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(
+        std::fs::read(source.join(MANIFEST)).unwrap(),
+        original_manifest
+    );
+    assert_eq!(std::fs::read(source.join("result.md")).unwrap(), payload);
+    assert!(!destination.exists());
+    assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+    assert!(!fixture.root.join("blocked-historical-query").exists());
+}
+
+#[test]
+fn archive_publishes_a_null_review_without_inventing_a_pull_request() {
+    let (fixture, _) = managed_fixture(false);
+    let gh = write_gh(&fixture, &BTreeMap::new());
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    );
+    let published = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "publish",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "-m",
+            "Archive task with no pending review",
+        ],
+    ));
+    assert_eq!(published["status"], "pushed");
+    let commit = published["commit_oid"].as_str().unwrap();
+    let receipt: Value = serde_json::from_slice(
+        &git(
+            &workplace,
+            ["show", &format!("{commit}:{DESTINATION}/{RECEIPT}")],
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(receipt.get("closed_pull_request"), Some(&Value::Null));
+    assert_eq!(
+        git(
+            &workplace,
+            ["show", &format!("{commit}:{DESTINATION}/result.md")]
+        )
+        .stdout,
+        b"retained result\n"
+    );
+}
+
+#[test]
+fn archive_does_not_treat_hosting_errors_or_invalid_json_as_an_empty_pr_list() {
+    let (fixture, _) = managed_fixture(false);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let source = workplace.join(DONE);
+    let original_manifest = std::fs::read(source.join(MANIFEST)).unwrap();
+    let payload = std::fs::read(source.join("result.md")).unwrap();
+    let head = oid(&workplace, "HEAD");
+    let index = git(&workplace, ["ls-files", "--stage", "-z"]).stdout;
+    let gh = fixture.root.join("failed-gh");
+    for script in [
+        "#!/bin/sh\necho 'hosting network unavailable' >&2\nexit 17\n",
+        "#!/bin/sh\nprintf '%s\\n' '{invalid-json'\n",
+    ] {
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for dry in [true, false] {
+            let mut args = vec!["archive", DONE, "--manifest", manifest.to_str().unwrap()];
+            if dry {
+                args.push("--dry-run");
+            }
+            let environment = archive_environment(&gh);
+            let environment = environment
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            let output = workspace_env_unchecked(&workplace, &args, &environment);
+            assert_eq!(output.status.code(), Some(2));
+            assert!(!output.stderr.is_empty());
+            assert_eq!(
+                std::fs::read(source.join(MANIFEST)).unwrap(),
+                original_manifest
+            );
+            assert_eq!(std::fs::read(source.join("result.md")).unwrap(), payload);
+            assert!(!source.join(RECEIPT).exists());
+            assert!(!workplace.join(DESTINATION).exists());
+            assert_eq!(oid(&workplace, "HEAD"), head);
+            assert_eq!(git(&workplace, ["ls-files", "--stage", "-z"]).stdout, index);
+        }
+    }
+}
+
+#[test]
+fn archive_checks_a_legacy_open_hint_even_when_the_metadata_branch_has_a_closed_pr() {
+    for current_closed in [false, true] {
+        let (fixture, _) = managed_fixture(false);
+        let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+        let legacy = value!({"task_id":DONE,"branch":"legacy/completed"});
+        let legacy_path = workplace.join(DONE).join(".workspace-mgr-legacy.json");
+        std::fs::write(&legacy_path, legacy.to_string()).unwrap();
+        let head = oid(&workplace, "HEAD");
+        let mut requests = BTreeMap::from([(
+            "legacy/completed",
+            vec![pr("OPEN", 9, "legacy/completed", "", &head)],
+        )]);
+        if current_closed {
+            requests.insert(
+                "codex/completed",
+                vec![pr("CLOSED", 8, "codex/completed", "", &head)],
+            );
+        }
+        let gh = write_gh(&fixture, &requests);
+        let preview = json(&archive(&workplace, &gh, &["archive", "--dry-run"]));
+        assert!(preview["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(preview["skipped"][0]["path"], DONE);
+        rejected(
+            &workplace,
+            &gh,
+            &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+            "archive refuses pending task",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy_path).unwrap(),
+            legacy.to_string()
+        );
+        assert!(!workplace.join(DESTINATION).exists());
+    }
+}
+
+#[test]
+fn archive_accepts_missing_legacy_and_completion_review_hints_as_done() {
+    let (fixture, merged) = managed_fixture(false);
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let legacy = value!({"task_id":DONE,"branch":"legacy/no-longer-present"});
+    std::fs::write(
+        workplace.join(DONE).join(".workspace-mgr-legacy.json"),
+        legacy.to_string(),
+    )
+    .unwrap();
+    let gh = write_gh_without_historical_queries(&fixture, &BTreeMap::new(), &[merged]);
+    let preview = json(&archive(
+        &workplace,
+        &gh,
+        &[
+            "archive",
+            DONE,
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--dry-run",
+        ],
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    assert!(preview["tasks"][0]["pull_request"].is_null());
+    assert!(!fixture.root.join("blocked-historical-query").exists());
+
+    let mut completion = completion_fixture();
+    completion.requests.clear();
+    let gh = completion.hosting();
+    let preview = json(&archive(
+        &completion.git.shared,
+        &gh,
+        &["archive", DONE, "--dry-run"],
+    ));
+    assert_eq!(preview["tasks"].as_array().unwrap().len(), 1);
+    assert!(preview["tasks"][0]["pull_request"].is_null());
+    completion.assert_no_historical_lookup();
+}
+
+#[test]
+fn legacy_adoption_without_a_pull_request_preserves_payload_and_can_be_archived() {
+    let fixture = GitFixture::new();
+    workspace(&fixture.seed, ["manage"]);
+    fixture.commit_seed("Initialize managed workspace");
+    std::fs::create_dir(fixture.seed.join(DONE)).unwrap();
+    let payload = b"directly imported result\n";
+    std::fs::write(fixture.seed.join(DONE).join("result.md"), payload).unwrap();
+    std::fs::write(
+        fixture.seed.join(DONE).join("README.md"),
+        "# Imported task\n",
+    )
+    .unwrap();
+    fixture.commit_seed("Import an old task without any PR");
+    fixture.clone_shared();
+    let (workplace, manifest) = organizer(&fixture, &[DONE, DESTINATION]);
+    let gh = fixture.root.join("no-adoption-hosting");
+    let queried = fixture.root.join("unexpected-adoption-hosting-query");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/usr/bin/env python3\nfrom pathlib import Path\nPath({:?}).write_text('queried')\nraise SystemExit('adoption must not rediscover historical reviews')\n",
+            queried.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for dry in [true, false] {
+        let mut args = vec![
+            "task",
+            "adopt",
+            DONE,
+            "--title",
+            "Retain imported work",
+            "--purpose",
+            "Preserve the user-selected legacy task",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ];
+        if dry {
+            args.push("--dry-run");
+        }
+        let adopted = json(&archive(&workplace, &gh, &args));
+        assert_eq!(adopted["status"], if dry { "dry_run" } else { "adopted" });
+        assert_eq!(
+            std::fs::read(workplace.join(DONE).join("result.md")).unwrap(),
+            payload
+        );
+        assert!(
+            !workplace
+                .join(DONE)
+                .join(".workspace-mgr-legacy.json")
+                .exists()
+        );
+        assert_eq!(workplace.join(DONE).join(MANIFEST).exists(), !dry);
+        assert!(!queried.exists());
+    }
+    let gh = write_gh(&fixture, &BTreeMap::new());
+    let archived = json(&archive(
+        &workplace,
+        &gh,
+        &["archive", DONE, "--manifest", manifest.to_str().unwrap()],
+    ));
+    assert_eq!(archived["status"], "archived");
+    assert!(archived["tasks"][0]["pull_request"].is_null());
+    assert_eq!(
+        std::fs::read(workplace.join(DESTINATION).join("result.md")).unwrap(),
+        payload
+    );
+    assert!(
+        !workplace
+            .join(DESTINATION)
+            .join(".workspace-mgr-legacy.json")
+            .exists()
+    );
 }

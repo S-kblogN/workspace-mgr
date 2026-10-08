@@ -1038,6 +1038,7 @@ fn registry_publish_and_cancel_preserve_explicit_historical_record_metadata() {
     fixture.store.source("data", "marker", b"", true);
     let mut planned = fixture.run("plan").unwrap();
     planned["task_id"] = "task".into();
+    planned["closed_pull_request"] = Value::Null;
     planned["historical_records"] = json!([{
         "path":"task/logs/history.log", "sha256":"reviewed-original-record",
         "unix_mode":33060, "role":"historical-record"
@@ -1058,6 +1059,7 @@ fn registry_publish_and_cancel_preserve_explicit_historical_record_metadata() {
     );
     let stored = registry_read_with(&fixture.store, "task").unwrap().unwrap();
     assert_eq!(stored["historical_records"], receipt["historical_records"]);
+    assert_eq!(stored.get("closed_pull_request"), Some(&Value::Null));
     assert_eq!(
         fixture.registry("publish", &receipt, &proof).unwrap()["status"],
         "unchanged"
