@@ -2397,28 +2397,47 @@ class Harness:
         )
         retired_ids = {(row["key"].removeprefix("objects/"), row["version_id"])
                        for row in self.s3_version_inventory() if row["key"] == s3_key}
+        queued_retired_ids = {(row["object"], row["version_id"])
+                              for row in refreshed["storage"]["purge"]["pending"]
+                              if "objects/" + row["object"] == s3_key}
+        self.check(queued_retired_ids == {(s3_path, latest_version["version_id"])}
+                   and queued_retired_ids.issubset(retired_ids),
+                   "the final tag protects the exact queued untrack version",
+                   queued=sorted(queued_retired_ids), physical_versions=sorted(retired_ids),
+                   expected=[(s3_path, latest_version["version_id"])])
         # Refresh rechecks every published receipt source, including exact
         # generations already absent after the previous guarded retirement.
         rename_source_ids = {(row["source_object"], row["source_version_id"])
                              for row in self.rename_retention["receipt"]["versions"]}
         self.git(self.shared, "push", "origin", f":refs/tags/{tag}")
         cleaned = self.wm(self.shared, "refresh")
+        purge = cleaned["storage"]["purge"]
+        deleted_ids = {(row["object"], row["version_id"]) for row in purge["deleted"]}
+        pending_ids = {(row["object"], row["version_id"]) for row in purge["pending"]}
+        remaining = [row for row in self.s3_version_inventory() if row["key"] == s3_key]
         self.check(
             cleaned["status"] == "no_changes"
-            and cleaned["storage"]["purge"]["status"] == "cleanup_pending"
-            and retired_ids
-            and {(row["object"], row["version_id"])
-                 for row in cleaned["storage"]["purge"]["deleted"]} == retired_ids | rename_source_ids
-            and {(row["object"], row["version_id"])
-                 for row in cleaned["storage"]["purge"]["pending"]}
-                == self.rename_retention["copied_ids"]
-            and not cleaned["storage"]["purge"].get("pending_prefixes", []),
-            "refresh retires every unrelated untrack obligation and retains only canonical rename copies",
+            and purge["status"] == "cleanup_pending",
+            "cleanup preserves the synchronized Git result and reports intentional history retention",
+            refresh_status=cleaned["status"], purge_status=purge["status"],
         )
-        remaining = self.s3.list_object_versions(Bucket=self.bucket, Prefix=s3_key)
         self.check(
-            not remaining.get("Versions") and not remaining.get("DeleteMarkers"),
+            deleted_ids == queued_retired_ids | rename_source_ids,
+            "refresh acknowledges every queued untrack version and rechecked canonical source",
+            expected_deleted=sorted(queued_retired_ids | rename_source_ids),
+            actual_deleted=sorted(deleted_ids), physical_versions_before=sorted(retired_ids),
+        )
+        self.check(
+            pending_ids == self.rename_retention["copied_ids"]
+            and not purge.get("pending_prefixes", []),
+            "refresh retains only canonical rename copies after unrelated untrack cleanup",
+            expected_pending=sorted(self.rename_retention["copied_ids"]),
+            actual_pending=sorted(pending_ids), pending_prefixes=purge.get("pending_prefixes", []),
+        )
+        self.check(
+            not remaining,
             "cleanup permanently removes every old S3 version and delete marker",
+            physical_versions_before=sorted(retired_ids), remaining=remaining,
         )
         self.check(
             git_payload.read_bytes() == git_bytes
