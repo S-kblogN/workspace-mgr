@@ -315,7 +315,7 @@ fn started_s3_rename_refuses_retarget_without_changing_controls() {
 }
 
 #[test]
-fn published_rename_allows_future_payload_edits_without_replaying_the_copy() {
+fn published_rename_allows_future_payload_edits_or_removal_without_replaying_the_copy() {
     let (_temporary, repo, task, receipt, _) = fixture();
     let renamed = move_task(
         &repo,
@@ -330,6 +330,11 @@ fn published_rename_allows_future_payload_edits_without_replaying_the_copy() {
     install_copied_receipt(&repo, &copied);
     let pointer = format!("{DESTINATION}/payload.bin{}", crate::storage_format::SUFFIX);
     crate::archive_migration::rewrite_pointer(&repo, &pointer, &copied).unwrap();
+    let pointer_path = repo.root.join(&pointer);
+    let pointer_bytes = fs::read(&pointer_path).unwrap();
+    fs::remove_file(&pointer_path).unwrap();
+    assert!(crate::archive_cancel::has_trusted_migration(&repo, &copied).is_err());
+    fs::write(&pointer_path, pointer_bytes).unwrap();
     repo.run(["add", "-A"]).unwrap();
     repo.run(["commit", "-q", "-m", "Published rename fixture"])
         .unwrap();
@@ -364,8 +369,32 @@ fn published_rename_allows_future_payload_edits_without_replaying_the_copy() {
             &base
         )
         .unwrap(),
-        vec![copied]
+        vec![copied.clone()]
     );
+    // Usage accounting reads a task-owned receipt before it reaches shared
+    // main even after normal publication removed its final current boundary.
+    // Only the copied immutable mapping remains authoritative at this point.
+    fs::remove_file(&pointer_path).unwrap();
+    fs::remove_file(repo.root.join(DESTINATION).join("payload.bin")).unwrap();
+    assert!(crate::archive_cancel::has_trusted_migration(&repo, &copied).unwrap());
+    assert!(crate::archive_cancel::has_trusted_migration(&repo, &receipt).is_err());
+    assert_eq!(
+        crate::archive_migration::pending_rename_source(&repo, &renamed, &base).unwrap(),
+        None
+    );
+    assert_eq!(
+        crate::archive_migration::prepare(
+            &repo,
+            &Config::default(),
+            &[DESTINATION.to_owned()],
+            &base
+        )
+        .unwrap(),
+        vec![copied.clone()]
+    );
+    let mut rebound = copied;
+    rebound["versions"][1]["destination_version_id"] = "foreign-generation".into();
+    assert!(crate::archive_cancel::has_trusted_migration(&repo, &rebound).is_err());
     let receipt_path = repo
         .root
         .join(DESTINATION)

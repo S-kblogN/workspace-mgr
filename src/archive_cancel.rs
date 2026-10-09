@@ -303,7 +303,16 @@ pub(crate) fn has_trusted_migration(repo: &GitRepo, receipt: &Value) -> Result<b
         ));
     }
     validate_current_receipt(repo, &attempt, receipt)?;
-    validate_metadata(repo, &resolved_under(&repo.root, destination), &attempt)?;
+    // Once a renamed task is published, its current storage boundaries can
+    // change or disappear. Usage credit remains bound to the frozen source
+    // and exact copied receipt, rather than the no-longer-cancellable undo
+    // metadata. Unpublished moves still require all original controls.
+    if attempt.status != "published"
+        || !crate::archive_migration::is_task_rename(receipt)
+        || receipt["status"] != "copied"
+    {
+        validate_metadata(repo, &resolved_under(&repo.root, destination), &attempt)?;
+    }
     Ok(true)
 }
 

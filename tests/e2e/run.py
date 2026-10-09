@@ -2080,7 +2080,7 @@ class Harness:
         self.check(refreshed["storage"]["purge"]["status"] == "cleanup_pending"
                    and {(row["object"], row["version_id"])
                         for row in refreshed["storage"]["purge"]["pending"]} == history["copied_ids"]
-                   and not refreshed["storage"]["purge"]["pending_prefixes"],
+                   and not refreshed["storage"]["purge"].get("pending_prefixes", []),
                    "only intentionally preserved copied destination identities remain queued")
         audited = self.wm(self.shared, "doctor", history["destination"])
         self.check(audited["storage"]["issues"] == []
@@ -2395,15 +2395,20 @@ class Harness:
             and self.list_s3_versions() == versions_before,
             "the remote tag independently protects retired S3 versions after main is merged",
         )
+        retired_ids = {(row["key"].removeprefix("objects/"), row["version_id"])
+                       for row in self.s3_version_inventory() if row["key"] == s3_key}
         self.git(self.shared, "push", "origin", f":refs/tags/{tag}")
         cleaned = self.wm(self.shared, "refresh")
         self.check(
-            cleaned["status"] == "s3_purged"
+            cleaned["status"] == "no_changes"
             and cleaned["storage"]["purge"]["status"] == "cleanup_pending"
+            and retired_ids
+            and {(row["object"], row["version_id"])
+                 for row in cleaned["storage"]["purge"]["deleted"]} == retired_ids
             and {(row["object"], row["version_id"])
                  for row in cleaned["storage"]["purge"]["pending"]}
                 == self.rename_retention["copied_ids"]
-            and not cleaned["storage"]["purge"]["pending_prefixes"],
+            and not cleaned["storage"]["purge"].get("pending_prefixes", []),
             "refresh retires every unrelated untrack obligation and retains only canonical rename copies",
         )
         remaining = self.s3.list_object_versions(Bucket=self.bucket, Prefix=s3_key)
@@ -3234,7 +3239,7 @@ class Harness:
                     == (["s3-cleanup-pending"] if expected_pending else [])
                 and {(row["object"], row["version_id"])
                      for row in after["storage"]["purge"]["pending"]} == expected_pending
-                and not after["storage"]["purge"]["pending_prefixes"]
+                and not after["storage"]["purge"].get("pending_prefixes", [])
                 and "unaddressable" not in after["storage"],
                 "recovery clears every unaddressable obligation and reports only intentional copied-history retention",
                 checkout=str(checkout),
