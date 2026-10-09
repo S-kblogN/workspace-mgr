@@ -2397,6 +2397,10 @@ class Harness:
         )
         retired_ids = {(row["key"].removeprefix("objects/"), row["version_id"])
                        for row in self.s3_version_inventory() if row["key"] == s3_key}
+        # Refresh rechecks every published receipt source, including exact
+        # generations already absent after the previous guarded retirement.
+        rename_source_ids = {(row["source_object"], row["source_version_id"])
+                             for row in self.rename_retention["receipt"]["versions"]}
         self.git(self.shared, "push", "origin", f":refs/tags/{tag}")
         cleaned = self.wm(self.shared, "refresh")
         self.check(
@@ -2404,7 +2408,7 @@ class Harness:
             and cleaned["storage"]["purge"]["status"] == "cleanup_pending"
             and retired_ids
             and {(row["object"], row["version_id"])
-                 for row in cleaned["storage"]["purge"]["deleted"]} == retired_ids
+                 for row in cleaned["storage"]["purge"]["deleted"]} == retired_ids | rename_source_ids
             and {(row["object"], row["version_id"])
                  for row in cleaned["storage"]["purge"]["pending"]}
                 == self.rename_retention["copied_ids"]
