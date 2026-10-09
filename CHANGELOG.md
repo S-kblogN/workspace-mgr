@@ -5,6 +5,28 @@ is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.11] - 2026-10-08
+
+### Fixed
+
+- Refresh retires copied archive source versions in guarded S3 batches,
+  normalizes duplicate queue aliases and checkpoints completed groups so
+  retries retain progress. Retirement waits for the canonical receipt to reach
+  shared main; storage failures report pending cleanup separately from successful
+  Git synchronization.
+- Task rename preserves existing S3 history through verified server-side copies
+  instead of uploading unchanged payloads again. Published copy bindings remain
+  available for historical hydration and subsequent archive migrations. S3 rename
+  publications require CLI 0.8.11.
+- Doctor recognizes canonical copied archive history at historical filenames,
+  including versions absent from current local outputs, while still reporting
+  missing copies, unmapped versions and obsolete source prefixes.
+
+### Changed
+
+- Batch Git refresh queries and checkouts with literal, NUL-framed paths and
+  prepare storage revisions without materializing unrelated payloads.
+
 ## [0.8.10] - 2026-10-08
 
 ### Fixed
