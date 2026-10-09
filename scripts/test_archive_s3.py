@@ -573,11 +573,20 @@ class ArchiveHarness(e2e.Harness):
                    and self.namespace_versions(RENAME_TASK) == [],
                    "merged rename retires every original payload version and delete marker")
         self.check_retained_copies(receipt, bodies)
+        # This clone already has the current Git tree. Refresh retires source
+        # history but does not hydrate unchanged pointer outputs implicitly.
+        current_history = self.namespace_versions(RENAMED_TASK)
+        hydrated = self.wm(cleaner / RENAMED_TASK, "storage", "hydrate")
+        self.check(hydrated["status"] == "hydrated"
+                   and self.namespace_versions(RENAME_TASK) == []
+                   and self.namespace_versions(RENAMED_TASK) == current_history,
+                   "explicit current hydration reads exact versions without creating any remote history")
         self.check((cleaner / RENAMED_TASK / "single.txt").read_bytes() == b"rename standalone version two\n"
                    and (cleaner / RENAMED_TASK / "bundle" / "alpha.txt").read_bytes()
                        == b"rename active alpha version three\n"
-                   and not (cleaner / RENAMED_TASK / "bundle" / "beta.bin").exists(),
-                   "fresh main hydration restores current edits without recreating the removed historical file")
+                   and not (cleaner / RENAMED_TASK / "bundle" / "beta.bin").exists()
+                   and not (cleaner / RENAMED_TASK / "gone.bin").exists(),
+                   "fresh main hydration restores current edits without recreating removed or marker-only historical files")
         history = self.root / "rename-historical-consumer"
         self.run(["git", "clone", self.remote_url, history])
         self.configure_git(history)
