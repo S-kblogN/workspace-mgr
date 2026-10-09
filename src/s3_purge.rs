@@ -320,7 +320,19 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
         .filter(|receipt| published.contains(receipt))
         .cloned()
         .collect::<Vec<_>>();
-    let protected_objects = referenced_objects(repo, config, remote, &state.pending)?;
+    let mut protected_objects = referenced_objects(repo, config, remote, &state.pending)?;
+    // A task publication can remove every live pointer at the original path
+    // before its copied receipt reaches the shared branch. Those generic
+    // aliases are still archive SOURCE retirement, and must wait for the same
+    // shared publication proof as the unsubmitted prefix itself.
+    protected_objects.extend(deferred_archive_source_candidates(
+        repo,
+        &state.pending,
+        &state.pending_prefixes,
+        &published,
+    )?);
+    protected_objects.sort();
+    protected_objects.dedup();
     purge_groups(
         state,
         protected_objects,
@@ -328,6 +340,49 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
         |payload| storage_metadata::version_purge_adapter(repo, "delete", payload),
         |next| write_state(repo, next),
     )
+}
+
+fn deferred_archive_source_candidates(
+    repo: &GitRepo,
+    candidates: &[ObjectVersion],
+    pending_prefixes: &BTreeMap<String, serde_json::Value>,
+    published: &[serde_json::Value],
+) -> Result<Vec<ObjectVersion>> {
+    let mut deferred = BTreeSet::new();
+    let mut client = None;
+    for receipt in pending_prefixes
+        .values()
+        .filter(|receipt| !published.contains(receipt))
+    {
+        let source = receipt_prefix(receipt)?;
+        if client.is_none() {
+            client = Some(crate::native_s3::S3Client::from_repo(repo)?);
+        }
+        let canonical = crate::native_archive::registry_read(
+            client.as_ref().expect("initialized storage client"),
+            repo,
+            &source,
+        )?;
+        if canonical.as_ref() != Some(receipt) {
+            return Err(Error::message(
+                "pending archive source differs from its canonical registry before shared publication",
+            ));
+        }
+        // Protection needs only the existing immutable claim. It must not
+        // attempt to create/republish a claim or require a shared receipt that
+        // this very source retirement is waiting for.
+        verify_retained_destination_binding(repo, receipt)?;
+        deferred.insert(format!("{source}/"));
+    }
+    Ok(candidates
+        .iter()
+        .filter(|candidate| {
+            deferred
+                .iter()
+                .any(|source| candidate.object.starts_with(source))
+        })
+        .cloned()
+        .collect())
 }
 
 /// Keep the successful shared-checkout result reviewable when retirement fails.
@@ -2685,6 +2740,11 @@ mod tests {
             assert_eq!(request.method, "GET");
             let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
             let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+            if query.contains_key("versioning") {
+                return Reply::xml(
+                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                );
+            }
             if query.contains_key("versions") {
                 assert_eq!(query["prefix"], registry_key);
                 return Reply::xml(&format!(
@@ -2872,5 +2932,101 @@ mod tests {
                 .iter()
                 .all(|request| request.method == "GET")
         );
+    }
+
+    #[test]
+    fn unpublished_copied_receipt_defers_source_cleanup_without_any_live_source_pointer() {
+        let (_directory, repo, receipt, worker) =
+            retained_destination_reference_fixture(false, false, false);
+        let destination = receipt["destination"].as_str().unwrap();
+        let path = format!("{destination}/{}", crate::archive_migration::RECEIPT_NAME);
+        repo.run(["rm", &path]).unwrap();
+        repo.run([
+            "commit",
+            "-q",
+            "-m",
+            "shared branch does not yet contain copied receipt",
+        ])
+        .unwrap();
+        repo.run(["push", "-q", "origin", "main"]).unwrap();
+        let source = receipt["source"].as_str().unwrap();
+        let source_object = receipt["versions"][0]["source_object"].as_str().unwrap();
+        let original = ObjectVersion {
+            pointer: format!("{source_object}.wm-storage.json"),
+            object: source_object.to_owned(),
+            version_id: "original-version".to_owned(),
+        };
+        let mut alias = original.clone();
+        alias.pointer = format!("{source}/{}", crate::archive_migration::RECEIPT_NAME);
+        let marker = ObjectVersion {
+            pointer: format!("{source}/retired.wm-storage.json"),
+            object: format!("{source}/retired"),
+            version_id: "original-marker".to_owned(),
+        };
+        let late = ObjectVersion {
+            pointer: format!("{source}/late.wm-storage.json"),
+            object: format!("{source}/late"),
+            version_id: "later-unmapped-source".to_owned(),
+        };
+        let mut candidates = vec![original, alias, marker, late];
+        candidates.sort();
+        queue(&repo, &candidates).unwrap();
+        queue_archive_prefixes(&repo, std::slice::from_ref(&receipt)).unwrap();
+        let report = purge_pending(&repo, &Config::load(&repo).unwrap(), "origin").unwrap();
+        assert_eq!(report.status, "cleanup_pending");
+        assert_eq!(report.pending, candidates);
+        assert_eq!(report.protected, candidates);
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.pending_prefixes, [source]);
+        assert_eq!(read_state(&repo).unwrap().pending, candidates);
+        assert_eq!(archive_prefixes(&repo).unwrap().get(source), Some(&receipt));
+        // Once the same exact receipt is shared, this extra deferral ends;
+        // destructive authorization remains the native source proof's job.
+        assert!(
+            deferred_archive_source_candidates(
+                &repo,
+                &candidates,
+                &BTreeMap::from([(source.to_owned(), receipt.clone())]),
+                &[receipt]
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let requests = worker.finish_requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| request.method == "GET"));
+    }
+
+    #[test]
+    fn unpublished_source_deferral_fails_closed_on_canonical_registry_or_binding_changes() {
+        for (tampered_registry, missing_binding) in [(true, false), (false, true)] {
+            let (_directory, repo, receipt, worker) =
+                retained_destination_reference_fixture(false, tampered_registry, missing_binding);
+            let source = receipt["source"].as_str().unwrap();
+            let candidate = ObjectVersion {
+                pointer: format!("{source}/retired.dvc"),
+                object: format!("{source}/retired"),
+                version_id: "original-marker".to_owned(),
+            };
+            let error = deferred_archive_source_candidates(
+                &repo,
+                &[candidate],
+                &BTreeMap::from([(source.to_owned(), receipt)]),
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("canonical registry")
+                    || error.contains("canonical Git coordination binding"),
+                "{error}"
+            );
+            assert!(
+                worker
+                    .finish_requests()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
     }
 }
