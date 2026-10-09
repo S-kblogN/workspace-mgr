@@ -70,6 +70,18 @@ impl RelocationPlan {
         })
     }
 
+    pub(crate) fn retarget(&self, destination: &Path) -> Result<Self> {
+        if !self.references.is_empty() || !destination.is_absolute() {
+            return Err(Error::message(
+                "only an opaque pending relocation can be retargeted",
+            ));
+        }
+        let mut next = self.clone();
+        next.destination = normalize(destination);
+        next.validate_scope()?;
+        Ok(next)
+    }
+
     /// New moves are opaque. Existing reference snapshots are cancellation
     /// evidence and must never authorize a fresh payload rewrite.
     pub(crate) fn apply(&self) -> Result<()> {

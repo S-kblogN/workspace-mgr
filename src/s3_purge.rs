@@ -43,11 +43,23 @@ pub struct PurgeReport {
     pub retained_mapped: Vec<ObjectVersion>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pending_prefixes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 impl PurgeReport {
     pub fn warning(&self) -> Option<(&'static str, String)> {
-        if self.status == "blocked_unmapped" {
+        if !self.errors.is_empty() {
+            Some((
+                "s3-cleanup-failed",
+                format!(
+                    "Git synchronization succeeded, but S3 cleanup did not finish: {}. Retry uses the last durable checkpoint; {} exact version records and {} archive prefixes remain queued for retry.",
+                    self.errors.join("; "),
+                    self.pending.len(),
+                    self.pending_prefixes.len(),
+                ),
+            ))
+        } else if self.status == "blocked_unmapped" {
             Some((
                 "s3-cleanup-blocked-unmapped",
                 format!(
@@ -308,54 +320,292 @@ pub fn purge_pending(repo: &GitRepo, config: &Config, remote: &str) -> Result<Pu
         .filter(|receipt| published.contains(receipt))
         .cloned()
         .collect::<Vec<_>>();
-    let submitted_prefixes = prefixes
-        .iter()
-        .map(receipt_prefix)
-        .collect::<Result<BTreeSet<_>>>()?;
     let protected_objects = referenced_objects(repo, config, remote, &state.pending)?;
-    let protected_set = protected_objects.iter().cloned().collect::<BTreeSet<_>>();
-    let deleted = state
-        .pending
-        .iter()
-        .filter(|candidate| !protected_set.contains(*candidate))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut retained_unmapped = Vec::new();
-    let mut retained_mapped: Vec<ObjectVersion> = Vec::new();
-    let mut cleaned_prefixes = Vec::new();
-    if !deleted.is_empty() || !prefixes.is_empty() {
-        let payload = serde_json::json!({"candidates":deleted,"prefixes":prefixes});
-        let response = storage_metadata::version_purge_adapter(repo, "delete", &payload)?;
-        if let Some(retained) = response.get("retained_unmapped") {
-            retained_unmapped = serde_json::from_value(retained.clone()).map_err(|error| {
-                Error::message(format!("invalid unmapped archive version report: {error}"))
-            })?;
-        }
-        if let Some(retained) = response.get("retained_mapped") {
-            retained_mapped = serde_json::from_value(retained.clone()).map_err(|error| {
-                Error::message(format!("invalid retained archive version report: {error}"))
-            })?;
-        }
-        if let Some(cleaned) = response.get("cleaned_prefixes") {
-            cleaned_prefixes = serde_json::from_value(cleaned.clone()).map_err(|error| {
-                Error::message(format!("invalid cleaned archive prefix report: {error}"))
-            })?;
+    purge_groups(
+        state,
+        protected_objects,
+        &prefixes,
+        |payload| storage_metadata::version_purge_adapter(repo, "delete", payload),
+        |next| write_state(repo, next),
+    )
+}
+
+/// Keep the successful shared-checkout result reviewable when retirement fails.
+/// Destructive callers still use `purge_pending` and receive its error normally.
+pub(crate) fn purge_after_sync(
+    repo: &GitRepo,
+    config: &Config,
+    remote: &str,
+) -> Result<PurgeReport> {
+    match purge_pending(repo, config, remote) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let mut report = preview(repo)?;
+            report.status = "cleanup_pending".to_owned();
+            report.errors.push(error.to_string());
+            Ok(report)
         }
     }
-    let (next, report) = finish_purge_with_prefixes(
-        &state.pending,
-        protected_objects,
-        deleted,
-        retained_unmapped,
-        retained_mapped,
-        PrefixCompletion {
-            pending: state.pending_prefixes,
-            submitted: submitted_prefixes,
-            cleaned: cleaned_prefixes,
-        },
-    )?;
-    write_state(repo, &next)?;
+}
+
+#[derive(Default)]
+struct PurgeGroup {
+    candidates: Vec<ObjectVersion>,
+    prefixes: Vec<serde_json::Value>,
+}
+
+/// A group is the entire source namespace of one bound receipt. Generic and
+/// archive aliases of the same physical version stay together. Never split a
+/// prefix: its final inventory must account for all mapped/protected history.
+fn purge_groups(
+    mut state: PurgeState,
+    protected: Vec<ObjectVersion>,
+    prefixes: &[serde_json::Value],
+    mut adapter: impl FnMut(&serde_json::Value) -> Result<serde_json::Value>,
+    mut checkpoint: impl FnMut(&PurgeState) -> Result<()>,
+) -> Result<PurgeReport> {
+    let mut groups = BTreeMap::<String, PurgeGroup>::new();
+    for receipt in prefixes {
+        let source = receipt_prefix(receipt)?;
+        groups
+            .entry(source)
+            .or_default()
+            .prefixes
+            .push(receipt.clone());
+    }
+    let mut generic = Vec::new();
+    for candidate in &state.pending {
+        let source = groups
+            .keys()
+            .filter(|source| candidate.object.starts_with(&format!("{source}/")))
+            .max_by_key(|source| source.len())
+            .cloned();
+        if let Some(source) = source {
+            groups
+                .get_mut(&source)
+                .expect("known purge group")
+                .candidates
+                .push(candidate.clone());
+        } else {
+            generic.push(candidate.clone());
+        }
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    // Bound generic batches limit lost progress without inventing receipt
+    // ownership or claiming an unscanned prefix is empty.
+    for (index, candidates) in generic.chunks(1000).enumerate() {
+        groups.push((
+            format!("generic batch {}", index + 1),
+            PurgeGroup {
+                candidates: candidates.to_vec(),
+                prefixes: Vec::new(),
+            },
+        ));
+    }
+    let protected_set = protected
+        .iter()
+        .map(|candidate| (candidate.object.clone(), candidate.version_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut report = PurgeReport::default();
+    for (index, (label, group)) in groups.iter().enumerate() {
+        let group_set = group.candidates.iter().cloned().collect::<BTreeSet<_>>();
+        let group_protected = group
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                protected_set.contains(&(candidate.object.clone(), candidate.version_id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let deleted = group
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                !protected_set.contains(&(candidate.object.clone(), candidate.version_id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let submitted = group
+            .prefixes
+            .iter()
+            .map(receipt_prefix)
+            .collect::<Result<BTreeSet<_>>>()?;
+        let requested = !deleted.is_empty() || !group.prefixes.is_empty();
+        let response = if !requested {
+            serde_json::json!({
+                "retained_unmapped":[],"retained_mapped":[],"cleaned_prefixes":[]
+            })
+        } else {
+            eprintln!(
+                "workspace-mgr: S3 cleanup group {}/{}: {label} ({} queued records)",
+                index + 1,
+                groups.len(),
+                group.candidates.len()
+            );
+            adapter(&serde_json::json!({"candidates":deleted,"prefixes":group.prefixes}))?
+        };
+        if requested {
+            if response["mode"] != "permanent-version-deletion" {
+                return Err(Error::message(
+                    "storage purge response has no confirmed deletion mode",
+                ));
+            }
+            for field in [
+                "deleted",
+                "already_absent",
+                "retained_unmapped",
+                "retained_mapped",
+                "cleaned_prefixes",
+            ] {
+                if !response[field].is_array() {
+                    return Err(Error::message(format!(
+                        "storage purge response omitted {field} inventory"
+                    )));
+                }
+            }
+        }
+        let parse = |name: &str| -> Result<Vec<ObjectVersion>> {
+            response
+                .get(name)
+                .map(|value| {
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        Error::message(format!("invalid {name} archive version report: {error}"))
+                    })
+                })
+                .transpose()
+                .map(Option::unwrap_or_default)
+        };
+        let cleaned = response
+            .get("cleaned_prefixes")
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    Error::message(format!("invalid cleaned archive prefix report: {error}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let retained_unmapped = parse("retained_unmapped")?;
+        let retained_mapped = parse("retained_mapped")?;
+        if requested {
+            validate_purge_acknowledgements(
+                &deleted,
+                &response,
+                &retained_unmapped,
+                &retained_mapped,
+            )?;
+        }
+        let (next_group, group_report) = finish_purge_with_prefixes(
+            &group.candidates,
+            group_protected,
+            deleted,
+            retained_unmapped,
+            retained_mapped,
+            PrefixCompletion {
+                pending: state
+                    .pending_prefixes
+                    .iter()
+                    .filter(|(source, _)| submitted.contains(*source))
+                    .map(|(source, receipt)| (source.clone(), receipt.clone()))
+                    .collect(),
+                submitted: submitted.clone(),
+                cleaned,
+            },
+        )?;
+        // Only after validated success can this group's obligations change.
+        // Every unsubmitted version and prefix remains byte-for-byte queued.
+        state
+            .pending
+            .retain(|candidate| !group_set.contains(candidate));
+        state.pending.extend(next_group.pending);
+        state.pending.sort();
+        state.pending.dedup();
+        for source in &submitted {
+            state.pending_prefixes.remove(source);
+        }
+        state.pending_prefixes.extend(next_group.pending_prefixes);
+        checkpoint(&state)?;
+        report.deleted.extend(group_report.deleted);
+        report.protected.extend(group_report.protected);
+        report
+            .retained_unmapped
+            .extend(group_report.retained_unmapped);
+        report.retained_mapped.extend(group_report.retained_mapped);
+    }
+    report.deleted.sort();
+    report.deleted.dedup();
+    report.protected.sort();
+    report.protected.dedup();
+    report.pending = state.pending;
+    report.pending_prefixes = state.pending_prefixes.into_keys().collect();
+    report.status = if !report.retained_unmapped.is_empty() {
+        "blocked_unmapped"
+    } else if report.pending.is_empty() && report.pending_prefixes.is_empty() {
+        "complete"
+    } else {
+        "cleanup_pending"
+    }
+    .to_owned();
     Ok(report)
+}
+
+fn validate_purge_acknowledgements(
+    submitted: &[ObjectVersion],
+    response: &serde_json::Value,
+    retained_unmapped: &[ObjectVersion],
+    retained_mapped: &[ObjectVersion],
+) -> Result<()> {
+    let objects = submitted
+        .iter()
+        .map(|item| item.object.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut confirmed = BTreeSet::new();
+    for field in ["deleted", "already_absent"] {
+        for row in response[field]
+            .as_array()
+            .expect("validated response array")
+        {
+            let object = row["object"]
+                .as_str()
+                .filter(|object| objects.contains(object))
+                .ok_or_else(|| Error::message("storage purge confirmed an unknown object"))?;
+            let versions = if field == "deleted" && row.get("deleted_version_ids").is_some() {
+                row["deleted_version_ids"]
+                    .as_array()
+                    .filter(|versions| !versions.is_empty())
+                    .ok_or_else(|| Error::message("storage purge has invalid deleted version IDs"))?
+                    .iter()
+                    .map(|version| version.as_str())
+                    .collect::<Vec<_>>()
+            } else {
+                vec![row["version_id"].as_str()]
+            };
+            for version in versions {
+                let version = version
+                    .filter(|version| !version.is_empty())
+                    .ok_or_else(|| Error::message("storage purge confirmed an invalid version"))?;
+                confirmed.insert((object, version));
+            }
+        }
+    }
+    let retained = retained_unmapped
+        .iter()
+        .chain(retained_mapped)
+        .map(|item| (item.object.as_str(), item.version_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    if confirmed.iter().any(|item| retained.contains(item)) {
+        return Err(Error::message(
+            "storage purge both confirmed deletion and retained the same version",
+        ));
+    }
+    if submitted.iter().any(|item| {
+        let physical = (item.object.as_str(), item.version_id.as_str());
+        !confirmed.contains(&physical) && !retained.contains(&physical)
+    }) {
+        return Err(Error::message(
+            "storage purge omitted confirmation for a submitted exact version",
+        ));
+    }
+    Ok(())
 }
 
 fn promote_archive_prefixes(
@@ -431,7 +681,10 @@ fn finish_purge_with_prefixes(
     mut retained_mapped: Vec<ObjectVersion>,
     mut prefixes: PrefixCompletion,
 ) -> Result<(PurgeState, PurgeReport)> {
-    if retained_mapped.iter().any(|item| !deleted.contains(item)) {
+    if retained_mapped
+        .iter()
+        .any(|item| !candidates.contains(item))
+    {
         return Err(Error::message(
             "storage purge retained an unknown candidate",
         ));
@@ -515,6 +768,7 @@ fn finish_purge_with_prefixes(
             retained_unmapped,
             retained_mapped,
             pending_prefixes,
+            errors: Vec::new(),
         },
     ))
 }
@@ -630,6 +884,12 @@ fn referenced_objects(
         .cloned()
         .map(|item| (item.object, item.version_id))
         .collect::<BTreeSet<_>>();
+    let candidate_objects = candidates
+        .iter()
+        .map(|candidate| candidate.object.clone())
+        .collect::<BTreeSet<_>>();
+    let retained_destinations =
+        retained_archive_destinations(repo, &published_receipts, &candidate_objects)?;
     let candidate_sources = candidates
         .iter()
         .filter_map(|candidate| {
@@ -699,7 +959,9 @@ fn referenced_objects(
             // canonical registry. They no longer require duplicate bytes at
             // the original path. New/unmapped generations remain protected.
             let identity = (candidate.object.clone(), candidate.version_id.clone());
-            if published_archive_versions.contains(&identity) {
+            if retained_destinations.contains(&identity) {
+                true
+            } else if published_archive_versions.contains(&identity) {
                 false
             } else if published_archive_sources
                 .iter()
@@ -715,6 +977,86 @@ fn referenced_objects(
         })
         .cloned()
         .collect())
+}
+
+/// A copied destination can remain the only physical copy after its live
+/// pointer disappears. Only the current outer receipt owns physical versions:
+/// nested earlier destinations may have been relocated again already.
+pub(crate) fn retained_archive_destinations(
+    repo: &GitRepo,
+    published: &[serde_json::Value],
+    objects: &BTreeSet<String>,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut retained = BTreeSet::new();
+    let mut client = None;
+    for receipt in published {
+        let rows = receipt["versions"]
+            .as_array()
+            .ok_or_else(|| Error::message("published archive receipt has no versions"))?;
+        if !rows.iter().any(|row| {
+            row["destination_object"]
+                .as_str()
+                .is_some_and(|object| objects.contains(object))
+        }) {
+            continue;
+        }
+        let source = receipt_prefix(receipt)?;
+        if client.is_none() {
+            client = Some(crate::native_s3::S3Client::from_repo(repo)?);
+        }
+        let client = client.as_ref().expect("initialized storage client");
+        let canonical = crate::native_archive::registry_read(client, repo, &source)?;
+        if canonical.as_ref() != Some(receipt) {
+            return Err(Error::message(
+                "retained archive destination differs from its published canonical registry",
+            ));
+        }
+        // Read the existing binding only. A missing/replaced claim must not
+        // authorize deletion by falling back to ordinary object retirement.
+        verify_retained_destination_binding(repo, receipt)?;
+        for row in rows {
+            let object = row["destination_object"].as_str().ok_or_else(|| {
+                Error::message("retained archive destination has no object identity")
+            })?;
+            if !objects.contains(object) {
+                continue;
+            }
+            let version = row["destination_version_id"].as_str().ok_or_else(|| {
+                Error::message("retained archive destination has no exact version identity")
+            })?;
+            retained.insert((object.to_owned(), version.to_owned()));
+        }
+    }
+    Ok(retained)
+}
+
+pub(crate) fn verify_retained_destination_binding(
+    repo: &GitRepo,
+    receipt: &serde_json::Value,
+) -> Result<()> {
+    let config = Config::load(repo)?;
+    let remote = &config.git.remote;
+    repo.validate_remote_name(remote)?;
+    let fetch = repo.run(["remote", "get-url", "--all", remote])?;
+    let push = repo.run(["remote", "get-url", "--push", "--all", remote])?;
+    if fetch.stdout.lines().count() != 1 || fetch.stdout != push.stdout {
+        return Err(Error::message(
+            "retained archive destination requires one identical Git fetch and push destination",
+        ));
+    }
+    let body = serde_json::to_string(receipt)
+        .map_err(|error| Error::message(format!("invalid retained archive receipt: {error}")))?;
+    let expected = crate::archive_git_control::object_ids(&repo.root, &body, false)?;
+    let reference = crate::archive_registry::binding_ref(receipt)?;
+    let observed = repo.run(["ls-remote", "--refs", "--", remote, &reference])?;
+    if observed.stdout != format!("{}\t{reference}\n", expected.commit)
+        && observed.stdout != format!("{}\t{reference}\n", expected.legacy_blob)
+    {
+        return Err(Error::message(
+            "retained archive destination has no matching canonical Git coordination binding",
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve every live branch/tag through the same two batched object queries.
@@ -969,6 +1311,232 @@ mod tests {
             "destination":format!("2026/07/{source}"),"status":"copied",
             "bucket":"isolated-fixture","remote_prefix":"dvc","versions":[]
         })
+    }
+
+    fn purge_response(cleaned: &[&str]) -> serde_json::Value {
+        serde_json::json!({"mode":"permanent-version-deletion",
+            "deleted":[],"already_absent":[],"retained_unmapped":[],
+            "retained_mapped":[],"cleaned_prefixes":cleaned})
+    }
+
+    #[test]
+    fn cleanup_checkpoints_confirmed_prefixes_before_a_later_transport_failure() {
+        let first = archive_version("first", "data", "v1");
+        let second = archive_version("second", "data", "v2");
+        let mut generic_alias = first.clone();
+        generic_alias.pointer = "first/data.wm-storage.json".to_owned();
+        let receipts = vec![empty_receipt("first"), empty_receipt("second")];
+        let state = PurgeState {
+            schema_version: STATE_SCHEMA,
+            pending: vec![first.clone(), generic_alias, second.clone()],
+            pending_prefixes: receipts
+                .iter()
+                .map(|receipt| {
+                    (
+                        receipt["source"].as_str().unwrap().to_owned(),
+                        receipt.clone(),
+                    )
+                })
+                .collect(),
+        };
+        let mut checkpoints = Vec::new();
+        let mut calls = 0;
+        let error = purge_groups(
+            state,
+            Vec::new(),
+            &receipts,
+            |payload| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(Error::message("S3 TransportError: timeout: connect"));
+                }
+                assert_eq!(payload["candidates"].as_array().unwrap().len(), 2);
+                assert_eq!(payload["prefixes"].as_array().unwrap().len(), 1);
+                let mut response = purge_response(&["first"]);
+                response["deleted"] = payload["candidates"].clone();
+                Ok(response)
+            },
+            |next| {
+                checkpoints.push(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timeout: connect"));
+        assert_eq!(calls, 2);
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].pending, vec![second]);
+        assert!(!checkpoints[0].pending_prefixes.contains_key("first"));
+        assert!(checkpoints[0].pending_prefixes.contains_key("second"));
+    }
+
+    #[test]
+    fn cleanup_does_not_checkpoint_a_false_empty_prefix_or_forget_unsubmitted_groups() {
+        let first = archive_version("first", "data", "v1");
+        let second = archive_version("second", "data", "v2");
+        let receipt = empty_receipt("first");
+        let state = PurgeState {
+            schema_version: STATE_SCHEMA,
+            pending: vec![first.clone(), second],
+            pending_prefixes: BTreeMap::from([("first".to_owned(), receipt.clone())]),
+        };
+        let mut checkpoints = Vec::new();
+        let error = purge_groups(
+            state,
+            vec![first.clone()],
+            &[receipt],
+            |_| {
+                let mut response = purge_response(&["first"]);
+                response["retained_mapped"] = serde_json::json!([first]);
+                Ok(response)
+            },
+            |next| {
+                checkpoints.push(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unverified empty archive prefix")
+        );
+        assert!(checkpoints.is_empty());
+    }
+
+    #[test]
+    fn cleanup_preserves_protected_aliases_and_new_unmapped_source_versions() {
+        let mapped = archive_version("source", "data", "v1");
+        let mut alias = mapped.clone();
+        alias.pointer = "source/data.wm-storage.json".to_owned();
+        let unexpected = archive_version("source", "new", "concurrent");
+        let receipt = empty_receipt("source");
+        let state = PurgeState {
+            schema_version: STATE_SCHEMA,
+            pending: vec![mapped.clone(), alias],
+            pending_prefixes: BTreeMap::from([("source".to_owned(), receipt.clone())]),
+        };
+        let mut checkpoints = Vec::new();
+        let report = purge_groups(
+            state,
+            vec![mapped.clone()],
+            &[receipt],
+            |payload| {
+                assert!(payload["candidates"].as_array().unwrap().is_empty());
+                let mut response = purge_response(&[]);
+                response["retained_mapped"] = serde_json::json!([mapped]);
+                response["retained_unmapped"] = serde_json::json!([unexpected]);
+                Ok(response)
+            },
+            |next| {
+                checkpoints.push(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(report.status, "blocked_unmapped");
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.retained_unmapped, vec![unexpected.clone()]);
+        assert!(checkpoints[0].pending.contains(&unexpected));
+        assert!(checkpoints[0].pending_prefixes.contains_key("source"));
+    }
+
+    #[test]
+    fn cleanup_keeps_last_checkpoint_when_persisting_later_progress_fails() {
+        let candidates = (0..1001)
+            .map(|index| ObjectVersion {
+                pointer: "task/data.wm-storage.json".to_owned(),
+                object: format!("task/data/{index}"),
+                version_id: format!("v{index}"),
+            })
+            .collect::<Vec<_>>();
+        let state = PurgeState {
+            schema_version: STATE_SCHEMA,
+            pending: candidates.clone(),
+            pending_prefixes: BTreeMap::new(),
+        };
+        let mut persisted = None;
+        let mut checkpoints = 0;
+        let error = purge_groups(
+            state,
+            Vec::new(),
+            &[],
+            |payload| {
+                let mut response = purge_response(&[]);
+                response["deleted"] = payload["candidates"].clone();
+                Ok(response)
+            },
+            |next| {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    return Err(Error::message("checkpoint disk full"));
+                }
+                persisted = Some(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disk full"));
+        assert_eq!(persisted.unwrap().pending, candidates[1000..]);
+    }
+
+    #[test]
+    fn cleanup_rejects_missing_result_inventories_before_checkpointing() {
+        let candidate = archive_version("task", "data", "v1");
+        let state = PurgeState {
+            schema_version: STATE_SCHEMA,
+            pending: vec![candidate],
+            pending_prefixes: BTreeMap::new(),
+        };
+        let mut responses = vec![serde_json::json!({}), purge_response(&[])];
+        for field in [
+            "deleted",
+            "already_absent",
+            "retained_unmapped",
+            "retained_mapped",
+            "cleaned_prefixes",
+        ] {
+            let mut response = purge_response(&[]);
+            response.as_object_mut().unwrap().remove(field);
+            responses.push(response);
+        }
+        for response in responses {
+            let mut checkpointed = false;
+            assert!(
+                purge_groups(
+                    state.clone(),
+                    Vec::new(),
+                    &[],
+                    |_| Ok(response.clone()),
+                    |_| {
+                        checkpointed = true;
+                        Ok(())
+                    }
+                )
+                .is_err()
+            );
+            assert!(!checkpointed);
+        }
+    }
+
+    #[test]
+    fn cleanup_confirms_aggregated_deleted_and_absent_exact_versions() {
+        let first = archive_version("task", "data", "v1");
+        let second = archive_version("task", "data", "v2");
+        let mut alias = first.clone();
+        alias.pointer = "task/data.wm-storage.json".into();
+        let candidates = vec![first.clone(), alias, second.clone()];
+        let mut response = purge_response(&[]);
+        response["deleted"] = serde_json::json!([{
+            "object":first.object,"version_id":"exemplar-is-not-an-ack",
+            "deleted_version_ids":["v1"]
+        }]);
+        assert!(validate_purge_acknowledgements(&candidates, &response, &[], &[]).is_err());
+        response["already_absent"] = serde_json::json!([second]);
+        validate_purge_acknowledgements(&candidates, &response, &[], &[]).unwrap();
+        assert!(validate_purge_acknowledgements(&candidates, &response, &[], &[first]).is_err());
+        response["already_absent"][0]["object"] = "neighbor/data".into();
+        assert!(validate_purge_acknowledgements(&candidates, &response, &[], &[]).is_err());
     }
 
     #[test]
@@ -2043,5 +2611,266 @@ mod tests {
         let requests = worker.finish_requests();
         assert!(!requests.is_empty());
         assert!(requests.iter().all(|request| request.method != "DELETE"));
+    }
+
+    fn retained_destination_reference_fixture(
+        archived_again: bool,
+        tampered_registry: bool,
+        missing_binding: bool,
+    ) -> (
+        tempfile::TempDir,
+        GitRepo,
+        serde_json::Value,
+        crate::native_s3::tests::RoutedFixture,
+    ) {
+        use crate::native_s3::tests::{Reply, configure_repo, routed_fixture};
+
+        const ORIGINAL: &str = "20261008-120000-original";
+        const RENAMED: &str = "20261008-120000-renamed";
+        let directory = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: directory.path().join("checkout"),
+        };
+        fs::create_dir(&repo.root).unwrap();
+        let remote = directory.path().join("remote.git");
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        repo.run(["config", "user.name", "Retained history fixture"])
+            .unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        repo.run(["init", "-q", "--bare", remote.to_str().unwrap()])
+            .unwrap();
+        repo.run(["remote", "add", "origin", remote.to_str().unwrap()])
+            .unwrap();
+        let renamed = serde_json::json!({
+            "schema_version":1,"task_id":ORIGINAL,"migration_kind":"task-rename",
+            "source":ORIGINAL,"destination":RENAMED,"status":"copied",
+            "remote":"workspace-mgr","bucket":"fixture-bucket","remote_prefix":"root",
+            "transaction_id":"rename-fixture","versions":[{
+                "source_object":format!("{ORIGINAL}/data/a.bin"),"source_version_id":"original-version",
+                "destination_object":format!("{RENAMED}/data/a.bin"),"destination_version_id":"rename-copy",
+                "delete_marker":false,"size":3,"source_etag":"abc","destination_etag":"copied"
+            },{
+                "source_object":format!("{ORIGINAL}/retired"),"source_version_id":"original-marker",
+                "destination_object":format!("{RENAMED}/retired"),"destination_version_id":"rename-marker",
+                "delete_marker":true
+            }]
+        });
+        let receipt = if archived_again {
+            let destination = format!("2026/10/{RENAMED}");
+            serde_json::json!({
+                "schema_version":1,"task_id":ORIGINAL,"source":RENAMED,"destination":destination,
+                "status":"copied","remote":"workspace-mgr","bucket":"fixture-bucket","remote_prefix":"root",
+                "transaction_id":"archive-fixture","previous_receipt":renamed,
+                "versions":[{
+                    "source_object":format!("{RENAMED}/data/a.bin"),"source_version_id":"rename-copy",
+                    "destination_object":format!("{destination}/data/a.bin"),"destination_version_id":"archive-copy",
+                    "delete_marker":false,"size":3,"source_etag":"copied","destination_etag":"archived"
+                }]
+            })
+        } else {
+            renamed
+        };
+        let mut canonical = receipt.clone();
+        if tampered_registry {
+            canonical["transaction_id"] = "unrelated-transaction".into();
+        }
+        let registry_key = format!(
+            "root/.workspace-mgr/archive/{}.json",
+            encode_lower(Sha256::digest(
+                receipt["source"].as_str().unwrap().as_bytes()
+            ))
+        );
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "GET");
+            let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+            let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+            if query.contains_key("versions") {
+                assert_eq!(query["prefix"], registry_key);
+                return Reply::xml(&format!(
+                    "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>{registry_key}</Key><VersionId>registry-version</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-08T20:00:00Z</LastModified><ETag>registry-etag</ETag><Size>1</Size></Version></ListVersionsResult>"
+                ));
+            }
+            assert_eq!(query["versionId"], "registry-version");
+            assert_eq!(url.path(), format!("/fixture-bucket/{registry_key}"));
+            Reply {
+                status: 200,
+                headers: vec![("x-amz-version-id", "registry-version".into())],
+                body: serde_json::to_vec(&canonical).unwrap(),
+            }
+        });
+        configure_repo(&client, &repo);
+        fs::write(repo.root.join(".gitignore"), "/.workspace-mgr/local/\n").unwrap();
+        let destination = receipt["destination"].as_str().unwrap();
+        let path = format!("{destination}/{}", crate::archive_migration::RECEIPT_NAME);
+        fs::create_dir_all(repo.root.join(destination)).unwrap();
+        fs::write(repo.root.join(&path), receipt.to_string()).unwrap();
+        write_reference_directory(
+            &repo,
+            &format!("{destination}/data.wm-storage.json"),
+            "data",
+            "a.bin",
+            receipt["versions"][0]["destination_version_id"]
+                .as_str()
+                .unwrap(),
+        );
+        repo.run(["add", "."]).unwrap();
+        repo.run(["commit", "-q", "-m", "Publish copied task history"])
+            .unwrap();
+        repo.run(["push", "-q", "origin", "main"]).unwrap();
+        if !missing_binding {
+            crate::archive_registry::coordinate_published(&repo, &receipt).unwrap();
+        }
+        repo.run(["rm", &format!("{destination}/data.wm-storage.json")])
+            .unwrap();
+        repo.run([
+            "commit",
+            "-q",
+            "-m",
+            "Remove the final live pointer in a later publication",
+        ])
+        .unwrap();
+        repo.run(["push", "-q", "origin", "main"]).unwrap();
+        (directory, repo, receipt, worker)
+    }
+
+    #[test]
+    fn retained_copied_destination_is_protected_after_later_publication_removes_its_pointer() {
+        let (_directory, repo, receipt, worker) =
+            retained_destination_reference_fixture(false, false, false);
+        let candidate = |row: usize| ObjectVersion {
+            pointer: format!(
+                "{}.wm-storage.json",
+                receipt["versions"][row]["destination_object"]
+                    .as_str()
+                    .unwrap()
+            ),
+            object: receipt["versions"][row]["destination_object"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            version_id: receipt["versions"][row]["destination_version_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        };
+        let copied = candidate(0);
+        let marker = candidate(1);
+        let later = ObjectVersion {
+            version_id: "later-unmapped-generation".to_owned(),
+            ..copied.clone()
+        };
+        let adjacent = ObjectVersion {
+            object: format!("{}-adjacent", copied.object),
+            ..copied.clone()
+        };
+        let config = Config::load(&repo).unwrap();
+        let protected = referenced_objects(
+            &repo,
+            &config,
+            "origin",
+            &[copied.clone(), marker.clone(), later, adjacent],
+        )
+        .unwrap();
+        assert_eq!(protected, [copied, marker]);
+        assert!(!worker.finish_requests().is_empty());
+    }
+
+    #[test]
+    fn retained_destination_protection_ignores_relocated_previous_receipt_versions() {
+        let (_directory, repo, receipt, worker) =
+            retained_destination_reference_fixture(true, false, false);
+        let copied = ObjectVersion {
+            pointer: "retired.wm-storage.json".to_owned(),
+            object: receipt["versions"][0]["destination_object"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            version_id: "archive-copy".to_owned(),
+        };
+        let intermediate = ObjectVersion {
+            object: receipt["previous_receipt"]["versions"][0]["destination_object"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            version_id: "rename-copy".to_owned(),
+            ..copied.clone()
+        };
+        let protected = referenced_objects(
+            &repo,
+            &Config::load(&repo).unwrap(),
+            "origin",
+            &[copied.clone(), intermediate],
+        )
+        .unwrap();
+        assert_eq!(protected, [copied]);
+        assert!(!worker.finish_requests().is_empty());
+    }
+
+    #[test]
+    fn retained_destination_retirement_fails_closed_on_registry_or_git_binding_changes() {
+        for (tampered_registry, missing_binding) in [(true, false), (false, true)] {
+            let (_directory, repo, receipt, worker) =
+                retained_destination_reference_fixture(false, tampered_registry, missing_binding);
+            let candidate = ObjectVersion {
+                pointer: "retired.wm-storage.json".to_owned(),
+                object: receipt["versions"][0]["destination_object"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                version_id: "rename-copy".to_owned(),
+            };
+            let error =
+                referenced_objects(&repo, &Config::load(&repo).unwrap(), "origin", &[candidate])
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("canonical registry")
+                    || error.contains("canonical Git coordination binding"),
+                "{error}"
+            );
+            assert!(
+                worker
+                    .finish_requests()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_binding_protects_copies_before_merge_and_after_receipt_file_removal() {
+        let (_directory, repo, receipt, worker) =
+            retained_destination_reference_fixture(false, false, false);
+        // The only surviving control is the immutable canonical binding. A
+        // protective read must not require a shared-branch receipt or private
+        // copy journal, nor recreate either of them.
+        let path = format!(
+            "{}/{}",
+            receipt["destination"].as_str().unwrap(),
+            crate::archive_migration::RECEIPT_NAME
+        );
+        repo.run(["rm", &path]).unwrap();
+        repo.run(["commit", "-q", "-m", "Remove the task publication receipt"])
+            .unwrap();
+        repo.run(["push", "-q", "origin", "main"]).unwrap();
+        assert!(archive_receipts_at(&repo, "HEAD", &[]).unwrap().is_empty());
+        let object = receipt["versions"][0]["destination_object"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let retained =
+            retained_archive_destinations(&repo, &[receipt], &BTreeSet::from([object.clone()]))
+                .unwrap();
+        assert_eq!(
+            retained,
+            BTreeSet::from([(object, "rename-copy".to_owned())])
+        );
+        assert!(
+            worker
+                .finish_requests()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
     }
 }

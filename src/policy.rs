@@ -26,6 +26,9 @@ pub const ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION: semver::Version = semver::Vers
 /// compatible reader and writer.
 pub const ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION: semver::Version =
     semver::Version::new(0, 8, 10);
+/// Active task renames retain exact server-copied history while normal storage
+/// reconciliation may publish newer versions in the destination namespace.
+pub const TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 8, 11);
 /// The first release that preserves published Git LFS identities after archive
 /// relocation, even when an old root-prefix filter no longer matches.
 pub const ARCHIVED_GIT_LFS_MINIMUM_CLI_VERSION: semver::Version = semver::Version::new(0, 8, 8);

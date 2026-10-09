@@ -31,7 +31,7 @@ struct Metadata {
     generated: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Attempt {
     schema_version: u32,
     root: PathBuf,
@@ -182,11 +182,100 @@ pub fn moved(repo: &GitRepo, source: &str, destination: &str) -> Result<()> {
     save(&path, &attempt)
 }
 
+/// Before the first remote reservation/copy, repeated local renames collapse
+/// to the original physical source and newest destination. Preserve the first
+/// undo snapshot so cancellation restores the original task identity/path.
+pub(crate) fn record_retargeted_rename(
+    repo: &GitRepo,
+    owner: &ResolvedTask,
+    previous: &Value,
+    next: &Value,
+) -> Result<()> {
+    validate_planned_rename_retarget(repo, owner, previous)?;
+    let source = text_field(previous, "source")?;
+    let old_destination = text_field(previous, "destination")?;
+    let destination = text_field(next, "destination")?;
+    crate::archive_migration::validate(&format!("{destination}/{RECEIPT_NAME}"), next)?;
+    if next["source"] != previous["source"] || next["task_id"] != previous["task_id"] {
+        return Err(Error::message(
+            "task rename retarget changes its original source or identity",
+        ));
+    }
+    let mut attempt: Attempt = read(&attempt_path(repo, source, old_destination)?)?;
+    attempt.destination = destination.to_owned();
+    attempt.expected_receipt = Some(next.clone());
+    attempt.relocation = attempt
+        .relocation
+        .retarget(&resolved_under(&repo.root, destination))?;
+    attempt.status = "prepared".to_owned();
+    let path = attempt_path(repo, source, destination)?;
+    if path.exists() && read::<Attempt>(&path)?.status != "cancelled" {
+        return Err(Error::message(
+            "a pending migration already owns the rename destination",
+        ));
+    }
+    save(&path, &attempt)
+}
+
+fn text_field<'a>(receipt: &'a Value, field: &str) -> Result<&'a str> {
+    receipt[field]
+        .as_str()
+        .ok_or_else(|| Error::message(format!("rename migration lacks {field}")))
+}
+
+pub(crate) fn validate_planned_rename_retarget(
+    repo: &GitRepo,
+    owner: &ResolvedTask,
+    receipt: &Value,
+) -> Result<()> {
+    if !crate::archive_migration::is_task_rename(receipt)
+        || receipt["status"] != "planned"
+        || receipt["task_id"] != owner.task_id
+        || receipt["destination"].as_str() != owner.task_path.as_deref()
+    {
+        return Err(Error::message(
+            "another S3 rename after copying or publication is unsupported; preserve the existing immutable history binding",
+        ));
+    }
+    if !has_trusted_migration(repo, receipt)? {
+        return Err(Error::message(
+            "task rename retarget requires its original durable move journal",
+        ));
+    }
+    let source = text_field(receipt, "source")?;
+    let destination = text_field(receipt, "destination")?;
+    let identity = serde_json::to_vec(&[
+        text_field(receipt, "bucket")?,
+        text_field(receipt, "remote_prefix")?,
+        source,
+    ])
+    .map_err(|error| Error::message(error.to_string()))?;
+    let reservation = repo
+        .local_state_dir()?
+        .join("archive-reservations")
+        .join(format!(
+            "{}.json",
+            crate::hex::encode_lower(Sha256::digest(identity))
+        ));
+    if copy_journal(repo, source, destination)?.exists() || reservation.exists() {
+        return Err(Error::message(
+            "S3 rename copy has started; finish publication or cancel it before another rename",
+        ));
+    }
+    Ok(())
+}
+
 /// Bind an unpublished migration to its local attempt when one was recorded.
 /// Older receipts without an undo journal still use current manifest and
 /// exact-version transport validation, but cannot promise lossless cancel.
 pub(crate) fn validate_migration(repo: &GitRepo, receipt: &Value) -> Result<()> {
-    has_trusted_migration(repo, receipt).map(|_| ())
+    let trusted = has_trusted_migration(repo, receipt)?;
+    if crate::archive_migration::is_task_rename(receipt) && !trusted {
+        return Err(Error::message(
+            "task rename migration requires its original durable move journal",
+        ));
+    }
+    Ok(())
 }
 
 /// An exact locally recorded move is evidence that archive payloads already
@@ -302,7 +391,10 @@ pub fn record_pointer_rewrite(
     reject_symlink_traversal(&repo.root, &pointer, "archive rewritten pointer")?;
     let relative = pointer
         .strip_prefix(&format!("{destination}/"))
-        .filter(|path| storage_metadata::is_pointer(path))
+        .filter(|path| {
+            storage_metadata::is_pointer(path)
+                || crate::archive_migration::is_task_rename(receipt) && *path == TASK_MANIFEST_NAME
+        })
         .ok_or_else(|| Error::message("archive rewritten pointer escaped its destination"))?;
     let metadata = attempt
         .metadata
@@ -323,6 +415,60 @@ pub fn record_pointer_rewrite(
             .any(|generated| generated == rendered_bytes)
     {
         metadata.generated.push(rendered_bytes.to_vec());
+        save(&path, &attempt)?;
+    }
+    Ok(())
+}
+
+/// Native reconciliation may replace a copied binding when the payload was
+/// edited after rename. Its caller captures the authorized preimage before
+/// the engine runs, including on a failed upload, so retries/cancel never
+/// mistake independently edited metadata for an engine-generated binding.
+pub(crate) fn record_rename_reconciliation(
+    repo: &GitRepo,
+    receipts: &[Value],
+    before: &[(String, Vec<u8>)],
+) -> Result<()> {
+    for receipt in receipts
+        .iter()
+        .filter(|receipt| crate::archive_migration::is_task_rename(receipt))
+    {
+        let source = text_field(receipt, "source")?;
+        let destination = text_field(receipt, "destination")?;
+        let path = attempt_path(repo, source, destination)?;
+        // Reviewed rename receipts are portable; another checkout may have
+        // no private undo journal. Unpublished receipts were already required
+        // to carry one by migration preparation.
+        if !path.exists() {
+            continue;
+        }
+        let mut attempt: Attempt = read(&path)?;
+        if attempt.status == "published" {
+            continue;
+        }
+        if !matches!(attempt.status.as_str(), "prepared" | "moved") {
+            return Err(Error::message(
+                "rename reconciliation has no active move journal",
+            ));
+        }
+        validate_current_receipt(repo, &attempt, receipt)?;
+        for (pointer, prior) in before {
+            let Some(relative) = pointer.strip_prefix(&format!("{destination}/")) else {
+                continue;
+            };
+            let metadata = attempt.metadata.iter_mut().find(|metadata| metadata.path == relative)
+                .ok_or_else(|| Error::message("rename reconciliation created uncaptured storage metadata; publish or cancel the move before adding storage outputs"))?;
+            let absolute = resolved_under(&repo.root, pointer);
+            reject_symlink_file(&absolute)?;
+            validate_metadata_mode(metadata, &absolute)?;
+            validate_pointer_bytes(metadata, &absolute, prior)?;
+            let current = fs::read(&absolute).at(&absolute)?;
+            if metadata.before.as_deref() != Some(current.as_slice())
+                && !metadata.generated.contains(&current)
+            {
+                metadata.generated.push(current);
+            }
+        }
         save(&path, &attempt)?;
     }
     Ok(())
@@ -378,15 +524,9 @@ pub fn cancel(
     };
     let _lock = RepositoryLock::acquire(&repo)?;
     let config = Config::load_compatible(&repo)?;
-    let manifest = manifest.ok_or_else(|| {
-        Error::message("archive --cancel requires the owning infrastructure --manifest")
-    })?;
+    let manifest = manifest
+        .ok_or_else(|| Error::message("archive --cancel requires the owning task --manifest"))?;
     let owner = ResolvedTask::load(&repo, &config, manifest)?;
-    if owner.kind != TaskKind::Infrastructure {
-        return Err(Error::message(
-            "archive --cancel requires an infrastructure task",
-        ));
-    }
     crate::task_rename::validate_checkout(&repo, &owner, "archive cancel")?;
     let selected = selected
         .iter()
@@ -443,6 +583,28 @@ pub fn cancel(
         if attempt.status == "cancelled" {
             continue;
         }
+        if owner.kind == TaskKind::Deliverable {
+            let receipt = attempt
+                .expected_receipt
+                .as_ref()
+                .ok_or_else(receipt_edit_error)?;
+            if !crate::archive_migration::is_task_rename(receipt)
+                || receipt["task_id"] != owner.task_id
+                || ![
+                    Some(attempt.source.as_str()),
+                    Some(attempt.destination.as_str()),
+                ]
+                .contains(&owner.task_path.as_deref())
+            {
+                return Err(Error::message(
+                    "deliverable cancellation is limited to its own task rename migration",
+                ));
+            }
+            crate::archive_migration::validate(
+                &format!("{}/{RECEIPT_NAME}", attempt.destination),
+                receipt,
+            )?;
+        }
         if attempt.status == "published" {
             return Err(Error::message(
                 "archive cancel refuses an attempt whose publication branch was pushed; revert it through review",
@@ -455,7 +617,7 @@ pub fn cancel(
         for path in [&attempt.source, &attempt.destination] {
             repo_path(path, "archive cancel path")?;
             reject_symlink_traversal(&repo.root, path, "archive cancel path")?;
-            if !allowed(path, &owner.scopes()) {
+            if owner.kind == TaskKind::Infrastructure && !allowed(path, &owner.scopes()) {
                 return Err(Error::message(
                     "archive cancel requires both source and destination scopes",
                 ));
@@ -698,6 +860,29 @@ pub fn cancel(
 }
 
 fn validate_metadata(repo: &GitRepo, destination: &Path, attempt: &Attempt) -> Result<()> {
+    if attempt
+        .expected_receipt
+        .as_ref()
+        .is_some_and(crate::archive_migration::is_task_rename)
+    {
+        let scope = destination
+            .strip_prefix(&repo.root)
+            .map_err(|error| Error::message(error.to_string()))?
+            .to_string_lossy()
+            .into_owned();
+        let pointers = storage_metadata::discover(repo, std::slice::from_ref(&scope))?;
+        if pointers.iter().any(|pointer| {
+            let relative = &pointer[scope.len() + 1..];
+            !attempt
+                .metadata
+                .iter()
+                .any(|metadata| metadata.path == relative)
+        }) {
+            return Err(Error::message(
+                "task rename has new storage metadata; finish or cancel the move before adding storage outputs",
+            ));
+        }
+    }
     for item in &attempt.metadata {
         repo_path(&item.path, "archive original metadata")?;
         reject_symlink_traversal(destination, &item.path, "archive metadata")?;
@@ -721,6 +906,13 @@ fn validate_metadata(repo: &GitRepo, destination: &Path, attempt: &Attempt) -> R
             if current != generated {
                 return Err(receipt_edit_error());
             }
+        } else if item.path == TASK_MANIFEST_NAME
+            && attempt
+                .expected_receipt
+                .as_ref()
+                .is_some_and(crate::archive_migration::is_task_rename)
+        {
+            validate_pointer_bytes(item, &path, &current)?;
         } else if item.path == TASK_MANIFEST_NAME {
             let mut expected: crate::manifest::TaskManifest = toml::from_str(
                 std::str::from_utf8(

@@ -922,6 +922,129 @@ fn complete_history_preserves_null_versions_retired_keys_markers_and_flat_suffix
 }
 
 #[test]
+fn renamed_task_history_verification_keeps_exact_copies_after_later_publications() {
+    let (mut fixture, receipt) = renamed_history_fixture();
+    fixture.store.add(
+        "storage/20260702-123456-renamed/data",
+        "later",
+        b"updated payload",
+        false,
+        None,
+        Value::Null,
+    );
+    fixture.store.add(
+        "storage/20260702-123456-renamed/new",
+        "new-file",
+        b"new payload",
+        false,
+        None,
+        Value::Null,
+    );
+    let context = receipt_context(&receipt);
+    assert!(verify_history_with(&fixture.store, &context, &mut receipt.clone()).is_err());
+    verify_receipt_history_with(&fixture.store, &context, &mut receipt.clone()).unwrap();
+    fixture.payload["receipt"] = receipt.clone();
+    let verified = fixture.run("verify").unwrap();
+    assert_eq!(verified["migration_kind"], "task-rename");
+    assert_eq!(rows(&verified).unwrap().len(), 2);
+    // Private copy retries retain strict complete destination ownership.
+    assert!(fixture.run("copy").is_err());
+}
+
+#[test]
+fn renamed_task_subset_verification_still_requires_every_copied_version_and_marker() {
+    for marker in [false, true] {
+        let (fixture, receipt) = renamed_history_fixture();
+        let removed = rows(&receipt)
+            .unwrap()
+            .iter()
+            .find(|row| row["delete_marker"] == marker)
+            .unwrap()["destination_version_id"]
+            .clone();
+        fixture.store.state.borrow_mut().versions.retain(|row| {
+            !(row.value["Key"]
+                .as_str()
+                .unwrap()
+                .starts_with("storage/20260702-123456-renamed/")
+                && row.value["VersionId"] == removed)
+        });
+        assert!(
+            verify_receipt_history_with(
+                &fixture.store,
+                &receipt_context(&receipt),
+                &mut receipt.clone()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("lost a previously copied")
+        );
+    }
+}
+
+fn renamed_history_fixture() -> (Fixture, Value) {
+    let mut fixture = Fixture::new();
+    let source = "20260702-123456-original";
+    let destination = "20260702-123456-renamed";
+    fixture.payload["source"] = source.into();
+    fixture.payload["destination"] = destination.into();
+    fixture.payload["state_path"] =
+        crate::archive_cancel::copy_journal(&fixture.repo, source, destination)
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+            .into();
+    fixture.store.add(
+        &format!("storage/{source}/data"),
+        "original",
+        b"payload",
+        false,
+        None,
+        Value::Null,
+    );
+    fixture.store.add(
+        &format!("storage/{source}/retired"),
+        "marker",
+        b"",
+        true,
+        None,
+        Value::Null,
+    );
+    fixture.reserve();
+    let mut receipt = fixture.run("copy").unwrap();
+    receipt["migration_kind"] = "task-rename".into();
+    receipt["task_id"] = source.into();
+    (fixture, receipt)
+}
+
+#[test]
+fn raw_rename_discriminator_cannot_relax_invalid_migration_identity() {
+    let (fixture, receipt) = renamed_history_fixture();
+    for (field, value) in [
+        ("migration_kind", "unknown-migration"),
+        ("task_id", "20260703-123456-foreign"),
+        ("task_id", "not-a-task-id"),
+    ] {
+        let mut invalid = receipt.clone();
+        invalid[field] = value.into();
+        assert!(
+            verify_receipt_history_with(
+                &fixture.store,
+                &receipt_context(&invalid),
+                &mut invalid.clone()
+            )
+            .is_err()
+        );
+        assert!(validate_registry_receipt(&fixture.store, &invalid).is_err());
+    }
+    let mut unrelated_archive = fixture.journal();
+    unrelated_archive["source"] = "task".into();
+    unrelated_archive["destination"] = "2026/07/task".into();
+    unrelated_archive["migration_kind"] = "task-rename".into();
+    unrelated_archive["task_id"] = "task".into();
+    assert!(validated_rename_receipt(&unrelated_archive).is_err());
+}
+
+#[test]
 fn legacy_copy_retry_and_cancel_fence_0_6_without_changing_the_public_receipt() {
     let mut fixture = Fixture::new();
     fixture

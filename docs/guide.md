@@ -288,7 +288,10 @@ rewrites its manifest. The immutable task ID and original target branch remain
 stable so the same draft pull request continues to represent the chat. The
 command writes no remote; the next ordinary `plan` shows both the published old
 path and current path, and `publish` removes the old Git tree after preserving
-Git/S3 placement history. The agent then updates the existing pull request's
+Git/S3 placement history. For versioned S3, rename records all source versions
+and delete markers; publication copies them through the S3 API and uploads
+only new or edited payloads. Its receipt requires CLI 0.8.11. Source cleanup
+waits for the copied receipt to merge. The agent then updates the existing pull request's
 title and description. An infrastructure rename uses `--manifest` to update its
 private current slug while its manifest path remains stable.
 
@@ -775,6 +778,11 @@ If the merged work requires a newer release than the installed one, refresh
 refuses and leaves the checkout untouched; after the user approves and
 completes the update, run it again.
 
+If S3 cleanup fails after Git synchronization, refresh retains the successful
+Git result and reports `storage.purge.errors`, `cleanup_pending` and a warning.
+Confirmed source-prefix groups are checkpointed before the next group; rerun
+refresh to finish the durable queue. Group progress is printed to stderr.
+
 After incoming content is materialized and verified, refresh automatically
 cleans local and configured-remote branches that still match a verified merged
 GitHub pull request in the same repository and against the configured base.
@@ -966,7 +974,7 @@ best-effort check is bounded, failure-silent, and never performs a remote write.
 | `doctor` | Read-only checks/output | S3 bucket settings when configured | None |
 | `task list`, `task path`, `task show` | Read-only local discovery; no cache writes or state migration | None, including no update check | None |
 | `task create` | Creates task files and a local branch ref | Fetches the Git base branch | None |
-| `task rename` | Moves a deliverable directory and rewrites task metadata | Fetches Git refs to reject merged tasks, collisions, and a newer required release | None |
+| `task rename` | Moves a deliverable directory, preserves bindings and records a history migration receipt | Fetches Git refs to reject merged tasks, collisions, and a newer required release; reads complete versioned S3 history | None; publication uses server-side history copy |
 | `task upgrade` | Upgrades current task metadata while preserving compatible saved fields; dry-run changes nothing | Fetches the configured shared branch for current manifest identity and version control | None |
 | `archive` | Moves done task directories and records migration receipts in an infrastructure task; dry-run changes no content | Queries current GitHub PR state: OPEN is pending; closed or no matching PR is done; query failures are errors. Reads current task/storage metadata and complete S3 version history | None; publication copies history and records exact-version mappings |
 | `task status`, `storage status` | Read-only report | None | None |

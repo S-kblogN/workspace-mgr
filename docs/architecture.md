@@ -412,10 +412,13 @@ branch preserves the existing pull request. When a published deliverable path
 differs from the current path, publication finds the prior manifest by stable
 task ID, treats that old tree as a temporary cleanup scope, maps published
 placement history to the new path, and removes the old tree in the same commit.
-Version-aware S3 object IDs are path-bound, so local rename removes their old
-path bindings from moved pointers. The next publish creates and verifies new
-object versions at the new path before publishing Git, then permanently deletes
-every version at the old path unless a current remote branch or tag protects it.
+Version-aware S3 object IDs are path-bound. Local rename retains source bindings
+and freezes a full-history receipt with `migration_kind: task-rename`. Publication
+uses server-side copy, verifies destination versions and rewrites bindings;
+new or changed active payloads then use normal reconciliation. The canonical
+registry keeps historical source identities resolvable. Source retirement waits
+for the complete copied receipt on the shared branch and retains protected or
+unmapped history. Marked rename receipts require CLI 0.8.11.
 
 For a task publication, the CLI:
 

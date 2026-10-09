@@ -18,6 +18,7 @@ const ARCHIVE_SUFFIX: &str = "/.workspace-mgr-archive.json";
 const MAX_ARCHIVE_HOPS: usize = 32;
 const WORKERS: usize = 16;
 const PURGE_WORKERS: usize = 4;
+const PURGE_BATCH_SIZE: usize = 1000;
 
 fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
@@ -246,10 +247,17 @@ fn pending_aliases(client: &S3Client, entries: &mut [Entry], receipts: &[Value])
         let destination = string(receipt, "destination")?;
         validate_task_prefix(source)?;
         validate_task_prefix(destination)?;
+        let rename = crate::archive_migration::is_task_rename(receipt);
+        if receipt.get("migration_kind").is_some() {
+            crate::archive_migration::validate(
+                &format!("{destination}{}", ARCHIVE_SUFFIX),
+                receipt,
+            )?;
+        }
         if source == destination
             || source.starts_with(&format!("{destination}/"))
             || destination.starts_with(&format!("{source}/"))
-            || source.rsplit('/').next() != destination.rsplit('/').next()
+            || !rename && source.rsplit('/').next() != destination.rsplit('/').next()
         {
             return Err(Error::message("invalid pending archive task prefixes"));
         }
@@ -714,10 +722,212 @@ pub(crate) fn purge(repo: &GitRepo, operation: &str, payload: &Value) -> Result<
     }
     let client = S3Client::from_repo(repo)?;
     check_client_versioning(&client)?;
-    delete_candidates(&client, repo, payload)
+    delete_candidates_with_catalog(&client, repo, payload, || {
+        bound_destination_receipts(&client, repo)
+    })
 }
 
+#[cfg(test)]
 fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Result<Value> {
+    delete_candidates_with_catalog(client, repo, payload, || Ok(DestinationCatalog::default()))
+}
+
+#[derive(Default)]
+struct DestinationCatalog {
+    receipts: Vec<Value>,
+    binding_snapshot: Option<(String, String)>,
+}
+
+fn destination_binding_snapshot(repo: &GitRepo, remote: &str) -> Result<String> {
+    let observed = repo.run([
+        "ls-remote",
+        "--refs",
+        "--",
+        remote,
+        "refs/tags/workspace-mgr/archive-registry/*",
+    ])?;
+    let mut bindings = BTreeMap::new();
+    for line in observed.stdout.lines() {
+        let (oid, reference) = line
+            .split_once('\t')
+            .ok_or_else(|| Error::message("invalid archive destination binding response"))?;
+        if ![40, 64].contains(&oid.len())
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !reference.starts_with("refs/tags/workspace-mgr/archive-registry/")
+            || bindings
+                .insert(reference.to_owned(), oid.to_owned())
+                .is_some()
+        {
+            return Err(Error::message(
+                "ambiguous archive destination binding response",
+            ));
+        }
+    }
+    Ok(bindings
+        .into_iter()
+        .map(|(reference, oid)| format!("{oid}\t{reference}\n"))
+        .collect())
+}
+
+/// Registry claims survive removal of the receipt from a live task tree and
+/// exist before a task publication reaches the shared branch. Discover those
+/// canonical Git controls once, without listing the S3 registry namespace.
+fn bound_destination_receipts(client: &S3Client, repo: &GitRepo) -> Result<DestinationCatalog> {
+    use sha2::{Digest, Sha256};
+
+    let config = crate::config::Config::load(repo)?;
+    let remote = &config.git.remote;
+    repo.validate_remote_name(remote)?;
+    let fetch = repo.run(["remote", "get-url", "--all", remote])?;
+    let push = repo.run(["remote", "get-url", "--push", "--all", remote])?;
+    if fetch.stdout.lines().count() != 1 || fetch.stdout != push.stdout {
+        return Err(Error::message(
+            "archive destination protection requires one identical Git fetch and push destination",
+        ));
+    }
+    let namespace = format!(
+        "refs/workspace-mgr/archive-destination-protection/{}",
+        crate::hex::encode_lower(Sha256::digest(fetch.stdout.as_bytes()))
+    );
+    let refspec = format!("+refs/tags/workspace-mgr/archive-registry/*:{namespace}/*");
+    repo.run([
+        "fetch",
+        "--quiet",
+        "--prune",
+        "--no-tags",
+        "--no-write-fetch-head",
+        remote,
+        &refspec,
+    ])?;
+    let listing = repo.run([
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        &namespace,
+    ])?;
+    let mut receipts = Vec::new();
+    let mut bindings = BTreeMap::new();
+    for line in listing.stdout.lines() {
+        let (oid, reference) = line
+            .split_once(' ')
+            .ok_or_else(|| Error::message("invalid archive destination protection ref response"))?;
+        let suffix = reference
+            .strip_prefix(&format!("{namespace}/"))
+            .ok_or_else(|| {
+                Error::message("archive destination protection ref escaped its namespace")
+            })?;
+        let body = crate::archive_git_control::read_body(&repo.root, oid)?;
+        let receipt: Value = serde_json::from_str(&body)
+            .map_err(|error| Error::message(format!("invalid bound archive receipt: {error}")))?;
+        if crate::archive_registry::binding_ref(&receipt)?
+            != format!("refs/tags/workspace-mgr/archive-registry/{suffix}")
+        {
+            return Err(Error::message(
+                "archive destination claim has an invalid receipt identity",
+            ));
+        }
+        bindings.insert(
+            format!("refs/tags/workspace-mgr/archive-registry/{suffix}"),
+            oid.to_owned(),
+        );
+        if receipt["bucket"] == client.bucket && receipt["remote_prefix"] == client.prefix {
+            receipts.push(receipt);
+        }
+    }
+    let snapshot = bindings
+        .into_iter()
+        .map(|(reference, oid)| format!("{oid}\t{reference}\n"))
+        .collect::<String>();
+    if destination_binding_snapshot(repo, remote)? != snapshot {
+        return Err(Error::message(
+            "archive destination claims changed during discovery",
+        ));
+    }
+    Ok(DestinationCatalog {
+        receipts,
+        binding_snapshot: Some((remote.clone(), snapshot)),
+    })
+}
+
+fn retained_destination_versions(
+    client: &S3Client,
+    repo: &GitRepo,
+    catalog: &DestinationCatalog,
+    object: &str,
+) -> Result<BTreeSet<String>> {
+    verify_destination_catalog(repo, catalog)?;
+    let receipts = &catalog.receipts;
+    let objects = BTreeSet::from([object.to_owned()]);
+    let protected = crate::s3_purge::retained_archive_destinations(repo, receipts, &objects)?;
+    if protected.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let remote = key(client, object);
+    let present = client
+        .list_versions(&remote)?
+        .into_iter()
+        .filter(|row| row["Key"] == remote)
+        .map(|row| Ok((string(&row, "VersionId")?.to_owned(), row)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for receipt in receipts {
+        for row in receipt["versions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| row["destination_object"] == object)
+        {
+            let version = string(row, "destination_version_id")?;
+            let actual = present
+                .get(version)
+                .ok_or_else(|| Error::message("retained archive destination version is missing"))?;
+            if actual["delete_marker"] != row["delete_marker"] {
+                return Err(Error::message(
+                    "retained archive destination changed version kind",
+                ));
+            }
+            if row["delete_marker"] == true {
+                continue;
+            }
+            let info = client
+                .call_s3(
+                    "head_object",
+                    &json!({
+                        "Bucket":client.bucket,"Key":remote,"VersionId":version
+                    }),
+                    None,
+                )?
+                .value;
+            if info["VersionId"] != version
+                || info["DeleteMarker"] == true
+                || info["ContentLength"] != row["size"]
+                || etag(string(&info, "ETag")?) != etag(string(row, "destination_etag")?)
+            {
+                return Err(Error::message(
+                    "retained archive destination has invalid immutable metadata",
+                ));
+            }
+        }
+    }
+    verify_destination_catalog(repo, catalog)?;
+    Ok(protected.into_iter().map(|(_, version)| version).collect())
+}
+
+fn verify_destination_catalog(repo: &GitRepo, catalog: &DestinationCatalog) -> Result<()> {
+    if let Some((remote, expected)) = &catalog.binding_snapshot
+        && destination_binding_snapshot(repo, remote)? != *expected
+    {
+        return Err(Error::message(
+            "archive destination claims changed during retirement",
+        ));
+    }
+    Ok(())
+}
+
+fn delete_candidates_with_catalog(
+    client: &S3Client,
+    repo: &GitRepo,
+    payload: &Value,
+    catalog: impl FnOnce() -> Result<DestinationCatalog>,
+) -> Result<Value> {
     let candidates = payload
         .get("candidates")
         .unwrap_or(payload)
@@ -837,6 +1047,7 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
     let mut deleted = Vec::new();
     let mut absent = Vec::new();
     let mut retained = Vec::new();
+    let mut retained_mapped = Vec::new();
     let mut cleaned = BTreeSet::new();
     for (source, objects) in &archives {
         let prefix = key(client, &format!("{source}/"));
@@ -845,9 +1056,22 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
             .into_iter()
             .map(|v| Ok((identity(&v)?, v)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        verify_registry(source, objects, Some(&present))?;
+        let receipt = verify_registry(source, objects, Some(&present))?;
+        let mapped = receipt["versions"]
+            .as_array()
+            .ok_or_else(|| Error::message("invalid canonical registry"))?
+            .iter()
+            .map(|row| {
+                Ok((
+                    string(row, "source_object")?.to_owned(),
+                    string(row, "source_version_id")?.to_owned(),
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
         generic.retain(|object, _| !object.starts_with(&format!("{source}/")));
         let mut wanted = BTreeSet::new();
+        let mut exact = Vec::new();
+        let mut existing_by_object = BTreeMap::new();
         for (object, candidates) in objects {
             let remote = key(client, object);
             let requested = candidates
@@ -858,23 +1082,43 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
             for version in requested {
                 wanted.insert((remote.clone(), version.clone()));
                 if present.contains_key(&(remote.clone(), version.clone())) {
-                    verify_registry(source, objects, Some(&present))?;
-                    client.call_s3(
-                        "delete_object",
-                        &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
-                        None,
-                    )?;
+                    exact.push((remote.clone(), version.clone()));
                     existing.push(version);
                 }
             }
-            if existing.is_empty() {
-                absent.push(candidates[0].clone());
-            } else {
+            existing_by_object.insert(object, existing);
+        }
+        // Every mutation request has one freshly verified immutable mapping,
+        // Git publication and complete destination history. Rechecking that
+        // entire history for every version would make a prefix quadratic.
+        // The batch helper deletes only these exact IDs and validates every
+        // acknowledgement; retries cannot target a replacement generation.
+        delete_archive_versions(client, &exact, || {
+            verify_registry(source, objects, Some(&present)).map(|_| ())
+        })?;
+        for (object, candidates) in objects {
+            let existing = existing_by_object.remove(object).unwrap_or_default();
+            absent.extend(
+                candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate["version_id"].as_str().is_some_and(|version| {
+                            !present.contains_key(&(key(client, object), version.to_owned()))
+                        })
+                    })
+                    .cloned(),
+            );
+            if !existing.is_empty() {
                 let mut result = candidates[0].clone();
                 result["deleted_version_ids"] = existing.into();
                 deleted.push(result);
             }
         }
+        // Do not report retirement completion if the canonical archive or its
+        // copied versions changed while the source request was in flight.
+        verify_registry(source, objects, Some(&present))?;
+        // Take the source snapshot last: a write during destination HEADs
+        // must remain queued rather than disappearing from an earlier scan.
         let remaining = client.list_versions(&prefix)?;
         if remaining
             .iter()
@@ -888,12 +1132,31 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
             cleaned.insert(source.clone());
         }
         for item in remaining {
-            retained.push(json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":format!("{source}/{}",string(&item,"Key")?.strip_prefix(&prefix).ok_or_else(||Error::message("purge history escaped prefix"))?),"version_id":string(&item,"VersionId")?}));
+            let object = format!(
+                "{source}/{}",
+                string(&item, "Key")?
+                    .strip_prefix(&prefix)
+                    .ok_or_else(|| Error::message("purge history escaped prefix"))?
+            );
+            let version = string(&item, "VersionId")?;
+            let retained_item = json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":object,"version_id":version});
+            if mapped.contains(&(object, version.to_owned())) {
+                retained_mapped.push(retained_item);
+            } else {
+                retained.push(retained_item);
+            }
         }
     }
     // Archive prefixes finish first. Each worker owns one distinct logical key
     // and performs fresh ancestor registry checks, exact deletes and verification.
     // No worker updates pointer documents, coordination bindings or purge state.
+    // Source-registry retirement below keeps its stronger publication proof.
+    // Destination protection is only needed for ordinary key retirement.
+    let destination_catalog = if generic.is_empty() {
+        DestinationCatalog::default()
+    } else {
+        catalog()?
+    };
     let generic = generic.into_iter().enumerate().collect::<Vec<_>>();
     let mut completed = bounded_map_with_workers(
         &generic,
@@ -903,6 +1166,7 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
             let mut deleted = Vec::new();
             let mut absent = Vec::new();
             let mut retained = Vec::new();
+            let mut retained_mapped = Vec::new();
             let parts = object.split('/').collect::<Vec<_>>();
             let mut archive = None;
             for length in (1..parts.len()).rev() {
@@ -940,27 +1204,60 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
                     .cloned()
                     .collect::<Vec<_>>();
                 let objects = BTreeMap::from([(object.clone(), exact.clone())]);
+                let requested = exact
+                    .iter()
+                    .map(|candidate| string(candidate, "version_id").map(str::to_owned))
+                    .collect::<Result<BTreeSet<_>>>()?;
                 if !exact.is_empty() {
                     verify_registry(&source, &objects, None)?;
                 }
                 let mut present = BTreeSet::new();
+                let mut mapped_versions = Vec::new();
                 for item in versions {
                     let version = string(&item, "VersionId")?;
                     present.insert(version.to_owned());
-                    if mapped.contains(&(object.clone(), version.to_owned())) {
+                    if requested.contains(version) {
                         if exact.is_empty() {
                             return Err(Error::message(
                                 "generic archive retirement has no coordinated exact mapping",
                             ));
                         }
-                        verify_registry(&source, &objects, None)?;
-                        client.call_s3(
-                            "delete_object",
-                            &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
-                            None,
-                        )?;
+                        mapped_versions.push((remote.clone(), version.to_owned()));
                     } else {
-                        retained.push(json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":object,"version_id":version}));
+                        let retained_item = json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":object,"version_id":version});
+                        if mapped.contains(&(object.clone(), version.to_owned())) {
+                            retained_mapped.push(retained_item);
+                        } else {
+                            retained.push(retained_item);
+                        }
+                    }
+                }
+                delete_archive_versions(client, &mapped_versions, || {
+                    verify_registry(&source, &objects, None).map(|_| ())
+                })?;
+                if !exact.is_empty() {
+                    verify_registry(&source, &objects, None)?;
+                    let remaining = client.list_versions(&remote)?;
+                    if remaining.iter().any(|item| {
+                        item["Key"] == remote
+                            && item["VersionId"]
+                                .as_str()
+                                .is_some_and(|version| requested.contains(version))
+                    }) {
+                        return Err(Error::message(
+                            "mapped archive object versions still exist after permanent deletion",
+                        ));
+                    }
+                    retained.clear();
+                    retained_mapped.clear();
+                    for item in remaining.iter().filter(|item| item["Key"] == remote) {
+                        let version = string(item, "VersionId")?;
+                        let retained_item = json!({"pointer":format!("{source}{ARCHIVE_SUFFIX}"),"object":object,"version_id":version});
+                        if mapped.contains(&(object.clone(), version.to_owned())) {
+                            retained_mapped.push(retained_item);
+                        } else {
+                            retained.push(retained_item);
+                        }
                     }
                 }
                 for candidate in candidates {
@@ -972,19 +1269,48 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
                     }
                 }
             } else {
+                let verify_destinations =
+                    || retained_destination_versions(client, repo, &destination_catalog, object);
+                let protected = verify_destinations()?;
                 if versions.is_empty() {
-                    absent.push(candidates[0].clone());
-                    return Ok((*index, deleted, absent, retained));
+                    absent.extend(candidates.iter().cloned());
+                    return Ok((*index, deleted, absent, retained, retained_mapped));
                 }
-                let mut ids = versions
+                let present = versions
                     .iter()
                     .map(|item| string(item, "VersionId").map(str::to_owned))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<BTreeSet<_>>>()?;
+                absent.extend(
+                    candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate["version_id"]
+                                .as_str()
+                                .is_some_and(|version| !present.contains(version))
+                        })
+                        .cloned(),
+                );
+                retained_mapped.extend(
+                    candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate["version_id"].as_str().is_some_and(|version| {
+                                present.contains(version) && protected.contains(version)
+                            })
+                        })
+                        .cloned(),
+                );
+                let mut ids = present.difference(&protected).cloned().collect::<Vec<_>>();
                 if ids.len() == 1 || ids.iter().any(|version| version == "null") {
                     // A bucket can retain its pre-versioning null generation.
                     // Keep the existing explicit single-delete behavior for
                     // that inventory; the batch helper accepts immutable IDs.
-                    for version in &ids {
+                    for (index, version) in ids.iter().enumerate() {
+                        if index != 0 && verify_destinations()? != protected {
+                            return Err(Error::message(
+                                "archive destination protection changed during retirement",
+                            ));
+                        }
                         client.call_s3(
                             "delete_object",
                             &json!({"Bucket":client.bucket,"Key":remote,"VersionId":version}),
@@ -1000,30 +1326,46 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
                         .iter()
                         .map(|version| (remote.clone(), version.clone()))
                         .collect::<Vec<_>>();
-                    client.delete_versions(&exact)?;
+                    delete_archive_versions(client, &exact, || {
+                        if verify_destinations()? != protected {
+                            return Err(Error::message(
+                                "archive destination protection changed during retirement",
+                            ));
+                        }
+                        Ok(())
+                    })?;
                 }
-                if client
-                    .list_versions(&remote)?
-                    .iter()
-                    .any(|v| v["Key"] == remote)
-                {
+                if verify_destinations()? != protected {
+                    return Err(Error::message(
+                        "archive destination protection changed during retirement",
+                    ));
+                }
+                if client.list_versions(&remote)?.iter().any(|v| {
+                    v["Key"] == remote
+                        && v["VersionId"]
+                            .as_str()
+                            .is_none_or(|id| !protected.contains(id))
+                }) {
                     return Err(Error::message(format!(
                         "managed-storage object versions still exist after permanent deletion: {object}"
                     )));
                 }
                 ids.sort();
-                let mut result = candidates[0].clone();
-                result["deleted_version_ids"] = ids.into();
-                deleted.push(result);
+                if !ids.is_empty() {
+                    let mut result = candidates[0].clone();
+                    result["deleted_version_ids"] = ids.into();
+                    deleted.push(result);
+                }
             }
-            Ok((*index, deleted, absent, retained))
+            Ok((*index, deleted, absent, retained, retained_mapped))
         },
     )?;
-    completed.sort_by_key(|(index, _, _, _)| *index);
-    for (_, object_deleted, object_absent, object_retained) in completed {
+    completed.sort_by_key(|(index, _, _, _, _)| *index);
+    for (_, object_deleted, object_absent, object_retained, object_retained_mapped) in completed {
         deleted.extend(object_deleted);
         absent.extend(object_absent);
         retained.extend(object_retained);
+        retained_mapped.extend(object_retained_mapped);
     }
     retained.sort_by_key(|v| {
         (
@@ -1033,8 +1375,44 @@ fn delete_candidates(client: &S3Client, repo: &GitRepo, payload: &Value) -> Resu
         )
     });
     Ok(
-        json!({"mode":"permanent-version-deletion","remote":"workspace-mgr","deleted":deleted,"already_absent":absent,"retained_unmapped":retained,"retained_mapped":[],"cleaned_prefixes":cleaned}),
+        json!({"mode":"permanent-version-deletion","remote":"workspace-mgr","deleted":deleted,"already_absent":absent,"retained_unmapped":retained,"retained_mapped":retained_mapped,"cleaned_prefixes":cleaned}),
     )
+}
+
+/// The caller has just verified the complete mapping and destination before
+/// the first request. Repeat that authorization before subsequent requests.
+/// A pre-versioning null source generation retains its explicit single-delete
+/// protocol; it cannot enter the immutable batch helper's retry contract.
+fn delete_archive_versions(
+    client: &S3Client,
+    versions: &[(String, String)],
+    mut verify: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let immutable = versions
+        .iter()
+        .filter(|(_, version)| version != "null")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut started = false;
+    for batch in immutable.chunks(PURGE_BATCH_SIZE) {
+        if started {
+            verify()?;
+        }
+        client.delete_versions(batch)?;
+        started = true;
+    }
+    for (key, version) in versions.iter().filter(|(_, version)| version == "null") {
+        if started {
+            verify()?;
+        }
+        client.call_s3(
+            "delete_object",
+            &json!({"Bucket":client.bucket,"Key":key,"VersionId":version}),
+            None,
+        )?;
+        started = true;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
