@@ -276,6 +276,9 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
             .map_err(|error| {
                 Error::message(format!("invalid archive receipt in {source}: {error}"))
             })?;
+        if let Some(previous) = &previous_receipt {
+            require_previous_source_retired(&repo, source, &task.task_id, previous)?;
+        }
         if previous_receipt
             .as_ref()
             .is_some_and(|receipt| receipt["status"] == "planned")
@@ -342,6 +345,72 @@ pub fn archive(options: &ArchiveOptions) -> Result<ArchiveReport> {
         remote_writes: false,
         notices,
     })
+}
+
+/// Once a later outer receipt replaces this one, its original publication
+/// path and physical intermediate copies may disappear. Finish the prior
+/// source obligation first, including history a fresh checkout never queued.
+fn require_previous_source_retired(
+    repo: &GitRepo,
+    current_source: &str,
+    task_id: &str,
+    receipt: &serde_json::Value,
+) -> Result<()> {
+    archive_migration::validate(&format!("{current_source}/{RECEIPT_NAME}"), receipt)?;
+    if receipt["task_id"] != task_id {
+        return Err(Error::message(
+            "previous archive receipt belongs to another immutable task identity",
+        ));
+    }
+    // Planned moves are rejected by the existing publication precondition.
+    // Local-only receipts have no physical source namespace to retire.
+    if receipt["status"] != "copied" || receipt.get("bucket").is_none() {
+        return Ok(());
+    }
+    let client = crate::native_s3::S3Client::from_repo(repo)?;
+    if receipt["bucket"] != client.bucket
+        || receipt["remote_prefix"] != client.prefix
+        || receipt["remote"] != "workspace-mgr"
+    {
+        return Err(Error::message(
+            "previous archive receipt selects another storage location or remote",
+        ));
+    }
+    let source = receipt["source"]
+        .as_str()
+        .expect("validated receipt source");
+    let canonical = crate::native_archive::registry_read(&client, repo, source)?;
+    if canonical.as_ref() != Some(receipt) {
+        return Err(Error::message(
+            "previous archive receipt differs from its canonical remote registry",
+        ));
+    }
+    crate::s3_purge::verify_retained_destination_binding(repo, receipt)?;
+    let prefix = if client.prefix.is_empty() {
+        format!("{source}/")
+    } else {
+        format!("{}/{source}/", client.prefix.trim_end_matches('/'))
+    };
+    if !client.list_versions(&prefix)?.is_empty() {
+        return Err(Error::message(
+            "finish prior source retirement with refresh before archiving again; the previous S3 source prefix still contains object versions or delete markers",
+        ));
+    }
+    let pending = crate::s3_purge::preview(repo)?;
+    if pending
+        .pending_prefixes
+        .iter()
+        .any(|prefix| prefix == source)
+        || pending
+            .pending
+            .iter()
+            .any(|object| object.object.starts_with(&format!("{source}/")))
+    {
+        return Err(Error::message(
+            "finish prior source retirement with refresh before archiving again; the previous S3 source is empty but durable retirement records still require checkpoint verification",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn infrastructure_task(
@@ -932,6 +1001,245 @@ mod tests {
             ".dvc/{year}",
         ] {
             assert!(grouping(layout, "20260712-120000").is_err());
+        }
+    }
+
+    fn prior_source_retirement_fixture(
+        history: &str,
+        tampered_registry: bool,
+    ) -> (
+        tempfile::TempDir,
+        GitRepo,
+        serde_json::Value,
+        crate::native_s3::tests::RoutedFixture,
+    ) {
+        use crate::native_s3::tests::{Reply, configure_repo, routed_fixture};
+        use sha2::{Digest, Sha256};
+
+        const ORIGINAL: &str = "20261008-120000-original";
+        const CURRENT: &str = "20261008-120000-renamed";
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temporary.path().join("checkout"),
+        };
+        fs::create_dir(&repo.root).unwrap();
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        repo.run(["config", "user.name", "Prior retirement fixture"])
+            .unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let remote = temporary.path().join("remote.git");
+        repo.run(["init", "-q", "--bare", remote.to_str().unwrap()])
+            .unwrap();
+        repo.run(["remote", "add", "origin", remote.to_str().unwrap()])
+            .unwrap();
+        let receipt = serde_json::json!({
+            "schema_version":1,"task_id":ORIGINAL,"migration_kind":"task-rename",
+            "source":ORIGINAL,"destination":CURRENT,"status":"copied",
+            "remote":"workspace-mgr","bucket":"fixture-bucket","remote_prefix":"root",
+            "transaction_id":"prior-rename","versions":[{
+                "source_object":format!("{ORIGINAL}/data"),"source_version_id":"old-version",
+                "destination_object":format!("{CURRENT}/data"),"destination_version_id":"copied-version",
+                "delete_marker":false,"size":3,"source_etag":"abc","destination_etag":"copied"
+            }]
+        });
+        let mut canonical = receipt.clone();
+        if tampered_registry {
+            canonical["transaction_id"] = "another-transaction".into();
+        }
+        let registry = format!(
+            "root/.workspace-mgr/archive/{}.json",
+            crate::hex::encode_lower(Sha256::digest(ORIGINAL.as_bytes()))
+        );
+        let history = history.to_owned();
+        let (client, worker) = routed_fixture(move |request| {
+            assert_eq!(request.method, "GET");
+            let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+            let query = url
+                .query_pairs()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            if query.contains_key("versions") {
+                let prefix = query["prefix"].as_ref();
+                let rows = if prefix == registry {
+                    format!(
+                        "<Version><Key>{registry}</Key><VersionId>registry-version</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-08T20:00:00Z</LastModified><ETag>registry-etag</ETag><Size>1</Size></Version>"
+                    )
+                } else {
+                    assert_eq!(prefix, format!("root/{ORIGINAL}/"));
+                    match history.as_str() {
+                        "empty" => String::new(),
+                        "version" => format!(
+                            "<Version><Key>root/{ORIGINAL}/unmapped</Key><VersionId>unmapped-version</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-08T20:00:00Z</LastModified><ETag>unmapped</ETag><Size>7</Size></Version>"
+                        ),
+                        "marker" => format!(
+                            "<DeleteMarker><Key>root/{ORIGINAL}/unmapped</Key><VersionId>unmapped-marker</VersionId><IsLatest>true</IsLatest><LastModified>2026-10-08T20:00:00Z</LastModified></DeleteMarker>"
+                        ),
+                        _ => unreachable!(),
+                    }
+                };
+                return Reply::xml(&format!(
+                    "<ListVersionsResult><IsTruncated>false</IsTruncated>{rows}</ListVersionsResult>"
+                ));
+            }
+            assert_eq!(url.path(), format!("/fixture-bucket/{registry}"));
+            assert_eq!(query["versionId"], "registry-version");
+            Reply {
+                status: 200,
+                headers: vec![("x-amz-version-id", "registry-version".into())],
+                body: serde_json::to_vec(&canonical).unwrap(),
+            }
+        });
+        configure_repo(&client, &repo);
+        fs::write(repo.root.join(".gitignore"), "/.workspace-mgr/local/\n").unwrap();
+        fs::create_dir(repo.root.join(CURRENT)).unwrap();
+        fs::write(
+            repo.root.join(CURRENT).join(RECEIPT_NAME),
+            receipt.to_string(),
+        )
+        .unwrap();
+        repo.run(["add", "."]).unwrap();
+        repo.run(["commit", "-q", "-m", "Publish previous renamed task"])
+            .unwrap();
+        repo.run(["push", "-q", "origin", "main"]).unwrap();
+        crate::archive_registry::coordinate_published(&repo, &receipt).unwrap();
+        (temporary, repo, receipt, worker)
+    }
+
+    #[test]
+    fn prior_source_retirement_requires_empty_full_history_even_without_a_local_queue() {
+        for history in ["version", "marker", "empty"] {
+            let (_temporary, repo, receipt, worker) =
+                prior_source_retirement_fixture(history, false);
+            assert!(!crate::s3_purge::has_pending(&repo).unwrap());
+            let result = require_previous_source_retired(
+                &repo,
+                receipt["destination"].as_str().unwrap(),
+                receipt["task_id"].as_str().unwrap(),
+                &receipt,
+            );
+            if history == "empty" {
+                result.unwrap();
+            } else {
+                assert!(result.unwrap_err().to_string().contains(
+                    "finish prior source retirement with refresh before archiving again"
+                ));
+            }
+            assert!(
+                worker
+                    .finish_requests()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+            assert!(!crate::s3_purge::has_pending(&repo).unwrap());
+        }
+    }
+
+    #[test]
+    fn prior_source_retirement_rejects_noncanonical_receipt_identity_and_location() {
+        let (_temporary, repo, receipt, worker) = prior_source_retirement_fixture("empty", true);
+        let current = receipt["destination"].as_str().unwrap();
+        let identity = receipt["task_id"].as_str().unwrap();
+        assert!(
+            require_previous_source_retired(&repo, current, identity, &receipt)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical remote registry")
+        );
+        let mut wrong_identity = receipt.clone();
+        wrong_identity["task_id"] = "20261008-120000-other".into();
+        assert!(
+            require_previous_source_retired(&repo, current, identity, &wrong_identity)
+                .unwrap_err()
+                .to_string()
+                .contains("another immutable task identity")
+        );
+        assert!(
+            require_previous_source_retired(&repo, "another/path", identity, &receipt).is_err()
+        );
+        let mut wrong_location = receipt.clone();
+        wrong_location["bucket"] = "another-bucket".into();
+        assert!(
+            require_previous_source_retired(&repo, current, identity, &wrong_location)
+                .unwrap_err()
+                .to_string()
+                .contains("another storage location")
+        );
+        assert!(
+            worker
+                .finish_requests()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+    }
+
+    #[test]
+    fn prior_source_retirement_keeps_local_only_rearchives_offline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: temporary.path().to_owned(),
+        };
+        let task = "20261008-120000-task";
+        let source = format!("2026/10/{task}");
+        let receipt = serde_json::json!({
+            "schema_version":1,"task_id":task,"source":task,"destination":source,
+            "status":"copied","versions":[]
+        });
+        require_previous_source_retired(&repo, &source, task, &receipt).unwrap();
+    }
+
+    #[test]
+    fn prior_source_retirement_requires_checkpointing_stale_local_obligations() {
+        for obligation in ["object", "prefix", "unrelated"] {
+            let (_temporary, repo, receipt, worker) =
+                prior_source_retirement_fixture("empty", false);
+            let source = receipt["source"].as_str().unwrap();
+            if obligation == "prefix" {
+                crate::s3_purge::queue_archive_prefixes(&repo, std::slice::from_ref(&receipt))
+                    .unwrap();
+            } else {
+                crate::s3_purge::queue(
+                    &repo,
+                    &[crate::s3_purge::ObjectVersion {
+                        pointer: format!("{source}/{RECEIPT_NAME}"),
+                        object: format!(
+                            "{}{}/data",
+                            source,
+                            if obligation == "unrelated" {
+                                "-neighbor"
+                            } else {
+                                ""
+                            }
+                        ),
+                        version_id: "already-deleted-version".to_owned(),
+                    }],
+                )
+                .unwrap();
+            }
+            let before = crate::s3_purge::preview(&repo).unwrap();
+            let result = require_previous_source_retired(
+                &repo,
+                receipt["destination"].as_str().unwrap(),
+                receipt["task_id"].as_str().unwrap(),
+                &receipt,
+            );
+            if obligation == "unrelated" {
+                result.unwrap();
+            } else {
+                assert!(
+                    result.unwrap_err().to_string().contains(
+                        "durable retirement records still require checkpoint verification"
+                    )
+                );
+            }
+            let after = crate::s3_purge::preview(&repo).unwrap();
+            assert_eq!(after.pending, before.pending);
+            assert_eq!(after.pending_prefixes, before.pending_prefixes);
+            assert!(
+                worker
+                    .finish_requests()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
         }
     }
 }

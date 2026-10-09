@@ -206,12 +206,15 @@ require a separate user request.
 When a conversation's topic changes, `task rename <new-slug>` moves the complete
 deliverable directory and updates task metadata while preserving the immutable
 task ID, target branch, and existing pull request. The next ordinary `publish`
-removes the previously published path and publishes the new one. `storage set`,
+removes the previously published path and publishes the new one. Versioned S3
+rename preserves complete history through server-side copy; unchanged payloads
+are not reuploaded, and old-source cleanup waits for the copied receipt to merge.
+`storage set`,
 `storage reset`, `move`, `remove`, and `untrack` change local desired state only.
 `storage hydrate` reads from S3. `plan` is read-only. `publish` verifies S3 before
-publishing the repository's Git revision. It then permanently deletes every S3
-version at object paths removed by delete, move, rename, untrack, or S3-to-Git
-placement; current remote branches
+publishing the repository's Git revision. It then permanently deletes
+unretained S3 versions at object paths removed by delete, move, untrack, or S3-to-Git
+placement. Exact receipt-mapped destination history remains preserved; current remote branches
 and tags defer deletion until the last live reference disappears. Shared legacy
 CAS sources remain available to old Git snapshots and are not automatically
 garbage-collected by this cleanup. If the user

@@ -10,6 +10,13 @@ pub struct GitRepo {
     pub root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeEntry {
+    pub mode: String,
+    pub kind: String,
+    pub oid: String,
+}
+
 impl GitRepo {
     pub fn discover(path: &Path) -> Result<Self> {
         let candidate = path.canonicalize().map_err(|source| Error::Io {
@@ -343,6 +350,97 @@ impl GitRepo {
         paths: &[String],
     ) -> Result<BTreeMap<String, Option<String>>> {
         self.file_ids(revision, paths, false, true, true)
+    }
+
+    /// Reads exact literal entries, including trees and symlinks, in bounded
+    /// batches. NUL framing keeps Git's filename quoting out of comparisons.
+    pub(crate) fn tree_entries(
+        &self,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, TreeEntry>> {
+        let requested = paths.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let literal = paths
+            .iter()
+            .map(|path| format!(":(literal){path}"))
+            .collect::<Vec<_>>();
+        let mut found = BTreeMap::new();
+        for batch in pathspec_batches(&literal) {
+            let mut args = vec!["ls-tree", "-r", "-t", "-z", revision, "--"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            args.extend(batch.iter().cloned());
+            let output = self.run_bytes(args, None)?;
+            for record in output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|r| !r.is_empty())
+            {
+                let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+                    return Err(Error::message("unexpected Git tree entry"));
+                };
+                let Ok(path) = std::str::from_utf8(&record[separator + 1..]) else {
+                    continue;
+                };
+                if !requested.contains(path) {
+                    continue;
+                }
+                let attributes = std::str::from_utf8(&record[..separator])
+                    .map_err(|_| Error::message("Git tree attributes are not UTF-8"))?;
+                let fields = attributes.split(' ').collect::<Vec<_>>();
+                let [mode, kind, oid] = fields.as_slice() else {
+                    return Err(Error::message("unexpected Git tree attributes"));
+                };
+                found.insert(
+                    path.to_owned(),
+                    TreeEntry {
+                        mode: (*mode).to_owned(),
+                        kind: (*kind).to_owned(),
+                        oid: (*oid).to_owned(),
+                    },
+                );
+            }
+        }
+        Ok(found)
+    }
+
+    /// Hashes files using their own paths for attributes and clean filters.
+    /// Literal argv avoids the line-based stdin-paths filename protocol.
+    pub(crate) fn filtered_worktree_hashes(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut found = BTreeMap::new();
+        for batch in pathspec_batches(paths) {
+            let mut args = vec![
+                "hash-object".to_owned(),
+                "--filters".to_owned(),
+                "--".to_owned(),
+            ];
+            args.extend(batch.iter().cloned());
+            let output = self.run_bytes(args, None)?;
+            let hashes = std::str::from_utf8(&output.stdout)
+                .map_err(|_| Error::message("Git working-tree hashes are not UTF-8"))?
+                .lines()
+                .collect::<Vec<_>>();
+            if hashes.len() != batch.len() {
+                return Err(Error::message(
+                    "Git working-tree hash batch omitted requested paths",
+                ));
+            }
+            for (path, hash) in batch.iter().zip(hashes) {
+                if !matches!(hash.len(), 40 | 64)
+                    || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(Error::message(
+                        "Git working-tree hash batch returned an invalid object ID",
+                    ));
+                }
+                found.insert(path.clone(), hash.to_owned());
+            }
+        }
+        Ok(found)
     }
 
     pub fn existing_paths(&self, revision: &str, paths: &[String]) -> Result<BTreeSet<String>> {

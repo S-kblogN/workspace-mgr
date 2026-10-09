@@ -33,6 +33,7 @@ pub(crate) struct AuditReport {
     pub status: String,
     pub expected_objects: usize,
     pub remote_versions: usize,
+    pub retained_archive_versions: usize,
     pub remote_checksum_objects: usize,
     pub verified_version_objects: usize,
     pub streamed_objects: usize,
@@ -59,6 +60,7 @@ impl AuditReport {
             status: "ok".into(),
             expected_objects: 0,
             remote_versions: 0,
+            retained_archive_versions: 0,
             remote_checksum_objects: 0,
             verified_version_objects: 0,
             streamed_objects: 0,
@@ -246,9 +248,27 @@ fn inspect_with(
 
     // Registry objects are exceptions only when a local receipt identifies
     // their exact canonical key. An arbitrary control-looking key is extra.
-    let registries = expected_registries(repo, scopes, retired_scopes, all, &mut report)?;
+    let mut outer_receipts = BTreeMap::new();
+    let registries = expected_registries(
+        repo,
+        scopes,
+        retired_scopes,
+        all,
+        &mut report,
+        &mut outer_receipts,
+        &mut metadata_snapshot,
+    )?;
     let root_prefix = client.key_for("");
     let inventory = load_inventory(client, scopes, retired_scopes, all, &registries)?;
+    let verified_registries = inspect_registries(repo, client, &registries, &mut report)?;
+    let retained = inspect_retained_archive_history(
+        client,
+        &outer_receipts,
+        &verified_registries,
+        &inventory,
+        &expected,
+        &mut report,
+    )?;
     let mut objects = BTreeMap::<String, Vec<&Value>>::new();
     for row in &inventory {
         let key = row["Key"]
@@ -276,7 +296,12 @@ fn inspect_with(
             continue;
         }
         report.remote_versions += 1;
-        if !expected.contains_key(path) {
+        if !expected.contains_key(path)
+            && !retained.contains(&(
+                path.to_owned(),
+                row["VersionId"].as_str().unwrap_or("").to_owned(),
+            ))
+        {
             report.issue(
                 "unexpected-object",
                 path,
@@ -315,41 +340,6 @@ fn inspect_with(
         report.streamed_bytes += partial.streamed_bytes;
         report.issues.extend(partial.issues);
     }
-    let registry_entries = registries.iter().collect::<Vec<_>>();
-    // Registry histories have their own workers. Split the same network
-    // budget across sources and their immutable versions rather than nesting
-    // two independent pools of sixteen.
-    let registry_workers = registry_entries.len().clamp(1, 16);
-    let registry_results = crate::native_versions::bounded_map_with_workers(
-        &registry_entries,
-        registry_workers,
-        false,
-        |(path, receipt)| {
-            let mut partial = AuditReport::new();
-            let source = receipt["source"]
-                .as_str()
-                .expect("validated receipt source");
-            match crate::native_archive::registry_read_with_parallelism(
-                client,
-                repo,
-                source,
-                16 / registry_workers,
-            ) {
-                Ok(Some(remote)) if remote == **receipt => {}
-                Ok(_) => partial.issue(
-                    "archive-registry-mismatch",
-                    path,
-                    "remote archive registry differs from the local copied receipt or is missing",
-                ),
-                Err(error) => partial.issue("archive-registry-mismatch", path, error.to_string()),
-            }
-            Ok(partial)
-        },
-    )?;
-    for partial in registry_results {
-        report.issues.extend(partial.issues);
-    }
-
     // Version listing is not an atomic snapshot. Never report success when
     // the compared logical inventory visibly changed during this audit.
     progress.stage("final remote and local snapshots");
@@ -401,6 +391,176 @@ fn inspect_with(
     }
     .into();
     Ok(report)
+}
+
+fn inspect_registries(
+    repo: &GitRepo,
+    client: &S3Client,
+    registries: &BTreeMap<String, Value>,
+    report: &mut AuditReport,
+) -> Result<BTreeSet<String>> {
+    let registry_entries = registries.iter().collect::<Vec<_>>();
+    // Registry histories have their own workers. Split the same network
+    // budget across sources and their immutable versions rather than nesting
+    // two independent pools of sixteen.
+    let registry_workers = registry_entries.len().clamp(1, 16);
+    let registry_results = crate::native_versions::bounded_map_with_workers(
+        &registry_entries,
+        registry_workers,
+        false,
+        |(path, receipt)| {
+            let mut partial = AuditReport::new();
+            let mut verified = false;
+            let source = receipt["source"]
+                .as_str()
+                .expect("validated receipt source");
+            match crate::native_archive::registry_read_with_parallelism(
+                client,
+                repo,
+                source,
+                16 / registry_workers,
+            ) {
+                Ok(Some(remote)) if remote == **receipt => verified = true,
+                Ok(_) => partial.issue(
+                    "archive-registry-mismatch",
+                    path,
+                    "remote archive registry differs from the local copied receipt or is missing",
+                ),
+                Err(error) => partial.issue("archive-registry-mismatch", path, error.to_string()),
+            }
+            Ok(((*path).clone(), verified, partial))
+        },
+    )?;
+    let mut verified = BTreeSet::new();
+    for (path, valid, partial) in registry_results {
+        report.issues.extend(partial.issues);
+        if valid {
+            verified.insert(path);
+        }
+    }
+    Ok(verified)
+}
+
+/// Only the current outer receipt names versions physically retained at the
+/// present destination. Previous receipts keep registry/alias checks but their
+/// intermediate versions may already have moved again. No local payload is
+/// required for this separately verified historical inventory.
+fn inspect_retained_archive_history(
+    client: &S3Client,
+    outer: &BTreeMap<String, Value>,
+    verified_registries: &BTreeSet<String>,
+    inventory: &[Value],
+    expected: &BTreeMap<String, StorageEntry>,
+    report: &mut AuditReport,
+) -> Result<BTreeSet<(String, String)>> {
+    let present = inventory
+        .iter()
+        .filter_map(|row| {
+            Some((
+                (
+                    row["Key"].as_str()?.to_owned(),
+                    row["VersionId"].as_str()?.to_owned(),
+                ),
+                row,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = BTreeMap::new();
+    for (registry, receipt) in outer {
+        if !verified_registries.contains(registry) {
+            continue;
+        }
+        let pointer = format!(
+            "{}/{}",
+            receipt["destination"].as_str().unwrap_or(""),
+            archive_migration::RECEIPT_NAME
+        );
+        for row in receipt["versions"].as_array().into_iter().flatten() {
+            let Some(object) = row["destination_object"].as_str() else {
+                continue;
+            };
+            let Some(version) = row["destination_version_id"].as_str() else {
+                continue;
+            };
+            let identity = (object.to_owned(), version.to_owned());
+            if entries
+                .insert(identity, (pointer.clone(), row.clone()))
+                .is_some_and(|previous| previous.1 != *row)
+            {
+                report.issue(
+                    "invalid-archive-receipt",
+                    &pointer,
+                    "current receipts disagree about a retained destination version",
+                );
+            }
+        }
+    }
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let results = crate::native_versions::bounded_map(
+        &entries,
+        |((object, version), (pointer, row))| {
+            let mut partial = AuditReport::new();
+            let issue = |partial: &mut AuditReport, code: &str, detail: String| {
+                partial.issue(code, object, detail);
+                let issue = partial.issues.last_mut().unwrap();
+                issue.pointer = Some(pointer.clone());
+                issue.version = Some(version.clone());
+            };
+            let Some(recorded) = present.get(&(client.key_for(object), version.clone())) else {
+                issue(&mut partial, "retained-archive-version-missing", "copied historical version or delete marker is absent at its current receipt destination".into());
+                return Ok((None, false, partial));
+            };
+            let marker = row["delete_marker"] == true;
+            if recorded["delete_marker"] != marker
+                || !marker
+                    && (recorded["Size"] != row["size"]
+                        || recorded["ETag"].as_str().map(tag)
+                            != row["destination_etag"].as_str().map(tag))
+            {
+                issue(&mut partial, "retained-archive-version-mismatch", "retained history inventory differs from its exact copied size, ETag, or marker binding".into());
+                return Ok((None, false, partial));
+            }
+            let current = expected
+                .get(object)
+                .is_some_and(|entry| entry.version_id.as_deref() == Some(version));
+            if !marker && !current {
+                let mut args = json!({"Bucket":client.bucket,"Key":client.key_for(object),"VersionId":version});
+                if let Some(etag) = row["destination_etag"].as_str() {
+                    args["IfMatch"] = format!("\"{}\"", tag(etag)).into();
+                }
+                match client.call_s3("head_object", &args, None) {
+                    Ok(head)
+                        if head.value["VersionId"] == *version
+                            && head.value["DeleteMarker"] != true
+                            && head.value["ContentLength"] == row["size"]
+                            && head.value["ETag"].as_str().map(tag)
+                                == row["destination_etag"].as_str().map(tag) => {}
+                    Ok(_) => {
+                        issue(&mut partial, "retained-archive-version-mismatch", "exact retained-history HEAD differs from its copied version, size, or ETag".into());
+                        return Ok((None, false, partial));
+                    }
+                    Err(error) => {
+                        issue(
+                            &mut partial,
+                            "retained-archive-read-failed",
+                            error.to_string(),
+                        );
+                        return Ok((None, false, partial));
+                    }
+                }
+            }
+            Ok((Some((object.clone(), version.clone())), !current, partial))
+        },
+    )?;
+    let mut retained = BTreeSet::new();
+    for (identity, historical, partial) in results {
+        report.issues.extend(partial.issues);
+        if let Some(identity) = identity {
+            retained.insert(identity);
+            report.retained_archive_versions += usize::from(historical);
+        }
+    }
+    Ok(retained)
 }
 
 fn local_state(repo: &GitRepo, boundary: &str) -> Result<BTreeMap<String, String>> {
@@ -1174,6 +1334,8 @@ fn expected_registries(
     retired: &[String],
     all: bool,
     report: &mut AuditReport,
+    outer: &mut BTreeMap<String, Value>,
+    metadata_snapshot: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<BTreeMap<String, Value>> {
     let mut result = BTreeMap::new();
     let receipt_scopes = scopes.iter().chain(retired).cloned().collect::<Vec<_>>();
@@ -1197,19 +1359,32 @@ fn expected_registries(
                 fs::read_to_string(&absolute).at(&absolute)
             })
             .and_then(|raw| {
-                serde_json::from_str::<Value>(&raw)
-                    .map_err(|error| Error::message(error.to_string()))
-            })
-            .and_then(|receipt| {
+                let receipt = serde_json::from_str::<Value>(&raw)
+                    .map_err(|error| Error::message(error.to_string()))?;
                 archive_migration::validate(&path, &receipt)?;
-                Ok(receipt)
+                Ok((raw.into_bytes(), receipt))
             });
         match receipt {
-            Ok(receipt) => collect_registries(&receipt, &mut result, report, 0),
+            Ok((raw, receipt)) => {
+                metadata_snapshot.insert(path, raw);
+                if receipt["status"] == "copied" {
+                    outer.insert(registry_path(&receipt), receipt.clone());
+                }
+                collect_registries(&receipt, &mut result, report, 0);
+            }
             Err(error) => report.issue("invalid-archive-receipt", &path, error.to_string()),
         }
     }
     Ok(result)
+}
+
+fn registry_path(receipt: &Value) -> String {
+    format!(
+        ".workspace-mgr/archive/{}.json",
+        crate::hex::encode_lower(Sha256::digest(
+            receipt["source"].as_str().unwrap_or("").as_bytes()
+        ))
+    )
 }
 
 fn collect_registries(
@@ -1236,11 +1411,8 @@ fn collect_registries(
         return;
     }
     if receipt["status"] == "copied" {
-        if let Some(source) = receipt["source"].as_str() {
-            let path = format!(
-                ".workspace-mgr/archive/{}.json",
-                crate::hex::encode_lower(Sha256::digest(source.as_bytes()))
-            );
+        if receipt["source"].is_string() {
+            let path = registry_path(receipt);
             if result
                 .insert(path.clone(), receipt.clone())
                 .is_some_and(|previous| previous != *receipt)
@@ -1499,6 +1671,255 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == code && issue.path == path)
+    }
+
+    fn historical_receipt() -> Value {
+        json!({
+            "schema_version":1,"status":"copied","task_id":"20261008-120000-task",
+            "remote":"workspace-mgr","bucket":"fixture-bucket","remote_prefix":"root",
+            "source":"old/task","destination":"task","transaction_id":"archive-copy",
+            "versions":[
+                {"source_object":"old/task/old-name.bin","destination_object":"task/old-name.bin",
+                 "source_version_id":"old-source","source_last_modified":"2026-10-08T00:00:00+00:00",
+                 "source_is_latest":true,"source_list_order":0,"delete_marker":false,"size":3,
+                 "source_etag":"remote-etag","destination_version_id":"history-payload",
+                 "destination_etag":"remote-etag","destination_last_modified":"2026-10-08T00:00:00+00:00"},
+                {"source_object":"old/task/retired-name.bin","destination_object":"task/retired-name.bin",
+                 "source_version_id":"old-marker","source_last_modified":"2026-10-08T00:00:00+00:00",
+                 "source_is_latest":true,"source_list_order":1,"delete_marker":true,"size":null,
+                 "source_etag":null,"destination_version_id":"history-marker",
+                 "destination_etag":null,"destination_last_modified":"2026-10-08T00:00:00+00:00"}
+            ]
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoryFault {
+        None,
+        MissingPayload,
+        MissingMarker,
+        Extra,
+        HeadMismatch,
+        InventoryMismatch,
+        OldSource,
+        TamperedReceipt,
+        UnboundRenameKind,
+        Nested,
+    }
+
+    fn retained_history_audit(fault: HistoryFault) -> AuditReport {
+        let fixture = Fixture::new();
+        fixture.file("task/current-name.bin", b"abc", "md5", true);
+        let mut remote_receipt = historical_receipt();
+        if matches!(fault, HistoryFault::Nested) {
+            let mut previous = historical_receipt();
+            previous["source"] = "original/task".into();
+            previous["destination"] = "old/task".into();
+            for row in previous["versions"].as_array_mut().unwrap() {
+                let suffix = row["destination_object"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("task/")
+                    .unwrap()
+                    .to_owned();
+                row["source_object"] = format!("original/task/{suffix}").into();
+                row["destination_object"] = format!("old/task/{suffix}").into();
+            }
+            remote_receipt["previous_receipt"] = previous;
+        }
+        let mut local_receipt = remote_receipt.clone();
+        if matches!(fault, HistoryFault::TamperedReceipt) {
+            local_receipt["versions"][0]["destination_version_id"] = "forged-history".into();
+        }
+        if matches!(fault, HistoryFault::UnboundRenameKind) {
+            local_receipt["migration_kind"] = "task-rename".into();
+        }
+        fs::write(
+            fixture.repo.root.join("task/.workspace-mgr-archive.json"),
+            serde_json::to_vec(&local_receipt).unwrap(),
+        )
+        .unwrap();
+        let mut registries = BTreeMap::new();
+        collect_registries(&remote_receipt, &mut registries, &mut AuditReport::new(), 0);
+        let mut rows = vec![row("task/current-name.bin", "v1", true, b"abc", false)];
+        if !matches!(fault, HistoryFault::MissingPayload) {
+            let mut payload = row("task/old-name.bin", "history-payload", true, b"old", false);
+            if matches!(fault, HistoryFault::InventoryMismatch) {
+                payload["Size"] = 99.into();
+            }
+            rows.push(payload);
+        }
+        if !matches!(fault, HistoryFault::MissingMarker) {
+            rows.push(row(
+                "task/retired-name.bin",
+                "history-marker",
+                true,
+                b"",
+                true,
+            ));
+        }
+        if matches!(fault, HistoryFault::Extra) {
+            rows.push(row(
+                "task/old-name.bin",
+                "unmapped-generation",
+                false,
+                b"extra",
+                false,
+            ));
+            rows.push(row(
+                "task/unmapped-name.bin",
+                "unmapped-file",
+                true,
+                b"extra",
+                false,
+            ));
+        }
+        if matches!(fault, HistoryFault::OldSource) {
+            rows.push(row(
+                "old/task/old-name.bin",
+                "old-source",
+                true,
+                b"old",
+                false,
+            ));
+        }
+        for (path, receipt) in &registries {
+            rows.push(row(
+                path,
+                "registry-version",
+                true,
+                &serde_json::to_vec(receipt).unwrap(),
+                false,
+            ));
+        }
+        let (client, server) = replayable_read_fixture(move |request| {
+            let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            if query.contains_key("versions") {
+                return Arc::new(Reply::xml(&listing(&rows, &query["prefix"])));
+            }
+            let path = url.path().strip_prefix("/fixture-bucket/root/").unwrap();
+            if let Some(receipt) = registries.get(path) {
+                assert_eq!(query["versionId"], "registry-version");
+                return Arc::new(Reply {
+                    status: 200,
+                    headers: vec![("x-amz-version-id", "registry-version".into())],
+                    body: serde_json::to_vec(receipt).unwrap(),
+                });
+            }
+            let (body, version) = if path == "task/current-name.bin" {
+                (&b"abc"[..], "v1")
+            } else {
+                assert_eq!(path, "task/old-name.bin");
+                assert_eq!(request.method, "HEAD");
+                (
+                    &b"old"[..],
+                    if matches!(fault, HistoryFault::HeadMismatch) {
+                        "wrong-version"
+                    } else {
+                        "history-payload"
+                    },
+                )
+            };
+            Arc::new(Reply {
+                status: 200,
+                headers: vec![
+                    ("x-amz-version-id", version.into()),
+                    ("etag", "\"remote-etag\"".into()),
+                ],
+                body: body.to_vec(),
+            })
+        });
+        configure_repo(&client, &fixture.repo);
+        let before = snapshot(&fixture.repo);
+        let report = inspect_with(
+            &fixture.repo,
+            &["task".into()],
+            false,
+            &["old/task".into()],
+            &client,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot(&fixture.repo),
+            before,
+            "retained history audit changed local bytes or caches"
+        );
+        assert!(!fixture.repo.root.join("task/old-name.bin").exists());
+        assert!(
+            server
+                .finish_requests()
+                .iter()
+                .all(|request| matches!(request.method.as_str(), "GET" | "HEAD"))
+        );
+        report
+    }
+
+    #[test]
+    fn canonical_copied_history_has_its_own_verified_inventory_without_local_payload() {
+        let report = retained_history_audit(HistoryFault::None);
+        assert_eq!(report.status, "ok", "{:?}", report.issues);
+        assert_eq!(report.expected_objects, 1);
+        assert_eq!(report.retained_archive_versions, 2);
+        let nested = retained_history_audit(HistoryFault::Nested);
+        assert_eq!(nested.status, "ok", "{:?}", nested.issues);
+        assert_eq!(
+            nested.retained_archive_versions, 2,
+            "previous receipt intermediate versions were already relocated"
+        );
+    }
+
+    #[test]
+    fn retained_archive_history_still_requires_exact_payload_and_marker_versions() {
+        for fault in [HistoryFault::MissingPayload, HistoryFault::MissingMarker] {
+            let report = retained_history_audit(fault);
+            assert_eq!(report.status, "error");
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "retained-archive-version-missing")
+            );
+        }
+        for fault in [HistoryFault::HeadMismatch, HistoryFault::InventoryMismatch] {
+            let report = retained_history_audit(fault);
+            assert_eq!(report.status, "error");
+            assert!(has(
+                &report,
+                "retained-archive-version-mismatch",
+                "task/old-name.bin"
+            ));
+        }
+    }
+
+    #[test]
+    fn copied_receipts_do_not_exempt_unmapped_versions_or_old_source_history() {
+        let extra = retained_history_audit(HistoryFault::Extra);
+        assert!(has(&extra, "unexpected-object", "task/old-name.bin"));
+        assert!(has(&extra, "unexpected-object", "task/unmapped-name.bin"));
+        let source = retained_history_audit(HistoryFault::OldSource);
+        assert!(has(&source, "unexpected-object", "old/task/old-name.bin"));
+    }
+
+    #[test]
+    fn local_receipt_tampering_cannot_create_retained_history_exceptions() {
+        let forged = retained_history_audit(HistoryFault::TamperedReceipt);
+        assert_eq!(forged.retained_archive_versions, 0);
+        assert!(
+            forged
+                .issues
+                .iter()
+                .any(|issue| issue.code == "archive-registry-mismatch")
+        );
+        assert!(has(&forged, "unexpected-object", "task/old-name.bin"));
+        let kind = retained_history_audit(HistoryFault::UnboundRenameKind);
+        assert_eq!(kind.retained_archive_versions, 0);
+        assert!(has(
+            &kind,
+            "invalid-archive-receipt",
+            "task/.workspace-mgr-archive.json"
+        ));
+        assert!(has(&kind, "unexpected-object", "task/old-name.bin"));
     }
 
     #[test]

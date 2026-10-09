@@ -31,7 +31,8 @@ use crate::policy::{
     ARCHIVED_TASK_PATH_MINIMUM_CLI_VERSION, AUTO_S3_ABOVE_BYTES, BULK_PUBLICATION_BYTES,
     BULK_PUBLICATION_FILES, BULK_PUBLICATION_MIB, REPOSITORY_IGNORE_MODULE, REVIEW_INITIAL_STATE,
     REVIEW_MANAGED_BY, REVIEW_MERGE_AUTHORITY, REVIEW_PULL_REQUEST, ROOT_IGNORE_NAME,
-    TASK_MANIFEST_NAME, minimum_cli_version_for_task_schema,
+    TASK_MANIFEST_NAME, TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION,
+    minimum_cli_version_for_task_schema,
 };
 use crate::s3_purge;
 use crate::scaffold::{product_ignore_rules, task_readme_directory_map};
@@ -306,6 +307,12 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
         scopes.dedup();
     }
 
+    if let Some(source) = archive_migration::pending_rename_source(&repo, &task, &base_oid)? {
+        scopes.push(source);
+        scopes.sort();
+        scopes.dedup();
+    }
+
     let installed = installed_cli_version();
     let base_location = format!("{}/{}", task.remote, task.base_branch);
     let own_manifest = task
@@ -507,7 +514,15 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
     } else {
         read_metadata(&repo, &pointers)?
     };
-    let mut s3 = storage_metadata::reconcile(&repo, &config, &ordinary_pointers, dry_run)?;
+    let reconciled = storage_metadata::reconcile(&repo, &config, &ordinary_pointers, dry_run);
+    if !dry_run {
+        crate::archive_cancel::record_rename_reconciliation(
+            &repo,
+            &archive_receipts,
+            &uncommitted_metadata,
+        )?;
+    }
+    let mut s3 = reconciled?;
     if !dry_run {
         stage_scopes(&repo, &config, &base_oid, &preview_index, &scopes)?;
         remove_stored_outputs_from_index(
@@ -558,7 +573,14 @@ pub fn execute(options: &TransactionOptions) -> Result<TransactionReport> {
                 },
             );
         }
-        storage_metadata::push_outputs(&repo, &config, &mut s3)?;
+        let before_upload = read_metadata(&repo, &ordinary_pointers)?;
+        let uploaded = storage_metadata::push_outputs(&repo, &config, &mut s3);
+        crate::archive_cancel::record_rename_reconciliation(
+            &repo,
+            &archive_receipts,
+            &before_upload,
+        )?;
+        uploaded?;
     }
     // Copied archive versions already exist remotely and may be deliberately
     // unmaterialized. Never let native storage upload manufacture replacement versions.
@@ -2670,6 +2692,13 @@ fn require_publishable(
             )));
         }
     }
+    if let Some(path) = &needs.task_rename
+        && !cli_version_satisfies(installed, &TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION)
+    {
+        return Err(Error::message(format!(
+            "this build (workspace-mgr {installed}) cannot publish task rename receipt {path}; preserving copied history with active destination publications requires workspace-mgr {TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION} or newer; update workspace-mgr"
+        )));
+    }
     if let Some(path) = &needs.archive_protocol
         && !cli_version_satisfies(installed, &ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION)
     {
@@ -2779,6 +2808,7 @@ struct ManifestNeeds {
     /// Archive receipts use a storage protocol newer than their task manifest
     /// and public data schemas. This floor must not depend on schema 4.
     archive_protocol: Option<String>,
+    task_rename: Option<String>,
     native_storage: Option<StorageManifestNeed>,
     /// Older writers can stage a materialized archived LFS file as ordinary
     /// Git after its original root-prefix filter stops matching.
@@ -2803,6 +2833,12 @@ impl ManifestNeeds {
                 self.archive_protocol
                     .as_ref()
                     .map(|_| ARCHIVE_STORAGE_PROTOCOL_MINIMUM_CLI_VERSION),
+                false,
+            ),
+            (
+                self.task_rename
+                    .as_ref()
+                    .map(|_| TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION),
                 false,
             ),
             (
@@ -2875,15 +2911,27 @@ fn manifest_requirement(
         })
         .map(|entry| (entry.oid.clone(), entry.path.clone()))
         .collect::<BTreeMap<_, _>>();
+    let archive_origins = entries
+        .iter()
+        .filter(|entry| {
+            entry.is_regular_file()
+                && entry
+                    .path
+                    .ends_with(&format!("/{}", archive_migration::RECEIPT_NAME))
+        })
+        .map(|entry| (entry.oid.clone(), entry.path.clone()))
+        .collect::<BTreeMap<_, _>>();
     let oids = manifests
         .iter()
         .map(|entry| entry.oid.clone())
         .chain(storage_origins.keys().cloned())
+        .chain(archive_origins.keys().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let mut schemas = std::collections::BTreeMap::new();
     let mut storage_schemas = BTreeMap::new();
+    let mut task_rename = None;
     crate::cloud_usage::read_blobs(repo, &oids, |oid, content| {
         if let Some(schema) = manifest_schema(content) {
             schemas.insert(oid.to_owned(), schema);
@@ -2894,6 +2942,13 @@ fn manifest_requirement(
             })?;
             let manifest = crate::storage_format::Manifest::parse(raw, origin)?;
             storage_schemas.insert(oid.to_owned(), manifest.schema_version);
+        }
+        if let Some(origin) = archive_origins.get(oid)
+            && let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(content)
+            && archive_migration::is_task_rename(&receipt)
+        {
+            archive_migration::validate(origin, &receipt)?;
+            task_rename = Some(origin.clone());
         }
         Ok(())
     })?;
@@ -2910,6 +2965,7 @@ fn manifest_requirement(
         .collect::<Vec<_>>();
     let mut needs = ManifestNeeds {
         archive_protocol: archive_receipts.first().map(|entry| entry.path.clone()),
+        task_rename,
         archived_git_lfs: archived_git_lfs_requirement(repo, index, &archive_receipts)?,
         ..ManifestNeeds::default()
     };
@@ -3855,6 +3911,45 @@ mod tests {
         let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
         assert!(needs.archived_git_lfs.is_none());
         assert_eq!(needs.highest(), Some((Version::new(0, 8, 10), None)));
+    }
+
+    #[test]
+    fn task_rename_receipt_requires_0_8_11_and_refuses_an_older_writer() {
+        let fixture = Fixture::new(Some(PLAIN_CONFIG));
+        let main = fixture.main.clone();
+        let source = "20261008-120000-original";
+        let destination = "20261008-120000-renamed";
+        let path = format!("{destination}/{}", archive_migration::RECEIPT_NAME);
+        fixture.write(
+            &path,
+            &serde_json::json!({
+                "schema_version":1,"task_id":source,"source":source,"destination":destination,
+                "migration_kind":"task-rename","status":"copied","versions":[]
+            })
+            .to_string(),
+        );
+        fixture.stage(&main, &[destination]);
+        let needs = manifest_requirement(&fixture.repo, &fixture.index, None).unwrap();
+        assert_eq!(needs.task_rename.as_deref(), Some(path.as_str()));
+        assert_eq!(needs.highest(), Some((Version::new(0, 8, 11), None)));
+        let error = fixture
+            .reconcile(&main, &main, None, false, "0.8.10")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("task rename receipt"), "{error}");
+        assert!(error.contains("requires workspace-mgr 0.8.11"), "{error}");
+        assert_eq!(fixture.staged_config().as_deref(), Some(PLAIN_CONFIG));
+        fixture
+            .reconcile(&main, &main, None, false, "0.8.11")
+            .unwrap();
+        assert_eq!(
+            fixture.staged_config().unwrap(),
+            declaring("0.8.11", PLAIN_CONFIG)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.root.join(CONFIG_NAME)).unwrap(),
+            PLAIN_CONFIG
+        );
     }
 
     #[test]

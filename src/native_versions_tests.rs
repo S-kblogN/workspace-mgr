@@ -296,6 +296,53 @@ fn pending_aliases_validate_exact_storage_size_and_identity() {
 }
 
 #[test]
+fn pending_aliases_allow_only_formally_validated_task_rename_leaf_changes() {
+    let (client, worker) = empty_fixture();
+    let source = "20260702-123456-original";
+    let destination = "20260702-123456-renamed";
+    let receipt = json!({"schema_version":1,"status":"planned","remote":"workspace-mgr",
+        "bucket":"fixture-bucket","remote_prefix":"root","migration_kind":"task-rename",
+        "task_id":source,"source":source,"destination":destination,"versions":[{
+        "source_object":format!("{source}/a"),"destination_object":format!("{destination}/a"),
+        "source_version_id":"v1","delete_marker":false,"size":3,"source_etag":"abc"}]});
+    let mut target = entry(&format!("{destination}/a"));
+    pending_aliases(
+        &client,
+        std::slice::from_mut(&mut target),
+        std::slice::from_ref(&receipt),
+    )
+    .unwrap();
+    assert_eq!(target.key, format!("root/{source}/a"));
+    for (field, value) in [
+        ("migration_kind", "unknown"),
+        ("task_id", "20260703-123456-other"),
+        ("destination", "20260703-123456-renamed"),
+    ] {
+        let mut invalid = receipt.clone();
+        invalid[field] = value.into();
+        assert!(
+            pending_aliases(
+                &client,
+                &mut [entry(&format!("{destination}/a"))],
+                &[invalid]
+            )
+            .is_err()
+        );
+    }
+    let mut unmarked = receipt;
+    unmarked.as_object_mut().unwrap().remove("migration_kind");
+    assert!(
+        pending_aliases(
+            &client,
+            &mut [entry(&format!("{destination}/a"))],
+            &[unmarked]
+        )
+        .is_err()
+    );
+    assert!(worker.finish_requests().is_empty());
+}
+
+#[test]
 fn historical_directory_manifest_flattens_without_reading_payload() {
     let (dir, repo) = repo();
     repo.run(["init"]).unwrap();
@@ -556,6 +603,45 @@ fn generic_purge_deletes_complete_exact_object_history_including_markers() {
             ("root/task/a".into(), "d1".into())
         ])
     );
+}
+
+#[test]
+fn generic_purge_acknowledges_every_initially_absent_candidate() {
+    for has_payload in [false, true] {
+        let (_directory, repo) = repo();
+        let removed = std::sync::atomic::AtomicBool::new(false);
+        let (client, worker) = routed_fixture(move |request| {
+            if request.method == "DELETE" {
+                assert!(request.target.ends_with("/root/task/a?versionId=v1"));
+                removed.store(true, Ordering::SeqCst);
+                return deleted();
+            }
+            assert_eq!(request.method, "GET");
+            if request.target.contains("prefix=root%2Ftask%2Fa")
+                && has_payload
+                && !removed.load(Ordering::SeqCst)
+            {
+                history(&version_row("root/task/a", "v1"))
+            } else {
+                history("")
+            }
+        });
+        let candidates = json!([
+            {"pointer":"task/a.dvc","object":"task/a","version_id":"v1"},
+            {"pointer":"task/a.dvc","object":"task/a","version_id":"absent-2"},
+            {"pointer":"task/a.wm-storage.json","object":"task/a","version_id":"absent-3"}
+        ]);
+        let result = delete_candidates(&client, &repo, &candidates).unwrap();
+        assert_eq!(
+            result["already_absent"],
+            if has_payload {
+                json!([candidates[1], candidates[2]])
+            } else {
+                candidates
+            }
+        );
+        worker.finish_requests();
+    }
 }
 
 #[test]
@@ -1017,7 +1103,13 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
         atomic::{AtomicUsize, Ordering},
     };
 
-    let (_directory, repo) = repo();
+    let (directory, repo) = repo();
+    repo.run(["init", "-q"]).unwrap();
+    let remote = directory.path().join("empty-remote.git");
+    repo.run(["init", "-q", "--bare", remote.to_str().unwrap()])
+        .unwrap();
+    repo.run(["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
     let payload = oversized_purge_candidates();
     let candidates = payload.as_array().unwrap();
     assert_eq!(candidates.len(), 6_869);
@@ -1094,8 +1186,7 @@ fn large_purge_adapter_deletes_retry_history_without_argv_or_neighbor_deletion()
     );
     assert_eq!(*retired.lock().unwrap(), expected_deleted);
     assert!(inventory_reads.load(Ordering::SeqCst) >= 2);
-    // Generic retirement reports per object, including retries with absent IDs.
-    assert_eq!(result["already_absent"], json!([]));
+    assert_eq!(result["already_absent"].as_array().unwrap().len(), 6_866);
     assert_eq!(result["retained_unmapped"], json!([]));
     let requests = worker.finish_requests();
     assert_eq!(
@@ -1745,6 +1836,201 @@ fn published_proof(repo: &GitRepo, remote: &Path, receipt: &Value) -> Value {
     crate::archive_registry::coordinate_published(repo, receipt).unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum DestinationGuardFault {
+    None,
+    MissingPayload,
+    MissingMarker,
+    EmptyInventory,
+    ChangedRegistry,
+    BindingAfterDelete,
+}
+
+fn generic_destination_guard_fixture(
+    fault: DestinationGuardFault,
+    submit_copies: bool,
+) -> (Value, Vec<WireRequest>) {
+    let (directory, repo) = repo();
+    let mut receipt = copied_receipt();
+    receipt["task_id"] = "task".into();
+    receipt["versions"][0]["source_is_latest"] = false.into();
+    receipt["versions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"source_object":"task/a",
+        "destination_object":"archive/task/a","source_version_id":"source-marker",
+        "source_last_modified":"2026-10-07T00:00:01+00:00","source_is_latest":true,
+        "source_list_order":1,"delete_marker":true,"size":null,"source_etag":null,
+        "destination_version_id":"dst-marker","destination_etag":null,
+        "destination_last_modified":"2026-10-07T00:00:02+00:00"}));
+    published_proof(&repo, &directory.path().join("remote.git"), &receipt);
+    // Keep the canonical claim while removing the receipt from every live
+    // tree. The same claim also exists before a task branch is merged.
+    repo.run(["rm", "archive/task/.workspace-mgr-archive.json"])
+        .unwrap();
+    repo.run(["commit", "-q", "-m", "remove live receipt"])
+        .unwrap();
+    repo.run(["push", "-q", "origin", "main"]).unwrap();
+    // A second unrelated control catches snapshot ordering by OID instead of ref.
+    let mut other = receipt.clone();
+    other["source"] = "other".into();
+    other["destination"] = "archive/other".into();
+    for row in other["versions"].as_array_mut().unwrap() {
+        row["source_object"] = "other/a".into();
+        row["destination_object"] = "archive/other/a".into();
+    }
+    let other_ref = crate::archive_registry::binding_ref(&other).unwrap();
+    let receipt_ref = crate::archive_registry::binding_ref(&receipt).unwrap();
+    let receipt_oid = crate::archive_git_control::object_ids(
+        &repo.root,
+        &serde_json::to_string(&receipt).unwrap(),
+        false,
+    )
+    .unwrap();
+    let oid = (0..100)
+        .find_map(|nonce| {
+            other["transaction_id"] = format!("other-{nonce}").into();
+            let control = crate::archive_git_control::object_ids(
+                &repo.root,
+                &serde_json::to_string(&other).unwrap(),
+                true,
+            )
+            .unwrap();
+            (control.commit.cmp(&receipt_oid.commit) != other_ref.cmp(&receipt_ref))
+                .then_some(control)
+        })
+        .expect("fixture controls have opposite ref and OID sort order");
+    repo.run([
+        "push",
+        "-q",
+        "origin",
+        &format!("{}:{other_ref}", oid.commit),
+    ])
+    .unwrap();
+    let root = repo.root.clone();
+    let reference = crate::archive_registry::binding_ref(&receipt).unwrap();
+    let retired = std::sync::atomic::AtomicBool::new(false);
+    let stored_receipt = receipt.clone();
+    let (client, worker) = routed_fixture(move |request| {
+        if request.method == "DELETE" {
+            assert_eq!(
+                request.target,
+                "/fixture-bucket/root/archive/task/a?versionId=later-edit"
+            );
+            retired.store(true, Ordering::SeqCst);
+            if matches!(fault, DestinationGuardFault::BindingAfterDelete) {
+                GitRepo { root: root.clone() }
+                    .run(["push", "-q", "origin", &format!(":{reference}")])
+                    .unwrap();
+            }
+            return deleted();
+        }
+        if request.method == "HEAD" {
+            return head("dst", "copied", 3);
+        }
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if query.contains_key("versioning") {
+            return versioning();
+        }
+        if query.contains_key("versions") {
+            if query["prefix"] == registry_object() {
+                return registry_listing();
+            }
+            if query["prefix"] != "root/archive/task/a" {
+                return history("");
+            }
+            if matches!(fault, DestinationGuardFault::EmptyInventory) {
+                return history("");
+            }
+            let mut rows = String::new();
+            if !matches!(fault, DestinationGuardFault::MissingPayload) {
+                rows.push_str(
+                    &version_row("root/archive/task/a", "dst")
+                        .replace("&quot;abc&quot;", "&quot;copied&quot;"),
+                );
+            }
+            if !matches!(fault, DestinationGuardFault::MissingMarker) {
+                rows.push_str(&marker_row("root/archive/task/a", "dst-marker"));
+            }
+            if !retired.load(Ordering::SeqCst) {
+                rows.push_str(&version_row("root/archive/task/a", "later-edit"));
+            }
+            return history(&rows);
+        }
+        let mut canonical = stored_receipt.clone();
+        if matches!(fault, DestinationGuardFault::ChangedRegistry) {
+            canonical["transaction_id"] = "replaced".into();
+        }
+        registry_body(&canonical)
+    });
+    configure_repo(&client, &repo);
+    let mut candidates = vec![
+        json!({"pointer":"archive/task/a.wm-storage.json","object":"archive/task/a","version_id":"later-edit"}),
+    ];
+    if submit_copies {
+        for version in ["dst", "dst-marker"] {
+            candidates.push(json!({"pointer":"archive/task/a.dvc","object":"archive/task/a","version_id":version}));
+        }
+    }
+    let result = purge(&repo, "delete", &json!(candidates));
+    let requests = worker.finish_requests();
+    match fault {
+        DestinationGuardFault::None => (result.unwrap(), requests),
+        _ => {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("retained archive destination") || error.contains("claims changed"),
+                "{error}"
+            );
+            if !matches!(fault, DestinationGuardFault::BindingAfterDelete) {
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request.method != "DELETE" && request.method != "POST")
+                );
+            }
+            (Value::Null, requests)
+        }
+    }
+}
+
+#[test]
+fn generic_retirement_preserves_canonical_destination_history_without_a_live_receipt() {
+    for submit_copies in [false, true] {
+        let (result, requests) =
+            generic_destination_guard_fixture(DestinationGuardFault::None, submit_copies);
+        assert_eq!(
+            result["deleted"][0]["deleted_version_ids"],
+            json!(["later-edit"])
+        );
+        assert_eq!(
+            result["retained_mapped"].as_array().unwrap().len(),
+            if submit_copies { 2 } else { 0 }
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "DELETE")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn generic_destination_retirement_fails_closed_when_canonical_copies_are_missing_or_changed() {
+    for fault in [
+        DestinationGuardFault::MissingPayload,
+        DestinationGuardFault::MissingMarker,
+        DestinationGuardFault::EmptyInventory,
+        DestinationGuardFault::ChangedRegistry,
+        DestinationGuardFault::BindingAfterDelete,
+    ] {
+        generic_destination_guard_fixture(fault, false);
+    }
+}
+
 #[test]
 fn published_archive_purge_deletes_only_mapped_versions_and_retains_new_writes() {
     published_archive_purge(false);
@@ -1780,17 +2066,20 @@ fn published_archive_purge(interrupt: bool) {
     let first_registry_read = AtomicBool::new(true);
     let (request_sent, request_received) = mpsc::channel();
     // Keep serving until the operation completes: an abandoned GET may replay,
-    // while each exact-version DELETE must still occur exactly once.
+    // while the exact-version batch must still occur exactly once.
     let (client, worker) = routed_fixture(move |request| {
-        if request.method == "DELETE" {
-            if request.target == "/fixture-bucket/root/task/a?versionId=v1" {
-                assert!(!payload_flag.swap(true, Ordering::SeqCst));
-            } else if request.target == "/fixture-bucket/root/task/a?versionId=d1" {
-                assert!(!marker_flag.swap(true, Ordering::SeqCst));
-            } else {
-                panic!("attempted unmapped version deletion: {}", request.target);
+        if request.method == "POST" {
+            let items = batch_delete_items(request);
+            assert_eq!(items.len(), 2);
+            for (object, version) in &items {
+                assert_eq!(object, "root/task/a");
+                match version.as_str() {
+                    "v1" => assert!(!payload_flag.swap(true, Ordering::SeqCst)),
+                    "d1" => assert!(!marker_flag.swap(true, Ordering::SeqCst)),
+                    _ => panic!("attempted unmapped version deletion: {version}"),
+                }
             }
-            return deleted();
+            return batch_deleted(&items);
         }
         if request.method == "HEAD" {
             assert_eq!(
@@ -1844,20 +2133,17 @@ fn published_archive_purge(interrupt: bool) {
     assert_eq!(result["retained_unmapped"].as_array().unwrap().len(), 2);
     assert_eq!(result["cleaned_prefixes"], json!([]));
     let attempts = worker.finish();
-    let mut deletions = attempts
+    let deletions = attempts
         .iter()
-        .filter(|attempt| attempt.request.method == "DELETE")
-        .map(|attempt| {
-            assert!(attempt.response_sent);
-            attempt.request.target.as_str()
-        })
+        .filter(|attempt| attempt.request.method == "POST")
         .collect::<Vec<_>>();
-    deletions.sort_unstable();
+    assert_eq!(deletions.len(), 1);
+    assert!(deletions[0].response_sent);
     assert_eq!(
-        deletions,
+        batch_delete_items(&deletions[0].request),
         [
-            "/fixture-bucket/root/task/a?versionId=d1",
-            "/fixture-bucket/root/task/a?versionId=v1"
+            ("root/task/a".into(), "d1".into()),
+            ("root/task/a".into(), "v1".into())
         ]
     );
     assert_eq!(injected.load(Ordering::SeqCst), usize::from(interrupt));
@@ -1865,5 +2151,350 @@ fn published_archive_purge(interrupt: bool) {
         .iter()
         .filter(|attempt| attempt.request.target == registry_target)
         .count();
-    assert!(registry_reads >= 3 + usize::from(interrupt));
+    assert_eq!(registry_reads, 2 + usize::from(interrupt));
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt.request.method == "HEAD")
+            .count(),
+        2,
+        "one destination HEAD per full verification pass"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveBatchFault {
+    None,
+    RegistryAfterBatch,
+    DestinationAfterBatch,
+    IncompleteBatch,
+    LostBatchResponse,
+    ProtectedSibling,
+    NullSource,
+    SourceWriteDuringFinalHead,
+}
+
+fn archive_batch_fixture(
+    count: usize,
+    fault: ArchiveBatchFault,
+) -> (Result<Value>, Vec<WireRequest>, usize) {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    let (directory, repo) = repo();
+    let mut receipt = copied_receipt();
+    let original = receipt["versions"][0].clone();
+    receipt["versions"] = (0..count)
+        .map(|index| {
+            let mut row = original.clone();
+            row["source_object"] = format!("task/a{index:04}").into();
+            row["destination_object"] = format!("archive/task/a{index:04}").into();
+            row["source_version_id"] =
+                if index == 0 && matches!(fault, ArchiveBatchFault::NullSource) {
+                    "null".into()
+                } else {
+                    format!("v{index}").into()
+                };
+            row["destination_version_id"] = format!("dst{index}").into();
+            row["source_list_order"] = index.into();
+            row
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let proof = published_proof(&repo, &directory.path().join("remote.git"), &receipt);
+    let stored = receipt.clone();
+    let completed = Arc::new(Mutex::new(BTreeSet::new()));
+    let completed_worker = completed.clone();
+    let new_source = Arc::new(AtomicBool::new(false));
+    let new_source_worker = new_source.clone();
+    let (request_sent, request_received) = mpsc::channel();
+    let (client, worker) = routed_fixture(move |request| {
+        let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        if request.method == "POST" {
+            let items = batch_delete_items(request);
+            let mut completed = completed_worker.lock().unwrap();
+            let first = completed.is_empty();
+            for (object, version) in &items {
+                let index = version.strip_prefix('v').unwrap().parse::<usize>().unwrap();
+                assert!(index < count);
+                assert_eq!(object, &format!("root/task/a{index:04}"));
+                let inserted = completed.insert((object.clone(), version.clone()));
+                assert!(inserted || matches!(fault, ArchiveBatchFault::LostBatchResponse));
+            }
+            if first && matches!(fault, ArchiveBatchFault::LostBatchResponse) {
+                request_sent.send(()).unwrap();
+            }
+            return if matches!(fault, ArchiveBatchFault::IncompleteBatch) {
+                batch_deleted(&items[..items.len() - 1])
+            } else {
+                batch_deleted(&items)
+            };
+        }
+        if request.method == "DELETE" {
+            let object = url.path().strip_prefix("/fixture-bucket/").unwrap();
+            let version = &query["versionId"];
+            if version == "null" {
+                assert!(matches!(fault, ArchiveBatchFault::NullSource));
+                assert_eq!(object, "root/task/a0000");
+            }
+            assert!(
+                completed_worker
+                    .lock()
+                    .unwrap()
+                    .insert((object.into(), version.clone()))
+            );
+            return deleted();
+        }
+        if request.method == "HEAD" {
+            let version = &query["versionId"];
+            let index = version
+                .strip_prefix("dst")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(
+                url.path(),
+                format!("/fixture-bucket/root/archive/task/a{index:04}")
+            );
+            if matches!(fault, ArchiveBatchFault::SourceWriteDuringFinalHead)
+                && !completed_worker.lock().unwrap().is_empty()
+            {
+                new_source_worker.store(true, Ordering::SeqCst);
+            }
+            return head(version, "copied", 3);
+        }
+        let completed = completed_worker.lock().unwrap();
+        if query.contains_key("versions") {
+            let prefix = &query["prefix"];
+            if prefix == &registry_object() {
+                return registry_listing();
+            }
+            if prefix == "root/archive/task/" {
+                let skip = usize::from(
+                    matches!(fault, ArchiveBatchFault::DestinationAfterBatch)
+                        && !completed.is_empty(),
+                );
+                let rows = (skip..count)
+                    .map(|index| {
+                        version_row(
+                            &format!("root/archive/task/a{index:04}"),
+                            &format!("dst{index}"),
+                        )
+                        .replace("&quot;abc&quot;", "&quot;copied&quot;")
+                        .replace("<IsLatest>false</IsLatest>", "<IsLatest>true</IsLatest>")
+                    })
+                    .collect::<String>();
+                return history(&rows);
+            }
+            assert_eq!(prefix, "root/task/");
+            let version_for = |index| {
+                if index == 0 && matches!(fault, ArchiveBatchFault::NullSource) {
+                    "null".to_owned()
+                } else {
+                    format!("v{index}")
+                }
+            };
+            let mut rows = (0..count)
+                .filter(|index| {
+                    !completed.contains(&(format!("root/task/a{index:04}"), version_for(*index)))
+                })
+                .map(|index| version_row(&format!("root/task/a{index:04}"), &version_for(index)))
+                .collect::<String>();
+            if new_source_worker.load(Ordering::SeqCst) {
+                rows.push_str(&version_row("root/task/concurrent", "late-source-version"));
+            }
+            return history(&rows);
+        }
+        let mut current = stored.clone();
+        if matches!(fault, ArchiveBatchFault::RegistryAfterBatch) && !completed.is_empty() {
+            current["transaction_id"] = "foreign-transaction".into();
+        }
+        registry_body(&current)
+    });
+    let client = if matches!(fault, ArchiveBatchFault::LostBatchResponse) {
+        crate::native_s3::tests::interrupt_response_once(
+            client,
+            "/fixture-bucket?delete=".into(),
+            request_received,
+        )
+        .0
+    } else {
+        client
+    };
+    let mut candidates = receipt["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(count - usize::from(matches!(fault, ArchiveBatchFault::ProtectedSibling)))
+        .map(|row| json!({"pointer":"task/.workspace-mgr-archive.json","object":row["source_object"],"version_id":row["source_version_id"]}))
+        .collect::<Vec<_>>();
+    candidates.push(json!({"pointer":"task/.workspace-mgr-archive.json","object":"task/a0000","version_id":"already-absent"}));
+    let result = delete_candidates_with_catalog(
+        &client,
+        &repo,
+        &json!({"candidates":candidates,"prefixes":[receipt],"coordination":[{"receipt":receipt,"coordination":proof}]}),
+        || panic!("archive-only retirement must not fetch a generic destination catalog"),
+    );
+    let requests = worker.finish_requests();
+    let deleted = completed.lock().unwrap().len();
+    (result, requests, deleted)
+}
+
+#[test]
+fn published_archive_batches_large_prefix_with_linear_destination_verification() {
+    let count = 512;
+    let (result, requests, deleted) = archive_batch_fixture(count, ArchiveBatchFault::None);
+    assert_eq!(deleted, count);
+    let result = result.unwrap();
+    assert_eq!(result["cleaned_prefixes"], json!(["task"]));
+    assert_eq!(
+        result["already_absent"],
+        json!([{"pointer":"task/.workspace-mgr-archive.json","object":"task/a0000","version_id":"already-absent"}])
+    );
+    assert!(result["retained_unmapped"].as_array().unwrap().is_empty());
+    let batches = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect::<Vec<_>>();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batch_delete_items(batches[0]).len(), count);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "HEAD")
+            .count(),
+        count * 2
+    );
+}
+
+#[test]
+fn published_archive_rechecks_changed_registry_before_next_batch() {
+    let (result, requests, deleted) =
+        archive_batch_fixture(1001, ArchiveBatchFault::RegistryAfterBatch);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("canonical registry")
+    );
+    assert_eq!(deleted, 1000);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request.method.as_str(), "POST" | "DELETE"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn published_archive_does_not_report_clean_prefix_after_destination_loss() {
+    let (result, _, deleted) = archive_batch_fixture(4, ArchiveBatchFault::DestinationAfterBatch);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("lost a previously copied")
+    );
+    assert_eq!(deleted, 4);
+}
+
+#[test]
+fn published_archive_incomplete_batch_acknowledgement_fails_without_replay() {
+    let (result, requests, deleted) = archive_batch_fixture(4, ArchiveBatchFault::IncompleteBatch);
+    assert!(result.is_err());
+    assert_eq!(deleted, 4);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn published_archive_lost_batch_response_retries_only_identical_exact_versions() {
+    let (result, requests, deleted) =
+        archive_batch_fixture(4, ArchiveBatchFault::LostBatchResponse);
+    assert_eq!(result.unwrap()["cleaned_prefixes"], json!(["task"]));
+    assert_eq!(deleted, 4);
+    let batches = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect::<Vec<_>>();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].target, batches[1].target);
+    assert_eq!(batches[0].body, batches[1].body);
+}
+
+#[test]
+fn published_archive_preserves_unrequested_mapped_sibling_as_mapped_retention() {
+    let (result, requests, deleted) = archive_batch_fixture(4, ArchiveBatchFault::ProtectedSibling);
+    let result = result.unwrap();
+    assert_eq!(deleted, 3);
+    assert_eq!(result["cleaned_prefixes"], json!([]));
+    assert!(result["retained_unmapped"].as_array().unwrap().is_empty());
+    assert_eq!(
+        result["retained_mapped"],
+        json!([{
+            "pointer":"task/.workspace-mgr-archive.json",
+            "object":"task/a0003",
+            "version_id":"v3"
+        }])
+    );
+    let batch = requests
+        .iter()
+        .find(|request| request.method == "POST")
+        .unwrap();
+    assert_eq!(batch_delete_items(batch).len(), 3);
+}
+
+#[test]
+fn published_archive_retires_pre_versioning_null_source_with_explicit_guarded_delete() {
+    let (result, requests, deleted) = archive_batch_fixture(4, ArchiveBatchFault::NullSource);
+    assert_eq!(result.unwrap()["cleaned_prefixes"], json!(["task"]));
+    assert_eq!(deleted, 4);
+    let single = requests
+        .iter()
+        .filter(|request| request.method == "DELETE")
+        .collect::<Vec<_>>();
+    assert_eq!(single.len(), 1);
+    assert_eq!(
+        single[0].target,
+        "/fixture-bucket/root/task/a0000?versionId=null"
+    );
+    let batch = requests
+        .iter()
+        .find(|request| request.method == "POST")
+        .unwrap();
+    assert_eq!(batch_delete_items(batch).len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "HEAD")
+            .count(),
+        12
+    );
+}
+
+#[test]
+fn published_archive_final_inventory_retains_write_during_final_destination_heads() {
+    let (result, _, deleted) =
+        archive_batch_fixture(4, ArchiveBatchFault::SourceWriteDuringFinalHead);
+    let result = result.unwrap();
+    assert_eq!(deleted, 4);
+    assert_eq!(result["cleaned_prefixes"], json!([]));
+    assert_eq!(
+        result["retained_unmapped"],
+        json!([{
+            "pointer":"task/.workspace-mgr-archive.json",
+            "object":"task/concurrent",
+            "version_id":"late-source-version"
+        }])
+    );
 }

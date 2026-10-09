@@ -17,13 +17,33 @@ pub const RECEIPT_NAME: &str = ".workspace-mgr-archive.json";
 
 /// Rust-owned task metadata is retained beside the transport mapping. Keep
 /// reconstruction and comparison in publish/cancel on the same field list.
-pub(crate) const RECEIPT_METADATA_FIELDS: [&str; 5] = [
+pub(crate) const RECEIPT_METADATA_FIELDS: [&str; 6] = [
     "task_id",
     "previous_receipt",
     "completion_reviews",
     "historical_records",
     "closed_pull_request",
+    "migration_kind",
 ];
+
+pub(crate) fn is_task_rename(receipt: &Value) -> bool {
+    receipt["migration_kind"] == "task-rename"
+}
+
+/// A rename changes the readable slug, never the immutable task timestamp.
+/// Keep this exception narrower than ordinary arbitrary-prefix relocation.
+fn validate_rename_identity(receipt: &Value, source: &str, destination: &str) -> Result<()> {
+    use crate::manifest::{TaskKind, parse_task_identity};
+    let identity = parse_task_identity(TaskKind::Deliverable, text(receipt, "task_id")?)?;
+    let old = parse_task_identity(TaskKind::Deliverable, source)?;
+    let new = parse_task_identity(TaskKind::Deliverable, destination)?;
+    if identity.timestamp != old.timestamp || identity.timestamp != new.timestamp {
+        return Err(Error::message(
+            "task rename migration changes the immutable task timestamp",
+        ));
+    }
+    Ok(())
+}
 
 pub fn plan(repo: &GitRepo, config: &Config, source: &str, destination: &str) -> Result<Value> {
     if !config.s3_enabled() {
@@ -73,13 +93,20 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 pub(crate) fn validate(path: &str, receipt: &Value) -> Result<()> {
     let source = repo_path(text(receipt, "source")?, "archive source")?;
     let destination = repo_path(text(receipt, "destination")?, "archive destination")?;
+    let rename = is_task_rename(receipt);
+    if receipt.get("migration_kind").is_some() && !rename {
+        return Err(Error::message("unknown task migration kind"));
+    }
+    if rename {
+        validate_rename_identity(receipt, &source, &destination)?;
+    }
     if receipt["schema_version"] != 1
         || !matches!(receipt["status"].as_str(), Some("planned" | "copied"))
         || path != format!("{destination}/{RECEIPT_NAME}")
         || source == destination
         || source.starts_with(&format!("{destination}/"))
         || destination.starts_with(&format!("{source}/"))
-        || source.rsplit('/').next() != destination.rsplit('/').next()
+        || !rename && source.rsplit('/').next() != destination.rsplit('/').next()
         || !receipt["versions"].is_array()
     {
         return Err(Error::message(format!(
@@ -109,12 +136,81 @@ pub(crate) fn validate(path: &str, receipt: &Value) -> Result<()> {
 pub fn pointer_set(repo: &GitRepo, scopes: &[String]) -> Result<BTreeSet<String>> {
     let mut result = BTreeSet::new();
     for (_, receipt) in receipts(repo, scopes)? {
+        // Active renamed tasks keep normal reconciliation: unchanged copied
+        // versions are reused, while later edits upload only changed bytes.
+        if is_task_rename(&receipt) {
+            continue;
+        }
         result.extend(storage_metadata::discover(
             repo,
             &[text(&receipt, "destination")?.to_owned()],
         )?);
     }
     Ok(result)
+}
+
+pub(crate) fn pending_rename_source(
+    repo: &GitRepo,
+    task: &crate::manifest::ResolvedTask,
+    base: &str,
+) -> Result<Option<String>> {
+    let Some(destination) = task.task_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = format!("{destination}/{RECEIPT_NAME}");
+    let absolute = resolved_under(&repo.root, &path);
+    let published = repo.run_unchecked(["show", &format!("{base}:{path}")])?;
+    let published_receipt = published
+        .success()
+        .then(|| serde_json::from_str::<Value>(&published.stdout).ok())
+        .flatten();
+    if let Some(original) = published_receipt
+        .as_ref()
+        .filter(|receipt| is_task_rename(receipt) && receipt["status"] == "copied")
+    {
+        validate(&path, original)?;
+        reject_symlink_traversal(&repo.root, &path, "published task rename receipt")?;
+        let current = fs::read(&absolute)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+        if current.as_ref() != Some(original) {
+            return Err(Error::message(
+                "published task rename receipt was removed or changed; restore its original copied history binding before publication",
+            ));
+        }
+        if original["task_id"] != task.task_id {
+            return Err(Error::message(
+                "published task rename receipt belongs to another immutable task identity",
+            ));
+        }
+        return Ok(None);
+    }
+    if !absolute.exists() {
+        return Ok(None);
+    }
+    reject_symlink_traversal(&repo.root, &path, "task rename receipt")?;
+    let receipt: Value = serde_json::from_slice(&fs::read(&absolute).at(&absolute)?)
+        .map_err(|error| Error::message(format!("invalid task rename receipt: {error}")))?;
+    if !is_task_rename(&receipt) {
+        return Ok(None);
+    }
+    validate(&path, &receipt)?;
+    if receipt["task_id"] != task.task_id {
+        return Err(Error::message(
+            "task rename receipt belongs to another immutable task identity",
+        ));
+    }
+    if published_receipt.as_ref() == Some(&receipt) {
+        return Ok(None);
+    }
+    crate::archive_cancel::validate_migration(repo, &receipt)?;
+    let source = text(&receipt, "source")?;
+    if resolved_under(&repo.root, source).exists() {
+        return Err(Error::message(
+            "the original S3 task rename source reappeared locally; preserve the conflicting path before publication",
+        ));
+    }
+    Ok(Some(source.to_owned()))
 }
 
 /// The source snapshot is revalidated by the transport before it copies any
@@ -136,6 +232,10 @@ pub fn prepare(
                 .ok()
                 .as_ref()
                 == Some(&receipt);
+        if published && is_task_rename(&receipt) {
+            completed.push(receipt);
+            continue;
+        }
         let pointers = storage_metadata::discover(repo, std::slice::from_ref(&destination))?;
         for pointer in &pointers {
             let absolute = resolved_under(&repo.root, pointer);
@@ -144,7 +244,9 @@ pub fn prepare(
                 &repo.root,
                 storage_metadata::boundary_path(pointer).unwrap(),
             );
-            if output.exists() && !storage_metadata::payload_matches_metadata(repo, pointer, &raw)?
+            if !is_task_rename(&receipt)
+                && output.exists()
+                && !storage_metadata::payload_matches_metadata(repo, pointer, &raw)?
             {
                 return Err(Error::message(format!(
                     "archived output changed after planning: {pointer}"
@@ -219,7 +321,9 @@ pub fn prepare(
             for pointer in &pointers {
                 rewrite_pointer_with_client(repo, pointer, &receipt, &mut proof_client)?;
             }
-            storage_metadata::verify_archived(repo, &pointers)?;
+            if !is_task_rename(&receipt) {
+                storage_metadata::verify_archived(repo, &pointers)?;
+            }
         }
         completed.push(receipt);
     }
@@ -300,7 +404,7 @@ pub fn purge_candidates(receipts: &[Value]) -> Result<Vec<ObjectVersion>> {
 }
 
 #[cfg(test)]
-fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()> {
+pub(crate) fn rewrite_pointer(repo: &GitRepo, pointer: &str, receipt: &Value) -> Result<()> {
     rewrite_pointer_with_client(repo, pointer, receipt, &mut None)
 }
 
@@ -321,6 +425,10 @@ fn rewrite_pointer_with_client(
         Some(manifest) => storage_metadata::logical_document(manifest).entries(pointer),
         None => storage_metadata::parse_pointer_document(&raw, pointer)?.entries(pointer),
     };
+    if is_task_rename(receipt) && storage_metadata::hash_algorithm(&raw, pointer)? == "md5-dos2unix"
+    {
+        rebind_normalized_caches(repo, pointer, &entries, receipt)?;
+    }
     if proof_client.is_none() && entries.iter().any(|entry| entry.verification.is_some()) {
         *proof_client = Some(crate::native_s3::S3Client::from_repo(repo)?);
     }
@@ -328,11 +436,15 @@ fn rewrite_pointer_with_client(
     if let Some(mut manifest) = manifest {
         match manifest.kind {
             crate::storage_format::Kind::File => {
-                manifest.version = Some(copied_version(client, &entries[0], receipt)?);
+                if needs_copy_binding(&entries[0], receipt) {
+                    manifest.version = Some(copied_version(client, &entries[0], receipt)?);
+                }
             }
             crate::storage_format::Kind::Directory => {
                 for (file, entry) in manifest.entries.as_mut().unwrap().iter_mut().zip(&entries) {
-                    file.version = Some(copied_version(client, entry, receipt)?);
+                    if needs_copy_binding(entry, receipt) {
+                        file.version = Some(copied_version(client, entry, receipt)?);
+                    }
                 }
             }
         }
@@ -368,6 +480,71 @@ fn rewrite_pointer_with_client(
         serde_yaml::to_string(&document).map_err(|error| Error::message(error.to_string()))?;
     crate::archive_cancel::record_pointer_rewrite(repo, receipt, pointer, rendered.as_bytes())?;
     atomic_write(&absolute, rendered.as_bytes())
+}
+
+/// A verified server copy preserves raw bytes, so its exact-version cache can
+/// inherit the original cache's association. Never fill it from the current
+/// payload, which may have been edited after the local rename.
+fn rebind_normalized_caches(
+    repo: &GitRepo,
+    pointer: &str,
+    entries: &[storage_metadata::PointerEntry],
+    receipt: &Value,
+) -> Result<()> {
+    let cache = crate::native_engine::CachePaths::new(repo)?;
+    let mut hashes = crate::native_engine::HashInventory::new();
+    for entry in entries.iter().filter(|entry| entry.verification.is_none()) {
+        let Some(row) = receipt["versions"].as_array().and_then(|rows| {
+            rows.iter().find(|row| {
+                row["destination_object"] == entry.key
+                    && row["delete_marker"] == false
+                    && entry.version_id.as_deref().is_some_and(|id| {
+                        row["source_version_id"] == id || row["destination_version_id"] == id
+                    })
+            })
+        }) else {
+            continue;
+        };
+        let source = crate::native_engine::StorageEntry {
+            pointer: pointer.to_owned(),
+            object: text(row, "source_object")?.to_owned(),
+            md5: entry.md5.clone(),
+            size: entry.size,
+            version_id: Some(text(row, "source_version_id")?.to_owned()),
+            etag: row["source_etag"].as_str().map(str::to_owned),
+            verification: None,
+            hash_name: "md5-dos2unix".to_owned(),
+        };
+        let mut destination = source.clone();
+        destination.object = entry.key.clone();
+        destination.version_id = Some(text(row, "destination_version_id")?.to_owned());
+        destination.etag = row["destination_etag"].as_str().map(str::to_owned);
+        let source_path = cache.entry(&source)?;
+        if !source_path.is_file() {
+            return Err(Error::message(
+                "task rename lost its exact source-version cache for normalized storage; hydrate or migrate the source binding before publishing",
+            ));
+        }
+        cache.install_entry_with_inventory(&destination, &source_path, &mut hashes)?;
+    }
+    Ok(())
+}
+
+fn needs_copy_binding(entry: &storage_metadata::PointerEntry, receipt: &Value) -> bool {
+    // Reconciliation can clear an edited output's version, or upload a newer
+    // destination version, before a Git push fails. Those exact generated
+    // controls are checked against the move journal before reaching here and
+    // then verified by normal native storage in the destination namespace.
+    !is_task_rename(receipt)
+        || receipt["versions"].as_array().is_some_and(|versions| {
+            versions.iter().any(|row| {
+                row["destination_object"] == entry.key
+                    && !row["delete_marker"].as_bool().unwrap_or(false)
+                    && entry.version_id.as_deref().is_some_and(|id| {
+                        row["source_version_id"] == id || row["destination_version_id"] == id
+                    })
+            })
+        })
 }
 
 fn copied_version(
@@ -486,6 +663,9 @@ fn replace_cloud(
     entry: &storage_metadata::PointerEntry,
     receipt: &Value,
 ) -> Result<()> {
+    if !needs_copy_binding(entry, receipt) {
+        return Ok(());
+    }
     let version = copied_version(client, entry, receipt)?;
     value["cloud"]["workspace-mgr"]["version_id"] = version.id.into();
     value["cloud"]["workspace-mgr"]["etag"] = version.etag.unwrap().into();

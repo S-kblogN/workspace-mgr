@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real CLI archive/publication/history E2E against a CI-owned MinIO service.
+"""Real CLI archive/rename/publication/history E2E against a CI-owned MinIO service.
 
 Requires a --features test-storage binary, boto3 for isolated S3 verification, and
 the same WORKSPACE_MGR_BIN / WORKSPACE_MGR_E2E_ROOT / MINIO_* variables as the
@@ -29,6 +29,10 @@ TASK = "20260712-121000-history-task"
 BRANCH = "codex/history-task"
 DESTINATION = f"2026/07/{TASK}"
 RECEIPT = ".workspace-mgr-archive.json"
+RENAME_TASK = "20260713-121000-rename-history"
+RENAME_BRANCH = "codex/rename-history"
+RENAMED_TASK = "20260713-121000-renamed-history"
+RENAMED_ARCHIVE = f"2026/07/{RENAMED_TASK}"
 
 
 class ArchiveHarness(e2e.Harness):
@@ -101,11 +105,11 @@ class ArchiveHarness(e2e.Harness):
         finally:
             response["Body"].close()
 
-    def fake_gh(self, merged_oid, head_oid):
-        database = {BRANCH: [{
-            "number": 7, "url": "https://example.invalid/owner/archive-fixture/pull/7",
+    def fake_gh(self, merged_oid, head_oid, branch=BRANCH, number=7):
+        database = {branch: [{
+            "number": number, "url": f"https://example.invalid/owner/archive-fixture/pull/{number}",
             "state": "MERGED", "mergedAt": "2026-07-12T20:00:00Z",
-            "mergeCommit": {"oid": merged_oid}, "headRefName": BRANCH,
+            "mergeCommit": {"oid": merged_oid}, "headRefName": branch,
             "headRefOid": head_oid,
             "baseRefName": "main", "isCrossRepository": False,
         }]}
@@ -115,13 +119,13 @@ class ArchiveHarness(e2e.Harness):
             f"database = json.loads({json.dumps(json.dumps(database))})\n"
             "if sys.argv[1] == 'api':\n"
             "    if '/commits/' in sys.argv[-1] and sys.argv[-1].split('?')[0].endswith('/pulls'):\n"
-            "        row = database['codex/history-task'][0]\n"
+            "        row = next(iter(database.values()))[0]\n"
             "        print(json.dumps([dict(number=row['number'], html_url=row['url'], state='closed', merged_at=row['mergedAt'], merge_commit_sha=row['mergeCommit']['oid'], head=dict(ref=row['headRefName'], sha=row['headRefOid'], repo=dict(full_name='owner/archive-fixture')), base=dict(ref='main', sha=row['mergeCommit']['oid'], repo=dict(full_name='owner/archive-fixture')))]))\n"
             "    else:\n"
             "        print(json.dumps({'protected': False}))\n"
             "    sys.exit(0)\n"
             "if sys.argv[1:3] == ['pr', 'view']:\n"
-            "    print(json.dumps(database['codex/history-task'][0]))\n"
+            "    print(json.dumps(next(iter(database.values()))[0]))\n"
             "    sys.exit(0)\n"
             "head = sys.argv[sys.argv.index('--head') + 1]\n"
             "print(json.dumps(database.get(head, [])))\n",
@@ -129,7 +133,7 @@ class ArchiveHarness(e2e.Harness):
         )
         executable.chmod(0o755)
         self.env["WORKSPACE_MGR_TEST_GH"] = str(executable)
-        self.run(["git", "--git-dir", self.remote, "update-ref", "refs/pull/7/head", head_oid])
+        self.run(["git", "--git-dir", self.remote, "update-ref", f"refs/pull/{number}/head", head_oid])
 
     def initialize(self):
         self.section("isolated versioned S3 and Git fixture")
@@ -306,7 +310,7 @@ class ArchiveHarness(e2e.Harness):
 
     def check_copied_history(self, receipt, original):
         mapped = {(row["source_object"], row["source_version_id"]): row for row in receipt["versions"]}
-        copied = self.namespace_versions(DESTINATION)
+        copied = self.namespace_versions(receipt["destination"])
         self.check(len(mapped) == len(original) == len(copied), "every source payload and marker has one copied destination version")
         actual = {(row["key"], row["version_id"]): row for row in copied}
         for old in original:
@@ -452,6 +456,187 @@ class ArchiveHarness(e2e.Harness):
         self.check(self.namespace_versions(TASK) == [] and self.namespace_versions(DESTINATION) == copied,
                    "historical reads neither recreate source objects nor change destination history")
 
+    def check_retained_copies(self, receipt, bodies):
+        actual = {(row["key"], row["version_id"]): row
+                  for row in self.namespace_versions(receipt["destination"])}
+        for row in receipt["versions"]:
+            identity = ("objects/" + row["destination_object"], row["destination_version_id"])
+            self.check(identity in actual and actual[identity]["delete_marker"] == row["delete_marker"],
+                       "active rename retains each exact copied payload and marker", identity=identity)
+            if not row["delete_marker"]:
+                self.check(self.exact_body(*identity) == bodies[(row["source_object"], row["source_version_id"])],
+                           "retained rename history keeps its original opaque bytes", identity=identity)
+
+    def rename_and_retire_history(self):
+        self.section("versioned task rename copies full history without an unchanged payload upload")
+        self.wm(self.shared, "refresh")
+        created = self.wm(
+            self.shared, "task", "create", "rename-history", "--timestamp", "20260713-121000",
+            "--title", "Exercise rename history retention", "--purpose", "Preserve copied history during later active work.",
+        )
+        task = Path(created["path"])
+        self.document_task(task)
+        (task / "single.txt").write_bytes(b"rename standalone version one\n")
+        (task / "bundle").mkdir()
+        (task / "bundle" / "alpha.txt").write_bytes(b"rename alpha version one\n")
+        (task / "bundle" / "beta.bin").write_bytes(b"rename historical beta\n")
+        for output in ("single.txt", "bundle"):
+            self.wm(task, "storage", "set", f"{RENAME_TASK}/{output}", "--to", "s3",
+                    "--reason", "Exercise versioned rename history.")
+        first = self.wm(task, "publish", "-m", "Publish original rename payloads")
+        first_oid = first["remote_oid"]
+        self.git(self.seed, "fetch", "origin", RENAME_BRANCH)
+        self.git(self.seed, "tag", "rename-historical-snapshot", first_oid)
+        self.git(self.seed, "push", "origin", "refs/tags/rename-historical-snapshot")
+        (task / "single.txt").write_bytes(b"rename standalone version two\n")
+        (task / "bundle" / "alpha.txt").write_bytes(b"rename alpha version two\n")
+        with (task / "record.md").open("a", encoding="utf-8") as record:
+            record.write("\nPublish second exact versions before changing the task topic.\n")
+        self.wm(task, "publish", "-m", "Publish second rename payload generations")
+        # Keep this task active: its first merge happens only after the rename
+        # and subsequent payload edits. A merged deliverable cannot be renamed.
+        # Full namespace history includes opaque keys absent from every current
+        # pointer and a current marker. Neither may be dropped by a rename.
+        orphan_key = f"objects/{RENAME_TASK}/gone.bin"
+        for body in (b"rename orphan generation one\n", b"rename orphan generation two\n"):
+            self.s3.put_object(Bucket=self.bucket, Key=orphan_key, Body=body)
+        self.s3.delete_object(Bucket=self.bucket, Key=orphan_key)
+        original = self.namespace_versions(RENAME_TASK)
+        bodies = {(row["key"].removeprefix("objects/"), row["version_id"]):
+                  self.exact_body(row["key"], row["version_id"])
+                  for row in original if not row["delete_marker"]}
+        self.check(sum(not row["delete_marker"] for row in original) == 7
+                   and any(row["delete_marker"] for row in original),
+                   "rename fixture has multiple payload generations and orphan delete-marker history")
+        preview = self.wm(task, "task", "rename", "renamed-history", "--dry-run")
+        self.check(preview["new_path"] == RENAMED_TASK
+                   and self.namespace_versions(RENAME_TASK) == original
+                   and self.namespace_versions(RENAMED_TASK) == [],
+                   "rename preview leaves every source version and destination untouched")
+        renamed = self.wm(task, "task", "rename", "renamed-history")
+        task = task.parent / RENAMED_TASK
+        self.check(renamed["task_id"] == RENAME_TASK and renamed["branch"] == RENAME_BRANCH
+                   and renamed["storage_migration"]["preserved_versions"] == len(original)
+                   and renamed["storage_migration"]["delete_markers"]
+                       == sum(row["delete_marker"] for row in original)
+                   and self.namespace_versions(RENAME_TASK) == original
+                   and self.namespace_versions(RENAMED_TASK) == [],
+                   "local rename freezes full history, preserves identity and performs no S3 writes")
+        published = self.wm(task, "publish", "-m", "Rename through exact server-side history copies")
+        receipt = json.loads((task / RECEIPT).read_text())
+        self.check(receipt["migration_kind"] == "task-rename" and receipt["status"] == "copied"
+                   and receipt["source"] == RENAME_TASK and receipt["destination"] == RENAMED_TASK,
+                   "rename publication produces a formally marked exact-version receipt")
+        copied = self.check_copied_history(receipt, original)
+        self.check(len(copied) == len(original)
+                   and self.namespace_versions(RENAME_TASK) == original
+                   and published["storage"]["purge"]["status"] == "cleanup_pending",
+                   "unchanged rename creates only copied generations and keeps source history pending before merge")
+        single = json.loads((task / "single.txt.wm-storage.json").read_text())
+        bundle = json.loads((task / "bundle.wm-storage.json").read_text())
+        copied_bindings = {(row["destination_object"], row["destination_version_id"])
+                           for row in receipt["versions"] if not row["delete_marker"]}
+        self.check((f"{RENAMED_TASK}/single.txt", single["version"]["id"]) in copied_bindings
+                   and all((f"{RENAMED_TASK}/bundle/{item['path']}", item["version"]["id"])
+                           in copied_bindings for item in bundle["entries"]),
+                   "unchanged native outputs bind copied versions instead of additional uploaded generations")
+
+        self.section("later active rename edits preserve unique copied history before shared merge")
+        (task / "bundle" / "alpha.txt").write_bytes(b"rename active alpha version three\n")
+        (task / "bundle" / "beta.bin").unlink()
+        with (task / "record.md").open("a", encoding="utf-8") as record:
+            record.write("\nEdit alpha and remove current beta while retaining immutable copied history.\n")
+        changed = self.wm(task, "publish", "-m", "Edit active renamed payloads before merge")
+        self.check(changed["status"] == "pushed"
+                   and json.loads((task / RECEIPT).read_text()) == receipt
+                   and self.namespace_versions(RENAME_TASK) == original,
+                   "subsequent publication keeps the rename receipt and original source obligation")
+        bundle = json.loads((task / "bundle.wm-storage.json").read_text())
+        self.check([item["path"] for item in bundle["entries"]] == ["alpha.txt"]
+                   and (f"{RENAMED_TASK}/bundle/alpha.txt", bundle["entries"][0]["version"]["id"])
+                       not in copied_bindings,
+                   "changed alpha gets a new exact binding and removed beta leaves the current manifest")
+        self.check_retained_copies(receipt, bodies)
+        self.check((task / "bundle" / "alpha.txt").read_bytes() == b"rename active alpha version three\n",
+                   "normal upload retains the new active opaque bytes")
+        self.section("rename merge retires original namespace and historical hydration follows exact copies")
+        merged = self.merge_branch_to_main(RENAME_BRANCH)
+        self.fake_gh(merged, changed["remote_oid"], RENAME_BRANCH, 8)
+        cleaner = self.root / "rename-retirement-clone"
+        self.run(["git", "clone", self.remote_url, cleaner])
+        self.configure_git(cleaner)
+        refused = self.wm(cleaner, "archive", RENAMED_TASK, "--dry-run", expected=2)
+        self.check("finish prior source retirement" in refused["stderr"],
+                   "rearchive refuses while a prior rename source still retains versions or markers")
+        completed = self.wm(cleaner, "refresh")
+        self.check(completed["storage"]["purge"]["status"] == "complete"
+                   and self.namespace_versions(RENAME_TASK) == [],
+                   "merged rename retires every original payload version and delete marker")
+        self.check_retained_copies(receipt, bodies)
+        # This clone already has the current Git tree. Refresh retires source
+        # history but does not hydrate unchanged pointer outputs implicitly.
+        current_history = self.namespace_versions(RENAMED_TASK)
+        hydrated = self.wm(cleaner / RENAMED_TASK, "storage", "hydrate")
+        self.check(hydrated["status"] == "hydrated"
+                   and self.namespace_versions(RENAME_TASK) == []
+                   and self.namespace_versions(RENAMED_TASK) == current_history,
+                   "explicit current hydration reads exact versions without creating any remote history")
+        self.check((cleaner / RENAMED_TASK / "single.txt").read_bytes() == b"rename standalone version two\n"
+                   and (cleaner / RENAMED_TASK / "bundle" / "alpha.txt").read_bytes()
+                       == b"rename active alpha version three\n"
+                   and not (cleaner / RENAMED_TASK / "bundle" / "beta.bin").exists()
+                   and not (cleaner / RENAMED_TASK / "gone.bin").exists(),
+                   "fresh main hydration restores current edits without recreating removed or marker-only historical files")
+        history = self.root / "rename-historical-consumer"
+        self.run(["git", "clone", self.remote_url, history])
+        self.configure_git(history)
+        self.git(history, "checkout", "--detach", first_oid)
+        self.wm(history / RENAME_TASK, "storage", "hydrate")
+        self.check((history / RENAME_TASK / "single.txt").read_bytes() == b"rename standalone version one\n"
+                   and (history / RENAME_TASK / "bundle" / "alpha.txt").read_bytes() == b"rename alpha version one\n"
+                   and (history / RENAME_TASK / "bundle" / "beta.bin").read_bytes() == b"rename historical beta\n",
+                   "historical Git pointers hydrate original exact bytes after source retirement and later removal")
+
+        self.section("rearchive after source retirement moves protected intermediate copies onward")
+        preview = self.wm(cleaner, "archive", RENAMED_TASK, "--dry-run")
+        self.check(preview["tasks"][0]["destination"] == RENAMED_ARCHIVE,
+                   "rearchive becomes eligible only after the earlier source namespace is empty")
+        created = self.wm(
+            cleaner, "task", "create", "archive-renamed-history", "--kind", "infrastructure",
+            "--title", "Archive renamed task", "--purpose", "Preserve a chained exact-version relocation.",
+            "--scope", RENAMED_TASK, "--scope", RENAMED_ARCHIVE,
+            "--scope-note", "Fixture-owned source retirement completed before this archive.",
+        )
+        manifest = created["manifest"]
+        before_archive = self.namespace_versions(RENAMED_TASK)
+        archived = self.wm(cleaner, "archive", RENAMED_TASK, "--manifest", manifest)
+        self.check(archived["status"] == "archived", "rearchive applies after earlier source retirement")
+        self.wm(cleaner, "publish", "--manifest", manifest, "-m", "Archive retained renamed history")
+        next_receipt = json.loads((cleaner / RENAMED_ARCHIVE / RECEIPT).read_text())
+        copied_again = self.check_copied_history(next_receipt, before_archive)
+        self.check(next_receipt["previous_receipt"] == receipt,
+                   "later archive retains the complete prior rename control record")
+        self.merge_branch_to_main(created["branch"])
+        completed = self.wm(cleaner, "refresh")
+        self.check(completed["storage"]["purge"]["status"] == "complete"
+                   and self.namespace_versions(RENAME_TASK) == []
+                   and self.namespace_versions(RENAMED_TASK) == []
+                   and self.namespace_versions(RENAMED_ARCHIVE) == copied_again,
+                   "canonical archive source retirement moves copied intermediate history onward without leaking it")
+        # Rehydrate with an empty exact-version cache so the A->B->C chain must
+        # resolve both canonical receipts rather than reuse the previous read.
+        chained_history = self.root / "rename-chained-historical-consumer"
+        self.run(["git", "clone", self.remote_url, chained_history])
+        self.configure_git(chained_history)
+        self.git(chained_history, "checkout", "--detach", first_oid)
+        self.wm(chained_history / RENAME_TASK, "storage", "hydrate")
+        self.check((chained_history / RENAME_TASK / "single.txt").read_bytes() == b"rename standalone version one\n"
+                   and (chained_history / RENAME_TASK / "bundle" / "alpha.txt").read_bytes() == b"rename alpha version one\n"
+                   and (chained_history / RENAME_TASK / "bundle" / "beta.bin").read_bytes() == b"rename historical beta\n"
+                   and self.namespace_versions(RENAME_TASK) == []
+                   and self.namespace_versions(RENAMED_TASK) == [],
+                   "historical hydration traverses rename and archive mappings without recreating retired namespaces")
+
     def execute(self):
         self.initialize()
         first_oid, original = self.publish_original()
@@ -459,6 +644,7 @@ class ArchiveHarness(e2e.Harness):
         self.cancel_failed_publication(worktree, branch, original, manifest)
         copied = self.publish_and_retry(worktree, branch, original, manifest)
         self.merge_and_read_history(organizer, branch, first_oid, copied)
+        self.rename_and_retire_history()
         summary = {"status": "passed", "assertions": self.assertions, "evidence": str(self.evidence_path),
                    "git_remote": self.remote_url, "s3_endpoint": self.endpoint, "bucket": self.bucket}
         self.record("summary", summary)

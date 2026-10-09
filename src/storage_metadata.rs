@@ -1317,6 +1317,7 @@ pub fn prepare_revision(
         "add",
         "--quiet",
         "--detach",
+        "--no-checkout",
         &checkout.to_string_lossy(),
         oid,
     ])?;
@@ -1324,6 +1325,7 @@ pub fn prepare_revision(
         let checkout_repo = GitRepo {
             root: checkout.clone(),
         };
+        materialize_preparation_controls(&checkout_repo, oid, pointers)?;
         link_private_worktree_state(repo, &checkout_repo)?;
         let revision_config = checkout_repo.root.join(".workspace-mgr.toml");
         let legacy_revision = !revision_config.exists()
@@ -1363,6 +1365,56 @@ pub fn prepare_revision(
             "{source}; temporary worktree cleanup also failed: {cleanup_error}"
         ))),
     }
+}
+
+/// Prefetch reads storage controls, not ordinary Git payload. Keep the full
+/// revision index for historical binding checks while only checking out the
+/// requested metadata, remote configuration, and attribute files. Checkout
+/// still goes through Git so filters and file modes retain their semantics.
+fn materialize_preparation_controls(repo: &GitRepo, oid: &str, pointers: &[String]) -> Result<()> {
+    repo.run(["read-tree", "--reset", oid])?;
+    let requested = pointers.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let listing = repo.run_bytes(["ls-files", "-z"], None)?;
+    let mut attributes = Vec::new();
+    let mut controls = Vec::new();
+    for path in listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        if Path::new(path).file_name().and_then(|name| name.to_str()) == Some(".gitattributes") {
+            attributes.push(path.to_owned());
+        } else if requested.contains(path)
+            || matches!(
+                path,
+                ".workspace-mgr.toml" | ".dvc/config" | ".dvc/config.local" | ".dvcignore"
+            )
+        {
+            controls.push(path.to_owned());
+        }
+    }
+    for paths in [&attributes, &controls] {
+        if !paths.is_empty() {
+            let input = paths
+                .iter()
+                .flat_map(|path| path.as_bytes().iter().copied().chain([0]))
+                .collect::<Vec<_>>();
+            repo.run_bytes(
+                [
+                    "checkout-index",
+                    "--force",
+                    "--ignore-skip-worktree-bits",
+                    "--stdin",
+                    "-z",
+                ],
+                Some(&input),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn link_private_worktree_state(source: &GitRepo, checkout: &GitRepo) -> Result<()> {
@@ -1599,6 +1651,104 @@ mod tests {
                 .stdout
                 .contains(&checkout.to_string_lossy().into_owned())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_materializes_filtered_literal_controls_without_git_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: directory.path().to_path_buf(),
+        };
+        repo.run(["init", "-q", "-b", "main"]).unwrap();
+        repo.run(["config", "user.name", "Preparation test"])
+            .unwrap();
+        repo.run(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        repo.run(["config", "filter.upper.clean", "tr A-Z a-z"])
+            .unwrap();
+        repo.run(["config", "filter.upper.smudge", "tr a-z A-Z"])
+            .unwrap();
+        repo.run(["config", "filter.payload.clean", "cat"]).unwrap();
+        repo.run(["config", "filter.payload.smudge", "false"])
+            .unwrap();
+        repo.run(["config", "filter.payload.required", "true"])
+            .unwrap();
+        fs::create_dir(repo.root.join("task")).unwrap();
+        fs::create_dir(repo.root.join(".dvc")).unwrap();
+        fs::write(
+            repo.root.join(".gitattributes"),
+            "*.payload filter=payload\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.root.join("task/.gitattributes"),
+            "*.dvc filter=upper\n",
+        )
+        .unwrap();
+        fs::write(repo.root.join(".workspace-mgr.toml"), "native config\n").unwrap();
+        fs::write(repo.root.join(".dvc/config"), "historical config\n").unwrap();
+        fs::write(
+            repo.root.join("unrelated.payload"),
+            "must not be checked out\n",
+        )
+        .unwrap();
+        let pointer = "task/quote\"tab\tline\n.dvc".to_owned();
+        fs::write(repo.root.join(&pointer), "FILTERED CONTROL\n").unwrap();
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "controls and unrelated payload"])
+            .unwrap();
+        let old = repo.optional_oid("HEAD").unwrap().unwrap();
+        fs::write(
+            repo.root.join(".workspace-mgr.toml"),
+            "changed native config\n",
+        )
+        .unwrap();
+        fs::write(repo.root.join(".dvc/config"), "changed historical config\n").unwrap();
+        repo.run(["add", "-A"]).unwrap();
+        repo.run(["commit", "-qm", "change current configuration"])
+            .unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let checkout = container.path().join("checkout");
+        repo.run([
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            "--no-checkout",
+            checkout.to_str().unwrap(),
+            &old,
+        ])
+        .unwrap();
+        let prepared = GitRepo {
+            root: checkout.clone(),
+        };
+        materialize_preparation_controls(&prepared, &old, std::slice::from_ref(&pointer)).unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join(&pointer)).unwrap(),
+            "FILTERED CONTROL\n"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join(".workspace-mgr.toml")).unwrap(),
+            "native config\n"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join(".dvc/config")).unwrap(),
+            "historical config\n"
+        );
+        assert!(!checkout.join("unrelated.payload").exists());
+        assert!(
+            prepared
+                .run(["ls-files", "--", "unrelated.payload"])
+                .unwrap()
+                .stdout
+                .contains("unrelated.payload")
+        );
+        assert_eq!(
+            prepared.optional_oid("HEAD").unwrap().as_deref(),
+            Some(old.as_str())
+        );
+        cleanup_preparation_worktree(&repo, &checkout, container).unwrap();
     }
 
     #[test]

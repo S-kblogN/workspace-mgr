@@ -320,6 +320,12 @@ A selected task also checks its former prefixes recorded in locally available
 Git history and archive receipts. Doctor never fetches refs or follows archive
 aliases to make an object at the wrong path pass. A repository-wide audit finds
 orphan paths even when their old task identity is no longer available locally.
+The current outer copied receipt may retain historical destination filenames
+absent from live pointers and local files. Doctor accepts only its exact
+key/version pairs after matching the canonical remote receipt and verifying
+destination inventory, size and ETag; delete markers must also match exactly.
+These records count as `retained_archive_versions`. Extra versions, missing
+copies, tampered receipts and leftover source history still fail the audit.
 The JSON report includes the selected `tasks` and structured `storage.issues`
 with exact paths and diagnostic codes. Doctor exits with status 2 if any check
 is unhealthy, or if the audit cannot finish; it never deletes or repairs data.
@@ -554,10 +560,29 @@ Git or S3 remote. On a published
 deliverable, the next normal `plan` includes the published old path as an
 identity-derived cleanup scope, preserves published Git/S3 placement at the new
 path, and `publish` deletes the old tree while advancing the same branch.
-Because version-aware S3 IDs are bound to object paths, rename clears those old
-bindings from moved pointers; publish creates and verifies new object versions
-at the new path, publishes Git, then permanently deletes every version at the
-old path unless another current remote branch or tag still references it.
+For versioned S3, rename freezes the complete source history in a migration
+receipt and preserves old bindings until publication. `publish` copies retained
+versions through S3 server-side `CopyObject` or multipart `UploadPartCopy`,
+recreates delete markers and publishes exact source-to-destination mappings.
+Unchanged payloads are not downloaded or reuploaded; new or edited payloads
+follow the normal verified upload path. Publication requires
+`minimum_cli_version = "0.8.11"`. Old source versions remain pending until the
+copied receipt reaches the shared branch, then guarded retirement removes only
+verified mapped history. Historical checkouts hydrate through the registry.
+Legacy `md5-dos2unix` inputs without a raw-byte proof require their trusted
+exact source-version cache before rename; hydrate or migrate them first if that
+cache is missing. Verified server copies rebind those same cached raw bytes to
+the destination version, preserving detection of raw line-ending changes.
+
+Repeated renames before any S3 reservation or copy collapse to the original
+source and final destination. A further S3 rename after copy has started or a
+copied receipt has been published is refused. New storage boundaries are also
+refused during an unpublished migration. Finish publication or preview
+`archive --cancel --dry-run --manifest <task-manifest>` to restore an unpublished
+attempt. Cancellation preserves changed bytes; if newer destination generations
+prevent safe copy ownership checks, finish publication before further changes.
+Later active publications preserve their already published copied rename receipt;
+removing or rebinding that control record is refused before storage mutations.
 
 ```sh
 workspace-mgr task rename current-research-question --dry-run
@@ -697,6 +722,12 @@ payload is not charged again to the infrastructure task's cloud-usage
 projection. New or changed payload and new Git/registry control data still
 count. The complete copy inventory remains in the archive receipts; temporary
 copies do not bypass verification or authorize early source retirement.
+Before reorganizing a task that already has a copied S3 receipt, archive checks
+that the prior receipt's source prefix has no versions or delete markers.
+Its prior source must also have no remaining local retirement records or prefix
+intent, including already deleted versions awaiting a checkpoint.
+Finish its earlier retirement with `refresh` before archiving it again; nesting
+a new receipt must not strand uncompleted obligations at an older source.
 Published Git and Git LFS files retain their original placement and object
 identity, even when several tasks move in one infrastructure publication or a
 legacy task has just been adopted.
@@ -1554,6 +1585,16 @@ first, before refresh inspects any incoming storage metadata, including the
 unaddressable boundaries described below, because a newer release may write
 metadata this one cannot read; `refresh --dry-run` applies it the same way.
 After the user approves and completes the update, rerun refresh.
+
+S3 retirement checks the complete receipt, canonical registry and copied
+destination history before each exact-version batch of at most 1,000, then
+rechecks destination history and lists the source prefix again. Confirmed
+source-prefix groups are atomically checkpointed; retries preserve unsubmitted
+groups and concurrent unmapped versions. If cleanup fails after Git succeeds,
+the report keeps the Git result and includes `storage.purge.errors`,
+`cleanup_pending` and an `s3-cleanup-failed` warning. Progress goes to stderr.
+Rerun refresh to finish the retained queue; `updated` alone does not establish
+completed storage retirement.
 
 After incoming materialization and storage verification succeed, refresh
 automatically checks local and configured-remote branches for cleanup, even

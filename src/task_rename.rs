@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::config::{Config, require_supported_cli_at};
 use crate::error::{Error, IoContext, Result};
@@ -46,6 +47,8 @@ pub struct TaskRenameReport {
     pub remote_branch_oid: Option<String>,
     pub local_actions: Vec<TaskRenameAction>,
     pub remote_writes: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_migration: Option<TaskRenameStorageMigration>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<RelocationNotice>,
     pub review: TaskRenameReview,
@@ -63,6 +66,17 @@ pub struct TaskRenameReview {
     pub head_branch_unchanged: bool,
     pub pull_request: &'static str,
     pub agent_action: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskRenameStorageMigration {
+    pub status: &'static str,
+    pub source: String,
+    pub destination: String,
+    pub preserved_versions: usize,
+    pub payload_versions: usize,
+    pub delete_markers: usize,
+    pub publication_action: &'static str,
 }
 
 pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
@@ -122,6 +136,23 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         }
         _ => None,
     };
+    let migration = match (&task.task_path, &new_task_path) {
+        (Some(old), Some(new)) => plan_storage_rename(&task_repo, &config, &task, old, new)?,
+        _ => None,
+    };
+    let storage_migration = migration.as_ref().map(|migration| {
+        let rows = migration.receipt["versions"].as_array().expect("validated versions");
+        let delete_markers = rows.iter().filter(|row| row["delete_marker"] == true).count();
+        TaskRenameStorageMigration {
+            status: "planned",
+            source: migration.receipt["source"].as_str().expect("validated source").to_owned(),
+            destination: migration.receipt["destination"].as_str().expect("validated destination").to_owned(),
+            preserved_versions: rows.len(),
+            payload_versions: rows.len() - delete_markers,
+            delete_markers,
+            publication_action: "server-copy history; upload changed payloads only; retire source after verified Git publication",
+        }
+    });
 
     // The rewritten manifest keeps every other field, including a recorded
     // cloud-usage approval, and uses the lowest schema that represents it.
@@ -162,6 +193,7 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
             new_task_path.as_deref(),
             &rendered,
             relocation.as_ref(),
+            migration.as_ref(),
         )?;
     }
 
@@ -186,6 +218,7 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
         remote_branch_oid,
         local_actions,
         remote_writes: false,
+        storage_migration,
         notices: if !options.dry_run && relocation.is_some() {
             vec![RelocationNotice::renamed_directory()]
         } else {
@@ -197,6 +230,121 @@ pub fn rename(options: &TaskRenameOptions) -> Result<TaskRenameReport> {
             agent_action: "update the existing pull request title and description after the renamed task is published",
         },
     })
+}
+
+struct StorageRename {
+    receipt: Value,
+    previous: Option<Value>,
+}
+
+/// Freeze exact remote history before moving the local directory. Publication
+/// copies those versions on the server and then rebases their local bindings.
+fn plan_storage_rename(
+    repo: &GitRepo,
+    config: &Config,
+    task: &ResolvedTask,
+    source: &str,
+    destination: &str,
+) -> Result<Option<StorageRename>> {
+    let receipt_path = format!("{source}/{}", crate::archive_migration::RECEIPT_NAME);
+    let absolute = resolved_under(&repo.root, &receipt_path);
+    if absolute.exists() {
+        reject_symlink_traversal(&repo.root, &receipt_path, "task rename receipt")?;
+        let raw = fs::read(&absolute).at(&absolute)?;
+        let previous: Value = serde_json::from_slice(&raw)
+            .map_err(|error| Error::message(format!("invalid task rename receipt: {error}")))?;
+        crate::archive_migration::validate(&receipt_path, &previous)?;
+        crate::archive_cancel::validate_planned_rename_retarget(repo, task, &previous)?;
+        let mut receipt = previous.clone();
+        receipt["destination"] = destination.into();
+        let original_source = previous["source"].as_str().expect("validated source");
+        for row in receipt["versions"]
+            .as_array_mut()
+            .expect("validated versions")
+        {
+            let object = row["source_object"]
+                .as_str()
+                .expect("validated source object");
+            row["destination_object"] =
+                format!("{destination}{}", &object[original_source.len()..]).into();
+        }
+        crate::archive_migration::validate(
+            &format!("{destination}/{}", crate::archive_migration::RECEIPT_NAME),
+            &receipt,
+        )?;
+        return Ok(Some(StorageRename {
+            receipt,
+            previous: Some(previous),
+        }));
+    }
+    if !config.requires_object_versioning() {
+        return Ok(None);
+    }
+    let pointers = storage_metadata::discover(repo, &[source.to_owned()])?;
+    // A normalized MD5 cannot prove raw-byte equality after changing the
+    // physical cache key. Keep the exact source cache as the trusted raw-byte
+    // association; preparation rebinds it after verifying the copy.
+    for pointer in &pointers {
+        let path = resolved_under(&repo.root, pointer);
+        let raw = fs::read_to_string(&path).at(&path)?;
+        if storage_metadata::hash_algorithm(&raw, pointer)? == "md5-dos2unix" {
+            for entry in storage_metadata::parse_pointer_document(&raw, pointer)?.entries(pointer) {
+                if entry.version_id.is_some() && entry.verification.is_none() {
+                    let source = crate::native_engine::StorageEntry {
+                        pointer: pointer.clone(),
+                        object: entry.key,
+                        md5: entry.md5,
+                        size: entry.size,
+                        version_id: entry.version_id,
+                        etag: entry.etag,
+                        verification: None,
+                        hash_name: "md5-dos2unix".to_owned(),
+                    };
+                    let cache = crate::native_engine::cache_path_for_entry(repo, &source)?;
+                    if !cache.is_file() {
+                        return Err(Error::message(
+                            "S3 task rename requires the exact source-version cache for legacy normalized storage; hydrate or migrate its storage metadata before renaming",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut receipt = crate::archive_migration::plan(repo, config, source, destination)?;
+    receipt["task_id"] = task.task_id.clone().into();
+    receipt["migration_kind"] = "task-rename".into();
+    crate::archive_migration::validate(
+        &format!("{destination}/{}", crate::archive_migration::RECEIPT_NAME),
+        &receipt,
+    )?;
+    for pointer in pointers {
+        let path = resolved_under(&repo.root, &pointer);
+        let raw = fs::read_to_string(&path).at(&path)?;
+        let document = storage_metadata::parse_pointer_document(&raw, &pointer)?;
+        for entry in document.entries(&pointer) {
+            if let Some(version) = entry.version_id {
+                let bound = receipt["versions"]
+                    .as_array()
+                    .expect("validated versions")
+                    .iter()
+                    .any(|row| {
+                        row["source_object"] == entry.key
+                            && row["source_version_id"] == version
+                            && row["delete_marker"] == false
+                    });
+                if !bound {
+                    return Err(Error::message(format!(
+                        "task rename cannot preserve missing exact source version for {}",
+                        entry.key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(Some(StorageRename {
+        receipt,
+        previous: None,
+    }))
 }
 
 /// Every writable task uses the shared checkout on the base branch.
@@ -309,6 +457,7 @@ fn apply_rename(
     new_task_path: Option<&str>,
     rendered: &str,
     relocation: Option<&RelocationPlan>,
+    migration: Option<&StorageRename>,
 ) -> Result<()> {
     match (task.task_path.as_deref(), new_task_path) {
         (Some(old_path), Some(new_path)) => {
@@ -316,15 +465,61 @@ fn apply_rename(
             let new = resolved_under(&repo.root, new_path);
             let original = fs::read_to_string(&task.manifest_path).at(&task.manifest_path)?;
             let pointer_snapshots = moved_pointer_snapshots(repo, old_path, new_path)?;
-            fs::rename(&old, &new).at(&old)?;
+            let receipt_name = crate::archive_migration::RECEIPT_NAME;
+            let original_receipt = match fs::read_to_string(old.join(receipt_name)) {
+                Ok(raw) => Some(raw),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: old.join(receipt_name),
+                        source,
+                    });
+                }
+            };
+            if let Some(migration) = migration {
+                if let Some(previous) = &migration.previous {
+                    crate::archive_cancel::record_retargeted_rename(
+                        repo,
+                        task,
+                        previous,
+                        &migration.receipt,
+                    )?;
+                } else {
+                    crate::archive_cancel::record_attempt(
+                        repo,
+                        task,
+                        old_path,
+                        new_path,
+                        relocation.expect("deliverable relocation"),
+                        &migration.receipt,
+                    )?;
+                }
+            }
+            if let Err(error) = fs::rename(&old, &new).at(&old) {
+                if let Some(migration) = migration {
+                    crate::archive_cancel::rolled_back(
+                        repo,
+                        migration.receipt["source"]
+                            .as_str()
+                            .expect("validated source"),
+                        new_path,
+                    )?;
+                }
+                return Err(error);
+            }
             let new_manifest = new.join(TASK_MANIFEST_NAME);
             let mut changed_pointers = Vec::new();
             let mut manifest_rewritten = false;
+            let mut receipt_rewritten = false;
             let result = (|| {
                 if let Some(relocation) = relocation {
                     relocation.apply()?;
                 }
-                for (index, snapshot) in pointer_snapshots.iter().enumerate() {
+                for (index, snapshot) in pointer_snapshots
+                    .iter()
+                    .enumerate()
+                    .filter(|_| migration.is_none())
+                {
                     if storage_metadata::reset_moved_pointer_cloud_metadata(
                         repo,
                         &snapshot.new_path,
@@ -332,20 +527,79 @@ fn apply_rename(
                         changed_pointers.push(index);
                     }
                 }
+                if let Some(migration) = migration {
+                    let raw = format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&migration.receipt)
+                            .map_err(|error| Error::message(error.to_string()))?
+                    );
+                    atomic_write(&new.join(receipt_name), &raw)?;
+                    receipt_rewritten = true;
+                    crate::archive_cancel::record_pointer_rewrite(
+                        repo,
+                        &migration.receipt,
+                        &format!("{new_path}/{TASK_MANIFEST_NAME}"),
+                        rendered.as_bytes(),
+                    )?;
+                }
                 atomic_write(&new_manifest, rendered)?;
                 manifest_rewritten = true;
-                ResolvedTask::load(repo, config, &new_manifest).map(|_| ())
+                ResolvedTask::load(repo, config, &new_manifest)?;
+                if let Some(migration) = migration {
+                    crate::archive_cancel::moved(
+                        repo,
+                        migration.receipt["source"]
+                            .as_str()
+                            .expect("validated source"),
+                        new_path,
+                    )?;
+                }
+                Ok(())
             })();
             if let Err(error) = result {
-                let rollback = rollback_deliverable(
-                    &new,
-                    &old,
-                    manifest_rewritten.then_some((&new_manifest, original.as_str())),
-                    &pointer_snapshots,
-                    &changed_pointers,
-                    relocation,
+                let receipt_rollback = if receipt_rewritten {
+                    match &original_receipt {
+                        Some(raw) => atomic_write(&new.join(receipt_name), raw),
+                        None => fs::remove_file(new.join(receipt_name)).at(new.join(receipt_name)),
+                    }
+                } else {
+                    Ok(())
+                };
+                let rollback = combine_rollbacks(
+                    receipt_rollback,
+                    rollback_deliverable(
+                        &new,
+                        &old,
+                        manifest_rewritten.then_some((&new_manifest, original.as_str())),
+                        &pointer_snapshots,
+                        &changed_pointers,
+                        relocation,
+                    ),
                 );
+                let rollback = if let Some(migration) = migration {
+                    combine_rollbacks(
+                        rollback,
+                        crate::archive_cancel::rolled_back(
+                            repo,
+                            migration.receipt["source"]
+                                .as_str()
+                                .expect("validated source"),
+                            new_path,
+                        ),
+                    )
+                } else {
+                    rollback
+                };
                 return Err(rollback_error(error, rollback));
+            }
+            if let Some(migration) = migration
+                && let Some(previous) = &migration.previous
+            {
+                crate::archive_cancel::rolled_back(
+                    repo,
+                    previous["source"].as_str().expect("validated source"),
+                    old_path,
+                )?;
             }
             Ok(())
         }
@@ -486,3 +740,7 @@ fn combine_rollbacks(first: Result<()>, second: Result<()>) -> Result<()> {
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "task_rename_tests.rs"]
+mod tests;

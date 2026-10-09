@@ -865,8 +865,9 @@ fn validate_destination(
     context: &Value,
     journal: &mut Value,
     recover: bool,
+    allow_additions: bool,
 ) -> Result<Vec<Value>> {
-    let actual = destination_inventory(store, context)?;
+    let mut actual = destination_inventory(store, context)?;
     let mut wanted = BTreeMap::<(String, String), usize>::new();
     let mut pending = Vec::new();
     for (index, row) in rows(journal)?.iter().enumerate() {
@@ -881,6 +882,17 @@ fn validate_destination(
         } else if row["started"] == true {
             pending.push(index);
         }
+    }
+    if allow_additions {
+        // A renamed task stays active. Later publications may add immutable
+        // versions at its new path; only the signed migration's exact copied
+        // history belongs to this retirement verification.
+        actual.retain(|item| {
+            wanted.contains_key(&(
+                item["Key"].as_str().unwrap_or("").to_owned(),
+                item["VersionId"].as_str().unwrap_or("").to_owned(),
+            ))
+        });
     }
     let unknown = actual
         .iter()
@@ -984,6 +996,14 @@ fn validate_destination(
     Ok(actual)
 }
 fn verify_history_with(store: &impl Storage, context: &Value, journal: &mut Value) -> Result<()> {
+    verify_history_mode(store, context, journal, false)
+}
+fn verify_history_mode(
+    store: &impl Storage,
+    context: &Value,
+    journal: &mut Value,
+    allow_additions: bool,
+) -> Result<()> {
     if rows(journal)?.iter().any(|row| {
         row["destination_version_id"]
             .as_str()
@@ -991,7 +1011,10 @@ fn verify_history_with(store: &impl Storage, context: &Value, journal: &mut Valu
     }) {
         return Err(message("archive history copy is incomplete"));
     }
-    let actual = validate_destination(store, context, journal, false)?;
+    let actual = validate_destination(store, context, journal, false, allow_additions)?;
+    if allow_additions {
+        return Ok(());
+    }
     let latest = actual
         .iter()
         .filter(|item| item["IsLatest"] == true)
@@ -1017,10 +1040,33 @@ fn verify_history_with(store: &impl Storage, context: &Value, journal: &mut Valu
     }
     Ok(())
 }
+fn verify_receipt_history_with(
+    store: &impl Storage,
+    context: &Value,
+    receipt: &mut Value,
+) -> Result<()> {
+    let allow_additions = validated_rename_receipt(receipt)?;
+    verify_history_mode(store, context, receipt, allow_additions)
+}
+fn validated_rename_receipt(receipt: &Value) -> Result<bool> {
+    if receipt.get("migration_kind").is_none() {
+        return Ok(false);
+    }
+    // A discriminator alone cannot turn an archive into an active-task
+    // exception. Bind it to the task's immutable ID/timestamp and the exact
+    // top-level old/new namespace mapping before accepting later versions.
+    let path = format!(
+        "{}/{}",
+        text(receipt, "destination")?,
+        crate::archive_migration::RECEIPT_NAME,
+    );
+    crate::archive_migration::validate(&path, receipt)?;
+    Ok(crate::archive_migration::is_task_rename(receipt))
+}
 pub(crate) fn verify_history(client: &S3Client, receipt: &Value) -> Result<()> {
     let context = context(client, receipt)?;
     validate_receipt(receipt, &context)?;
-    verify_history_with(client, &context, &mut receipt.clone())
+    verify_receipt_history_with(client, &context, &mut receipt.clone())
 }
 fn verify_cancel_source_with(store: &impl Storage, context: &Value, receipt: &Value) -> Result<()> {
     validate_receipt(receipt, context)?;
@@ -1621,12 +1667,18 @@ fn execute_with(
         );
     }
     if ["verify", "verify-source"].contains(&operation) {
-        let mut receipt = journal
+        let migration_receipt = payload
+            .get("receipt")
+            .filter(|receipt| receipt.get("migration_kind").is_some())
+            .cloned();
+        let mut receipt = migration_receipt
+            .or(journal)
             .or_else(|| payload.get("receipt").cloned())
             .or_else(|| payload.get("planned").cloned())
             .or_else(|| payload.get("versions").is_some().then(|| payload.clone()))
             .ok_or_else(|| message("archive verification requires a receipt"))?;
         validate_receipt(&receipt, &context)?;
+        validated_rename_receipt(&receipt)?;
         if operation == "verify-source" {
             if source_signature(&source_inventory(store, &context)?)
                 != source_signature(rows(&receipt)?)
@@ -1637,7 +1689,7 @@ fn execute_with(
             }
             return public_receipt(&receipt, Some("source-verified"));
         }
-        verify_history_with(store, &context, &mut receipt)?;
+        verify_receipt_history_with(store, &context, &mut receipt)?;
         return public_receipt(&receipt, Some("verified"));
     }
     let state =
@@ -1734,7 +1786,7 @@ fn execute_with(
     if source_signature(rows(&journal)?) != source_signature(&current) {
         return Err(message("archive source history changed during copying"));
     }
-    validate_destination(store, &context, &mut journal, true)?;
+    validate_destination(store, &context, &mut journal, true, false)?;
     save_journal(state, &journal)?;
     let mut written = rows(&journal)?
         .iter()
@@ -1803,6 +1855,7 @@ fn validate_registry_receipt(store: &impl Storage, receipt: &Value) -> Result<()
     if !receipt.is_object() || receipt["schema_version"] != 1 {
         return Err(message("unsupported archive registry receipt schema"));
     }
+    validated_rename_receipt(receipt)?;
     let source = relative_path(text(receipt, "source")?)?;
     let destination = relative_path(text(receipt, "destination")?)?;
     if source == destination {

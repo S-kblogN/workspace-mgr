@@ -25,6 +25,7 @@ import botocore.session
 from botocore.config import Config as BotocoreConfig
 
 VERIFIED_STORAGE_MINIMUM_CLI_VERSION = "0.8.7"
+TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION = "0.8.11"
 
 
 class E2EFailure(RuntimeError):
@@ -282,6 +283,13 @@ class Harness:
             )
             bodies.append(response["Body"].read())
         return bodies
+
+    def exact_s3_body(self, key: str, version_id: str) -> bytes:
+        response = self.s3.get_object(Bucket=self.bucket, Key=key, VersionId=version_id)
+        try:
+            return response["Body"].read()
+        finally:
+            response["Body"].close()
 
     def s3_version_for_body(self, expected: bytes) -> dict[str, Any]:
         matches = []
@@ -1212,10 +1220,12 @@ class Harness:
         self.check(local_branch.returncode == 128, "infrastructure discard deletes its local branch")
         self.check(
             all(item["key"] != infra_discarded_key for item in self.list_s3_versions())
-            and discarded["s3_purge"]["status"] == "complete"
-            and discarded["s3_purge"]["pending"] == []
-            and discarded["s3_purge"].get("pending_prefixes", []) == [],
-            "infrastructure discard permanently purges unreferenced versioned S3 content",
+            and discarded["s3_purge"]["status"] == "cleanup_pending"
+            and {(row["object"], row["version_id"])
+                 for row in discarded["s3_purge"]["pending"]}
+                == self.rename_retention["pending_before_merge"]
+            and discarded["s3_purge"].get("pending_prefixes", []) == [self.rename_retention["source"]],
+            "infrastructure discard purges its content and preserves only the pending rename history",
         )
         self.assert_shared_head()
 
@@ -1792,6 +1802,7 @@ class Harness:
         first = self.wm(task, "publish", "-m", "Publish the initial task topic")
         first_oid = first["remote_oid"]
         old_artifact_key = self.s3_version_for_body(payload)["key"]
+        self.git(self.shared, "push", "origin", f"{first_oid}:refs/tags/e2e-rename-original-history")
         self.check(
             self.remote_path_exists(first_oid, f"{task_id}/artifact.bin.wm-storage.json"),
             "initial published tree contains the S3 pointer",
@@ -1808,6 +1819,8 @@ class Harness:
             "reset removes the explicit choice and inherits published S3 placement",
         )
         versions_before = self.list_s3_versions()
+        original = [row for row in self.s3_version_inventory()
+                    if row["key"].startswith(f"objects/{task_id}/")]
         remote_before = self.remote_ref(branch)
 
         preview = self.wm(task, "task", "rename", "current-topic", "--dry-run")
@@ -1898,12 +1911,51 @@ class Harness:
             ),
             "renamed publication removes the old tree and publishes the new tree",
         )
+        receipt = json.loads((renamed_task / ".workspace-mgr-archive.json").read_text())
+        original_ids = {(row["key"].removeprefix("objects/"), row["version_id"])
+                        for row in original}
+        copied_ids = {(row["destination_object"], row["destination_version_id"])
+                      for row in receipt["versions"]}
+        copied = [row for row in self.s3_version_inventory()
+                  if row["key"].startswith(f"objects/{renamed_id}/")]
         self.check(
-            all(item["key"] != old_artifact_key for item in self.list_s3_versions()),
-            "renamed publication permanently removes every S3 version at the old task path",
+            receipt["migration_kind"] == "task-rename" and receipt["status"] == "copied"
+            and receipt["task_id"] == task_id and receipt["source"] == task_id
+            and receipt["destination"] == renamed_id
+            and {(row["source_object"], row["source_version_id"])
+                 for row in receipt["versions"]} == original_ids
+            and {(row["key"].removeprefix("objects/"), row["version_id"])
+                 for row in copied} == copied_ids
+            and len(copied) == len(original),
+            "rename copies every exact source generation with no extra unchanged-payload uploads",
         )
-        self.check(self.wm(self.shared, "doctor", renamed_id)["storage"]["issues"] == [],
-                   "doctor accepts a published task at its current renamed path")
+        copied_by_id = {(row["key"].removeprefix("objects/"), row["version_id"]): row
+                        for row in copied}
+        for row in receipt["versions"]:
+            actual = copied_by_id[(row["destination_object"], row["destination_version_id"])]
+            self.check(actual["delete_marker"] == row["delete_marker"],
+                       "rename preserves the exact copied generation kind")
+            if not row["delete_marker"]:
+                self.check(self.exact_s3_body("objects/" + row["source_object"], row["source_version_id"])
+                           == self.exact_s3_body("objects/" + row["destination_object"], row["destination_version_id"])
+                           == payload,
+                           "rename server copies retain the original exact opaque payload bytes")
+        self.check(
+            [row for row in self.s3_version_inventory()
+             if row["key"].startswith(f"objects/{task_id}/")] == original
+            and published["storage"]["purge"]["status"] == "cleanup_pending"
+            and task_id in published["storage"]["purge"]["pending_prefixes"],
+            "rename preserves complete source history until its copied receipt reaches shared main",
+        )
+        pending_doctor = json.loads(self.wm(self.shared, "doctor", renamed_id, expected=2)["stdout"])
+        self.check(
+            pending_doctor["storage"]["issues"]
+            and all(issue["code"] == "unexpected-object" and issue["path"] == f"{task_id}/artifact.bin"
+                    for issue in pending_doctor["storage"]["issues"])
+            and {issue["version"] for issue in pending_doctor["storage"]["issues"]}
+                == {row["version_id"] for row in original},
+            "doctor diagnoses every pending old-source generation while the copied current path verifies",
+        )
         stale_version = self.s3.put_object(Bucket=self.bucket, Key=old_artifact_key, Body=payload)["VersionId"]
         stale_marker = self.create_s3_delete_marker(old_artifact_key)
         try:
@@ -1912,8 +1964,9 @@ class Harness:
                            for issue in stale["storage"]["issues"]),
                        "current task selection diagnoses leftover versions and markers at its historical pre-rename path")
             old_rows = [row for row in self.s3_version_inventory() if row["key"] == old_artifact_key]
-            self.check({row["version_id"] for row in old_rows} == {stale_version, stale_marker},
-                       "doctor reports retired S3 history without cleaning it")
+            self.check({row["version_id"] for row in old_rows}
+                       == {row["version_id"] for row in original} | {stale_version, stale_marker},
+                       "doctor preserves mapped source history and both unreviewed added generations")
         finally:
             self.s3.delete_object(Bucket=self.bucket, Key=old_artifact_key, VersionId=stale_marker)
             self.s3.delete_object(Bucket=self.bucket, Key=old_artifact_key, VersionId=stale_version)
@@ -1941,7 +1994,7 @@ class Harness:
             and (renamed_task / "artifact.bin").read_bytes() == payload,
             "renamed S3 boundary hydrates its exact published payload",
         )
-        renamed_artifact_key = self.s3_version_for_body(payload)["key"]
+        renamed_artifact_key = f"objects/{renamed_id}/artifact.bin"
         removed = self.wm(
             renamed_task,
             "remove",
@@ -1962,9 +2015,88 @@ class Harness:
         )
         self.check(removed_publish["status"] == "pushed", "explicit S3 deletion publishes")
         self.check(
-            all(item["key"] != renamed_artifact_key for item in self.list_s3_versions()),
-            "publishing remove permanently deletes every S3 version at the removed path",
+            [row for row in self.s3_version_inventory()
+             if row["key"].startswith(f"objects/{task_id}/")] == original
+            and [row for row in self.s3_version_inventory()
+                 if row["key"].startswith(f"objects/{renamed_id}/")] == copied
+            and json.loads((renamed_task / ".workspace-mgr-archive.json").read_text()) == receipt
+            and removed_publish["storage"]["purge"]["status"] == "cleanup_pending",
+            "removing current payload preserves the exact copied history and pending source retirement",
         )
+        self.check(all(self.exact_s3_body(renamed_artifact_key, row["version_id"]) == payload
+                       for row in copied if not row["delete_marker"]),
+                   "removed current output remains readable through each retained immutable copy")
+        self.rename_retention = {
+            "source": task_id, "destination": renamed_id, "branch": branch,
+            "task": renamed_task, "first_oid": first_oid, "payload": payload,
+            "receipt": receipt, "copied": copied, "copied_ids": copied_ids,
+            "pending_before_merge": {(row["object"], row["version_id"])
+                                     for row in removed_publish["storage"]["purge"]["pending"]},
+        }
+
+    def finish_renamed_history(self) -> None:
+        assert self.shared is not None
+        self.section("merged rename source retirement and retained historical output")
+        history = self.rename_retention
+        base = self.remote_ref("main")
+        head = self.remote_ref(history["branch"])
+        self.git(self.seed, "fetch", "origin")
+        self.git(self.seed, "checkout", "--detach", base)
+        merged_result = self.git(self.seed, "merge", "--no-ff", head,
+                                 "-m", "Merge renamed task and its preserved exact history", expected=(0, 1))
+        if merged_result.returncode:
+            # Both independent tasks can raise the same compatibility floor.
+            # Resolve only that one control line, retaining the rename's higher
+            # requirement; payload/configuration conflicts remain hard errors.
+            conflicts = self.git(self.seed, "diff", "--name-only", "--diff-filter=U").stdout.splitlines()
+            main_config = self.remote_file(base, ".workspace-mgr.toml")
+            renamed_config = self.remote_file(head, ".workspace-mgr.toml")
+            without_floor = lambda text: "".join(line for line in text.splitlines(keepends=True)
+                                                if not line.startswith("minimum_cli_version = "))
+            self.check(conflicts == [".workspace-mgr.toml"]
+                       and without_floor(main_config) == without_floor(renamed_config)
+                       and f'minimum_cli_version = "{TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION}"' in renamed_config,
+                       "fixture merge resolves only the rename's higher shared CLI requirement")
+            self.git(self.seed, "checkout", "--theirs", "--", ".workspace-mgr.toml")
+            self.git(self.seed, "add", ".workspace-mgr.toml")
+            self.git(self.seed, "commit", "-m", "Merge renamed task with its required CLI floor")
+        merged = self.git(self.seed, "rev-parse", "HEAD").stdout.strip()
+        for parent in (base, head):
+            self.git(self.seed, "merge-base", "--is-ancestor", parent, merged)
+        self.git(self.seed, "push", "origin", "HEAD:refs/heads/main")
+        self.check(self.remote_ref("main") == merged,
+                   "fixture main merge preserves both primary and renamed task histories")
+        refreshed = self.wm(self.shared, "refresh")
+        self.check(refreshed["new_oid"] == merged
+                   and not [row for row in self.s3_version_inventory()
+                            if row["key"].startswith(f"objects/{history['source']}/")],
+                   "shared receipt publication retires all exact original source generations")
+        self.check([row for row in self.s3_version_inventory()
+                    if row["key"].startswith(f"objects/{history['destination']}/")] == history["copied"],
+                   "source cleanup preserves precisely the receipt-mapped destination history")
+        # Copied destination history is intentional retention. This private
+        # queue preserves those protected obligations for a later canonical
+        # onward archive; unrelated cleanup must still finish completely.
+        self.check(refreshed["storage"]["purge"]["status"] == "cleanup_pending"
+                   and {(row["object"], row["version_id"])
+                        for row in refreshed["storage"]["purge"]["pending"]} == history["copied_ids"]
+                   and not refreshed["storage"]["purge"].get("pending_prefixes", []),
+                   "only intentionally preserved copied destination identities remain queued")
+        audited = self.wm(self.shared, "doctor", history["destination"])
+        self.check(audited["storage"]["issues"] == []
+                   and audited["storage"]["retained_archive_versions"] == len(history["copied"]),
+                   "doctor accepts every exact historical copy after removal of its current output")
+        consumer = self.root / "rename-original-history-consumer"
+        self.run(["git", "clone", self.remote_url, consumer], cwd=self.root)
+        self.configure_git(consumer)
+        self.git(consumer, "checkout", "--detach", history["first_oid"])
+        self.wm(consumer / history["source"], "storage", "hydrate", f"{history['source']}/artifact.bin")
+        self.check((consumer / history["source"] / "artifact.bin").read_bytes() == history["payload"]
+                   and not [row for row in self.s3_version_inventory()
+                            if row["key"].startswith(f"objects/{history['source']}/")]
+                   and [row for row in self.s3_version_inventory()
+                        if row["key"].startswith(f"objects/{history['destination']}/")] == history["copied"],
+                   "old Git pointers hydrate original bytes without recreating source or copied generations")
 
     def refresh_and_cross_clone(self, task_id: str, task: Path, branch: str) -> None:
         assert self.shared is not None
@@ -2092,6 +2224,10 @@ class Harness:
         staged = self.git(self.shared, "diff", "--cached", "--name-only").stdout
         self.check(staged == "", "refresh leaves shared index clean")
         self.check(self.wm(self.shared, "refresh")["status"] == "no_changes", "repeat refresh is idempotent")
+
+        # Merge the separate rename task after this section's primary branch
+        # has advanced main, preserving the primary fast-forward assertions.
+        self.finish_renamed_history()
 
         consumer = self.root / "consumer"
         self.run(["git", "clone", self.remote_url, consumer], cwd=self.root)
@@ -2259,18 +2395,49 @@ class Harness:
             and self.list_s3_versions() == versions_before,
             "the remote tag independently protects retired S3 versions after main is merged",
         )
+        retired_ids = {(row["key"].removeprefix("objects/"), row["version_id"])
+                       for row in self.s3_version_inventory() if row["key"] == s3_key}
+        queued_retired_ids = {(row["object"], row["version_id"])
+                              for row in refreshed["storage"]["purge"]["pending"]
+                              if "objects/" + row["object"] == s3_key}
+        self.check(queued_retired_ids == {(s3_path, latest_version["version_id"])}
+                   and queued_retired_ids.issubset(retired_ids),
+                   "the final tag protects the exact queued untrack version",
+                   queued=sorted(queued_retired_ids), physical_versions=sorted(retired_ids),
+                   expected=[(s3_path, latest_version["version_id"])])
+        # Refresh rechecks every published receipt source, including exact
+        # generations already absent after the previous guarded retirement.
+        rename_source_ids = {(row["source_object"], row["source_version_id"])
+                             for row in self.rename_retention["receipt"]["versions"]}
         self.git(self.shared, "push", "origin", f":refs/tags/{tag}")
         cleaned = self.wm(self.shared, "refresh")
+        purge = cleaned["storage"]["purge"]
+        deleted_ids = {(row["object"], row["version_id"]) for row in purge["deleted"]}
+        pending_ids = {(row["object"], row["version_id"]) for row in purge["pending"]}
+        remaining = [row for row in self.s3_version_inventory() if row["key"] == s3_key]
         self.check(
-            cleaned["status"] == "s3_purged"
-            and cleaned["storage"]["purge"]["status"] == "complete"
-            and cleaned["storage"]["purge"]["pending"] == [],
-            "refresh retries and completes cleanup after the last remote reference disappears",
+            cleaned["status"] == "no_changes"
+            and purge["status"] == "cleanup_pending",
+            "cleanup preserves the synchronized Git result and reports intentional history retention",
+            refresh_status=cleaned["status"], purge_status=purge["status"],
         )
-        remaining = self.s3.list_object_versions(Bucket=self.bucket, Prefix=s3_key)
         self.check(
-            not remaining.get("Versions") and not remaining.get("DeleteMarkers"),
+            deleted_ids == queued_retired_ids | rename_source_ids,
+            "refresh acknowledges every queued untrack version and rechecked canonical source",
+            expected_deleted=sorted(queued_retired_ids | rename_source_ids),
+            actual_deleted=sorted(deleted_ids), physical_versions_before=sorted(retired_ids),
+        )
+        self.check(
+            pending_ids == self.rename_retention["copied_ids"]
+            and not purge.get("pending_prefixes", []),
+            "refresh retains only canonical rename copies after unrelated untrack cleanup",
+            expected_pending=sorted(self.rename_retention["copied_ids"]),
+            actual_pending=sorted(pending_ids), pending_prefixes=purge.get("pending_prefixes", []),
+        )
+        self.check(
+            not remaining,
             "cleanup permanently removes every old S3 version and delete marker",
+            physical_versions_before=sorted(retired_ids), remaining=remaining,
         )
         self.check(
             git_payload.read_bytes() == git_bytes
@@ -2648,8 +2815,8 @@ class Harness:
         )
         published_config = self.remote_file(commit, config_name)
         self.check(
-            published_config == shared_config and f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"' in published_config,
-            "the published tree retains the repository native compatibility requirement",
+            published_config == shared_config and f'minimum_cli_version = "{TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION}"' in published_config,
+            "the published tree retains the higher merged rename compatibility requirement",
             config=published_config,
         )
         self.check(
@@ -2660,8 +2827,8 @@ class Harness:
             (self.shared / config_name).read_text(encoding="utf-8") == shared_config
             and self.git(self.shared, "status", "--porcelain", "--", config_name).stdout == ""
             and self.remote_ref("main") == main_before
-            and f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"' in self.remote_file(main_before, config_name),
-            "publication leaves shared main and its native compatibility requirement unchanged",
+            and f'minimum_cli_version = "{TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION}"' in self.remote_file(main_before, config_name),
+            "publication leaves shared main and its higher rename compatibility requirement unchanged",
         )
         self.check(
             self.list_s3_versions() == versions_before,
@@ -2829,10 +2996,11 @@ class Harness:
         self.check(local_branch.returncode == 128, "deliverable discard deletes its local branch")
         self.check(
             all(item["key"] != discarded_key for item in self.list_s3_versions())
-            and discarded["s3_purge"]["status"] == "complete"
-            and discarded["s3_purge"]["pending"] == []
+            and discarded["s3_purge"]["status"] == "cleanup_pending"
+            and {(row["object"], row["version_id"])
+                 for row in discarded["s3_purge"]["pending"]} == self.rename_retention["copied_ids"]
             and discarded["s3_purge"].get("pending_prefixes", []) == [],
-            "deliverable discard permanently removes every S3 version owned only by its branch",
+            "deliverable discard removes every owned S3 version and retains only canonical rename copies",
         )
         self.check(
             self.git(self.shared, "rev-parse", "main").stdout.strip() == shared_head,
@@ -3088,9 +3256,15 @@ class Harness:
         for checkout in (consumer, self.shared):
             after = self.wm(checkout, "refresh")
             self.check(after["status"] == "updated", "refresh takes the recovery", checkout=str(checkout))
+            expected_pending = self.rename_retention["copied_ids"] if checkout == self.shared else set()
             self.check(
-                "warnings" not in after and "unaddressable" not in after["storage"],
-                "refresh after the recovery reports nothing unaddressable",
+                [warning["code"] for warning in after.get("warnings", [])]
+                    == (["s3-cleanup-pending"] if expected_pending else [])
+                and {(row["object"], row["version_id"])
+                     for row in after["storage"]["purge"]["pending"]} == expected_pending
+                and not after["storage"]["purge"].get("pending_prefixes", [])
+                and "unaddressable" not in after["storage"],
+                "recovery clears every unaddressable obligation and reports only intentional copied-history retention",
                 checkout=str(checkout),
             )
             self.check(
@@ -3124,8 +3298,8 @@ class Harness:
         # Advance main by a fast-forward whose configuration requires a
         # release that does not exist yet.
         config = self.remote_file(local_main, config_name)
-        requirement = f'minimum_cli_version = "{VERIFIED_STORAGE_MINIMUM_CLI_VERSION}"'
-        self.check(requirement in config, "shared main declares the verified-storage compatibility requirement")
+        requirement = f'minimum_cli_version = "{TASK_RENAME_STORAGE_MINIMUM_CLI_VERSION}"'
+        self.check(requirement in config, "shared main preserves the merged rename compatibility requirement")
         raised = self.root / "raised-workspace-config.toml"
         raised.write_text(config.replace(requirement, 'minimum_cli_version = "99.0.0"'), encoding="utf-8")
         blob = self.git(self.shared, "hash-object", "-w", str(raised)).stdout.strip()

@@ -9,6 +9,12 @@ run independent computation or network requests concurrently.
 - Git trees and immutable blobs are read with `ls-tree -z` and `cat-file --batch`.
   Blob IDs, modes, framing, missing objects, and requested paths are checked.
   Index removal and staging use NUL-delimited batches, including unusual paths.
+- Refresh compares overlay paths with bounded literal tree and filtered hash
+  batches, then materializes approved ordinary Git paths with one NUL-delimited
+  `checkout-index` request. Executable modes, symlinks, filters and overlay
+  conflicts remain checked. Temporary historical worktrees load their exact
+  index and check out only storage controls, avoiding unrelated payloads and
+  their smudge filters.
 - Cache routing is discovered once per engine or verification phase. Every candidate still receives
   its path traversal, file type, size, and checksum checks. Directory manifests
   are parsed once and remote version inventories are shared across their entries.
@@ -41,8 +47,25 @@ up to 1,000 per request, while retaining the ancestor registry checks and final
 version inventory. Every response must cover the requested exact key/version
 pairs once; HTTP 200 with an item error fails the operation. A regression fixture
 retires 2,005 versions in three requests and proves that partial failure can be
-retried without deleting neighboring objects. Archive retirement and cancellation
-retain their per-version authorization and journal protocol.
+retried without deleting neighboring objects. Archive retirement revalidates
+the complete published receipt, canonical registry and destination history
+before each batch of at most 1,000 exact versions and once after mutation.
+Pre-versioning `null` source versions use freshly guarded single-version
+deletion. A final source inventory runs after the destination checks, so new
+source writes remain pending. Cancellation retains its per-version ownership
+and journal protocol.
+
+Cleanup saves each confirmed source-prefix group atomically, keeping generic
+and receipt aliases of the same physical version together. Generic cleanup
+groups have at most 1,000 queued records. An interrupted or failed group remains
+retryable, while previous checkpoints survive. Refresh preserves the successful
+Git result and reports cleanup errors, durable pending versions and prefixes
+in JSON; group progress goes to stderr.
+
+Task rename uses the same server-side history copy as archive at publication.
+Unchanged copied payloads require no client payload transfer. Active renamed
+tasks retain normal reconciliation for later edits. This marked receipt requires
+CLI 0.8.11; ordinary archive receipts continue to require 0.8.10.
 
 Pagination within a single inventory remains ordered. Archive copies retain
 their mutation order because lost-response recovery and version ownership depend
@@ -163,3 +186,11 @@ An earlier run against release 0.8.4 during concurrent integration tests measure
 affects these timings.
 Updated full-workspace timings require a stable target workspace and are not
 inferred from these benchmarks.
+
+Refresh regressions cover 1,205 paths, including long names, tabs, newlines,
+glob characters, executable files, symlinks and Git filters. The Git trace
+requires bounded hash batches and one checkout request rather than a subprocess
+sequence per file. A 512-version archive retirement fixture requires one delete
+batch and 1,024 destination HEAD checks across its pre/post guards. A 1,001-version
+fixture checks that registry changes between batches stop the second mutation.
+These are request-count and safety assertions, not measured B2 wall-clock gains.

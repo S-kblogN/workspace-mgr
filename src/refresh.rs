@@ -249,7 +249,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
         if !options.dry_run {
             s3_purge::queue(&repo, &purge_candidates)?;
             s3_purge::queue_archive_prefixes(&repo, &archive_receipts)?;
-            report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
+            report.storage.purge = s3_purge::purge_after_sync(&repo, &config, &remote)?;
             report.storage.purge.queued = purge_candidates;
             if let Some((code, message)) = report.storage.purge.warning() {
                 report.warnings.push(RefreshWarning {
@@ -445,7 +445,7 @@ pub fn execute(options: &RefreshOptions) -> Result<RefreshReport> {
     );
     report.working_changes_after = working_changes(&repo)?;
     cleanup_branches(&repo, &config, &new_oid, false, &mut report);
-    report.storage.purge = s3_purge::purge_pending(&repo, &config, &remote)?;
+    report.storage.purge = s3_purge::purge_after_sync(&repo, &config, &remote)?;
     report.storage.purge.queued = purge_candidates;
     if let Some((code, message)) = report.storage.purge.warning() {
         report.warnings.push(RefreshWarning {
@@ -811,31 +811,63 @@ fn safe_git_materialization_paths(
     old_oid: &str,
     paths: &[String],
 ) -> Result<Vec<String>> {
-    let mut safe = std::collections::BTreeSet::new();
+    let entries = repo.tree_entries(old_oid, paths)?;
+    let mut safe = BTreeSet::new();
+    let mut regular = Vec::new();
+    let mut directories = Vec::new();
+    let filemode = git_tracks_filemode(repo)?;
     for path in paths {
-        match tree_entry_kind(repo, old_oid, path)? {
-            TreeEntryKind::WorktreeEntry => {
-                if worktree_file_matches_tree(repo, old_oid, path)? {
-                    safe.insert(path.clone());
-                }
+        let Some(entry) = entries.get(path) else {
+            continue;
+        };
+        if entry.kind == "tree" {
+            directories.push(path.clone());
+            continue;
+        }
+        // Preserve symlinks and gitlinks as overlays. In particular, never
+        // hash or check out a regular file through a symlinked ancestor.
+        if !matches!(entry.mode.as_str(), "100644" | "100755")
+            || !has_directory_ancestors(repo, path)?
+        {
+            continue;
+        }
+        let candidate = resolved_under(&repo.root, path);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    path: candidate,
+                    source,
+                });
             }
-            TreeEntryKind::Tree => {
-                let status = repo.run([
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                    "--",
-                    path,
-                ])?;
-                if status.stdout.is_empty() {
-                    safe.insert(path.clone());
-                }
-            }
-            TreeEntryKind::Missing => {}
+        };
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && (!filemode || matches_executable_mode(&metadata, &entry.mode))
+        {
+            regular.push(path.clone());
+        }
+    }
+    let hashes = repo.filtered_worktree_hashes(&regular)?;
+    for path in regular {
+        if hashes.get(&path) == Some(&entries[&path].oid) {
+            safe.insert(path);
+        }
+    }
+    let dirty = dirty_directory_paths(repo, &directories)?;
+    for directory in directories {
+        if !dirty
+            .iter()
+            .any(|path| path == &directory || path.starts_with(&format!("{directory}/")))
+            && has_directory_ancestors(repo, &directory)?
+            && !resolved_under(&repo.root, &directory).is_symlink()
+        {
+            safe.insert(directory);
         }
     }
     for path in paths {
-        if tree_entry_kind(repo, old_oid, path)? == TreeEntryKind::Missing
+        if !entries.contains_key(path)
             && path_is_absent_without_symlink_ancestors(repo, path, &safe)?
         {
             safe.insert(path.clone());
@@ -848,48 +880,100 @@ fn safe_git_materialization_paths(
         .collect())
 }
 
-fn worktree_file_matches_tree(repo: &GitRepo, oid: &str, path: &str) -> Result<bool> {
-    let candidate = resolved_under(&repo.root, path);
-    let metadata = match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(Error::Io {
-                path: candidate,
-                source: error,
-            });
-        }
-    };
-    // Symlinks and gitlinks require type-specific comparison. Preserve them as
-    // overlays rather than guessing that an incoming change is safe.
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+fn git_tracks_filemode(repo: &GitRepo) -> Result<bool> {
+    if !cfg!(unix) {
         return Ok(false);
     }
-    let tree = repo.run(["ls-tree", oid, "--", path])?;
-    let Some((entry, actual_path)) = tree.stdout.trim_end().split_once('\t') else {
-        return Ok(false);
-    };
-    if actual_path != path {
-        return Ok(false);
-    }
-    let fields: Vec<&str> = entry.split_whitespace().collect();
-    if fields.len() != 3 || fields[1] != "blob" {
-        return Ok(false);
-    }
-    let hashed = repo.run_unchecked([
-        "hash-object",
-        &format!("--path={path}"),
-        "--filters",
-        "--",
-        path,
-    ])?;
-    match hashed.code {
-        0 => Ok(hashed.stdout.trim() == fields[2]),
+    let output = repo.run_unchecked(["config", "--bool", "core.filemode"])?;
+    match output.code {
+        0 => Ok(output.stdout.trim() != "false"),
+        1 => Ok(true),
         _ => Err(Error::message(format!(
-            "failed to hash working-tree path {path:?}: {}",
-            hashed.stderr.trim()
+            "failed to inspect Git filemode configuration: {}",
+            output.stderr.trim()
         ))),
     }
+}
+
+#[cfg(unix)]
+fn matches_executable_mode(metadata: &fs::Metadata, mode: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    (metadata.permissions().mode() & 0o100 != 0) == (mode == "100755")
+}
+
+#[cfg(not(unix))]
+fn matches_executable_mode(_metadata: &fs::Metadata, _mode: &str) -> bool {
+    true
+}
+
+fn has_directory_ancestors(repo: &GitRepo, path: &str) -> Result<bool> {
+    let mut current = repo.root.clone();
+    if let Some(parent) = Path::new(path).parent() {
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => return Ok(false),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: current,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn dirty_directory_paths(repo: &GitRepo, paths: &[String]) -> Result<BTreeSet<String>> {
+    let literal = paths
+        .iter()
+        .map(|path| format!(":(literal){path}"))
+        .collect::<Vec<_>>();
+    let mut dirty = BTreeSet::new();
+    for batch in crate::git::pathspec_batches(&literal) {
+        let mut args = vec![
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        args.extend(batch.iter().cloned());
+        let output = repo.run_bytes(args, None)?;
+        let mut records = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty());
+        while let Some(record) = records.next() {
+            if record.len() < 4 || record[2] != b' ' {
+                return Err(Error::message("unexpected Git working-tree status record"));
+            }
+            dirty.insert(String::from_utf8_lossy(&record[3..]).into_owned());
+            if record[..2]
+                .iter()
+                .any(|status| matches!(*status, b'R' | b'C'))
+            {
+                let source = records
+                    .next()
+                    .ok_or_else(|| Error::message("Git rename status omitted its source path"))?;
+                dirty.insert(String::from_utf8_lossy(source).into_owned());
+            }
+        }
+    }
+    Ok(dirty)
 }
 
 fn path_is_absent_without_symlink_ancestors(
@@ -939,41 +1023,14 @@ fn path_is_absent_without_symlink_ancestors(
     Ok(true)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeEntryKind {
-    Missing,
-    Tree,
-    WorktreeEntry,
-}
-
-fn tree_entry_kind(repo: &GitRepo, oid: &str, path: &str) -> Result<TreeEntryKind> {
-    let output = repo.run(["ls-tree", "-z", oid, "--", path])?;
-    for entry in output.stdout.split('\0').filter(|entry| !entry.is_empty()) {
-        let Some((metadata, actual_path)) = entry.split_once('\t') else {
-            return Err(Error::message(format!(
-                "Git returned invalid tree metadata for {path:?}"
-            )));
-        };
-        if actual_path != path {
-            continue;
-        }
-        let mode = metadata.split_whitespace().next().unwrap_or_default();
-        return Ok(if mode == "040000" {
-            TreeEntryKind::Tree
-        } else {
-            TreeEntryKind::WorktreeEntry
-        });
-    }
-    Ok(TreeEntryKind::Missing)
-}
-
 fn materialize_git_paths(repo: &GitRepo, oid: &str, paths: &[String]) -> Result<()> {
+    let entries = repo.tree_entries(oid, paths)?;
     let mut deleted = Vec::new();
     let mut present = Vec::new();
     for path in paths {
-        match tree_entry_kind(repo, oid, path)? {
-            TreeEntryKind::WorktreeEntry => present.push(path.clone()),
-            TreeEntryKind::Missing | TreeEntryKind::Tree => deleted.push(path.clone()),
+        match entries.get(path) {
+            Some(entry) if entry.kind != "tree" => present.push(path.clone()),
+            _ => deleted.push(path.clone()),
         }
     }
     deleted.sort_by_key(|path| std::cmp::Reverse(Path::new(path).components().count()));
@@ -987,7 +1044,13 @@ fn materialize_git_paths(repo: &GitRepo, oid: &str, paths: &[String]) -> Result<
         if candidate.is_dir() && !candidate.is_symlink() {
             fs::remove_dir(&candidate).at(&candidate)?;
         }
-        repo.run(["checkout-index", "--force", "--", path])?;
+    }
+    if !present.is_empty() {
+        let input = present
+            .iter()
+            .flat_map(|path| path.as_bytes().iter().copied().chain([0]))
+            .collect::<Vec<_>>();
+        repo.run_bytes(["checkout-index", "--force", "--stdin", "-z"], Some(&input))?;
     }
     Ok(())
 }
