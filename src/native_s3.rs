@@ -2586,6 +2586,12 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum FixtureResponsePolicy {
+        Standard,
+        AllowAbandonedDeleteBatch,
+    }
+
     #[derive(Debug)]
     pub(crate) struct ReadAttempt {
         pub request: WireRequest,
@@ -2632,7 +2638,7 @@ pub(crate) mod tests {
     ) -> (S3Client, RoutedFixture) {
         response_fixture(move |request| {
             assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
-            handler(request)
+            (handler(request), FixtureResponsePolicy::Standard)
         })
     }
 
@@ -2641,11 +2647,24 @@ pub(crate) mod tests {
     pub(crate) fn routed_fixture(
         handler: impl Fn(&WireRequest) -> Reply + Send + Sync + 'static,
     ) -> (S3Client, RoutedFixture) {
-        response_fixture(move |request| Arc::new(handler(request)))
+        response_fixture(move |request| {
+            (Arc::new(handler(request)), FixtureResponsePolicy::Standard)
+        })
+    }
+
+    /// Only a deliberately lost DeleteObjects reply may opt out of the normal
+    /// strict mutation response writes; the request remains fully recorded.
+    pub(crate) fn routed_fixture_with_response_policy(
+        handler: impl Fn(&WireRequest) -> (Reply, FixtureResponsePolicy) + Send + Sync + 'static,
+    ) -> (S3Client, RoutedFixture) {
+        response_fixture(move |request| {
+            let (reply, policy) = handler(request);
+            (Arc::new(reply), policy)
+        })
     }
 
     fn response_fixture(
-        handler: impl Fn(&WireRequest) -> Arc<Reply> + Send + Sync + 'static,
+        handler: impl Fn(&WireRequest) -> (Arc<Reply>, FixtureResponsePolicy) + Send + Sync + 'static,
     ) -> (S3Client, RoutedFixture) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2704,9 +2723,10 @@ pub(crate) mod tests {
                         }
                         Err(error) => panic!("mock read: {error}"),
                     };
-                    let reply = handler(&request);
-                    let response_sent = write_fixture_response(&mut connection, &request, &reply)
-                        .unwrap_or_else(|error| panic!("mock response: {error}"));
+                    let (reply, policy) = handler(&request);
+                    let response_sent =
+                        write_fixture_response(&mut connection, &request, &reply, policy)
+                            .unwrap_or_else(|error| panic!("mock response: {error}"));
                     Some(ReadAttempt {
                         request,
                         response_sent,
@@ -2743,6 +2763,7 @@ pub(crate) mod tests {
         output: &mut impl Write,
         request: &WireRequest,
         reply: &Reply,
+        policy: FixtureResponsePolicy,
     ) -> std::io::Result<bool> {
         let mut headers = format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", reply.status);
         if !reply
@@ -2762,7 +2783,10 @@ pub(crate) mod tests {
         {
             Ok(()) => Ok(true),
             Err(error)
-                if matches!(request.method.as_str(), "GET" | "HEAD")
+                if (matches!(request.method.as_str(), "GET" | "HEAD")
+                    || (matches!(policy, FixtureResponsePolicy::AllowAbandonedDeleteBatch)
+                        && request.method == "POST"
+                        && request.target.ends_with("?delete=")))
                     && matches!(
                         error.kind(),
                         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
@@ -2775,7 +2799,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fixture_response_tolerates_only_abandoned_read_connections() {
+    fn fixture_response_tolerates_only_abandoned_reads_or_opted_in_delete_batches() {
         struct FailingWriter {
             kind: std::io::ErrorKind,
             successful_writes: usize,
@@ -2797,28 +2821,50 @@ pub(crate) mod tests {
             std::io::ErrorKind::ConnectionReset,
             std::io::ErrorKind::TimedOut,
         ] {
-            for method in ["GET", "HEAD", "DELETE", "PUT"] {
-                for successful_writes in [0, 1] {
-                    let request = WireRequest {
-                        method: method.into(),
-                        target: "/fixture".into(),
-                        headers: BTreeMap::new(),
-                        body: Vec::new(),
-                    };
-                    let mut output = FailingWriter {
-                        kind,
-                        successful_writes,
-                    };
-                    let result = write_fixture_response(&mut output, &request, &Reply::xml("body"));
-                    if matches!(method, "GET" | "HEAD")
-                        && matches!(
+            for method in ["GET", "HEAD", "POST", "DELETE", "PUT"] {
+                for (target, policy) in [
+                    ("/fixture", FixtureResponsePolicy::Standard),
+                    ("/fixture?delete=", FixtureResponsePolicy::Standard),
+                    ("/fixture", FixtureResponsePolicy::AllowAbandonedDeleteBatch),
+                    (
+                        "/fixture?delete=",
+                        FixtureResponsePolicy::AllowAbandonedDeleteBatch,
+                    ),
+                ] {
+                    for successful_writes in [0, 1] {
+                        let request = WireRequest {
+                            method: method.into(),
+                            target: target.into(),
+                            headers: BTreeMap::new(),
+                            body: Vec::new(),
+                        };
+                        let mut output = FailingWriter {
                             kind,
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        )
-                    {
-                        assert!(!result.unwrap());
-                    } else {
-                        assert_eq!(result.unwrap_err().kind(), kind);
+                            successful_writes,
+                        };
+                        let result = write_fixture_response(
+                            &mut output,
+                            &request,
+                            &Reply::xml("body"),
+                            policy,
+                        );
+                        if (matches!(method, "GET" | "HEAD")
+                            || (method == "POST"
+                                && target == "/fixture?delete="
+                                && matches!(
+                                    policy,
+                                    FixtureResponsePolicy::AllowAbandonedDeleteBatch
+                                )))
+                            && matches!(
+                                kind,
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            )
+                        {
+                            assert!(!result.unwrap());
+                        } else {
+                            assert_eq!(result.unwrap_err().kind(), kind);
+                        }
                     }
                 }
             }
@@ -3093,7 +3139,7 @@ pub(crate) mod tests {
                 *seen = Some(requested);
             }
             drop(seen);
-            reply.clone()
+            (reply.clone(), FixtureResponsePolicy::Standard)
         })
     }
 

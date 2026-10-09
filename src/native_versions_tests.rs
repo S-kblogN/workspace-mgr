@@ -1,8 +1,8 @@
 //! Adapter regressions through the native HTTP client, using loopback only.
 use super::*;
 use crate::native_s3::tests::{
-    Reply, RoutedFixture, WireRequest, configure_repo, empty_fixture, routed_fixture,
-    single_reply_fixture,
+    FixtureResponsePolicy, Reply, RoutedFixture, WireRequest, configure_repo, empty_fixture,
+    routed_fixture, routed_fixture_with_response_policy, single_reply_fixture,
 };
 use md5::Md5;
 use sha2::{Digest, Sha256};
@@ -2211,7 +2211,7 @@ fn archive_batch_fixture(
     let new_source = Arc::new(AtomicBool::new(false));
     let new_source_worker = new_source.clone();
     let (request_sent, request_received) = mpsc::channel();
-    let (client, worker) = routed_fixture(move |request| {
+    let (client, worker) = routed_fixture_with_response_policy(move |request| {
         let url = url::Url::parse(&format!("http://fixture{}", request.target)).unwrap();
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
         if request.method == "POST" {
@@ -2225,14 +2225,22 @@ fn archive_batch_fixture(
                 let inserted = completed.insert((object.clone(), version.clone()));
                 assert!(inserted || matches!(fault, ArchiveBatchFault::LostBatchResponse));
             }
-            if first && matches!(fault, ArchiveBatchFault::LostBatchResponse) {
+            let policy = if first && matches!(fault, ArchiveBatchFault::LostBatchResponse) {
+                // The client intentionally abandons this one reply after these
+                // exact deletions are recorded. A reset while writing it is an
+                // expected fixture outcome, never permission for another POST.
+                assert_eq!(request.target, "/fixture-bucket?delete=");
                 request_sent.send(()).unwrap();
-            }
-            return if matches!(fault, ArchiveBatchFault::IncompleteBatch) {
+                FixtureResponsePolicy::AllowAbandonedDeleteBatch
+            } else {
+                FixtureResponsePolicy::Standard
+            };
+            let reply = if matches!(fault, ArchiveBatchFault::IncompleteBatch) {
                 batch_deleted(&items[..items.len() - 1])
             } else {
                 batch_deleted(&items)
             };
+            return (reply, policy);
         }
         if request.method == "DELETE" {
             let object = url.path().strip_prefix("/fixture-bucket/").unwrap();
@@ -2247,7 +2255,7 @@ fn archive_batch_fixture(
                     .unwrap()
                     .insert((object.into(), version.clone()))
             );
-            return deleted();
+            return (deleted(), FixtureResponsePolicy::Standard);
         }
         if request.method == "HEAD" {
             let version = &query["versionId"];
@@ -2265,13 +2273,13 @@ fn archive_batch_fixture(
             {
                 new_source_worker.store(true, Ordering::SeqCst);
             }
-            return head(version, "copied", 3);
+            return (head(version, "copied", 3), FixtureResponsePolicy::Standard);
         }
         let completed = completed_worker.lock().unwrap();
         if query.contains_key("versions") {
             let prefix = &query["prefix"];
             if prefix == &registry_object() {
-                return registry_listing();
+                return (registry_listing(), FixtureResponsePolicy::Standard);
             }
             if prefix == "root/archive/task/" {
                 let skip = usize::from(
@@ -2288,7 +2296,7 @@ fn archive_batch_fixture(
                         .replace("<IsLatest>false</IsLatest>", "<IsLatest>true</IsLatest>")
                     })
                     .collect::<String>();
-                return history(&rows);
+                return (history(&rows), FixtureResponsePolicy::Standard);
             }
             assert_eq!(prefix, "root/task/");
             let version_for = |index| {
@@ -2307,23 +2315,23 @@ fn archive_batch_fixture(
             if new_source_worker.load(Ordering::SeqCst) {
                 rows.push_str(&version_row("root/task/concurrent", "late-source-version"));
             }
-            return history(&rows);
+            return (history(&rows), FixtureResponsePolicy::Standard);
         }
         let mut current = stored.clone();
         if matches!(fault, ArchiveBatchFault::RegistryAfterBatch) && !completed.is_empty() {
             current["transaction_id"] = "foreign-transaction".into();
         }
-        registry_body(&current)
+        (registry_body(&current), FixtureResponsePolicy::Standard)
     });
-    let client = if matches!(fault, ArchiveBatchFault::LostBatchResponse) {
-        crate::native_s3::tests::interrupt_response_once(
+    let (client, injected) = if matches!(fault, ArchiveBatchFault::LostBatchResponse) {
+        let (client, injected) = crate::native_s3::tests::interrupt_response_once(
             client,
             "/fixture-bucket?delete=".into(),
             request_received,
-        )
-        .0
+        );
+        (client, Some(injected))
     } else {
-        client
+        (client, None)
     };
     let mut candidates = receipt["versions"]
         .as_array()
@@ -2339,6 +2347,9 @@ fn archive_batch_fixture(
         &json!({"candidates":candidates,"prefixes":[receipt],"coordination":[{"receipt":receipt,"coordination":proof}]}),
         || panic!("archive-only retirement must not fetch a generic destination catalog"),
     );
+    if let Some(injected) = injected {
+        assert_eq!(injected.load(Ordering::SeqCst), 1);
+    }
     let requests = worker.finish_requests();
     let deleted = completed.lock().unwrap().len();
     (result, requests, deleted)
@@ -2430,6 +2441,14 @@ fn published_archive_lost_batch_response_retries_only_identical_exact_versions()
     assert_eq!(batches.len(), 2);
     assert_eq!(batches[0].target, batches[1].target);
     assert_eq!(batches[0].body, batches[1].body);
+    let items = batch_delete_items(batches[0]);
+    assert_eq!(items.len(), 4);
+    assert_eq!(
+        items.into_iter().collect::<BTreeSet<_>>(),
+        (0..4)
+            .map(|index| (format!("root/task/a{index:04}"), format!("v{index}")))
+            .collect()
+    );
 }
 
 #[test]
