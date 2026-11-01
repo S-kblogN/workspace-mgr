@@ -89,7 +89,7 @@ jobs:
           test -x "${install_root}/prefix/bin/workspace-mgr"
           "${install_root}/prefix/bin/workspace-mgr" --version
       - name: Upload native archive
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: native-workspace-mgr-x86_64-unknown-linux-gnu
           path: |
@@ -131,7 +131,7 @@ jobs:
       - name: Package native archive
         run: sh scripts/package-native.sh ${{ matrix.target }}
       - name: Upload native archive
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: native-workspace-mgr-${{ matrix.target }}
           path: |
