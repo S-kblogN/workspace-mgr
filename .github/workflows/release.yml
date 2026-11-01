@@ -161,7 +161,7 @@ jobs:
         if: >-
           steps.current.outputs.version_exists == 'false' &&
           steps.current.outputs.crate_exists == 'true'
-        uses: rust-lang/crates-io-auth-action@v1.0.5
+        uses: rust-lang/crates-io-auth-action@v1.0.6
       - name: Publish first crate version
         if: >-
           steps.current.outputs.version_exists == 'false' &&
