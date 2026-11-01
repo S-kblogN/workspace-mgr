@@ -96,7 +96,7 @@ jobs:
           cp "${RUNNER_TEMP}/minio.log" "${evidence_root}/minio.log" || true
       - name: Upload E2E evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: workspace-mgr-e2e-evidence
           path: |

@@ -62,7 +62,7 @@ jobs:
           fi
           sh scripts/package-native.sh ${{ matrix.target }}
       - name: Upload immutable workflow artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-native-workspace-mgr-${{ matrix.target }}
           path: |
